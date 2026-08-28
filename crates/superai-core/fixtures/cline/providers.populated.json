@@ -1,0 +1,18 @@
+{
+  "_provenance": "source=docs/harness-configs/cline.md last_verified=2026-08-25 sanitized fake sk-fake-",
+  "apiProvider": "openai-compatible",
+  "openAiBaseUrl": "http://localhost:4000/v1",
+  "openAiApiKey": "sk-fake-cline-1234567890",
+  "openAiModelId": "claude-sonnet-4-5",
+  "modelId": "claude-sonnet-4-5",
+  "preferredLanguage": "English",
+  "mcp": {
+    "mcpServers": {
+      "linear": {
+        "command": "node",
+        "args": ["/path/to/build/index.js"],
+        "disabled": false
+      }
+    }
+  }
+}

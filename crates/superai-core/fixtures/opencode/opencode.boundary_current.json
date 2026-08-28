@@ -1,0 +1,49 @@
+{
+  "_provenance": "source=docs/harness-configs/opencode.md last_verified=2026-08-25 sanitized fake sk-fake- current",
+  "$schema": "https://opencode.ai/config.json",
+  "model": "anthropic/claude-sonnet-4-5",
+  "small_model": "anthropic/claude-haiku-4-5",
+  "share": "manual",
+  "autoupdate": false,
+  "provider": {
+    "anthropic": {
+      "options": {
+        "baseURL": "https://api.anthropic.com/v1",
+        "apiKey": "sk-fake-current-2222"
+      },
+      "models": {
+        "claude-sonnet-4-5": {
+          "name": "Claude Sonnet 4.5",
+          "limit": {
+            "context": 200000,
+            "output": 65536
+          }
+        }
+      }
+    },
+    "openrouter": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "OpenRouter",
+      "options": {
+        "baseURL": "https://openrouter.ai/api/v1",
+        "apiKey": "sk-fake-openrouter-9999"
+      },
+      "models": {
+        "anthropic/claude-sonnet-4": {
+          "name": "Claude Sonnet 4"
+        }
+      }
+    }
+  },
+  "mcp": {
+    "local-server": {
+      "type": "local",
+      "command": ["npx", "-y", "@modelcontextprotocol/server-everything"],
+      "enabled": true
+    }
+  },
+  "permission": {
+    "edit": "allow",
+    "bash": "ask"
+  }
+}

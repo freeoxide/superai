@@ -1,0 +1,22 @@
+# Provenance: source=docs/harness-configs/codex-cli.md last_verified=2026-08-25 sanitized fake sk-fake- current
+# Current schema boundary: relocated-root, profile files $CODEX_HOME/<name>.config.toml, wire_api="responses"
+model = "gpt-5.5"
+model_provider = "openai"
+model_reasoning_effort = "high"
+model_verbosity = "medium"
+openai_base_url = "https://api.openai.com/v1"
+
+[model_providers.openrouter]
+name = "OpenRouter"
+base_url = "https://openrouter.ai/api/v1"
+env_key = "OPENROUTER_API_KEY" # fake sk-fake-openrouter
+wire_api = "responses"
+
+[mcp_servers.context7]
+command = "npx"
+args = ["-y", "@upstash/context7-mcp"]
+env = { CTX7_KEY = "sk-fake-ctx7-1111" }
+
+# foreign preservation
+customField = "preserve-me"
+unknownTopLevel = "keep"

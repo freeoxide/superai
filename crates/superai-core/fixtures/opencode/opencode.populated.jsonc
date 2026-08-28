@@ -1,0 +1,22 @@
+{
+  // OpenCode populated config — JSONC with comments and trailing commas
+  // Provenance: source=docs/harness-configs/opencode.md last_verified=2026-08-25 sanitized fake sk-fake-
+  "$schema": "https://opencode.ai/config.json",
+  "model": "anthropic/claude-sonnet-4-5", // primary model
+  "small_model": "anthropic/claude-haiku-4-5",
+  /* provider block */
+  "provider": {
+    "anthropic": {
+      "options": {
+        "baseURL": "https://api.anthropic.com/v1",
+        "apiKey": "sk-fake-anthropic-populated-123", // fake
+      },
+    },
+  },
+  "mcp": {
+    "local-server": {
+      "type": "local",
+      "command": ["npx", "-y", "@modelcontextprotocol/server-everything"],
+    },
+  },
+}
