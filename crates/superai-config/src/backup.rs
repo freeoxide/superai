@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::atomic::{WriteExpectation, atomic_write_expecting};
 use crate::error::{ConfigError, Result};
 
 // ---------------------------------------------------------------------------
@@ -39,8 +40,11 @@ fn set_permissions_u32(path: &Path, mode: u32) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn set_permissions_u32(path: &Path, _mode: u32) -> Result<()> {
-    let _ = path;
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "windows has no POSIX chmod; keeps the unix call sites uniform"
+)]
+fn set_permissions_u32(_path: &Path, _mode: u32) -> Result<()> {
     Ok(())
 }
 
@@ -233,15 +237,10 @@ pub fn backup_with_operation(
 
     std::fs::copy(path, &target).map_err(|e| ConfigError::io(path, e))?;
 
+    // No POSIX mode exists off unix, so `permissions` is always None there
+    // and this is a windows no-op.
     if let Some(mode) = permissions {
-        #[cfg(unix)]
-        {
-            set_permissions_u32(&target, mode)?;
-        }
-        #[cfg(not(unix))]
-        {
-            let _mode = mode;
-        }
+        set_permissions_u32(&target, mode)?;
     }
 
     {
@@ -288,6 +287,14 @@ pub fn backup_with_operation(
 }
 
 /// Restore a backup produced by [`backup`] over `path`.
+///
+/// The backup bytes are committed with the same atomic discipline as every
+/// other write in this crate: a same-directory, same-filesystem temporary
+/// file is written, flushed, and synced, the permission bits recorded in the
+/// backup file itself are applied, and the temp is renamed over `path`. The
+/// target is never truncated or written in place, so an interrupted restore
+/// can only leave `path` fully at its previous bytes or fully restored. The
+/// committed bytes are read back and verified before returning.
 pub fn restore(backup_path: &Path, path: &Path) -> Result<()> {
     let backup_meta =
         std::fs::symlink_metadata(backup_path).map_err(|e| ConfigError::io(backup_path, e))?;
@@ -297,27 +304,18 @@ pub fn restore(backup_path: &Path, path: &Path) -> Result<()> {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "backup is a directory"),
         ));
     }
-
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent).map_err(|e| ConfigError::io(parent, e))?;
-    }
-
-    std::fs::copy(backup_path, path).map_err(|e| ConfigError::io(path, e))?;
-
-    {
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .open(path)
-            .map_err(|e| ConfigError::io(path, e))?;
-        file.sync_all().map_err(|e| ConfigError::io(path, e))?;
-    }
-
-    Ok(())
+    let backup_bytes = std::fs::read(backup_path).map_err(|e| ConfigError::io(backup_path, e))?;
+    // `backup` copies the original's permission bits onto the backup file, so
+    // deriving the mode from the backup reinstates the recorded permissions.
+    let mode = get_permissions_u32(&backup_meta);
+    atomic_write_expecting(path, &backup_bytes, WriteExpectation::Any, mode)
 }
 
 /// Restore via a [`BackupEntry`], verifying the backup first.
+///
+/// The backup file's digest and size must match the entry or the restore is
+/// refused without touching the target. Replacement is atomic — see
+/// [`restore`].
 pub fn restore_entry(entry: &BackupEntry) -> Result<()> {
     let verified = verify_backup(entry)?;
     if !verified {
@@ -603,7 +601,10 @@ pub fn restore_by_id(original_path: &Path, backup_id: &BackupId) -> Result<Resto
 /// 2. Fresh-read current target and preview reverse diff (redacted).
 /// 3. Back up current target before restore unless it is missing (failed
 ///    uncommitted creation).
-/// 4. Atomic replace and semantic verification.
+/// 4. Atomic replace: the backup bytes are written to a same-directory temp,
+///    flushed and synced, given the permissions recorded in the entry, and
+///    renamed over the target. The target is never truncated in place.
+/// 5. Fresh read-back digest and size verification.
 pub fn restore_verified(entry: &BackupEntry) -> Result<RestoreReport> {
     // 1. Verify backup digest
     let digest_ok = verify_backup(entry)?;
@@ -621,13 +622,20 @@ pub fn restore_verified(entry: &BackupEntry) -> Result<RestoreReport> {
             "backup relation mismatch: entry does not belong to target",
         ));
     }
-    // 3. Fresh-read current target and preview diff (redacted)
-    let current_bytes = std::fs::read(&entry.original_path).unwrap_or_default();
+    // 3. Fresh-read current target and preview diff (redacted). A target that
+    //    cannot be read for any reason other than being absent aborts the
+    //    restore instead of silently diffing against empty bytes.
+    let current_bytes = match std::fs::read(&entry.original_path) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(ConfigError::io(&entry.original_path, e)),
+    };
     let backup_bytes =
         std::fs::read(&entry.backup_path).map_err(|e| ConfigError::io(&entry.backup_path, e))?;
-    let preview_redacted = redacted_diff_preview(&current_bytes, &backup_bytes);
+    let preview_redacted =
+        redacted_diff_preview(current_bytes.as_deref().unwrap_or_default(), &backup_bytes);
     // 4. Back up current target before restore unless missing
-    let backup_before = if entry.original_path.exists() {
+    let backup_before = if current_bytes.is_some() {
         backup_with_operation(
             &entry.original_path,
             entry.operation_id.as_deref(),
@@ -636,34 +644,32 @@ pub fn restore_verified(entry: &BackupEntry) -> Result<RestoreReport> {
     } else {
         None
     };
-    // 5. Atomic replace: copy backup to target, flush, sync, verify
-    if let Some(parent) = entry.original_path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent).map_err(|e| ConfigError::io(parent, e))?;
-    }
-    std::fs::copy(&entry.backup_path, &entry.original_path)
-        .map_err(|e| ConfigError::io(&entry.original_path, e))?;
-    {
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .open(&entry.original_path)
-            .map_err(|e| ConfigError::io(&entry.original_path, e))?;
-        file.sync_all()
-            .map_err(|e| ConfigError::io(&entry.original_path, e))?;
-    }
+    // 5. Atomic replace. The digest observed at step 3 is the conflict token:
+    //    a target that changed since the fresh read aborts with
+    //    ConcurrentModification instead of clobbering the newer bytes. The
+    //    entry's recorded permissions are reinstated on the replacement.
+    let current_digest = current_bytes.as_ref().map(|bytes| compute_digest(bytes));
+    let expectation = match current_digest.as_deref() {
+        Some(digest) => WriteExpectation::Digest(digest),
+        None => WriteExpectation::Missing,
+    };
+    atomic_write_expecting(
+        &entry.original_path,
+        &backup_bytes,
+        expectation,
+        entry.permissions,
+    )?;
+    // 6. Fresh read-back verification of the replaced file.
     let restored_bytes = std::fs::read(&entry.original_path)
         .map_err(|e| ConfigError::io(&entry.original_path, e))?;
     let restored_digest = compute_digest(&restored_bytes);
-    let expected_digest = compute_digest(&backup_bytes);
+    let backup_digest = compute_digest(&backup_bytes);
     let verification_passed =
-        restored_digest == expected_digest && restored_bytes.len() == backup_bytes.len();
+        restored_digest == backup_digest && restored_bytes.len() == backup_bytes.len();
     if !verification_passed {
         return Err(ConfigError::verification(
             &entry.original_path,
-            format!(
-                "restore verification failed: expected {expected_digest}, got {restored_digest}"
-            ),
+            format!("restore verification failed: expected {backup_digest}, got {restored_digest}"),
         ));
     }
     // Optional semantic validation by kind
@@ -1036,5 +1042,221 @@ mod tests {
         assert_eq!(d1, d2);
         assert_ne!(d1, d3);
         assert_eq!(d1.len(), 16);
+    }
+
+    fn assert_no_temp_litter(dir: &Path) {
+        let entries = std::fs::read_dir(dir).unwrap();
+        for e in entries.filter_map(std::result::Result::ok) {
+            let name = e.file_name().to_string_lossy().into_owned();
+            assert!(
+                !name.starts_with(".tmp."),
+                "restore must not leave temp files behind: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn restore_replaces_target_by_rename_never_in_place_truncation() {
+        let path = unique_scratch("atomic-restore");
+        std::fs::write(&path, b"original bytes that were backed up").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perm = std::fs::Permissions::from_mode(0o600);
+            std::fs::set_permissions(&path, perm).unwrap();
+        }
+        let entry = backup(&path).unwrap().expect("backup");
+
+        #[cfg(unix)]
+        let inode_before = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(&path).unwrap().ino()
+        };
+
+        std::fs::write(&path, b"changed bytes that differ in length").unwrap();
+        restore_entry(&entry).unwrap();
+
+        let restored = std::fs::read(&path).unwrap();
+        assert_eq!(
+            restored, b"original bytes that were backed up",
+            "restore must land the backup bytes exactly, with no tail residue"
+        );
+
+        // The mechanism: the replacement arrives by rename, not by writing
+        // through the live file. An in-place copy keeps the inode; a rename
+        // over the target replaces it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let meta = std::fs::metadata(&path).unwrap();
+            assert_ne!(
+                meta.ino(),
+                inode_before,
+                "restore must rename a new file into place, never truncate the target"
+            );
+            assert_eq!(
+                meta.permissions().mode() & 0o777,
+                0o600,
+                "restored file must carry the permissions recorded in the entry"
+            );
+        }
+
+        assert_no_temp_litter(path.parent().unwrap());
+        drop(std::fs::remove_file(&path));
+        drop(std::fs::remove_file(&entry.backup_path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_failure_leaves_target_bytes_fully_intact() {
+        use std::os::unix::fs::PermissionsExt;
+        // A restore that cannot even stage its temporary file must leave the
+        // target exactly at its previous bytes — never a truncated or torn
+        // mix of old and restored content.
+        let dir = crate::test_util::temp_dir_unique("config-backup-restore-fail");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("target.json");
+        std::fs::write(&path, b"current bytes that must survive a failed restore").unwrap();
+        let entry = backup(&path).unwrap().expect("backup");
+        std::fs::write(&path, b"newer bytes").unwrap();
+
+        let read_only = std::fs::Permissions::from_mode(0o500);
+        std::fs::set_permissions(&dir, read_only).unwrap();
+        let result = restore_entry(&entry);
+        let writable = std::fs::Permissions::from_mode(0o700);
+        std::fs::set_permissions(&dir, writable).unwrap();
+
+        let err = result.expect_err("restore must fail while the directory rejects new files");
+        assert!(
+            matches!(err, ConfigError::Io { .. }),
+            "expected io error, got {err:?}"
+        );
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(
+            after, b"newer bytes",
+            "a failed restore must leave the target fully at its pre-restore bytes"
+        );
+        assert_no_temp_litter(&dir);
+        drop(std::fs::remove_file(&path));
+        drop(std::fs::remove_file(&entry.backup_path));
+        drop(std::fs::remove_dir(&dir));
+    }
+
+    #[test]
+    fn restore_verified_round_trips_and_recreates_missing_target() {
+        let path = unique_scratch("verified-restore");
+        std::fs::write(&path, b"v1").unwrap();
+        let entry = backup(&path).unwrap().expect("backup");
+        std::fs::write(&path, b"v2 which is longer than v1").unwrap();
+
+        let report = restore_verified(&entry).unwrap();
+        assert!(report.verification_passed, "read-back verification");
+        assert_eq!(std::fs::read(&path).unwrap(), b"v1");
+        let before = report
+            .backup_before
+            .expect("an existing target must be backed up before restore");
+        assert_eq!(before.reason, "pre-restore backup");
+        assert_eq!(before.digest, compute_digest(b"v2 which is longer than v1"));
+        assert_no_temp_litter(path.parent().unwrap());
+
+        // A missing target (failed uncommitted creation) is recreated from the
+        // backup rather than refused.
+        drop(std::fs::remove_file(&path));
+        drop(std::fs::remove_file(&before.backup_path));
+        let second = restore_verified(&entry).unwrap();
+        assert!(second.verification_passed);
+        assert!(
+            second.backup_before.is_none(),
+            "nothing to back up for a missing target"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"v1");
+        assert_no_temp_litter(path.parent().unwrap());
+
+        drop(std::fs::remove_file(&path));
+        drop(std::fs::remove_file(&entry.backup_path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_over_symlinked_original_replaces_the_link_not_its_referent() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_util::temp_dir_unique("config-backup-restore-symlink");
+        std::fs::create_dir_all(&dir).unwrap();
+        let referent = dir.join("referent.json");
+        std::fs::write(&referent, b"referent bytes").unwrap();
+        let link = dir.join("link.json");
+        std::os::unix::fs::symlink(&referent, &link).unwrap();
+
+        // The backup is taken through the link, so it records the referent's
+        // bytes under the link's path.
+        let entry = backup(&link)
+            .unwrap()
+            .expect("backup through a file symlink");
+        std::fs::write(&link, b"changed by writing through the link").unwrap();
+        assert_eq!(
+            std::fs::read(&referent).unwrap(),
+            b"changed by writing through the link"
+        );
+
+        restore_entry(&entry).unwrap();
+
+        // The link itself is replaced by a regular file carrying the backup
+        // bytes; the restore never writes through to the old referent.
+        let link_meta = std::fs::symlink_metadata(&link).unwrap();
+        assert!(
+            !link_meta.file_type().is_symlink(),
+            "restore must replace the link itself, not follow it"
+        );
+        assert!(link_meta.is_file());
+        assert_eq!(std::fs::read(&link).unwrap(), b"referent bytes");
+        assert_eq!(
+            std::fs::read(&referent).unwrap(),
+            b"changed by writing through the link",
+            "the referent the link pointed at must be untouched"
+        );
+        assert_no_temp_litter(&dir);
+
+        // The restored file may carry the link-derived mode, so relax it
+        // before cleanup.
+        std::fs::set_permissions(&link, std::fs::Permissions::from_mode(0o600)).unwrap();
+        drop(std::fs::remove_file(&link));
+        drop(std::fs::remove_file(&referent));
+        drop(std::fs::remove_file(&entry.backup_path));
+        drop(std::fs::remove_dir(&dir));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_succeeds_over_read_only_target_and_lands_recorded_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        fn set_mode(path: &Path, mode: u32) {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+
+        let path = unique_scratch("restore-readonly");
+        std::fs::write(&path, b"backed up bytes").unwrap();
+        set_mode(&path, 0o400);
+
+        let entry = backup(&path).unwrap().expect("backup of a read-only file");
+        assert_eq!(entry.permissions.map(|m| m & 0o777), Some(0o400));
+
+        // Change the bytes and leave the target read-only: an in-place write
+        // (the old `std::fs::copy` restore) could not open it at all.
+        set_mode(&path, 0o600);
+        std::fs::write(&path, b"newer bytes").unwrap();
+        set_mode(&path, 0o400);
+
+        restore_entry(&entry).unwrap();
+
+        let restored = std::fs::read(&path).unwrap();
+        assert_eq!(restored, b"backed up bytes");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o400, "the recorded read-only mode must be landed");
+        assert_no_temp_litter(path.parent().unwrap());
+
+        set_mode(&path, 0o600);
+        set_mode(&entry.backup_path, 0o600);
+        drop(std::fs::remove_file(&path));
+        drop(std::fs::remove_file(&entry.backup_path));
     }
 }

@@ -1074,30 +1074,34 @@ mod tests {
     }
 
     #[test]
-    fn unknown_key_preservation_via_yaml_edit() {
+    fn unknown_keys_survive_because_changing_yaml_edit_refuses() {
         let dir = crate::test_util::temp_dir_unique("aider");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("preserve.yml");
         let original = "model: gpt-4\nforeignKey: keep-me\ncustomField: 123\n";
         std::fs::write(&path, original).unwrap();
 
-        superai_config::yaml::edit(&path, |map| {
+        // codec-honesty (DOC-06): changing YAML writes on existing files are
+        // refused outright; preservation is expressed by refusing.
+        let result = superai_config::yaml::edit(&path, |map| {
             map.insert(
                 "model".to_owned(),
                 serde_json::Value::String("gpt-5".to_owned()),
             );
-        })
-        .unwrap();
+        });
+        match result {
+            Err(superai_config::ConfigError::LossyWrite { format, .. }) => {
+                assert_eq!(format, "yaml");
+            }
+            other => panic!("expected LossyWrite, got {other:?}"),
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
         let after = superai_config::yaml::load(&path).unwrap();
         assert_eq!(
             after["foreignKey"],
             serde_json::Value::String("keep-me".to_owned())
         );
         assert_eq!(after["customField"], serde_json::Value::Number(123.into()));
-        assert_eq!(
-            after["model"],
-            serde_json::Value::String("gpt-5".to_owned())
-        );
         drop(std::fs::remove_file(&path));
     }
 
@@ -1110,13 +1114,20 @@ mod tests {
         std::fs::write(&yml_path, "model: gpt-4\ndark-mode: true\n").unwrap();
         std::fs::write(&env_path, "OPENAI_API_KEY=sk-old\n").unwrap();
 
-        superai_config::yaml::edit(&yml_path, |map| {
+        // codec-honesty (DOC-06): the YAML leg refuses; the env leg is a
+        // preserving codec and still succeeds.
+        let yml_result = superai_config::yaml::edit(&yml_path, |map| {
             map.insert(
                 "model".to_owned(),
                 serde_json::Value::String("openrouter/anthropic/claude-sonnet-4".to_owned()),
             );
-        })
-        .unwrap();
+        });
+        match yml_result {
+            Err(superai_config::ConfigError::LossyWrite { format, .. }) => {
+                assert_eq!(format, "yaml");
+            }
+            other => panic!("expected LossyWrite, got {other:?}"),
+        }
         superai_config::env_file::edit(&env_path, |map| {
             map.insert("OPENAI_API_KEY".to_owned(), "sk-new".to_owned());
             map.insert(
@@ -1129,7 +1140,7 @@ mod tests {
         let after_yml = superai_config::yaml::load(&yml_path).unwrap();
         assert_eq!(
             after_yml["model"],
-            serde_json::Value::String("openrouter/anthropic/claude-sonnet-4".to_owned())
+            serde_json::Value::String("gpt-4".to_owned())
         );
         let after_env = superai_config::env_file::load(&env_path).unwrap();
         assert_eq!(after_env["OPENAI_API_KEY"], "sk-new");
@@ -1189,7 +1200,10 @@ mod tests {
     }
 
     #[test]
-    fn yaml_comment_handling() {
+    fn yaml_comment_changing_write_refused_and_comments_preserved() {
+        // codec-honesty (DOC-06): comments parse on read, but a changing write
+        // on a comment-bearing YAML file is refused instead of normalizing the
+        // comments away; the on-disk bytes survive verbatim.
         let dir = crate::test_util::temp_dir_unique("aider");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("comment.yml");
@@ -1198,17 +1212,22 @@ mod tests {
         let map = superai_config::yaml::load(&path).unwrap();
         assert_eq!(map["model"], serde_json::Value::String("gpt-4".to_owned()));
         assert_eq!(map["dark-mode"], serde_json::Value::Bool(true));
-        superai_config::yaml::edit(&path, |m| {
+        let result = superai_config::yaml::edit(&path, |m| {
             m.insert(
                 "model".to_owned(),
                 serde_json::Value::String("gpt-5".to_owned()),
             );
-        })
-        .unwrap();
-        let after = superai_config::yaml::load(&path).unwrap();
+        });
+        match result {
+            Err(superai_config::ConfigError::LossyWrite { format, .. }) => {
+                assert_eq!(format, "yaml");
+            }
+            other => panic!("expected LossyWrite, got {other:?}"),
+        }
         assert_eq!(
-            after["model"],
-            serde_json::Value::String("gpt-5".to_owned())
+            std::fs::read_to_string(&path).unwrap(),
+            content,
+            "refused edit must leave the file byte-identical"
         );
         drop(std::fs::remove_file(&path));
     }

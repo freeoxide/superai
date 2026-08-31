@@ -7,7 +7,6 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use crate::adapter::Adapter;
 use crate::error::{CoreError, Result};
 use crate::ids::HarnessId;
 use crate::registry::Registry;
@@ -565,72 +564,19 @@ fn normalize_path(path: &Path) -> PathBuf {
 const MAX_HOME_ENTRIES: usize = 1024;
 const MAX_XDG_ENTRIES: usize = 256;
 
-/// Expand a list of adapter-derived patterns into existing absolute paths.
+/// Collect adapter-derived candidate patterns for the scan.
+///
+/// Patterns come from every adapter in the harness catalog via
+/// [`crate::harness_catalog::all_adapters`]: concrete adapters contribute
+/// their `scan_candidates`, and a harness without a concrete adapter falls
+/// back to the generic `~/.<id>` hints of [`crate::adapter::GenericAdapter`].
+/// The scanner keeps only patterns that expand to an existing path (see
+/// [`scan_candidate_roots_limited`]).
 fn candidate_patterns() -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    // Concrete adapters with accurate scan_candidates
-    if let Ok(adapter) = crate::adapters::claude_code::ClaudeCodeAdapter::new() {
-        out.extend(adapter.scan_candidates());
-    }
-    if let Ok(adapter) = crate::adapters::codex_cli::CodexCliAdapter::new() {
-        out.extend(adapter.scan_candidates());
-    }
-    if let Ok(adapter) = crate::adapters::aider::AiderAdapter::new() {
-        out.extend(adapter.scan_candidates());
-    }
-    if let Ok(adapter) = crate::adapters::opencode::OpenCodeAdapter::new() {
-        out.extend(adapter.scan_candidates());
-    }
-    if let Ok(adapter) = crate::adapters::cline::ClineAdapter::new() {
-        out.extend(adapter.scan_candidates());
-    }
-    if let Ok(adapter) = crate::adapters::copilot_cli::CopilotCliAdapter::new() {
-        out.extend(adapter.scan_candidates());
-    }
-    if let Ok(adapter) = crate::adapters::goose::GooseAdapter::new() {
-        out.extend(adapter.scan_candidates());
-    }
-    if let Ok(adapter) = crate::adapters::qwen_code::QwenCodeAdapter::new() {
-        out.extend(adapter.scan_candidates());
-    }
-    if let Ok(adapter) = crate::adapters::kimi_code::KimiCodeAdapter::new() {
-        out.extend(adapter.scan_candidates());
-    }
-    if let Ok(adapter) = crate::adapters::grok_build::GrokBuildAdapter::new() {
-        out.extend(adapter.scan_candidates());
-    }
-    if let Ok(adapter) = crate::adapters::mistral_vibe::MistralVibeAdapter::new() {
-        out.extend(adapter.scan_candidates());
-    }
-    if let Ok(adapter) = crate::adapters::forge::ForgeAdapter::new() {
-        out.extend(adapter.scan_candidates());
-    }
-    if let Ok(adapter) = crate::adapters::kode::KodeAdapter::new() {
-        out.extend(adapter.scan_candidates());
-    }
-    if let Ok(adapter) = crate::adapters::pi::PiAdapter::new() {
-        out.extend(adapter.scan_candidates());
-    }
-    if let Ok(adapter) = crate::adapters::nanocoder::NanocoderAdapter::new() {
-        out.extend(adapter.scan_candidates());
-    }
-    if let Ok(adapter) = crate::adapters::hermes::HermesAdapter::new() {
-        out.extend(adapter.scan_candidates());
-    }
-    if let Ok(adapter) = crate::adapters::mimo::MimoAdapter::new() {
-        out.extend(adapter.scan_candidates());
-    }
-    if let Ok(adapter) = crate::adapters::junie::JunieAdapter::new() {
-        out.extend(adapter.scan_candidates());
-    }
-    // Generic entries from catalog for remaining harnesses
-    for entry in crate::harness_catalog::ENTRIES {
-        let candidate = format!("~/.{}", entry.id);
-        if !out.contains(&candidate) {
-            out.push(candidate);
-        }
-    }
-    out
+    crate::harness_catalog::all_adapters()
+        .iter()
+        .flat_map(|adapter| adapter.scan_candidates())
+        .collect()
 }
 
 /// Scan `home` for candidate config roots.
@@ -776,51 +722,63 @@ pub fn scan_candidate_roots_limited(home: &Path, max_entries: usize) -> Vec<Path
 ///
 /// On Unix, two paths that point to the same inode/device are considered one.
 /// Otherwise, lexical dedup is used. The first occurrence's display path is kept.
-#[expect(clippy::excessive_nesting, reason = "dedup branches are explicit")]
 pub fn deduplicate_by_identity(candidates: Vec<PathBuf>) -> Vec<PathBuf> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt as _;
-        let mut seen_ids: HashSet<(u64, u64)> = HashSet::new();
-        let mut seen_lexical: HashSet<String> = HashSet::new();
-        let mut out: Vec<PathBuf> = Vec::new();
-        for path in candidates {
-            let normalized_key = normalize_path(&path).to_string_lossy().into_owned();
-            // Lexical dedup first
-            if !seen_lexical.insert(normalized_key.clone()) {
-                continue;
-            }
-            if let Ok(meta) = std::fs::metadata(&path) {
-                let id = (meta.dev(), meta.ino());
-                if !seen_ids.insert(id) {
-                    // Duplicate inode; keep first display path, skip this one
-                    // Need to remove the lexical we just inserted? No, we want to keep lexical set
-                    // but this inode dup means we should remove the duplicate path from out
-                    // Since we haven't pushed yet, just skip.
-                    // But we already inserted lexical; keep it to prevent re-adding same normalized path via symlink.
-                    // The inode dup should be skipped.
-                    continue;
-                }
-            }
-            out.push(path);
-        }
-        out
+        dedup_by_identity_unix(candidates)
     }
     #[cfg(not(unix))]
     {
-        let mut seen: HashSet<String> = HashSet::new();
-        let mut out: Vec<PathBuf> = Vec::new();
-        for path in candidates {
-            let key = normalize_path(&path)
-                .to_string_lossy()
-                .into_owned()
-                .to_lowercase();
-            if seen.insert(key) {
-                out.push(path);
+        dedup_by_identity_lexical(candidates)
+    }
+}
+
+/// Unix: same inode/device is one entry; the first display path is kept.
+#[cfg(unix)]
+fn dedup_by_identity_unix(candidates: Vec<PathBuf>) -> Vec<PathBuf> {
+    use std::os::unix::fs::MetadataExt as _;
+    let mut seen_ids: HashSet<(u64, u64)> = HashSet::new();
+    let mut seen_lexical: HashSet<String> = HashSet::new();
+    let mut out: Vec<PathBuf> = Vec::new();
+    for path in candidates {
+        let normalized_key = normalize_path(&path).to_string_lossy().into_owned();
+        // Lexical dedup first
+        if !seen_lexical.insert(normalized_key.clone()) {
+            continue;
+        }
+        if let Ok(meta) = std::fs::metadata(&path) {
+            let id = (meta.dev(), meta.ino());
+            if !seen_ids.insert(id) {
+                // Duplicate inode; keep first display path, skip this one
+                // Need to remove the lexical we just inserted? No, we want to keep lexical set
+                // but this inode dup means we should remove the duplicate path from out
+                // Since we haven't pushed yet, just skip.
+                // But we already inserted lexical; keep it to prevent re-adding same normalized path via symlink.
+                // The inode dup should be skipped.
+                continue;
             }
         }
-        out
+        out.push(path);
     }
+    out
+}
+
+/// Non-unix: no inode identity; case-folded lexical dedup (Windows filesystems
+/// are case-insensitive by default).
+#[cfg(not(unix))]
+fn dedup_by_identity_lexical(candidates: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<PathBuf> = Vec::new();
+    for path in candidates {
+        let key = normalize_path(&path)
+            .to_string_lossy()
+            .into_owned()
+            .to_lowercase();
+        if seen.insert(key) {
+            out.push(path);
+        }
+    }
+    out
 }
 
 /// Find unmanaged candidates by scanning `home` and filtering against the registry.
@@ -951,22 +909,54 @@ fn days_to_ymd(days: i64) -> (i32, u32, u32) {
 // adoption helper (record-first, config-preserving)
 // ---------------------------------------------------------------------------
 
+/// Minimum fingerprint confidence adoption requires.
+///
+/// [`Confidence::Medium`] is the lowest level that requires a canonical config
+/// file to be present: `fingerprint_candidate` only assigns `Medium` or
+/// `High` inside a canonical-file branch, while [`Confidence::Low`] is
+/// name-pattern only and [`Confidence::None`] is no evidence at all. DRF-02
+/// forbids a directory name alone from establishing harness identity, so
+/// `Low` can never satisfy this floor.
+pub const ADOPTION_CONFIDENCE_FLOOR: Confidence = Confidence::Medium;
+
+/// Whether `confidence` carries more than a name-pattern match.
+fn meets_adoption_floor(confidence: Confidence) -> bool {
+    matches!(confidence, Confidence::High | Confidence::Medium)
+}
+
 /// Validate that a candidate can be adopted.
 ///
-/// Checks: harness fingerprint (prove harness/version), foreign ownership,
-/// fresh config read (at least one canonical file or directory exists),
-/// and isolation class. Returns the fingerprint on success.
+/// Checks: harness fingerprint at or above
+/// [`ADOPTION_CONFIDENCE_FLOOR`] (a canonical config file must prove the
+/// harness — a directory name alone never does), a readable canonical config
+/// file (so the preview→commit conflict token is enforceable rather than
+/// vacuously empty), foreign ownership, and a fresh readable candidate.
+/// Returns the fingerprint on success.
 /// Never copies, migrates, normalizes, or reformats the harness config.
 pub fn can_adopt(candidate: &Path, home: Option<&Path>) -> Result<Fingerprint> {
     let fingerprint = fingerprint_candidate(candidate);
-    if fingerprint.confidence == Confidence::None {
-        return Err(CoreError::Validation {
-            field: "candidate".to_owned(),
-            reason: format!(
-                "cannot prove harness for {}: {}",
-                candidate.display(),
-                fingerprint.evidence.join("; ")
+    if !meets_adoption_floor(fingerprint.confidence) {
+        return Err(CoreError::InsufficientEvidence {
+            path: candidate.to_path_buf(),
+            required: ADOPTION_CONFIDENCE_FLOOR.to_string(),
+            observed: fingerprint.confidence.to_string(),
+            evidence: fingerprint.evidence,
+        });
+    }
+    // A Medium+ fingerprint implies a canonical file exists; it must also be
+    // READABLE, or the digest token adoption compares between preview and
+    // commit would be empty and that check would pass vacuously.
+    if canonical_config_digests(candidate).is_empty() {
+        return Err(CoreError::InsufficientEvidence {
+            path: candidate.to_path_buf(),
+            required: format!(
+                "{ADOPTION_CONFIDENCE_FLOOR} confidence with a readable canonical config file"
             ),
+            observed: format!(
+                "{} confidence with no readable canonical config file",
+                fingerprint.confidence
+            ),
+            evidence: fingerprint.evidence,
         });
     }
     let foreign = is_foreign_managed(candidate, home);
@@ -988,6 +978,40 @@ pub fn can_adopt(candidate: &Path, home: Option<&Path>) -> Result<Fingerprint> {
         reason: format!("cannot stat {}: {e}", candidate.display()),
     })?;
     Ok(fingerprint)
+}
+
+/// Canonical config file names adoption uses as its conflict token.
+///
+/// These are the readable harness files [`fingerprint_candidate`] proves
+/// identity from — never a secret store — so a digest over exactly this set
+/// is the minimal token that says "the proof still stands".
+const ADOPTION_TOKEN_FILES: &[&str] = &[
+    "settings.json",
+    "config.toml",
+    "opencode.json",
+    "opencode.jsonc",
+    ".aider.conf.yml",
+    "aider.conf.yml",
+    ".aider.model.metadata.json",
+];
+
+/// Fresh digests of a candidate's canonical config files.
+///
+/// Returns one `(file name, digest)` pair per canonical file that is present
+/// and readable, in [`ADOPTION_TOKEN_FILES`] order. Never reads a secret
+/// store. Adoption compares this set between preview and commit: the same
+/// names with the same digests mean the fingerprint proof still holds for the
+/// bytes it was proven on. A canonical file that exists but cannot be read
+/// contributes no pair (its content was never part of the proof either).
+pub fn canonical_config_digests(candidate: &Path) -> Vec<(String, String)> {
+    let mut tokens: Vec<(String, String)> = Vec::new();
+    for name in ADOPTION_TOKEN_FILES {
+        let snap = superai_config::snapshot::snapshot(&candidate.join(name));
+        if let Some(digest) = snap.digest {
+            tokens.push(((*name).to_owned(), digest));
+        }
+    }
+    tokens
 }
 
 // ---------------------------------------------------------------------------
@@ -1169,7 +1193,7 @@ mod tests {
         }
         #[cfg(not(unix))]
         {
-            let candidates = vec![real.clone(), real.clone()];
+            let candidates = vec![real.clone(), real];
             let deduped = deduplicate_by_identity(candidates);
             assert_eq!(deduped.len(), 1);
         }
@@ -1313,5 +1337,71 @@ mod tests {
         // Also ensure content unchanged
         let content = std::fs::read_to_string(&settings).unwrap();
         assert_eq!(content, r#"{"model":"sonnet"}"#);
+    }
+
+    /// Platform: all — wiring is pure pattern-string assembly, no FS access.
+    /// Every catalog harness must resolve to its concrete adapter and every
+    /// adapter-specific candidate must be part of the discovery pattern set
+    /// (HAD-09/10/11): a future catalog row without a concrete adapter fails
+    /// here instead of silently falling back to generic `~/.<id>` hints.
+    #[test]
+    fn scan_patterns_cover_every_catalog_concrete_adapter() {
+        let patterns = candidate_patterns();
+        for entry in crate::harness_catalog::all_entries() {
+            let adapter = crate::harness_catalog::concrete_adapter_for(entry.id)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "catalog id `{}` has no concrete adapter; discovery would silently fall back to generic `~/.{}` candidates",
+                        entry.id, entry.id
+                    )
+                });
+            for candidate in adapter.scan_candidates() {
+                assert!(
+                    patterns.contains(&candidate),
+                    "discovery patterns must include `{candidate}` from adapter `{}`",
+                    entry.id
+                );
+            }
+        }
+    }
+
+    /// Platform: all — `~/.config/warp-terminal/cli/settings.toml` under a temp
+    /// home; tilde expansion via `expand_tilde` is uniform.
+    /// A previously generic-only harness now gets adapter-specific candidates:
+    /// warp's CLI settings file is reachable only through
+    /// `WarpAdapter::scan_candidates` — the generic `~/.<id>` fallback never
+    /// listed it, no known home prefix matches, and the XDG crawl ignores
+    /// `warp-terminal`.
+    #[test]
+    fn scan_finds_adapter_specific_warp_candidate() {
+        let home = tmp_home("scan_warp_cli");
+        let settings = home
+            .join(".config")
+            .join("warp-terminal")
+            .join("cli")
+            .join("settings.toml");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        std::fs::write(&settings, "model = \"sonnet\"\n").unwrap();
+        let candidates = scan_candidate_roots(&home);
+        assert!(
+            candidates.iter().any(|p| p == &settings),
+            "scan must find warp's adapter-specific settings via scan_candidates, got {candidates:?}"
+        );
+    }
+
+    /// swe-agent's project-layout candidate `config/default.yaml` is likewise
+    /// adapter-specific: the generic fallback only ever offered
+    /// `~/.swe-agent`, and no known home prefix matches `config`.
+    #[test]
+    fn scan_finds_adapter_specific_swe_agent_candidate() {
+        let home = tmp_home("scan_swe_agent");
+        let cfg = home.join("config").join("default.yaml");
+        std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+        std::fs::write(&cfg, "model:\n  name: sonnet\n").unwrap();
+        let candidates = scan_candidate_roots(&home);
+        assert!(
+            candidates.iter().any(|p| p == &cfg),
+            "scan must find swe-agent's config/default.yaml via scan_candidates, got {candidates:?}"
+        );
     }
 }

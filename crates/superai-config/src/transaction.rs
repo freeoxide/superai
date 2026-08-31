@@ -404,9 +404,23 @@ fn set_safe_permissions(path: &Path, original_path: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn set_safe_permissions(path: &Path, _original_path: &Path) -> Result<()> {
-    let _ = path;
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "windows has no POSIX chmod; keeps the unix call sites uniform"
+)]
+fn set_safe_permissions(_path: &Path, _original_path: &Path) -> Result<()> {
     Ok(())
+}
+
+/// Best-effort probe that a planned path's unix file identity (device+inode)
+/// is observable; duplicate identities across steps are surfaced by
+/// verification after commit.
+#[cfg(unix)]
+fn note_inode_identity(path: &Path) {
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        use std::os::unix::fs::MetadataExt;
+        let _ = (meta.dev(), meta.ino());
+    }
 }
 
 fn sync_parent(path: &Path) -> Result<()> {
@@ -714,6 +728,15 @@ pub struct Transaction {
     pub backups: Vec<BackupEntry>,
     /// Temporary files staged during prepare.
     pub staged_temps: Vec<PathBuf>,
+    /// Outcome of the rollback [`Transaction::commit`] performs internally
+    /// when a step fails after other steps already committed.
+    ///
+    /// `residuals` lists the paths the rollback could not undo; they remain
+    /// on disk in their committed state and must reach the caller.
+    /// [`Transaction::execute`] copies this into
+    /// [`TransactionOutcome::rollback`] instead of reporting an empty
+    /// rollback. `None` after a successful commit.
+    pub partial_rollback: Option<RollbackOutcome>,
 }
 
 impl Transaction {
@@ -724,6 +747,7 @@ impl Transaction {
             steps,
             backups: Vec::new(),
             staged_temps: Vec::new(),
+            partial_rollback: None,
         }
     }
 
@@ -731,10 +755,6 @@ impl Transaction {
     ///
     /// Checks path safety, symlink loops, duplicate inode/file identity
     /// surrogates (same path or case-fold collision), and traversal.
-    #[expect(
-        clippy::excessive_nesting,
-        reason = "plan validation requires nested checks"
-    )]
     pub fn validate_plan(&self) -> Result<()> {
         let mut seen: HashSet<String> = HashSet::new();
         let mut seen_folded: HashSet<String> = HashSet::new();
@@ -773,14 +793,7 @@ impl Transaction {
             // Detect multiple planned paths resolving to same inode where file exists
             // (best-effort via symlink_metadata device+inode on unix).
             #[cfg(unix)]
-            {
-                if let Ok(meta) = std::fs::symlink_metadata(path) {
-                    use std::os::unix::fs::MetadataExt;
-                    let dev = meta.dev();
-                    let ino = meta.ino();
-                    let _ = (dev, ino);
-                }
-            }
+            note_inode_identity(path);
         }
         // Check sorted order will be deterministic: ensure no hard-link surprise
         // is silently ignored. We warn via verification later.
@@ -969,6 +982,7 @@ impl Transaction {
     pub fn commit(&mut self) -> Result<CommitOutcome> {
         let mut committed: Vec<PathBuf> = Vec::new();
         let mut write_index = 0usize;
+        self.partial_rollback = None;
 
         for step in self.steps.clone() {
             let res: Result<()> = match &step {
@@ -993,12 +1007,12 @@ impl Transaction {
                 FileAction::QuarantineMove { from, to } => self.commit_quarantine_move(from, to),
             };
             if let Err(e) = res {
-                // Attempt rollback of already committed files before surfacing error.
+                // Compensate the already committed steps in reverse order and
+                // retain the outcome: any path the rollback could not undo is
+                // a residual that must reach the caller. The original commit
+                // error stays the surfaced error; nothing is masked.
                 let rollback = self.rollback_partial(&committed);
-                if !rollback.residuals.is_empty() {
-                    // Surface the original error but diagnostics will contain residuals.
-                    // We do not mask the commit error.
-                }
+                self.partial_rollback = Some(rollback);
                 return Err(e);
             }
             committed.push(step.primary_path().to_path_buf());
@@ -1363,13 +1377,30 @@ impl Transaction {
         let commit_outcome = match self.commit() {
             Ok(c) => c,
             Err(e) => {
-                let rollback = self.rollback_with_filter(&[]);
+                // `commit` already compensated the steps that had landed; its
+                // recorded outcome — including residuals it could not undo —
+                // is what the caller sees. A filtered no-op rollback here
+                // would report nothing, hiding the compensation entirely.
+                let mut diagnostics_redacted = vec![format!("[commit failed] {e}")];
+                if let Some(rollback) = &self.partial_rollback
+                    && !rollback.residuals.is_empty()
+                {
+                    let residual_paths: Vec<String> = rollback
+                        .residuals
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect();
+                    diagnostics_redacted.push(format!(
+                        "[rollback residuals] {}",
+                        residual_paths.join(", ")
+                    ));
+                }
                 return Ok(TransactionOutcome {
                     success: false,
                     commit: None,
                     verification: Vec::new(),
-                    rollback: Some(rollback),
-                    diagnostics_redacted: vec![format!("[commit failed] {e}")],
+                    rollback: self.partial_rollback.clone(),
+                    diagnostics_redacted,
                 });
             }
         };
@@ -1674,5 +1705,143 @@ mod tests {
             drop(std::fs::remove_file(temp));
         }
         drop(std::fs::remove_dir(&root));
+    }
+
+    #[test]
+    fn commit_failure_surfaces_intermediate_rollback_in_outcome() {
+        let root = tmp_root();
+        // A pre-existing non-empty directory: committed as a CreateDir step,
+        // but rollback cannot undo it with remove_dir.
+        let dir = root.join("preexisting-dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("foreign.txt"), b"foreign").unwrap();
+        let target = root.join("a.json");
+        std::fs::write(&target, b"{\"a\":1}").unwrap();
+        // The link path already exists as a regular file, so the symlink step
+        // fails after the earlier steps have already committed.
+        let link = root.join("not-a-link");
+        std::fs::write(&link, b"").unwrap();
+
+        let id = OperationId::new("op-residual-outcome").unwrap();
+        let mut txn = Transaction::new(
+            id,
+            vec![
+                FileAction::CreateDir { path: dir.clone() },
+                FileAction::Write {
+                    path: target.clone(),
+                    content: b"{\"a\":2}".to_vec(),
+                    kind: DocumentKind::StrictJson,
+                },
+                FileAction::Symlink {
+                    link: link.clone(),
+                    target: PathBuf::from("/nonexistent-symlink-target"),
+                },
+            ],
+        );
+        let outcome = txn.execute().unwrap();
+
+        assert!(!outcome.success, "commit failed mid-way");
+        let rollback = outcome
+            .rollback
+            .expect("the compensation commit performed internally must be reported");
+        assert!(
+            rollback.rolled_back.contains(&target),
+            "the committed write must be restored: {rollback:?}"
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"{\"a\":1}",
+            "rollback must restore the pre-transaction bytes"
+        );
+        assert!(
+            rollback.residuals.contains(&dir),
+            "the path rollback could not undo must be reported as residual: {rollback:?}"
+        );
+        assert!(
+            outcome
+                .diagnostics_redacted
+                .iter()
+                .any(|d| d.contains(&dir.display().to_string())),
+            "residual paths must reach the diagnostics: {:?}",
+            outcome.diagnostics_redacted
+        );
+
+        drop(std::fs::remove_file(dir.join("foreign.txt")));
+        drop(std::fs::remove_dir(&dir));
+        drop(std::fs::remove_file(&target));
+        drop(std::fs::remove_file(&link));
+        for entry in txn.backups {
+            drop(std::fs::remove_file(entry.backup_path));
+        }
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    #[test]
+    fn commit_retains_intermediate_residuals_for_direct_callers() {
+        let root = tmp_root();
+        let a = root.join("a.json");
+        let b = root.join("b.json");
+        std::fs::write(&a, b"{\"a\":1}").unwrap();
+        std::fs::write(&b, b"{\"b\":1}").unwrap();
+
+        let id = OperationId::new("op-partial-residual").unwrap();
+        let mut txn = Transaction::new(
+            id,
+            vec![
+                FileAction::Write {
+                    path: a.clone(),
+                    content: b"{\"a\":2}".to_vec(),
+                    kind: DocumentKind::StrictJson,
+                },
+                FileAction::Write {
+                    path: b.clone(),
+                    content: b"{\"b\":2}".to_vec(),
+                    kind: DocumentKind::StrictJson,
+                },
+            ],
+        );
+        txn.prepare().unwrap();
+        let a_backup = txn
+            .backups
+            .iter()
+            .find(|e| e.original_path == a)
+            .cloned()
+            .expect("prepare backs up the foreign target");
+        // Corrupt a's backup so its rollback cannot verify, and destroy b's
+        // staged temp so b's commit fails after a already committed.
+        std::fs::write(&a_backup.backup_path, b"corrupted").unwrap();
+        if let Some(temp) = txn.staged_temps.get(1).cloned() {
+            drop(std::fs::remove_file(&temp));
+        }
+
+        let res = txn.commit();
+        assert!(
+            res.is_err(),
+            "second write must fail without its staged temp"
+        );
+        let rollback = txn
+            .partial_rollback
+            .clone()
+            .expect("commit must retain the intermediate rollback it performed");
+        assert!(
+            rollback.residuals.contains(&a),
+            "the unrestorable path must be a residual: {rollback:?}"
+        );
+        assert!(
+            rollback.rolled_back.is_empty(),
+            "nothing was undoable: {rollback:?}"
+        );
+        // a stays at its committed bytes because the corrupted backup was
+        // refused; it is reported rather than silently dropped.
+        assert_eq!(std::fs::read(&a).unwrap(), b"{\"a\":2}");
+        assert_eq!(std::fs::read(&b).unwrap(), b"{\"b\":1}");
+
+        drop(std::fs::remove_file(&a));
+        drop(std::fs::remove_file(&b));
+        drop(std::fs::remove_file(&a_backup.backup_path));
+        for temp in txn.staged_temps {
+            drop(std::fs::remove_file(temp));
+        }
+        drop(std::fs::remove_dir_all(&root));
     }
 }
