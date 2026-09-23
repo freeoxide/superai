@@ -1,7 +1,5 @@
-//! Template schema and catalog for remote distribution.
-//!
-//! Implements TPL-01 (catalog layout) and TPL-02 (template schema, validation,
-//! semver, digest, traversal, secret/shell checks, adapter selector validation).
+//! Template schema and catalog for remote distribution: TPL-01 catalog,
+//! TPL-02 schema and validation (semver, digest, traversal, secrets).
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Component, Path};
@@ -15,28 +13,18 @@ use crate::error::{CoreError, RedactedString, Result};
 use crate::ids::{HarnessId, ProviderId, TemplateId, TemplateVersion};
 use crate::instance::Instance;
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
 /// Current template schema version.
 pub const TEMPLATE_SCHEMA_VERSION: u32 = 1;
 
 /// Current catalog schema version.
 pub const CATALOG_SCHEMA_VERSION: u32 = 1;
 
-/// Example template repository `owner/repo` used in docs and tests.
-///
-/// Domain logic must not hard-code a single repository; this constant is only
-/// for examples and for [`TemplateRepoConfig::example`].
+/// Example template repository `owner/repo` used in docs and tests only;
+/// domain logic never hard-codes a single repository.
 pub const EXAMPLE_REPO: &str = "freeoxide/superai-templates";
 
 /// Maximum allowed template or catalog file size (1 MiB).
 pub const MAX_TEMPLATE_BYTES: usize = 1_048_576;
-
-// ---------------------------------------------------------------------------
-// Helpers: digest, path validation, semver
-// ---------------------------------------------------------------------------
 
 /// Compute SHA-256 hex digest of `bytes`.
 pub fn compute_digest(bytes: &[u8]) -> String {
@@ -45,10 +33,8 @@ pub fn compute_digest(bytes: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// Verify that `bytes` match `expected` digest (hex, case-insensitive).
-///
-/// `expected` must be 64 hex characters (SHA-256). Returns `Ok(())` on match,
-/// or `Err` with `DigestMismatch` context.
+/// Verify `bytes` match `expected` (64 hex chars, case-insensitive);
+/// `Err` carries `DigestMismatch` context.
 pub fn verify_digest(bytes: &[u8], expected: &str) -> Result<()> {
     let normalized = expected.trim().to_ascii_lowercase();
     if normalized.len() != 64 || !normalized.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -71,10 +57,8 @@ pub fn verify_digest(bytes: &[u8], expected: &str) -> Result<()> {
     Ok(())
 }
 
-/// Validate that a template content `path` is safe to join to a base URL or
-/// filesystem without traversal.
-///
-/// Rejects empty, absolute, `..`, control chars, `:` , `\`, and NUL.
+/// Validate a content `path` is safe to join without traversal: rejects
+/// empty, absolute, `..`, control chars, `:`, `\`, NUL.
 pub fn validate_template_path(path: &str) -> Result<()> {
     if path.is_empty() {
         return Err(CoreError::Validation {
@@ -132,10 +116,7 @@ pub fn parse_semver(version: &str) -> Result<semver::Version> {
     })
 }
 
-/// Compare two semver strings.
-///
-/// Returns `Ok(ordering)` where `ordering` is `candidate` compared to `current`.
-/// `Ok(true)` helper `is_newer_version` returns whether `candidate` is newer.
+/// Compare two semver strings (`candidate` against `current`).
 pub fn compare_semver(current: &str, candidate: &str) -> Result<std::cmp::Ordering> {
     let cur = parse_semver(current)?;
     let cand = parse_semver(candidate)?;
@@ -146,10 +127,6 @@ pub fn compare_semver(current: &str, candidate: &str) -> Result<std::cmp::Orderi
 pub fn is_newer_version(current: &str, candidate: &str) -> Result<bool> {
     Ok(compare_semver(current, candidate)? == std::cmp::Ordering::Greater)
 }
-
-// ---------------------------------------------------------------------------
-// Forbidden payload detection
-// ---------------------------------------------------------------------------
 
 /// Heuristic patterns that indicate an embedded secret.
 const SECRET_PATTERNS: &[&str] = &[
@@ -164,9 +141,8 @@ const SHELL_PATTERNS: &[&str] = &[
     "wget ",
 ];
 
-/// Check whether a JSON value contains forbidden secret/shell/binary content.
-///
-/// Returns `Ok(())` if clean, or `Err` describing the first violation.
+/// Check a JSON value for forbidden secret/shell/binary content; `Err`
+/// names the first violation.
 #[expect(
     clippy::excessive_nesting,
     reason = "forbidden payload checks are branched"
@@ -238,7 +214,6 @@ pub fn check_value_forbidden(value: &Value) -> Result<()> {
                         });
                     }
                 }
-                // For object values, recurse.
                 check_value_forbidden(v)?;
             }
             Ok(())
@@ -246,10 +221,6 @@ pub fn check_value_forbidden(value: &Value) -> Result<()> {
         _ => Ok(()),
     }
 }
-
-// ---------------------------------------------------------------------------
-// TemplateStatus
-// ---------------------------------------------------------------------------
 
 /// Lifecycle status of a template catalog entry or template file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -277,10 +248,6 @@ impl std::fmt::Display for TemplateStatus {
     }
 }
 
-// ---------------------------------------------------------------------------
-// TemplateFileRef + TemplateCatalogEntry + Catalog
-// ---------------------------------------------------------------------------
-
 /// One immutable version file for a template.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TemplateFileRef {
@@ -295,7 +262,6 @@ pub struct TemplateFileRef {
 impl TemplateFileRef {
     /// Validate path traversal and digest format.
     pub fn validate(&self) -> Result<()> {
-        // TemplateVersion validated via newtype construction.
         validate_template_path(&self.path)?;
         let d = self.digest.trim();
         if d.len() != 64 || !d.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -308,7 +274,6 @@ impl TemplateFileRef {
                 ),
             });
         }
-        // Ensure digest is lowercased?
         if d.chars().any(|c| c.is_ascii_uppercase()) {
             return Err(CoreError::Validation {
                 field: "digest".to_owned(),
@@ -373,11 +338,13 @@ impl TemplateCatalogEntry {
         for f in &self.files {
             f.validate()?;
             parse_semver(f.version.as_str())?;
-            let ver_norm = f.version.as_str().to_owned();
-            if !seen_versions.insert(ver_norm.clone()) {
+            if !seen_versions.insert(f.version.as_str().to_owned()) {
                 return Err(CoreError::Validation {
                     field: "files.version".to_owned(),
-                    reason: format!("duplicate version `{ver_norm}` in template `{}`", self.id),
+                    reason: format!(
+                        "duplicate version `{}` in template `{}`",
+                        f.version, self.id
+                    ),
                 });
             }
             if !seen_paths.insert(f.path.clone()) {
@@ -492,26 +459,10 @@ impl Catalog {
         catalog.validate()?;
         Ok(catalog)
     }
-
-    /// Serialize to JSON bytes (canonical).
-    pub fn to_json_bytes(&self) -> Result<Vec<u8>> {
-        serde_json::to_vec(self).map_err(|e| CoreError::Validation {
-            field: "catalog".to_owned(),
-            reason: format!("catalog serialize failed: {e}"),
-        })
-    }
 }
 
-// ---------------------------------------------------------------------------
-// Template config (host/owner/repo/ref/base_url)
-// ---------------------------------------------------------------------------
-
-/// Configuration for locating the remote template repository.
-///
-/// No field is hard-coded to a single owner or host; the example
-/// `freeoxide/superai-templates` is only the default for
-/// [`Self::example`]. All callers must supply a config or explicitly use
-/// `example()`.
+/// Configuration for locating the remote template repository; nothing is
+/// hard-coded to one owner or host (`example()` is only a default).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TemplateRepoConfig {
     /// Git host, e.g. `raw.githubusercontent.com` or `github.example.com`.
@@ -523,14 +474,38 @@ pub struct TemplateRepoConfig {
     /// Git ref, tag, branch, or commit SHA that pins the channel.
     #[serde(rename = "ref")]
     pub git_ref: String,
-    /// Optional fully-qualified base URL that overrides `https://{host}/{owner}/{repo}/{ref}`.
-    ///
-    /// When `Some`, it is used verbatim as the prefix for `catalog_url()` and
-    /// `template_url()`. This is intended for tests (`file://` or local
-    /// `http://`) and for self-hosted mirrors. When `None`, the URL is built
-    /// from `host`/`owner`/`repo`/`git_ref`.
+    /// Optional base URL overriding `https://{host}/{owner}/{repo}/{ref}`;
+    /// must be http(s) and is used verbatim when `Some`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    /// Test builds may point `base_url` at `file://`; the field does not
+    /// exist in production, so runtime input cannot reopen the scheme gate.
+    #[cfg(test)]
+    #[serde(default, skip_serializing_if = "is_false")]
+    test_file_base: bool,
+}
+
+/// `skip_serializing_if` helper for the test-only `file://` escape.
+#[cfg(test)]
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if passes the field by reference"
+)]
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// Whether this config may use the test-only `file://` base; production
+/// builds have no such flag, so the answer is unconditionally no.
+#[cfg(test)]
+fn file_base_allowed(cfg: &TemplateRepoConfig) -> bool {
+    cfg.test_file_base
+}
+
+/// Production arm: no test-only escape exists, the scheme gate is absolute.
+#[cfg(not(test))]
+fn file_base_allowed(_cfg: &TemplateRepoConfig) -> bool {
+    false
 }
 
 impl TemplateRepoConfig {
@@ -542,6 +517,8 @@ impl TemplateRepoConfig {
             repo: repo.to_owned(),
             git_ref: git_ref.to_owned(),
             base_url: None,
+            #[cfg(test)]
+            test_file_base: false,
         };
         cfg.validate()?;
         Ok(cfg)
@@ -555,6 +532,22 @@ impl TemplateRepoConfig {
             repo: "superai-templates".to_owned(),
             git_ref: "main".to_owned(),
             base_url: None,
+            #[cfg(test)]
+            test_file_base: false,
+        }
+    }
+
+    /// Test-only config whose base URL is a local `file://` root; the
+    /// scheme gate refuses this shape for every other constructor.
+    #[cfg(test)]
+    pub(crate) fn for_local_tests(dir: &Path) -> Self {
+        Self {
+            host: "example.com".to_owned(),
+            owner: "owner".to_owned(),
+            repo: "repo".to_owned(),
+            git_ref: "main".to_owned(),
+            base_url: Some(format!("file://{}", dir.display())),
+            test_file_base: true,
         }
     }
 
@@ -579,10 +572,8 @@ impl TemplateRepoConfig {
                 });
             }
             if value.contains('/') || value.contains('\\') || value.contains(':') {
-                // host may contain '.' and '-', owner/repo may contain '-' '_' '.'
-                // but must not contain path separators. For host, allow '.' and '-'.
-                // Check specifically for slashes which would allow traversal; colon is
-                // also rejected to prevent scheme injection.
+                // Slashes would allow traversal and a colon scheme injection;
+                // '.'/'-'/'_' stay legal in these fields.
                 return Err(CoreError::Validation {
                     field: field.to_owned(),
                     reason: format!("{field} must not contain '/', '\\', or ':'"),
@@ -602,44 +593,36 @@ impl TemplateRepoConfig {
                     reason: "base_url must not be empty if provided".to_owned(),
                 });
             }
-            // base_url may be file:// for tests or https:// for real. Validate not
-            // containing NUL/control and that it parses as having a scheme.
-            if base.contains('\0') {
+            if base.contains('\0') || base.chars().any(char::is_control) {
                 return Err(CoreError::Validation {
                     field: "base_url".to_owned(),
-                    reason: "base_url must not contain NUL".to_owned(),
+                    reason: "base_url must not contain NUL or control chars".to_owned(),
+                });
+            }
+            // Only http(s): another scheme would turn the configured repo
+            // into a local-file reader.
+            let trimmed = base.trim_end_matches('/');
+            if !trimmed.starts_with("https://")
+                && !trimmed.starts_with("http://")
+                && !file_base_allowed(self)
+            {
+                return Err(CoreError::Validation {
+                    field: "base_url".to_owned(),
+                    reason: format!("base_url scheme must be https:// or http://, got `{trimmed}`"),
                 });
             }
         }
         Ok(())
     }
 
-    /// Build the catalog URL for this config.
-    ///
-    /// If `base_url` is `Some`, returns `{base_url}/catalog.json` (ensuring one
-    /// slash). Otherwise builds `https://{host}/{owner}/{repo}/raw/{ref}/catalog.json`
-    /// for raw.githubusercontent.com style, or `https://{host}/{owner}/{repo}/{ref}/catalog.json`
-    /// generically. For `raw.githubusercontent.com` we emit the canonical raw path.
+    /// Build the catalog URL: `{base_url}/catalog.json` when set, else
+    /// `https://{host}/{owner}/{repo}/{ref}/catalog.json`.
     pub fn catalog_url(&self) -> Result<String> {
         self.validate()?;
         if let Some(base) = self.base_url.as_deref() {
             let trimmed = base.trim_end_matches('/');
-            if trimmed.starts_with("file://") {
-                // For file URLs, validation is filesystem path safety; still return as-is.
-                return Ok(format!("{trimmed}/catalog.json"));
-            }
-            if !trimmed.starts_with("https://") && !trimmed.starts_with("http://") {
-                return Err(CoreError::Validation {
-                    field: "base_url".to_owned(),
-                    reason: format!(
-                        "base_url must start with https:// or file://, got `{trimmed}`"
-                    ),
-                });
-            }
             return Ok(format!("{trimmed}/catalog.json"));
         }
-        // Canonical construction. For raw.githubusercontent.com the raw path is
-        // /{owner}/{repo}/{ref}/catalog.json
         Ok(format!(
             "https://{}/{}/{}/{}/catalog.json",
             self.host, self.owner, self.repo, self.git_ref
@@ -652,10 +635,7 @@ impl TemplateRepoConfig {
         validate_template_path(relative_path)?;
         if let Some(base) = self.base_url.as_deref() {
             let trimmed = base.trim_end_matches('/');
-            if trimmed.starts_with("file://") {
-                return Ok(format!("{trimmed}/{relative_path}"));
-            }
-            if !trimmed.starts_with("https://") {
+            if !trimmed.starts_with("https://") && !file_base_allowed(self) {
                 return Err(CoreError::Validation {
                     field: "base_url".to_owned(),
                     reason: "base_url must be https:// when fetching remote templates".to_owned(),
@@ -670,9 +650,7 @@ impl TemplateRepoConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Template schema (TPL-02)
-// ---------------------------------------------------------------------------
 
 /// One required or optional input the user must supply when instantiating.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -824,7 +802,6 @@ impl Template {
             });
         }
         parse_semver(&self.version)?;
-        // digest must be 64 hex
         let d = self.digest.trim();
         if d.len() != 64 || !d.chars().all(|c| c.is_ascii_hexdigit()) {
             return Err(CoreError::Validation {
@@ -876,26 +853,42 @@ impl Template {
                     reason: "wrapper_env key must not be empty".to_owned(),
                 });
             }
-            if k.contains('\0') || k.chars().any(char::is_control) {
+            // Keys reach wrappers unquoted in every dialect (`export`,
+            // `$env:`, `set`); only identifier shapes cannot inject.
+            if !k
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                || !k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
                 return Err(CoreError::Validation {
                     field: "wrapper_env".to_owned(),
-                    reason: format!("wrapper_env key must not contain control/NUL: `{k}`"),
+                    reason: format!(
+                        "wrapper_env key must be an identifier ([A-Za-z_][A-Za-z0-9_]*): `{k}`"
+                    ),
                 });
             }
-            if v.contains('\0') {
+            if k.chars().any(char::is_control) {
                 return Err(CoreError::Validation {
                     field: "wrapper_env".to_owned(),
-                    reason: "wrapper_env value must not contain NUL".to_owned(),
+                    reason: format!("wrapper_env key must not contain control chars: `{k}`"),
                 });
             }
-            // Forbid secrets/shell in env values as well.
+            // A line break escapes `set "KEY=..."` as fresh batch
+            // commands; no dialect can quote a control char usefully.
+            if v.chars().any(char::is_control) {
+                return Err(CoreError::Validation {
+                    field: "wrapper_env".to_owned(),
+                    reason: "wrapper_env value must not contain control chars".to_owned(),
+                });
+            }
             check_value_forbidden(&Value::String(v.clone()))?;
         }
         for arg in &self.wrapper_args {
-            if arg.contains('\0') {
+            if arg.chars().any(char::is_control) {
                 return Err(CoreError::Validation {
                     field: "wrapper_args".to_owned(),
-                    reason: "wrapper arg must not contain NUL".to_owned(),
+                    reason: "wrapper arg must not contain control chars".to_owned(),
                 });
             }
             // Shell patterns in args are forbidden (no `sh -c` etc).
@@ -919,7 +912,6 @@ impl Template {
                     reason: "harness_version_req must not be empty if present".to_owned(),
                 });
             }
-            // Validate as semver req syntax.
             semver::VersionReq::parse(req).map_err(|e| CoreError::Validation {
                 field: "harness_version_req".to_owned(),
                 reason: format!("invalid semver req `{req}`: {e}"),
@@ -969,22 +961,19 @@ impl Template {
         tmpl.validate()?;
         Ok(tmpl)
     }
+}
 
-    /// Verify that the template's digest matches the hash of `bytes`.
-    ///
-    /// The digest is computed over the raw file bytes. Callers that have the
-    /// original bytes should use this to ensure the file was not tampered with.
-    pub fn verify_bytes_digest(&self, bytes: &[u8]) -> Result<()> {
-        verify_digest(bytes, &self.digest)
-    }
+/// True when `full` equals `prefix` plus one or more dot-separated levels
+/// under it (allocation-free `starts_with(prefix + ".")`).
+fn extends_by_dot(prefix: &str, full: &str) -> bool {
+    full.len() > prefix.len()
+        && full.starts_with(prefix)
+        && full.as_bytes().get(prefix.len()) == Some(&b'.')
+}
 
-    /// Validate that every patch selector is owned by the given adapter.
-    ///
-    /// Collects `owned_selectors` from `adapter.config_surfaces()` and checks
-    /// that each `patches[].selector` appears there, or is a prefix of an
-    /// owned path, or matches a `supported_operations` key if the adapter
-    /// exposes operation names that correspond to selectors. The primary check
-    /// is against `config_surfaces().owned_selectors`.
+impl Template {
+    /// Validate every patch selector is adapter-owned: exact match (typed
+    /// or plain), a supported operation, or a dot-relative of an owned key.
     #[expect(
         clippy::excessive_nesting,
         reason = "adapter selector matching branches are explicit"
@@ -995,27 +984,22 @@ impl Template {
         for surface in &surfaces {
             for sel in &surface.owned_selectors {
                 owned.insert(sel.clone());
-                // Also insert the typed-string form if it parses as a selector,
-                // so both `model` and `key:model` are recognised.
+                // Also insert the typed-string form so both `model` and
+                // `key:model` are recognised.
                 if let Ok(parsed) = superai_config::document::Selector::parse(sel) {
                     owned.insert(parsed.to_typed_string());
                 }
             }
         }
-        // Also include operation names as owned keys for adapters that declare
-        // ownership via supported_operations (per spec: call supported_operations
-        // to verify owned keys).
         for (op, _support) in adapter.supported_operations() {
             owned.insert(op);
         }
 
         for patch in &self.patches {
             let selector = patch.selector.trim();
-            // Direct match?
             if owned.contains(selector) {
                 continue;
             }
-            // Try parsed canonical form.
             let canonical = match superai_config::document::Selector::parse(selector) {
                 Ok(s) => s.to_typed_string(),
                 Err(_) => selector.to_owned(),
@@ -1023,8 +1007,6 @@ impl Template {
             if owned.contains(&canonical) {
                 continue;
             }
-            // For Key selectors, check if the raw key after `key:` prefix matches.
-            // e.g. patch `key:model` should match owned `model`.
             let mut matched = false;
             if let Ok(superai_config::document::Selector::Key(k)) =
                 superai_config::document::Selector::parse(selector)
@@ -1032,18 +1014,19 @@ impl Template {
                 if owned.contains(&k) {
                     matched = true;
                 }
-                for o in &owned {
-                    if k == *o || k.starts_with(&format!("{o}.")) || o.starts_with(&format!("{k}."))
-                    {
-                        matched = true;
-                        break;
-                    }
-                    if let Ok(superai_config::document::Selector::Key(ok)) =
-                        superai_config::document::Selector::parse(o)
-                        && ok == k
-                    {
-                        matched = true;
-                        break;
+                if !matched {
+                    for o in &owned {
+                        if extends_by_dot(o, &k) || extends_by_dot(&k, o) {
+                            matched = true;
+                            break;
+                        }
+                        if let Ok(superai_config::document::Selector::Key(ok)) =
+                            superai_config::document::Selector::parse(o)
+                            && ok == k
+                        {
+                            matched = true;
+                            break;
+                        }
                     }
                 }
             }
@@ -1069,12 +1052,8 @@ impl Template {
                 ),
             });
         }
-        // CAP-04: incomplete capability coverage blocks template use. When
-        // the adapter has modeled its capability transport, every catalog
-        // capability must resolve from adapter + template data (provider
-        // data is folded in at resolution time); it never defaults to
-        // absent silently. Adapters without declarations are skipped —
-        // coverage is not evaluable for them.
+        // CAP-04: with modeled capability transport, every catalog
+        // capability must resolve; undeclared adapters are skipped.
         if !adapter.capability_declarations().is_empty() {
             crate::capability_resolver::validate_resolution_completeness(
                 &self.harness,
@@ -1088,16 +1067,7 @@ impl Template {
         }
         Ok(())
     }
-
-    /// Compute the digest that should be stored for `bytes`.
-    pub fn expected_digest_for(bytes: &[u8]) -> String {
-        compute_digest(bytes)
-    }
 }
-
-// ---------------------------------------------------------------------------
-// Update status and version discovery (TPL-04)
-// ---------------------------------------------------------------------------
 
 /// Result of checking whether an instance's template is up to date.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1139,15 +1109,9 @@ impl UpdateStatus {
     }
 }
 
-/// Pure catalog-based update check (no network).
-///
-/// Validates the instance's template reference against the provided catalog
-/// using semver ordering and yanked status. Harness/adapter compatibility
-/// beyond semver ordering is not checked here; use [`check_update`] for the
-/// network-aware variant that also verifies `harness_version_req` and harness
-/// identity by fetching the candidate template.
+/// Pure catalog-based update check (no network); harness compatibility
+/// beyond semver is refined by the network-aware [`check_update`].
 pub fn check_update_with_catalog(instance: &Instance, catalog: &Catalog) -> UpdateStatus {
-    // Instance must have a template reference to be considered.
     let Some(template_ref) = instance.template.as_ref() else {
         return UpdateStatus::CurrentMissing;
     };
@@ -1156,29 +1120,21 @@ pub fn check_update_with_catalog(instance: &Instance, catalog: &Catalog) -> Upda
         return UpdateStatus::CurrentMissing;
     };
 
-    // Yanked entries are always reported as yanked.
     if entry.status == TemplateStatus::Yanked {
         return UpdateStatus::Yanked;
     }
 
-    // Deprecated entries report the replacement pointer (TPL-08).
     if entry.status == TemplateStatus::Deprecated {
         return UpdateStatus::Deprecated {
             replacement: entry.replacement.as_ref().map(ToString::to_string),
         };
     }
 
-    // Current version must exist in the catalog's file list.
     let current_version_str = template_ref.version.as_str();
-    let current_file = entry.file_for_version(current_version_str);
-    if current_file.is_none() {
+    if entry.file_for_version(current_version_str).is_none() {
         return UpdateStatus::CurrentMissing;
     }
 
-    // If the current template's own file is yanked, the entry status already
-    // reflects that, but also check the specific template file's status if we
-    // had it; catalog entry status is authoritative for now.
-    // Validate semver for current and latest.
     let current_ver = match parse_semver(current_version_str) {
         Ok(v) => v,
         Err(e) => {
@@ -1197,20 +1153,13 @@ pub fn check_update_with_catalog(instance: &Instance, catalog: &Catalog) -> Upda
         }
     };
 
-    // Compare semver: candidate > current => update available, == => up to date,
-    // < => local is ahead (treat as up to date).
-    if latest_ver == current_ver {
-        return UpdateStatus::UpToDate;
-    }
-    if latest_ver < current_ver {
+    // Equal or local-ahead both count as up to date.
+    if latest_ver <= current_ver {
         return UpdateStatus::UpToDate;
     }
 
-    // latest > current: potential update. Check if the current version itself
-    // is yanked (entry already checked) else report available.
-    // For pure catalog check we cannot verify harness_version_req without
-    // fetching the template file, so we report UpdateAvailable here; the
-    // network-aware `check_update` will refine to Incompatible when needed.
+    // latest > current: harness_version_req needs the file fetched, so
+    // report available; `check_update` refines to Incompatible.
     match TemplateVersion::new(latest_str) {
         Ok(latest) => UpdateStatus::UpdateAvailable { latest },
         Err(_) => UpdateStatus::Incompatible {
@@ -1219,10 +1168,8 @@ pub fn check_update_with_catalog(instance: &Instance, catalog: &Catalog) -> Upda
     }
 }
 
-/// Check whether a template's harness and `harness_version_req` are compatible
-/// with the given instance.
-///
-/// Returns `Ok(())` if compatible, or `Err(reason)` if incompatible.
+/// Whether a template's harness and `harness_version_req` fit the
+/// instance; `Err` carries the reason.
 fn check_template_compatible(
     instance: &Instance,
     template: &Template,
@@ -1236,56 +1183,42 @@ fn check_template_compatible(
     if let Some(req_str) = template.harness_version_req.as_deref() {
         let req = semver::VersionReq::parse(req_str)
             .map_err(|e| format!("invalid harness_version_req `{req_str}`: {e}"))?;
-        // Use instance.adapter_revision as a proxy for the harness version.
+        // instance.adapter_revision stands in for the harness version; a
+        // non-semver revision cannot be checked, so compatibility stands.
         let harness_ver_str = instance.adapter_revision.as_str();
-        // Some revisions may not be semver (e.g., "0.1.0" is semver, but if not, skip check).
-        if let Ok(harness_ver) = semver::Version::parse(harness_ver_str) {
-            if !req.matches(&harness_ver) {
-                return Err(format!(
-                    "harness version `{harness_ver_str}` does not satisfy `{req_str}`"
-                ));
-            }
-        } else {
-            // If harness version is not semver, we cannot enforce the requirement;
-            // treat as compatible rather than blocking.
+        if let Ok(harness_ver) = semver::Version::parse(harness_ver_str)
+            && !req.matches(&harness_ver)
+        {
+            return Err(format!(
+                "harness version `{harness_ver_str}` does not satisfy `{req_str}`"
+            ));
         }
     }
     Ok(())
 }
 
-/// Network-aware update check that fetches the catalog fresh.
-///
-/// Must be called with a `repo` that points at the remote template repository
-/// (usually `file://` for tests). Fetches the catalog via
-/// [`crate::template_fetch::fetch_catalog`]; on network failure returns
-/// [`UpdateStatus::Offline`]. Otherwise uses the fresh catalog to determine
-/// status, additionally verifying harness compatibility by fetching the latest
-/// template file when an update appears available.
+/// Network-aware update check: fetches the catalog fresh (offline on
+/// failure), then verifies harness fit by fetching the latest template.
 pub fn check_update(
     instance: &Instance,
-    catalog: &Catalog,
+    _catalog: &Catalog,
     repo: &TemplateRepoConfig,
 ) -> UpdateStatus {
-    // Validate repo early; invalid repo is treated as offline to avoid panics.
+    // Invalid repo is treated as offline; the freshly fetched catalog below
+    // is authoritative, so the passed-in one is never trusted for status.
     if repo.validate().is_err() {
         return UpdateStatus::Offline;
     }
-    // The provided catalog is validated opportunistically; errors are ignored
-    // because fresh fetch is authoritative. Avoid `let _ =` on must_use.
-    drop(catalog.validate().err());
-
     let Ok(fresh) = crate::template_fetch::fetch_catalog(repo) else {
         return UpdateStatus::Offline;
     };
 
-    // First, run the pure catalog check.
     let pure_status = check_update_with_catalog(instance, &fresh);
     let latest = match &pure_status {
         UpdateStatus::UpdateAvailable { latest } => latest.clone(),
         other => return other.clone(),
     };
 
-    // For UpdateAvailable, verify harness compatibility by fetching the latest template.
     let template_id = match instance.template.as_ref() {
         Some(t) => t.name.as_str(),
         None => return UpdateStatus::CurrentMissing,
@@ -1302,9 +1235,7 @@ pub fn check_update(
             }
         }
         Err(e) => {
-            // Map fetch errors: offline vs missing.
             let msg = format!("{e}");
-            // If the template file is not found, treat as CurrentMissing rather than Offline.
             if msg.contains("not found") || msg.contains("NotFound") {
                 UpdateStatus::CurrentMissing
             } else if msg.contains("digest") || msg.contains("DigestMismatch") {
@@ -1312,8 +1243,6 @@ pub fn check_update(
                     reason: format!("latest template digest mismatch: {msg}"),
                 }
             } else {
-                // For network/rate-limit etc., treat as Offline to be safe, but only if the catalog itself was fresh.
-                // Since we already fetched the catalog, a template fetch failure is more likely a catalog inconsistency.
                 UpdateStatus::Incompatible {
                     reason: format!("cannot fetch latest template `{latest_str}`: {msg}"),
                 }
@@ -1321,10 +1250,6 @@ pub fn check_update(
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Template diff (TPL-05)
-// ---------------------------------------------------------------------------
 
 fn is_secret_like(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
@@ -1499,16 +1424,13 @@ impl TemplateDiff {
     clippy::too_many_lines,
     reason = "diff assembles multiple semantic categories"
 )]
-/// Compute a semantic diff between two template versions.
-///
-/// Redacts secret-like values via [`RedactedString`] and reports provider,
-/// model, capability, wrapper, asset and selector changes.
+/// Compute a semantic diff between two template versions; secret-like
+/// values redact via [`RedactedString`].
 pub fn diff_templates(old: &Template, new: &Template) -> TemplateDiff {
     let template_id = old.id.to_string();
     let from_version = old.version.clone();
     let to_version = new.version.clone();
 
-    // --- provider / harness / status / label / version req ---
     let harness_changed = if old.harness == new.harness {
         None
     } else {
@@ -1552,7 +1474,6 @@ pub fn diff_templates(old: &Template, new: &Template) -> TemplateDiff {
         Some((redact_string(&old.label), redact_string(&new.label)))
     };
 
-    // --- capability map ---
     let mut cap_added = Vec::new();
     let mut cap_removed = Vec::new();
     let mut cap_changed = Vec::new();
@@ -1583,7 +1504,6 @@ pub fn diff_templates(old: &Template, new: &Template) -> TemplateDiff {
         changed: cap_changed,
     };
 
-    // --- wrapper env ---
     let mut env_added = Vec::new();
     let mut env_removed = Vec::new();
     let mut env_changed = Vec::new();
@@ -1608,7 +1528,6 @@ pub fn diff_templates(old: &Template, new: &Template) -> TemplateDiff {
         changed: env_changed,
     };
 
-    // --- wrapper args (set diff) ---
     let old_args_set: BTreeSet<&String> = old.wrapper_args.iter().collect();
     let new_args_set: BTreeSet<&String> = new.wrapper_args.iter().collect();
     let mut args_added = Vec::new();
@@ -1628,7 +1547,6 @@ pub fn diff_templates(old: &Template, new: &Template) -> TemplateDiff {
         removed: args_removed,
     };
 
-    // --- assets (set diff) ---
     let old_assets_set: BTreeSet<&String> = old.assets.iter().collect();
     let new_assets_set: BTreeSet<&String> = new.assets.iter().collect();
     let mut asset_added = Vec::new();
@@ -1648,7 +1566,6 @@ pub fn diff_templates(old: &Template, new: &Template) -> TemplateDiff {
         removed: asset_removed,
     };
 
-    // --- selector / patch diff (all patches) ---
     let mut old_map: BTreeMap<String, Value> = BTreeMap::new();
     for p in &old.patches {
         old_map.insert(p.selector.clone(), redact_value(&p.value));
@@ -1681,7 +1598,6 @@ pub fn diff_templates(old: &Template, new: &Template) -> TemplateDiff {
         changed: sel_changed.clone(),
     };
 
-    // --- model changes: filter selector changes where selector contains "model" ---
     let mut model_added = Vec::new();
     let mut model_removed = Vec::new();
     let mut model_changed_entries = Vec::new();
@@ -1716,20 +1632,10 @@ pub fn diff_templates(old: &Template, new: &Template) -> TemplateDiff {
         default_changed,
     };
 
-    // --- inputs ---
     let old_inputs: BTreeSet<&String> = old.inputs.iter().map(|i| &i.key).collect();
     let new_inputs: BTreeSet<&String> = new.inputs.iter().map(|i| &i.key).collect();
     let mut inputs_added = Vec::new();
     let mut inputs_removed = Vec::new();
-    for inp in &old.inputs {
-        if !new_inputs.contains(&inp.key) {
-            inputs_added.push(inp.key.clone());
-            // Actually this is removed; fix logic below
-        }
-    }
-    // Correct the above: we pushed to wrong vec; recompute cleanly.
-    inputs_added.clear();
-    inputs_removed.clear();
     for inp in &old.inputs {
         if !new_inputs.contains(&inp.key) {
             inputs_removed.push(inp.key.clone());
@@ -1745,7 +1651,6 @@ pub fn diff_templates(old: &Template, new: &Template) -> TemplateDiff {
         removed: inputs_removed,
     };
 
-    // --- migration notes ---
     let mut migration_notes_added = Vec::new();
     for note in &new.migration_notes {
         if !old.migration_notes.contains(note) {
@@ -1795,10 +1700,6 @@ pub fn diff_templates(old: &Template, new: &Template) -> TemplateDiff {
         has_changes,
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 #[expect(redundant_imports, reason = "test imports overlap via super")]
@@ -1866,7 +1767,7 @@ mod tests {
     fn catalog_round_trip() {
         let catalog = minimal_catalog();
         catalog.validate().unwrap();
-        let bytes = catalog.to_json_bytes().unwrap();
+        let bytes = serde_json::to_vec(&catalog).unwrap();
         let back = Catalog::from_json_bytes(&bytes).unwrap();
         assert_eq!(catalog, back);
     }
@@ -1897,7 +1798,6 @@ mod tests {
     #[test]
     fn catalog_rejects_not_max_latest() {
         let mut catalog = minimal_catalog();
-        // latest should be 1.2.0 (max), set to 1.1.0 should fail
         catalog.templates[0].latest_version = TemplateVersion::new("1.1.0").unwrap();
         catalog.validate().unwrap_err();
     }
@@ -2051,18 +1951,52 @@ mod tests {
         TemplateRepoConfig::new("", "owner", "repo", "main").unwrap_err();
     }
 
+    /// `file://` (and every non-http(s) scheme) is refused as a base URL:
+    /// a configured repo must not become a local-file reader.
     #[test]
-    fn repo_config_base_url_file_scheme() {
-        let mut cfg = TemplateRepoConfig::example();
-        let base = format!(
-            "file://{}",
-            crate::test_util::tmp_abs("templates").display()
+    fn repo_config_base_url_refuses_non_http_schemes() {
+        for base in [
+            format!(
+                "file://{}",
+                crate::test_util::tmp_abs("templates").display()
+            ),
+            "ftp://example.com/templates".to_owned(),
+            "gopher://example.com".to_owned(),
+            "example.com/templates".to_owned(),
+        ] {
+            let mut cfg = TemplateRepoConfig::example();
+            cfg.base_url = Some(base.clone());
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(
+                err.contains("https:// or http://"),
+                "base `{base}` must be refused with the scheme rule: {err}"
+            );
+            cfg.catalog_url().unwrap_err();
+        }
+        let mut http = TemplateRepoConfig::example();
+        http.base_url = Some("http://insecure.example.com/templates".to_owned());
+        http.validate().unwrap();
+        assert_eq!(
+            http.catalog_url().unwrap(),
+            "http://insecure.example.com/templates/catalog.json"
         );
-        cfg.base_url = Some(base.clone());
-        let url = cfg.catalog_url().unwrap();
-        assert_eq!(url, format!("{base}/catalog.json"));
-        let turl = cfg.template_url("claude-glm/1.2.0.json").unwrap();
-        assert_eq!(turl, format!("{base}/claude-glm/1.2.0.json"));
+        let mut https = TemplateRepoConfig::example();
+        https.base_url = Some("https://mirror.example.com/t".to_owned());
+        https.validate().unwrap();
+        assert_eq!(
+            https.catalog_url().unwrap(),
+            "https://mirror.example.com/t/catalog.json"
+        );
+        let dir = crate::test_util::tmp_abs("templates");
+        let local = TemplateRepoConfig::for_local_tests(&dir);
+        assert_eq!(
+            local.catalog_url().unwrap(),
+            format!("file://{}/catalog.json", dir.display())
+        );
+        assert_eq!(
+            local.template_url("claude-glm/1.2.0.json").unwrap(),
+            format!("file://{}/claude-glm/1.2.0.json", dir.display())
+        );
     }
 
     #[test]
@@ -2114,10 +2048,40 @@ mod tests {
         let mut tmpl = minimal_template();
         tmpl.wrapper_env
             .insert("API_KEY".to_owned(), "sk-123".to_owned());
-        // The key itself is not checked for secret, but value is.
-        // Actually wrapper_env values are checked via check_value_forbidden which
-        // will reject secret pattern.
         tmpl.validate().unwrap_err();
+    }
+
+    /// A `wrapper_env` key reaches `export KEY=...` unquoted; a key carrying
+    /// shell metacharacters would inject into every launcher dialect.
+    #[test]
+    fn template_wrapper_env_keys_must_be_identifiers() {
+        for hostile in ["X; rm -rf", "A$(cmd)", "1LEADS_WITH_DIGIT", "HAS-DASH"] {
+            let mut tmpl = minimal_template();
+            tmpl.wrapper_env
+                .insert(hostile.to_owned(), "value".to_owned());
+            let err = tmpl.validate().unwrap_err().to_string();
+            assert!(err.contains("identifier"), "{hostile}: {err}");
+        }
+        let mut tmpl = minimal_template();
+        tmpl.wrapper_env
+            .insert("ANTHROPIC_MODEL".to_owned(), "m".to_owned());
+        tmpl.validate().unwrap();
+    }
+
+    /// A `\r\n` in a value would escape `set "KEY=..."` as fresh batch
+    /// lines; validation refuses it before wrapper bytes are generated.
+    #[test]
+    fn template_wrapper_env_and_args_reject_control_characters() {
+        let mut tmpl = minimal_template();
+        tmpl.wrapper_env
+            .insert("CLAUDE_CONFIG_DIR".to_owned(), "x\r\n del /q C:".to_owned());
+        let err = tmpl.validate().unwrap_err().to_string();
+        assert!(err.contains("control chars"), "{err}");
+
+        let mut args_only = minimal_template();
+        args_only.wrapper_args.push("--flag\r\nrm -rf /".to_owned());
+        let err = args_only.validate().unwrap_err().to_string();
+        assert!(err.contains("control chars"), "{err}");
     }
 
     #[test]
@@ -2146,10 +2110,6 @@ mod tests {
         catalog.templates[0].files[0].digest = "A".repeat(64);
         catalog.validate().unwrap_err();
     }
-
-    // -----------------------------------------------------------------------
-    // TPL-04 tests: version discovery
-    // -----------------------------------------------------------------------
 
     fn sample_instance_with_template(
         harness: &str,
@@ -2215,7 +2175,6 @@ mod tests {
             UpdateStatus::UpdateAvailable { latest } => assert_eq!(latest.as_str(), "1.10.0"),
             other => panic!("expected UpdateAvailable for semver ordering, got {other:?}"),
         }
-        // Pre-release ordering: 1.0.0-alpha is less than 1.0.0
         assert!(is_newer_version("1.0.0-alpha", "1.0.0").unwrap());
         assert!(!is_newer_version("1.0.0", "1.0.0-alpha").unwrap());
         assert!(is_newer_version("1.0.0", "1.0.1").unwrap());
@@ -2256,7 +2215,8 @@ mod tests {
 
     #[test]
     fn check_update_offline_via_repo() {
-        // Use a file:// repo that points to a non-existent directory to trigger Offline
+        // A file:// repo is refused by the scheme gate before any fetch;
+        // check_update reports an unusable repo as Offline.
         let catalog = minimal_catalog();
         let instance = sample_instance_with_template("claude-code", "claude-glm", "1.1.0", "0.1.0");
         let mut repo = TemplateRepoConfig::example();
@@ -2265,11 +2225,15 @@ mod tests {
         repo.base_url = Some(format!("file://{}", missing.display()));
         let status = check_update(&instance, &catalog, &repo);
         assert_eq!(status, UpdateStatus::Offline);
+        // An unreachable local root behind the test-only constructor also
+        // reports Offline (the fetch itself fails).
+        let repo2 = TemplateRepoConfig::for_local_tests(&missing);
+        let status2 = check_update(&instance, &catalog, &repo2);
+        assert_eq!(status2, UpdateStatus::Offline);
     }
 
     #[test]
     fn check_update_incompatible_via_network_fetch() {
-        // Create a temp repo with catalog and two templates where latest has incompatible harness_version_req
         let dir = crate::test_util::temp_dir_unique("tpl");
         drop(std::fs::remove_dir_all(&dir));
         std::fs::create_dir_all(&dir).unwrap();
@@ -2277,25 +2241,18 @@ mod tests {
 
         let instance = sample_instance_with_template("claude-code", "claude-glm", "1.1.0", "0.1.0");
 
-        // Create old template file (1.1.0) with no harness_version_req
+        // The in-file digest is a valid-hex placeholder: fetch verifies the
+        // file bytes against the CATALOG digest, not the template's field.
         let old_bytes = {
             let mut tmpl = minimal_template();
             tmpl.version = "1.1.0".to_owned();
             tmpl.harness_version_req = None;
-            // Set digest to valid lowercase hex placeholder
             tmpl.digest = "d".repeat(64);
-            // Write actual bytes and compute digest for catalog? We use placeholder digest but we need catalog digest to match file hash
-            // Instead, compute digest from bytes after serializing with placeholder digest, then update template digest to match?
-            // Simpler: create template with digest = compute_digest(bytes_without_digest_check)
-            // But Template::from_json_bytes will validate digest format only, not that it matches file hash via verify_digest separately.
-            // The fetch_template verifies digest of file bytes against catalog digest, not template.digest field.
-            // So we can keep template.digest as "d".repeat(64) and catalog digest as compute_digest(raw)
             serde_json::to_vec(&tmpl).unwrap()
         };
         let old_catalog_digest = compute_digest(&old_bytes);
         std::fs::write(dir.join("claude-glm/1.1.0.json"), &old_bytes).unwrap();
 
-        // Create new template file (1.2.0) with harness_version_req that is incompatible with instance adapter_revision 0.1.0
         let new_bytes = {
             let mut tmpl = minimal_template();
             tmpl.version = "1.2.0".to_owned();
@@ -2306,7 +2263,6 @@ mod tests {
         let new_catalog_digest = compute_digest(&new_bytes);
         std::fs::write(dir.join("claude-glm/1.2.0.json"), &new_bytes).unwrap();
 
-        // Catalog with both versions, latest 1.2.0
         let catalog = Catalog {
             version: CATALOG_SCHEMA_VERSION,
             templates: vec![TemplateCatalogEntry {
@@ -2331,15 +2287,8 @@ mod tests {
         let catalog_bytes = serde_json::to_vec(&catalog).unwrap();
         std::fs::write(dir.join("catalog.json"), &catalog_bytes).unwrap();
 
-        let repo = TemplateRepoConfig {
-            host: "example.com".to_owned(),
-            owner: "owner".to_owned(),
-            repo: "repo".to_owned(),
-            git_ref: "main".to_owned(),
-            base_url: Some(format!("file://{}", dir.display())),
-        };
+        let repo = TemplateRepoConfig::for_local_tests(&dir);
 
-        // check_update should detect incompatible due to harness_version_req
         let status = check_update(&instance, &catalog, &repo);
         match status {
             UpdateStatus::Incompatible { reason } => assert!(
@@ -2354,7 +2303,6 @@ mod tests {
 
     #[test]
     fn check_update_via_file_repo_update_available() {
-        // Similar setup but compatible version should be UpdateAvailable
         let dir = crate::test_util::temp_dir_unique("tpl");
         drop(std::fs::remove_dir_all(&dir));
         std::fs::create_dir_all(dir.join("claude-glm")).unwrap();
@@ -2407,13 +2355,7 @@ mod tests {
         )
         .unwrap();
 
-        let repo = TemplateRepoConfig {
-            host: "example.com".to_owned(),
-            owner: "owner".to_owned(),
-            repo: "repo".to_owned(),
-            git_ref: "main".to_owned(),
-            base_url: Some(format!("file://{}", dir.display())),
-        };
+        let repo = TemplateRepoConfig::for_local_tests(&dir);
 
         let status = check_update(&instance, &catalog, &repo);
         match status {
@@ -2423,10 +2365,6 @@ mod tests {
 
         drop(std::fs::remove_dir_all(&dir));
     }
-
-    // -----------------------------------------------------------------------
-    // TPL-05 tests: diff
-    // -----------------------------------------------------------------------
 
     #[test]
     #[expect(clippy::too_many_lines, reason = "diff test covers many categories")]
@@ -2488,18 +2426,15 @@ mod tests {
         assert!(!diff.is_empty());
         assert_eq!(diff.from_version, "1.1.0");
         assert_eq!(diff.to_version, "1.2.0");
-        // provider changes
         assert!(diff.provider_diff.has_change);
         assert_eq!(
             diff.provider_diff.provider_changed,
             Some(("glm".to_owned(), "minimax".to_owned()))
         );
-        // provider protocol changed
         assert_eq!(
             diff.provider_diff.protocol_changed,
             Some((None, Some("openai".to_owned())))
         );
-        // model changes: old model glm-4 -> glm-4.5 and added/removed
         assert!(!diff.model_changes.changed.is_empty());
         assert!(
             diff.model_changes
@@ -2509,9 +2444,7 @@ mod tests {
                     && old_v == &json!("glm-4")
                     && new_v == &json!("glm-4.5"))
         );
-        // model default_changed should be set
         assert!(diff.model_changes.default_changed.is_some());
-        // capability changes: web_search native -> substituted, vision added
         assert!(
             diff.capability_changes
                 .changed
@@ -2524,7 +2457,6 @@ mod tests {
                 .iter()
                 .any(|(k, v)| k == "vision" && v == "native")
         );
-        // wrapper env changes: FOO bar->baz, BAR added
         assert!(
             diff.wrapper_env_changes
                 .changed
@@ -2537,19 +2469,16 @@ mod tests {
                 .iter()
                 .any(|(k, v)| k == "BAR" && v == "qux")
         );
-        // wrapper args: BAR added? Actually --bar added
         assert!(
             diff.wrapper_args_changes
                 .added
                 .contains(&"--bar".to_owned())
         );
-        // asset changes: b added
         assert!(
             diff.asset_changes
                 .added
                 .contains(&"asset/b.json".to_owned())
         );
-        // selector changes: temperature removed, max_tokens added, model changed
         assert!(
             diff.selector_changes
                 .removed
@@ -2581,9 +2510,8 @@ mod tests {
 
     #[test]
     fn diff_redacts_secret_placeholders_consistently() {
-        // Create two templates that differ in a value that looks like a secret placeholder
-        // Use a value that contains a secret pattern but is still allowed via direct construction
-        // (bypassing validate). diff should redact it to [REDACTED].
+        // Values built directly (bypassing validate) still redact to
+        // [REDACTED] in the diff.
         let mut old = minimal_template();
         old.patches = vec![OwnedPatch {
             selector: "key:api_url".to_owned(),
@@ -2594,30 +2522,23 @@ mod tests {
             selector: "key:api_url".to_owned(),
             value: json!("https://api.example.com/v2"),
         }];
-        // Add a wrapper env that contains a secret-like placeholder
         old.wrapper_env
             .insert("MY_TOKEN".to_owned(), "secret-value-sk-123".to_owned());
         new.wrapper_env
             .insert("MY_TOKEN".to_owned(), "secret-value-sk-456".to_owned());
-        // Add capability with secret-like? Not needed.
         let diff = diff_templates(&old, &new);
-        // Check that secret values are redacted in diff
         let redacted = RedactedString::placeholder();
-        // wrapper env changed entry should be redacted
         for (key, old_v, new_v) in &diff.wrapper_env_changes.changed {
             if key == "MY_TOKEN" {
                 assert_eq!(old_v, redacted);
                 assert_eq!(new_v, redacted);
             }
         }
-        // Also ensure no raw secret appears in debug output of diff
         let debug = format!("{diff:?}");
         assert!(
             !debug.contains("sk-123") && !debug.contains("sk-456"),
             "diff debug must not leak secret: {debug}"
         );
-        // Also check that selector values containing secret pattern are redacted
-        // Create a diff where patch value is secret-like
         let mut old2 = minimal_template();
         old2.patches = vec![OwnedPatch {
             selector: "key:model".to_owned(),
@@ -2639,10 +2560,6 @@ mod tests {
         assert!(!debug2.contains("sk-abc") && !debug2.contains("sk-def"));
     }
 
-    // -------------------------------------------------------------------
-    // TPL-08 — replacement pointers + CAP-01/04 validation
-    // -------------------------------------------------------------------
-
     #[test]
     fn deprecated_template_requires_replacement_pointer() {
         let mut tmpl = minimal_template();
@@ -2652,7 +2569,6 @@ mod tests {
         tmpl.replacement = Some(TemplateId::new("claude-glm-next").unwrap());
         tmpl.validate().unwrap();
 
-        // Active templates must not carry a replacement pointer.
         let mut active = minimal_template();
         active.replacement = Some(TemplateId::new("claude-glm-next").unwrap());
         let err = active.validate().unwrap_err().to_string();

@@ -1,83 +1,12 @@
-//! Operation preview and result contracts.
-//!
-//! Every mutating workflow returns a [`OperationPreview`] before commit and a
-//! [`OperationResult`] after commit. No interface types are referenced; all
-//! fields are harness-agnostic, serializable, and redact secrets.
+//! Operation preview and result contracts: every mutating workflow returns
+//! a preview before commit and a result after; secrets stay redacted.
 
 use std::fmt;
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 
 use crate::ids::{BackupId, HarnessId, InstanceName, OperationId};
 use crate::paths::AbsolutePath;
-
-// ---------------------------------------------------------------------------
-// Redacted helper
-// ---------------------------------------------------------------------------
-
-/// Wrapper for secret-bearing values that never exposes the inner value.
-///
-/// Debug, Display, and Serialize all emit a fixed placeholder. The raw secret
-/// is only reachable via [`Self::expose_secret`], which callers must use
-/// explicitly at the harness-write boundary.
-#[derive(Clone, PartialEq, Eq)]
-pub struct RedactedString(String);
-
-impl RedactedString {
-    /// Create a new redacted wrapper from a secret value.
-    pub fn new(secret: &str) -> Self {
-        Self(secret.to_owned())
-    }
-
-    /// Borrow the raw secret. Use only at the sink that writes to the harness
-    /// config; never log or serialize this value.
-    pub fn expose_secret(&self) -> &str {
-        &self.0
-    }
-
-    /// Redacted placeholder used in serialization and display.
-    pub fn placeholder() -> &'static str {
-        "[REDACTED]"
-    }
-}
-
-impl fmt::Debug for RedactedString {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("RedactedString([REDACTED])")
-    }
-}
-
-impl fmt::Display for RedactedString {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("[REDACTED]")
-    }
-}
-
-impl Serialize for RedactedString {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(Self::placeholder())
-    }
-}
-
-impl<'de> Deserialize<'de> for RedactedString {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        // Deserializing a preview/result never recovers the original secret;
-        // the placeholder is stored. The true secret is only available from
-        // the live `RedactedString` held at call-site, not from persisted JSON.
-        Ok(Self(s))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// OperationKind
-// ---------------------------------------------------------------------------
 
 /// High-level kind of a mutating operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -147,10 +76,6 @@ impl fmt::Display for OperationKind {
     }
 }
 
-// ---------------------------------------------------------------------------
-// RequestedTarget / ResolvedResource
-// ---------------------------------------------------------------------------
-
 /// What the caller asked to operate on, before adapter resolution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RequestedTarget {
@@ -174,10 +99,6 @@ pub struct ResolvedResource {
     /// Whether the resource is owned by superai or is foreign.
     pub owned_by_superai: bool,
 }
-
-// ---------------------------------------------------------------------------
-// Preconditions
-// ---------------------------------------------------------------------------
 
 /// Kind of precondition that must hold before commit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -216,10 +137,6 @@ pub struct Precondition {
     /// Whether the precondition is currently satisfied.
     pub satisfied: bool,
 }
-
-// ---------------------------------------------------------------------------
-// Planned actions (ordered file/process actions)
-// ---------------------------------------------------------------------------
 
 /// Kind of ordered action in the plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -264,10 +181,6 @@ pub struct PlannedAction {
     pub requires_backup: bool,
 }
 
-// ---------------------------------------------------------------------------
-// Diffs (redacted)
-// ---------------------------------------------------------------------------
-
 /// A redacted diff for a single surface. Secrets are never included.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RedactedDiff {
@@ -282,10 +195,6 @@ pub struct RedactedDiff {
     /// Names of fields whose values were redacted in this diff.
     pub redacted_fields: Vec<String>,
 }
-
-// ---------------------------------------------------------------------------
-// Backups
-// ---------------------------------------------------------------------------
 
 /// A backup that will be created before the first write to a foreign file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -316,10 +225,6 @@ pub struct BackupRecord {
     /// Whether a backup file was created (false for a first-write creation).
     pub created: bool,
 }
-
-// ---------------------------------------------------------------------------
-// Warnings / Conflicts / Limitations
-// ---------------------------------------------------------------------------
 
 /// Non-blocking warning about the operation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -374,10 +279,6 @@ pub struct RestartRequirement {
     pub required: bool,
 }
 
-// ---------------------------------------------------------------------------
-// Rollback
-// ---------------------------------------------------------------------------
-
 /// A single step in the rollback plan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RollbackStep {
@@ -401,10 +302,6 @@ pub struct RollbackPlan {
     /// Estimated number of steps.
     pub estimated_steps: usize,
 }
-
-// ---------------------------------------------------------------------------
-// Commit result types
-// ---------------------------------------------------------------------------
 
 /// An action that was executed during commit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -479,15 +376,7 @@ impl fmt::Display for RollbackStatus {
     }
 }
 
-// ---------------------------------------------------------------------------
-// OperationPreview / OperationResult
-// ---------------------------------------------------------------------------
-
-/// Preview of a mutating operation before commit.
-///
-/// Contains every field required by FND-05: identification, targets, preconditions,
-/// ordered actions, redacted diffs, backups, warnings/conflicts/limitations,
-/// auth and restart requirements, and a deterministic rollback plan. No interface
+/// Preview of a mutating operation before commit (FND-05). No interface
 /// types are present and all secrets are redacted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OperationPreview {
@@ -521,11 +410,8 @@ pub struct OperationPreview {
     pub rollback_plan: RollbackPlan,
 }
 
-/// Result of committing an operation preview.
-///
-/// Contains every field required by FND-05: exact actions completed, backup
-/// IDs and paths, verification results, rollback status, and redacted diagnostics.
-/// No interface types are present and all secrets are redacted.
+/// Result of committing an operation preview (FND-05). All secrets are
+/// redacted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OperationResult {
     /// Identifier of the operation that was committed.
@@ -545,10 +431,6 @@ pub struct OperationResult {
     /// Whether the whole operation is considered successful.
     pub success: bool,
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -687,10 +569,6 @@ mod tests {
     fn preview_serializes_without_leaking_secret() {
         let (preview, _tmp_root) = sample_preview();
         let secret = "super-secret-sentinel-42";
-        // Simulate that diff lexical was correctly redacted: it must not contain the secret,
-        // and must contain the placeholder.
-        let redacted_diff = format!("apiKey set to {}", RedactedString::placeholder());
-        let _ = redacted_diff;
         let json = serde_json::to_string(&preview).unwrap();
         assert!(
             !json.contains(secret),
@@ -700,7 +578,6 @@ mod tests {
             json.contains("[REDACTED]"),
             "serialized preview must contain redacted placeholder"
         );
-        // Ensure preview round-trips.
         let back: OperationPreview = serde_json::from_str(&json).unwrap();
         assert_eq!(preview, back);
     }
@@ -708,9 +585,9 @@ mod tests {
     #[test]
     fn result_serializes_without_leaking_secret() {
         let mut result = sample_result();
-        // Put a diagnostic that has been redacted prior to insertion.
         let secret = "another-super-secret-99";
-        let diagnostic_redacted = format!("apiKey was {}", RedactedString::placeholder());
+        let diagnostic_redacted =
+            format!("apiKey was {}", crate::error::RedactedString::placeholder());
         result.diagnostics_redacted.push(diagnostic_redacted);
         let json = serde_json::to_string(&result).unwrap();
         assert!(!json.contains(secret));
@@ -720,45 +597,13 @@ mod tests {
     }
 
     #[test]
-    fn redacted_string_debug_and_display_do_not_leak() {
-        let secret = "my-very-secret-api-key-xyz";
-        let redacted = RedactedString::new(secret);
-        let debug = format!("{redacted:?}");
-        let display = format!("{redacted}");
-        let json = serde_json::to_string(&redacted).unwrap();
-        for output in [debug, display, json] {
-            assert!(
-                !output.contains(secret),
-                "redacted output must not contain secret: {output}"
-            );
-            assert!(
-                output.contains("[REDACTED]"),
-                "redacted output must contain placeholder: {output}"
-            );
-        }
-        // Expose is explicit.
-        assert_eq!(redacted.expose_secret(), secret);
-    }
-
-    #[test]
-    fn redacted_string_equality_is_based_on_secret() {
-        let a = RedactedString::new("same");
-        let b = RedactedString::new("same");
-        let c = RedactedString::new("different");
-        assert_eq!(a, b);
-        assert_ne!(a, c);
-    }
-
-    #[test]
     fn preview_contains_all_required_fields() {
         let (preview, _tmp_root) = sample_preview();
-        // Verify that all required FND-05 sections are present and non-empty where expected.
         assert!(!preview.actions.is_empty(), "actions must be ordered");
         assert_eq!(preview.actions[0].order, 0);
         assert!(!preview.diffs.is_empty());
         assert!(!preview.backups.is_empty());
         assert!(!preview.rollback_plan.steps.is_empty());
-        // Ensure actions are ordered.
         let mut last_order: Option<u32> = None;
         for action in &preview.actions {
             if let Some(prev) = last_order {
@@ -794,7 +639,6 @@ mod tests {
         assert!(!result.backups.is_empty());
         assert!(!result.verification.is_empty());
         assert!(result.verification[0].passed);
-        // Backups must carry IDs.
         let ids: HashSet<_> = result
             .backups
             .iter()
@@ -814,7 +658,6 @@ mod tests {
                 .to_string_lossy(),
             tmp_root
         );
-        // Ensure paths are normalized absolute (no traversal).
         for resource in &preview.resolved_resources {
             assert!(resource.path.as_path().is_absolute());
             for comp in resource.path.as_path().components() {
@@ -830,7 +673,6 @@ mod tests {
     fn rollback_status_display() {
         assert_eq!(RollbackStatus::Succeeded.to_string(), "succeeded");
         assert_eq!(RollbackStatus::NotNeeded.to_string(), "not_needed");
-        // Serialization round-trip.
         let json = serde_json::to_string(&RollbackStatus::Failed).unwrap();
         assert_eq!(json, "\"failed\"");
         let back: RollbackStatus = serde_json::from_str(&json).unwrap();

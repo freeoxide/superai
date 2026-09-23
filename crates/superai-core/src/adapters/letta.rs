@@ -1,20 +1,7 @@
-//! Letta Code adapter — client config plus server/provider state, `Constrained`.
-//!
-//! Research source: `docs/harness-configs/letta-code.md` (last verified 2026-08-25).
-//! Executable `letta`, client backends `cloud`/`local`/`self-hosted`, local state
-//! `~/.letta/lc-local-backend` or `$LETTA_LOCAL_BACKEND_DIR`, server connection
-//! `LETTA_API_KEY`/`LETTA_BASE_URL`/`LETTA_APP_SERVER_URL`, per-agent `MemFS`
-//! `memfs/<agent-id>/memory`, skills `${MEMORY_DIR}/skills` / `.agents/skills` /
-//! `~/.letta/skills`, isolation `daemon_service` (local backend plus server,
-//! separate per-provider server processes), support `Constrained` — client
-//! mutation via isolated local dir, server/provider state separate and not
-//! directly mutated per-instance.
+//! Letta Code adapter: client config via `$LETTA_LOCAL_BACKEND_DIR`, server
+//! connection via `LETTA_BASE_URL`/`LETTA_API_KEY`; client-only mutation.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
 
 use crate::adapter::{
     ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
@@ -25,10 +12,6 @@ use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence, Isolation};
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
 
 /// Harness identifier for Letta Code.
 pub const HARNESS_ID_STR: &str = "letta-code";
@@ -84,20 +67,11 @@ pub const OWNED_SELECTORS: &[&str] = &[
     "context_limit",
 ];
 
-/// Constrained note — separate server.
-pub const CONSTRAINED_NOTE: &str = "client config isolated via LETTA_LOCAL_BACKEND_DIR; separate server per provider state (LETTA_BASE_URL, LETTA_API_KEY, Ollama/vLLM) is separate server and not per-instance mutated — run one server per provider (different ports/volumes at /root/.letta)";
+/// Constrained note: the server is separate, one per provider.
+pub const CONSTRAINED_NOTE: &str = "client config isolated via LETTA_LOCAL_BACKEND_DIR; separate server per provider state (LETTA_BASE_URL, LETTA_API_KEY, Ollama/vLLM) is separate server and not per-instance mutated: run one server per provider (different ports/volumes at /root/.letta)";
 
-// ---------------------------------------------------------------------------
-// Adapter struct
-// ---------------------------------------------------------------------------
-
-/// Concrete adapter for Letta Code (`Constrained`).
-///
-/// Isolation is `daemon_service`: each instance gets an isolated local
-/// backend dir via `LETTA_LOCAL_BACKEND_DIR`; server-side provider
-/// connections (`LETTA_BASE_URL` with keys for Anthropic/Ollama/etc.)
-/// are separate and require distinct server processes/volumes. The wrapper
-/// sets `LETTA_LOCAL_BACKEND_DIR` and `LETTA_BASE_URL` for the client.
+/// Letta Code adapter (`Constrained`): each instance gets its own
+/// `LETTA_LOCAL_BACKEND_DIR`; provider servers stay external to the instance.
 #[derive(Debug, Clone)]
 pub struct LettaAdapter {
     id: HarnessId,
@@ -130,109 +104,6 @@ impl LettaAdapter {
         BASE_URL_ENV_VAR
     }
 
-    /// Try to locate the `letta` binary via `PATH`.
-    #[expect(clippy::unused_self, reason = "adapter method uses instance constants")]
-    #[expect(clippy::excessive_nesting, reason = "PATH scan branches are explicit")]
-    fn find_binary_in_path(&self) -> Option<PathBuf> {
-        let path_var = std::env::var("PATH").ok()?;
-        let separator = if cfg!(windows) { ';' } else { ':' };
-        for exec in [EXECUTABLE, EXECUTABLE_ALT] {
-            for dir in path_var.split(separator) {
-                if dir.is_empty() {
-                    continue;
-                }
-                let candidate = Path::new(dir).join(exec);
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
-                if cfg!(windows) {
-                    let exe_candidate = Path::new(dir).join(format!("{exec}.exe"));
-                    if exe_candidate.is_file() {
-                        return Some(exe_candidate);
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    /// Probe `letta --version` with a timeout, returning the parsed version string if successful.
-    fn probe_version(binary: &Path) -> Option<String> {
-        let binary_owned = binary.to_path_buf();
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let output = Command::new(&binary_owned)
-                .arg("--version")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output();
-            drop(tx.send(output));
-        });
-        let Ok(Ok(output)) = rx.recv_timeout(Duration::from_secs(2)) else {
-            return None;
-        };
-        if !output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
-            return None;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let combined = if stdout.trim().is_empty() {
-            stderr.into_owned()
-        } else if stderr.trim().is_empty() {
-            stdout.into_owned()
-        } else {
-            format!("{stdout} {stderr}")
-        };
-        Self::parse_version_output(&combined)
-    }
-
-    /// Parse version output like `letta 0.2.1` into `0.2.1`.
-    #[expect(
-        clippy::excessive_nesting,
-        reason = "version parsing branches are explicit"
-    )]
-    fn parse_version_output(output: &str) -> Option<String> {
-        let trimmed = output.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        for token in trimmed.split_whitespace() {
-            let mut candidate = token;
-            if let Some(stripped) = candidate.strip_prefix('v') {
-                candidate = stripped;
-            } else if let Some(stripped) = candidate.strip_prefix('V') {
-                candidate = stripped;
-            }
-            let cleaned = candidate.trim_matches(|c: char| c == ',' || c == ')' || c == '(');
-            if cleaned.is_empty() {
-                continue;
-            }
-            let has_dot = cleaned.contains('.');
-            let starts_digit = cleaned.chars().next().is_some_and(|c| c.is_ascii_digit());
-            if has_dot && starts_digit {
-                let is_version_like = cleaned
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+');
-                if is_version_like {
-                    return Some(cleaned.to_owned());
-                }
-                let mut version_part = String::new();
-                for ch in cleaned.chars() {
-                    if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '+' {
-                        version_part.push(ch);
-                    } else {
-                        break;
-                    }
-                }
-                if version_part.contains('.') && !version_part.is_empty() {
-                    return Some(version_part);
-                }
-            }
-        }
-        None
-    }
-
-    /// Resolve the default local backend dir: `$LETTA_LOCAL_BACKEND_DIR` or `~/.letta/lc-local-backend`.
     fn default_local_backend_dir() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var(LOCAL_BACKEND_ENV_VAR)
             && !dir.trim().is_empty()
@@ -248,7 +119,6 @@ impl LettaAdapter {
         Some(PathBuf::from(home).join(".letta").join("lc-local-backend"))
     }
 
-    /// Resolve the default state dir `~/.letta`.
     fn default_state_dir() -> Option<PathBuf> {
         let home = std::env::var("HOME")
             .ok()
@@ -259,7 +129,6 @@ impl LettaAdapter {
         Some(PathBuf::from(home).join(".letta"))
     }
 
-    /// Build detection evidence about local backend, state, and server config.
     #[expect(
         clippy::excessive_nesting,
         reason = "detection branches are explicit for evidence"
@@ -335,7 +204,6 @@ impl LettaAdapter {
                 evidence.push(format!("{var} not set"));
             }
         }
-        // Project skills
         if Path::new(".agents/skills").exists() {
             evidence.push(".agents/skills present in cwd (project)".to_owned());
         }
@@ -391,14 +259,14 @@ impl Adapter for LettaAdapter {
         let mut version: Option<String> = None;
         let mut binary_path: Option<PathBuf> = None;
 
-        match self.find_binary_in_path() {
+        match super::find_in_path(&[EXECUTABLE, EXECUTABLE_ALT]) {
             Some(path) => {
                 evidence.push(format!(
                     "found binary `{}` at {}",
                     EXECUTABLE,
                     path.display()
                 ));
-                match Self::probe_version(&path) {
+                match super::probe_version(&path) {
                     Some(v) => {
                         evidence.push(format!("version `{v}` via `{EXECUTABLE} --version`"));
                         version = Some(v);
@@ -459,7 +327,6 @@ impl Adapter for LettaAdapter {
     fn config_surfaces(&self) -> Vec<ConfigSurface> {
         let mut surfaces = Vec::new();
 
-        // Local backend state — JSON-ish state per agent, user/instance scope
         let backend_resolver = PathResolver::new(
             Some("$LETTA_LOCAL_BACKEND_DIR"),
             Some("$LETTA_LOCAL_BACKEND_DIR"),
@@ -478,7 +345,6 @@ impl Adapter for LettaAdapter {
         backend.restart_behavior = RestartBehavior::Reload;
         surfaces.push(backend);
 
-        // MemFS per agent — git-backed memory filesystem, instance scope
         let memfs_resolver = PathResolver::new(
             Some("$LETTA_LOCAL_BACKEND_DIR/memfs/<agent-id>/memory"),
             Some("$LETTA_LOCAL_BACKEND_DIR/memfs/<agent-id>/memory"),
@@ -496,7 +362,6 @@ impl Adapter for LettaAdapter {
         memfs.backup_required = false;
         surfaces.push(memfs);
 
-        // Global skills — computer scope
         let global_skills_resolver = PathResolver::new(
             Some("~/.letta/skills/<name>/"),
             Some("~/.letta/skills/<name>/"),
@@ -514,7 +379,6 @@ impl Adapter for LettaAdapter {
         global_skills.backup_required = false;
         surfaces.push(global_skills);
 
-        // Project skills — committed with repo
         let project_skills_resolver =
             PathResolver::fallback_only(".agents/skills/<name>/ (project)");
         let mut project_skills = ConfigSurface::new(
@@ -528,7 +392,6 @@ impl Adapter for LettaAdapter {
         project_skills.backup_required = false;
         surfaces.push(project_skills);
 
-        // Agent skills — inside memfs, per agent
         let agent_skills_resolver = PathResolver::new(
             Some("$LETTA_LOCAL_BACKEND_DIR/memfs/<agent-id>/skills/<name>/"),
             Some("$LETTA_LOCAL_BACKEND_DIR/memfs/<agent-id>/skills/<name>/"),
@@ -546,7 +409,6 @@ impl Adapter for LettaAdapter {
         agent_skills.backup_required = false;
         surfaces.push(agent_skills);
 
-        // Client env config — LETTA_BASE_URL / LETTA_API_KEY (session inline, not file)
         let env_resolver = PathResolver::new(
             Some("$LETTA_BASE_URL / $LETTA_API_KEY (env, session)"),
             Some("$LETTA_BASE_URL / $LETTA_API_KEY (env, session)"),
@@ -572,7 +434,6 @@ impl Adapter for LettaAdapter {
         env_surface.restart_behavior = RestartBehavior::ReLogin;
         surfaces.push(env_surface);
 
-        // Server provider state — separate server process, constrained
         let server_resolver = PathResolver::fallback_only(
             "server provider state (separate process per provider, /root/.letta, LETTA_APP_SERVER_TOKEN)",
         );
@@ -637,9 +498,8 @@ impl Adapter for LettaAdapter {
             LOCAL_BACKEND_ENV_VAR.to_owned(),
             instance.config_root.to_string(),
         ));
-        // Add a deterministic base-url hint based on instance root for isolation; real server url remains external
-        // For constrained isolation we set LOCAL_BACKEND_DIR deterministically and leave BASE_URL to caller env.
-        // To make wrapper deterministic and testable, we also set a derived BASE_URL if not externally set.
+        // Deterministic per-instance port hint derived from the name; the
+        // real server url stays external to the instance.
         #[expect(
             clippy::cast_possible_truncation,
             reason = "name len < 100 truncation intentional"
@@ -698,14 +558,12 @@ impl Adapter for LettaAdapter {
         ]
     }
 
-    /// EXT-09: explicit MCP absence (corpus-grounded).
     fn mcp_absence_reason(&self) -> Option<&'static str> {
         Some(
             "no dedicated MCP config page in corpus (404); MCP access is mediated through skills + permissions (letta-code.md 5)",
         )
     }
 
-    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some("no plugin mechanism documented (letta-code.md)")
     }
@@ -809,7 +667,7 @@ mod tests {
             ("not a version", None),
         ];
         for (input, expected) in cases {
-            let got = LettaAdapter::parse_version_output(input);
+            let got = crate::adapters::parse_version_output(input);
             assert_eq!(got.as_deref(), expected, "input: {input:?}");
         }
     }
@@ -990,10 +848,6 @@ mod tests {
         assert!(modes.contains(&crate::adapter::SkillMode::LinkSelected));
         assert!(modes.contains(&crate::adapter::SkillMode::CopySelected));
     }
-
-    // -----------------------------------------------------------------------
-    // Fixture-backed conformance tests
-    // -----------------------------------------------------------------------
 
     fn fixtures_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/letta_code")

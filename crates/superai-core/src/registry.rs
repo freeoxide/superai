@@ -1,20 +1,5 @@
-//! Registry schema v1 with migration and validation.
-//!
-//! Top-level record:
-//! - `schema_version: u32` (currently 1)
-//! - `instances: Vec<Instance>`
-//! - any other top-level keys are foreign and preserved verbatim
-//!
-//! Instance record fields per FND-03:
-//! `id`, `name`, `harness`, `config_root`, `binary`, `wrapper`, `isolation`,
-//! `origin`, `ownership`, `template`, `created_at`, `adapter_revision`.
-//!
-//! Forbidden: `model`, `endpoint`, `key`, skill/plugin/mcp lists, etc.
-//!
-//! Migration: old records stored `name`/`harness`/`config_dir`/`binary_path`/`template{name,version}`
-//! without `schema_version` and without stable IDs. On load we validate with
-//! `ids`/`paths`, generate a stable `InstanceId` from `name+config_dir`, and set
-//! `origin = AdoptedLegacy`, `isolation = Unknown`, `ownership = ExplicitlyAdopted`.
+//! Registry schema v1 with migration and validation. Records carry no
+//! model/endpoint/key data; foreign top-level keys survive verbatim.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -36,10 +21,6 @@ const SCHEMA_VERSION_KEY: &str = "schema_version";
 pub const SCHEMA_VERSION: u32 = 1;
 /// Adapter revision written into new records (crate version).
 const ADAPTER_REVISION: &str = env!("CARGO_PKG_VERSION");
-
-// ---------------------------------------------------------------------------
-// helpers: time, stable id
-// ---------------------------------------------------------------------------
 
 fn unix_secs_to_rfc3339(secs: u64) -> String {
     #[expect(
@@ -78,11 +59,233 @@ fn days_to_ymd(days: i64) -> (i32, u32, u32) {
     (year as i32, m as u32, d as u32)
 }
 
-fn now_iso8601() -> String {
+/// Shared with `daemon.rs` for identity timestamps.
+pub(crate) fn now_iso8601() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     unix_secs_to_rfc3339(secs)
+}
+
+/// Operation-id string unique across threads and processes; profile,
+/// alias, and `template_update` all draw from this one home.
+pub(crate) fn unique_operation_string(prefix: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut hasher = DefaultHasher::new();
+    millis.hash(&mut hasher);
+    count.hash(&mut hasher);
+    std::process::id().hash(&mut hasher);
+    let suffix = hasher.finish() & 0xffff;
+    format!("{prefix}-{millis:013}-{suffix:04x}-{count:04x}")
+}
+
+// SSRF gate, shared by template_fetch, health, and skills fetch. One home so
+// a new bypass spelling is fixed once, not per copy.
+
+/// Lowercased http(s) host: strips `user:pass@`, unwraps bracketed IPv6
+/// (`[::1]:8443` -> `::1`), and cuts the authority at '/', '?', '#', or '\'.
+pub(crate) fn extract_host(url: &str) -> Option<String> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let end = rest.find(['/', '?', '#', '\\']).unwrap_or(rest.len());
+    let host_port = rest.get(0..end)?;
+    let host_port = host_port.rsplit('@').next().unwrap_or_default();
+    let host = if let Some(bracketed) = host_port.strip_prefix('[') {
+        bracketed.split(']').next().unwrap_or_default()
+    } else {
+        host_port.split(':').next().unwrap_or_default()
+    };
+    Some(host.to_ascii_lowercase())
+}
+
+/// Hosts a fetch must never reach: localhost, loopback, link-local, and
+/// RFC1918 in every `inet_aton` spelling; IPv6 literals judged numerically.
+pub(crate) fn is_private_host(host: &str) -> bool {
+    // A trailing dot is the DNS root label: "localhost." is localhost.
+    let h = host.to_ascii_lowercase();
+    let h = h.trim_end_matches('.');
+    if h == "localhost" || h.is_empty() {
+        return true;
+    }
+    if h.contains(':') {
+        // A colon host is an IPv6 literal; anything unparseable is refused
+        // rather than guessed at (no real parser would dial it).
+        return parse_ipv6(h).is_none_or(is_private_v6);
+    }
+    is_private_v4_literal(h)
+}
+
+/// Dotted-IPv4-shaped literal in private/loopback/link-local space; parses
+/// `inet_aton` forms, unparseable shapes fall back to textual prefixes.
+fn is_private_v4_literal(h: &str) -> bool {
+    if let Some(v) = parse_inet_aton(h) {
+        return is_private_v4_u32(v);
+    }
+    if h.starts_with("0.")
+        || h.starts_with("10.")
+        || h.starts_with("127.")
+        || h.starts_with("192.168.")
+        || h.starts_with("169.254.")
+    {
+        return true;
+    }
+    if h.starts_with("172.") {
+        let second = h.split('.').nth(1).unwrap_or_default();
+        return second.parse::<u8>().is_ok_and(|v| (16..=31).contains(&v));
+    }
+    false
+}
+
+fn is_private_v4_u32(v: u32) -> bool {
+    let first = v >> 24;
+    let second = (v >> 16) & 0xff;
+    matches!(first, 0 | 10 | 127)
+        || (first == 172 && (16..=31).contains(&second))
+        || (first == 192 && second == 168)
+        || (first == 169 && second == 254)
+}
+
+/// `inet_aton` parse: 1-4 dot-separated decimal/octal/hex parts, the last
+/// filling remaining bytes; digits-only parts mean address, never domain.
+fn parse_inet_aton(s: &str) -> Option<u32> {
+    let parts: Vec<&str> = s.split('.').collect();
+    if parts.is_empty()
+        || parts.len() > 4
+        || !parts.iter().all(|p| {
+            if let Some(hex) = p.strip_prefix("0x").or_else(|| p.strip_prefix("0X")) {
+                !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit())
+            } else {
+                !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())
+            }
+        })
+    {
+        return None;
+    }
+    let mut value: u32 = 0;
+    let last = parts.len() - 1;
+    for (i, part) in parts.iter().enumerate() {
+        let num = if let Some(hex) = part.strip_prefix("0x").or_else(|| part.strip_prefix("0X")) {
+            u32::from_str_radix(hex, 16).ok()?
+        } else if let Some(octal) = part.strip_prefix('0') {
+            if octal.is_empty() {
+                0
+            } else {
+                u32::from_str_radix(octal, 8).ok()?
+            }
+        } else {
+            part.parse::<u32>().ok()?
+        };
+        if i < last {
+            if num > 0xff {
+                return None;
+            }
+            value = (value << 8) | num;
+        } else {
+            // The final part spans every byte the earlier parts did not fill.
+            let bits = 32 - 8 * last;
+            if u64::from(num) >= 1u64 << bits {
+                return None;
+            }
+            let combined = (u64::from(value) << bits) | u64::from(num);
+            value = u32::try_from(combined).ok()?;
+        }
+    }
+    Some(value)
+}
+
+fn is_private_v6(v: u128) -> bool {
+    // fe80::/10 link-local, fc00::/7 unique-local.
+    if v >> 118 == 0x3fa || v >> 121 == 0x7e {
+        return true;
+    }
+    // v4-mapped (::ffff:0:0/96) and v4-compatible (::/96) tails are judged
+    // by their embedded v4 address, compressed or full-form alike.
+    if v >> 32 == 0xffff || v >> 32 == 0 {
+        return is_private_v4_u32((v & 0xffff_ffff) as u32);
+    }
+    false
+}
+
+/// Numeric value of an IPv6 literal, accepting `::` compression (once) and
+/// a dotted-quad tail. `None` when `h` is not a valid literal.
+fn parse_ipv6(h: &str) -> Option<u128> {
+    let (head, compressed_tail) = match h.split_once("::") {
+        Some((a, b)) => (a, Some(b)),
+        None => (h, None),
+    };
+    let mut head_words: Vec<u16> = Vec::new();
+    let mut head_v4: Option<u32> = None;
+    if !parse_v6_side(head, &mut head_words, &mut head_v4) {
+        return None;
+    }
+    // A dotted tail is only valid as the literal's last bytes.
+    if head_v4.is_some() && compressed_tail.is_some() {
+        return None;
+    }
+    let mut tail_words: Vec<u16> = Vec::new();
+    let mut tail_v4: Option<u32> = None;
+    if let Some(tail) = compressed_tail
+        && !parse_v6_side(tail, &mut tail_words, &mut tail_v4)
+    {
+        return None;
+    }
+    let head_len = head_words.len() + 2 * usize::from(head_v4.is_some());
+    let tail_len = tail_words.len() + 2 * usize::from(tail_v4.is_some());
+    let mut words: Vec<u16> = head_words;
+    if let Some(v4) = head_v4 {
+        words.push((v4 >> 16) as u16);
+        words.push((v4 & 0xffff) as u16);
+    }
+    if compressed_tail.is_some() {
+        if head_len + tail_len > 8 {
+            return None;
+        }
+        words.resize(head_len + (8 - head_len - tail_len), 0);
+        words.extend(tail_words);
+        if let Some(v4) = tail_v4 {
+            words.push((v4 >> 16) as u16);
+            words.push((v4 & 0xffff) as u16);
+        }
+    } else if words.len() != 8 {
+        return None;
+    }
+    Some(
+        words
+            .iter()
+            .fold(0u128, |acc, w| (acc << 16) | u128::from(*w)),
+    )
+}
+
+/// Parse one `::`-free side into 16-bit groups; a final dotted-quad segment
+/// (the v4 tail) lands in `v4` instead. Empty sides are fine (`::` edges).
+fn parse_v6_side(side: &str, groups: &mut Vec<u16>, v4: &mut Option<u32>) -> bool {
+    if side.is_empty() {
+        return true;
+    }
+    let segments: Vec<&str> = side.split(':').collect();
+    let last = segments.len() - 1;
+    for (i, seg) in segments.iter().enumerate() {
+        if i == last && seg.contains('.') {
+            match parse_inet_aton(seg) {
+                Some(v) => *v4 = Some(v),
+                None => return false,
+            }
+        } else if seg.is_empty() || seg.len() > 4 || !seg.chars().all(|c| c.is_ascii_hexdigit()) {
+            return false;
+        } else if let Ok(g) = u16::from_str_radix(seg, 16) {
+            groups.push(g);
+        } else {
+            return false;
+        }
+    }
+    true
 }
 
 fn stable_id_for_legacy(name: &str, config_root: &str) -> Result<InstanceId> {
@@ -97,10 +300,6 @@ fn stable_id_for_legacy(name: &str, config_root: &str) -> Result<InstanceId> {
         reason: format!("generated legacy id `{candidate}` is invalid: {e}"),
     })
 }
-
-// ---------------------------------------------------------------------------
-// Old shape for migration
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Serialize, Deserialize)]
 struct OldInstance {
@@ -120,8 +319,7 @@ struct OldTemplateRef {
 }
 
 #[expect(clippy::unnecessary_to_owned, reason = "need owned string for hash")]
-fn migrate_old_instance(old: OldInstance, path: &Path) -> Result<Instance> {
-    // Validate harness/name/config_root using the same validators the new types use.
+fn migrate_old_instance(old: OldInstance) -> Result<Instance> {
     let name = InstanceName::new(&old.name).map_err(|e| CoreError::Validation {
         field: "name".to_owned(),
         reason: format!("invalid old instance name `{}`: {e}", old.name),
@@ -162,7 +360,7 @@ fn migrate_old_instance(old: OldInstance, path: &Path) -> Result<Instance> {
     } else {
         None
     };
-    let id = stable_id_for_legacy(name.as_str(), &config_root.to_string())?; // expect(clippy::unnecessary_to_owned) suppressed below
+    let id = stable_id_for_legacy(name.as_str(), &config_root.to_string())?;
     let created_at = now_iso8601();
     let inst = Instance {
         id,
@@ -178,21 +376,12 @@ fn migrate_old_instance(old: OldInstance, path: &Path) -> Result<Instance> {
         created_at,
         adapter_revision: ADAPTER_REVISION.to_owned(),
     };
-    // Ensure the generated instance validates (created_at non-empty etc.)
     inst.validate()?;
-    // Also ensure paths themselves are valid (already validated).
-    let _ = path;
     Ok(inst)
 }
 
-// ---------------------------------------------------------------------------
-// Registry
-// ---------------------------------------------------------------------------
-
-/// The set of instances superai knows about, stored in its own records file.
-///
-/// Foreign top-level keys are preserved verbatim on store; only
-/// `schema_version` and `instances` are owned by superai.
+/// The set of instances superai knows about, in its own records file;
+/// only `schema_version` and `instances` are owned, foreign keys survive.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Registry {
     /// Schema version of the file. Currently 1.
@@ -221,15 +410,8 @@ impl Registry {
         Ok(home.join(".superai").join("instances.json"))
     }
 
-    /// Read the records file fresh. A missing file is an empty registry.
-    ///
-    /// Migration is applied transparently:
-    ///
-    /// - bare array → old vector, migrated
-    /// - object without `schema_version` but with `instances` → try new shape, fallback to old migration
-    /// - object with `schema_version` → must equal `SCHEMA_VERSION`, otherwise actionable error
-    ///
-    /// Foreign keys are ignored on load but preserved on store.
+    /// Read the records file fresh (a missing file is an empty registry);
+    /// legacy shapes migrate transparently, foreign keys survive store.
     #[expect(
         clippy::too_many_lines,
         reason = "migration branches for bare array and object with/without schema_version are intentionally explicit"
@@ -249,7 +431,6 @@ impl Registry {
                 if map.is_empty() {
                     return Ok(Self::default());
                 }
-                // Check schema_version first.
                 if let Some(sv) = map.get(SCHEMA_VERSION_KEY) {
                     let sv_num = u32::try_from(sv.as_u64().ok_or_else(|| CoreError::SchemaValidation {
                         path: path.to_path_buf(),
@@ -287,8 +468,7 @@ impl Registry {
                     reg.validate()?;
                     Ok(reg)
                 } else if let Some(instances_raw) = map.get(INSTANCES_KEY) {
-                    // No schema_version, but has instances.
-                    // Try new shape first (covers files written by newer code that forgot version, or manual edits).
+                    // Files written without schema_version: try the v1 shape, fall back to legacy migration.
                     let try_new: std::result::Result<Vec<Instance>, _> =
                         serde_json::from_value(instances_raw.clone());
                     if let Ok(instances) = try_new {
@@ -296,11 +476,9 @@ impl Registry {
                             schema_version: SCHEMA_VERSION,
                             instances,
                         };
-                        // Validate duplicates etc.; if validation fails with duplicate, surface it.
                         reg.validate()?;
                         return Ok(reg);
                     }
-                    // Fallback to old shape migration.
                     let old_instances: Vec<OldInstance> = serde_json::from_value(instances_raw.clone())
                         .map_err(|e| CoreError::SchemaValidation {
                             path: path.to_path_buf(),
@@ -311,7 +489,7 @@ impl Registry {
                         })?;
                     let mut instances = Vec::with_capacity(old_instances.len());
                     for old in old_instances {
-                        instances.push(migrate_old_instance(old, path)?);
+                        instances.push(migrate_old_instance(old)?);
                     }
                     let reg = Self {
                         schema_version: SCHEMA_VERSION,
@@ -320,7 +498,6 @@ impl Registry {
                     reg.validate()?;
                     Ok(reg)
                 } else {
-                    // Object with no instances and no schema_version: only foreign keys.
                     Ok(Self::default())
                 }
             }
@@ -328,7 +505,6 @@ impl Registry {
                 if arr.is_empty() {
                     return Ok(Self::default());
                 }
-                // Bare array root: could be new or old.
                 let try_new: std::result::Result<Vec<Instance>, _> =
                     serde_json::from_value(Value::Array(arr.clone()));
                 if let Ok(instances) = try_new {
@@ -348,7 +524,7 @@ impl Registry {
                     })?;
                 let mut instances = Vec::with_capacity(old_instances.len());
                 for old in old_instances {
-                    instances.push(migrate_old_instance(old, path)?);
+                    instances.push(migrate_old_instance(old)?);
                 }
                 let reg = Self {
                     schema_version: SCHEMA_VERSION,
@@ -373,12 +549,9 @@ impl Registry {
         }
     }
 
-    /// Back up and write the records file, leaving any other key in it untouched.
-    ///
-    /// Only `schema_version` and `instances` are written; foreign keys are preserved
-    /// by loading the existing map fresh and merging.
+    /// Back up and write the records file; only `schema_version` and
+    /// `instances` are written, foreign keys preserved by a fresh merge.
     pub fn store(&self, path: &Path) -> Result<()> {
-        // Validate before writing.
         self.validate()?;
         for inst in &self.instances {
             inst.validate()?;
@@ -417,24 +590,20 @@ impl Registry {
         self.instances.iter().find(|i| i.id.as_str() == id)
     }
 
-    /// Validate duplicate invariants.
+    /// Checks normalized-name, id, config-root, wrapper-path, and wrapper-command
+    /// collisions, including wrapper commands colliding with instance names.
     #[expect(
         clippy::excessive_nesting,
         reason = "validation checks multiple collision kinds"
     )]
-    ///
-    /// Checks: normalized name collisions, duplicate ids, duplicate `config_roots`,
-    /// duplicate wrapper paths and wrapper command collisions (including collision
-    /// between wrapper commands and instance names).
     fn validate(&self) -> Result<()> {
         let mut names: HashMap<String, &Instance> = HashMap::new();
         let mut ids: HashSet<String> = HashSet::new();
-        let mut roots: HashSet<String> = HashSet::new();
-        let mut wrapper_paths: HashSet<String> = HashSet::new();
+        let mut roots: HashMap<String, String> = HashMap::new();
+        let mut wrapper_paths: HashMap<String, String> = HashMap::new();
         let mut wrapper_commands: HashMap<String, &Instance> = HashMap::new();
 
         for inst in &self.instances {
-            // name (case-folded)
             let normalized = inst.name.normalized();
             if let Some(prev) = names.get(&normalized) {
                 return Err(CoreError::NameCollision {
@@ -448,7 +617,6 @@ impl Registry {
             }
             names.insert(normalized.clone(), inst);
 
-            // id
             let id_str = inst.id.as_str().to_owned();
             if !ids.insert(id_str.clone()) {
                 return Err(CoreError::NameCollision {
@@ -458,25 +626,23 @@ impl Registry {
                 });
             }
 
-            // config_root (normalized absolute path string)
             let root_str = inst.config_root.to_string();
-            if !roots.insert(root_str.clone()) {
+            if let Some(prev_owner) = roots.insert(root_str.clone(), inst.name.to_string()) {
                 return Err(CoreError::Validation {
                     field: "config_root".to_owned(),
                     reason: format!(
-                        "duplicate config_root `{root_str}` collides with another instance"
+                        "duplicate config_root `{root_str}` collides with instance `{prev_owner}`"
                     ),
                 });
             }
 
-            // wrapper
             if let Some(wrapper) = &inst.wrapper {
                 let wp = wrapper.path.to_string();
-                if !wrapper_paths.insert(wp.clone()) {
+                if let Some(prev_owner) = wrapper_paths.insert(wp.clone(), inst.name.to_string()) {
                     return Err(CoreError::Validation {
                         field: "wrapper.path".to_owned(),
                         reason: format!(
-                            "duplicate wrapper path `{wp}` collides with another instance"
+                            "duplicate wrapper path `{wp}` collides with instance `{prev_owner}`"
                         ),
                     });
                 }
@@ -516,99 +682,26 @@ impl Registry {
         Ok(())
     }
 
-    /// Add an instance, or fail if the `name`/`id`/`config_root`/`wrapper` collides.
-    #[expect(
-        clippy::excessive_nesting,
-        reason = "insert checks multiple collision kinds"
-    )]
+    /// Add an instance or fail on collision; [`Registry::validate`] is the
+    /// single authority and a failed insert leaves the registry untouched.
     pub fn insert(&mut self, instance: Instance) -> Result<()> {
         instance.validate()?;
-        // Quick pre-check for normalized name collision before push to give better error.
-        let new_norm = instance.name.normalized();
-        for existing in &self.instances {
-            if existing.name.normalized() == new_norm {
-                return Err(CoreError::NameCollision {
-                    kind: "InstanceName".to_owned(),
-                    name: instance.name.to_string(),
-                    reason: format!(
-                        "case-fold collision with existing instance '{}' (normalized `{}`)",
-                        existing.name, new_norm
-                    ),
-                });
-            }
-            if existing.id.as_str() == instance.id.as_str() {
-                return Err(CoreError::NameCollision {
-                    kind: "InstanceId".to_owned(),
-                    name: instance.id.to_string(),
-                    reason: "duplicate id".to_owned(),
-                });
-            }
-            if existing.config_root == instance.config_root {
-                return Err(CoreError::Validation {
-                    field: "config_root".to_owned(),
-                    reason: format!(
-                        "duplicate config_root `{}` collides with instance '{}'",
-                        instance.config_root, existing.name
-                    ),
-                });
-            }
-            if let (Some(existing_w), Some(new_w)) = (&existing.wrapper, &instance.wrapper) {
-                if existing_w.path == new_w.path {
-                    return Err(CoreError::Validation {
-                        field: "wrapper.path".to_owned(),
-                        reason: format!(
-                            "duplicate wrapper path `{}` collides with instance '{}'",
-                            new_w.path, existing.name
-                        ),
-                    });
-                }
-                if existing_w.command_name.normalized() == new_w.command_name.normalized() {
-                    return Err(CoreError::NameCollision {
-                        kind: "WrapperCommand".to_owned(),
-                        name: new_w.command_name.to_string(),
-                        reason: format!(
-                            "case-fold collision with wrapper command of '{}'",
-                            existing.name
-                        ),
-                    });
-                }
-            }
-            // wrapper command vs instance name cross-check
-            if let Some(new_w) = &instance.wrapper
-                && existing.name.normalized() == new_w.command_name.normalized()
-                && existing.id.as_str() != instance.id.as_str()
-            {
-                return Err(CoreError::NameCollision {
-                    kind: "WrapperCommand/InstanceName".to_owned(),
-                    name: new_w.command_name.to_string(),
-                    reason: format!(
-                        "wrapper command `{}` collides with existing instance '{}'",
-                        new_w.command_name, existing.name
-                    ),
-                });
-            }
-            if let Some(existing_w) = &existing.wrapper
-                && existing_w.command_name.normalized() == instance.name.normalized()
-                && existing.id.as_str() != instance.id.as_str()
-            {
-                return Err(CoreError::NameCollision {
-                    kind: "InstanceName/WrapperCommand".to_owned(),
-                    name: instance.name.to_string(),
-                    reason: format!(
-                        "instance name `{}` collides with wrapper command of '{}'",
-                        instance.name, existing.name
-                    ),
-                });
-            }
-        }
-
         self.instances.push(instance);
-        // Full validation as safety net (covers edge cases).
         if let Err(e) = self.validate() {
             self.instances.pop();
             return Err(e);
         }
         Ok(())
+    }
+
+    /// Test-only constructor skipping validation: defensive consumers must
+    /// be testable for record shapes `load`/`insert` rightly refuse.
+    #[cfg(test)]
+    pub(crate) fn from_instances_unchecked(instances: Vec<Instance>) -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION,
+            instances,
+        }
     }
 
     /// Remove an instance by name (exact case-sensitive), returning it. This touches no files on disk.
@@ -630,10 +723,8 @@ impl Registry {
         Some(self.instances.remove(idx))
     }
 
-    /// Rename an instance, preserving its `id`, `config_root`, `template`, etc.
-    ///
-    /// The wrapper's `command_name` is updated if it currently equals the old name
-    /// (case-folded). Collision checks are platform-aware (case-folded).
+    /// Rename an instance, preserving id/root/template; the wrapper's
+    /// `command_name` follows when it equalled the old name (case-folded).
     #[expect(
         clippy::indexing_slicing,
         reason = "idx validated via position search, bounds checked"
@@ -676,48 +767,32 @@ impl Registry {
                 });
             }
         }
-        // Also check new wrapper command after rename would collide with existing names.
-        // If the renamed instance has a wrapper, its command_name may be updated to new_name,
-        // so we must ensure that new command doesn't collide with another instance's name.
-        // The loop above already checks that.
-
-        // Preserve id for assertion.
-        let preserved_id = self.instances[idx].id.clone();
-        let preserved_root = self.instances[idx].config_root.clone();
-        let preserved_template = self.instances[idx].template.clone();
-
-        // Perform rename.
         let inst = &mut self.instances[idx];
         let old_name_owned = inst.name.to_string();
+        let old_command = inst.wrapper.as_ref().map(|w| w.command_name.clone());
         inst.name = new_name.clone();
-        // Update wrapper command_name if it matches old name (case-folded).
         if let Some(wrapper) = &mut inst.wrapper
-            && (wrapper.command_name.normalized() == old_name_owned.to_lowercase()
-                || wrapper.command_name.as_str() == old_name_owned)
+            && wrapper.command_name.normalized() == old_name_owned.to_lowercase()
         {
             wrapper.command_name = new_name.clone();
         }
 
-        // Validate whole registry after rename.
         if let Err(e) = self.validate() {
-            // Roll back
+            // Roll back the name and any wrapper command the rename touched.
             let inst = &mut self.instances[idx];
             inst.name = InstanceName::new(&old_name_owned).unwrap_or(new_name);
+            if let (Some(wrapper), Some(command)) = (&mut inst.wrapper, old_command) {
+                wrapper.command_name = command;
+            }
             return Err(e);
         }
-
-        // Ensure id/template/root preserved.
-        debug_assert_eq!(self.instances[idx].id, preserved_id);
-        debug_assert_eq!(self.instances[idx].config_root, preserved_root);
-        debug_assert_eq!(self.instances[idx].template, preserved_template);
 
         Ok(())
     }
 }
 
-/// Config dirs on disk that no record and no wrapper accounts for.
-///
-/// Adoption or removal is the user's call — superai only reports what it found.
+/// Config dirs on disk that no record accounts for; adoption or removal
+/// is the user's call, superai only reports what it found.
 pub fn unmanaged_dirs(registry: &Registry, candidates: &[PathBuf]) -> Vec<PathBuf> {
     candidates
         .iter()
@@ -731,10 +806,6 @@ pub fn unmanaged_dirs(registry: &Registry, candidates: &[PathBuf]) -> Vec<PathBu
         .cloned()
         .collect()
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -799,7 +870,6 @@ mod tests {
             None,
         ))
         .unwrap();
-        // case-fold collision: "WORK" vs "work"
         let dup = sample_instance(
             "WORK",
             &crate::test_util::tmp_abs_str("u/.claude-work2"),
@@ -837,13 +907,34 @@ mod tests {
         }
     }
 
+    /// Insert collision errors name the conflicting key and the existing
+    /// instance, so the message is actionable without a debugger.
+    #[test]
+    fn insert_collision_errors_name_the_conflict() {
+        let tmp_root = crate::test_util::tmp_abs_str(".claude-work");
+        let mut r = Registry::default();
+        r.insert(sample_instance(
+            "work",
+            tmp_root.as_str(),
+            "id-conflict-1",
+            None,
+        ))
+        .unwrap();
+        let dup = sample_instance("other", tmp_root.as_str(), "id-conflict-2", None);
+        let err = r.insert(dup).unwrap_err().to_string();
+        assert!(
+            err.contains(".claude-work") && err.contains("`work`"),
+            "collision text must name key and instance: {err}"
+        );
+        assert_eq!(r.instances().len(), 1, "failed insert must not mutate");
+    }
+
     #[test]
     fn duplicate_config_roots_are_rejected() {
         let tmp_root = crate::test_util::tmp_abs_str("u/.claude-work");
         let mut r = Registry::default();
         r.insert(sample_instance("work", tmp_root.as_str(), "id-1", None))
             .unwrap();
-        // Same path normalized differently with extra slash
         let dup = sample_instance("other", tmp_root.as_str(), "id-2", None);
         let err = r.insert(dup).unwrap_err();
         match err {
@@ -893,7 +984,6 @@ mod tests {
             "id-2",
             Some(crate::test_util::tmp_abs_str("wrapper2").as_str()),
         );
-        // Force wrapper command to collide case-folded
         dup.wrapper.as_mut().unwrap().command_name = InstanceName::new("WORK").unwrap();
         let err = r.insert(dup).unwrap_err();
         match err {
@@ -915,7 +1005,6 @@ mod tests {
             None,
         ))
         .unwrap();
-        // New instance whose wrapper command collides with existing instance name "work"
         let mut with_wrapper = sample_instance(
             "other",
             &crate::test_util::tmp_abs_str(".claude-other"),
@@ -1012,13 +1101,11 @@ mod tests {
         .unwrap();
         r.store(&path).unwrap();
 
-        // Loaded registry must equal what we stored.
         let loaded = Registry::load(&path).unwrap();
         assert_eq!(loaded.instances().len(), 1);
         assert_eq!(loaded.schema_version(), SCHEMA_VERSION);
         assert_eq!(loaded.instances()[0].name.as_str(), "work");
 
-        // Foreign keys preserved.
         let raw = superai_config::json::load(&path).unwrap();
         assert_eq!(raw["schema"], serde_json::json!(7));
         assert_eq!(raw["custom"], serde_json::json!("keep-me"));
@@ -1049,7 +1136,6 @@ mod tests {
     #[test]
     fn migration_from_old_vector_and_instances_key() {
         let tmp_root = crate::test_util::tmp_abs_str("u/.claude-work");
-        // Test bare array migration
         let path = crate::test_util::temp_dir_unique("registry").join("migration_bare.json");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let old = vec![instance_legacy("work", tmp_root.as_str())];
@@ -1063,11 +1149,9 @@ mod tests {
         assert_eq!(inst.origin, InstanceOrigin::AdoptedLegacy);
         assert_eq!(inst.isolation, Isolation::Unknown);
         assert_eq!(inst.ownership, Ownership::ExplicitlyAdopted);
-        // Stable id is deterministic: same name+config yields same id on reload.
         let reg2 = Registry::load(&path).unwrap();
         assert_eq!(reg.instances()[0].id, reg2.instances()[0].id);
 
-        // Test object with instances key holding old shape
         let path2 = crate::test_util::temp_dir_unique("registry").join("migration_wrapped.json");
         let wrapped = serde_json::json!({
             "instances": [ {
@@ -1083,7 +1167,6 @@ mod tests {
         assert_eq!(reg3.instances().len(), 1);
         assert_eq!(reg3.instances()[0].name.as_str(), "oldie");
         assert_eq!(reg3.instances()[0].origin, InstanceOrigin::AdoptedLegacy);
-        // After storing, foreign key preserved and schema_version added.
         reg3.store(&path2).unwrap();
         let raw = superai_config::json::load(&path2).unwrap();
         assert_eq!(raw["keep"], serde_json::json!(123));
@@ -1100,8 +1183,7 @@ mod tests {
             binary_path: None,
             template: None,
         };
-        let path = crate::test_util::tmp_abs("fake");
-        let err = migrate_old_instance(bad_old, &path).unwrap_err();
+        let err = migrate_old_instance(bad_old).unwrap_err();
         match err {
             CoreError::Validation { field, .. } => assert_eq!(field, "name"),
             other => panic!("expected validation, got {other:?}"),
@@ -1114,7 +1196,7 @@ mod tests {
             binary_path: None,
             template: None,
         };
-        let err2 = migrate_old_instance(bad_old2, &path).unwrap_err();
+        let err2 = migrate_old_instance(bad_old2).unwrap_err();
         match err2 {
             CoreError::Validation { field, .. } => assert_eq!(field, "harness"),
             other => panic!("expected validation, got {other:?}"),
@@ -1127,7 +1209,7 @@ mod tests {
             binary_path: None,
             template: None,
         };
-        let err3 = migrate_old_instance(bad_old3, &path).unwrap_err();
+        let err3 = migrate_old_instance(bad_old3).unwrap_err();
         match err3 {
             CoreError::Validation { field, .. } => assert_eq!(field, "config_root"),
             other => panic!("expected validation, got {other:?}"),
@@ -1159,7 +1241,6 @@ mod tests {
                 "forbidden field `{field}` must not be emitted: {text}"
             );
         }
-        // Also check top-level registry serialization
         let full_json = serde_json::to_string(&serde_json::json!({
             "schema_version": reg.schema_version(),
             "instances": reg.instances()
@@ -1178,7 +1259,6 @@ mod tests {
     fn unknown_enum_and_schema_failure_are_actionable() {
         let path = crate::test_util::temp_dir_unique("registry").join("unknown_enum.json");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        // Unknown isolation variant
         let bad = serde_json::json!({
             "schema_version": 1,
             "instances": [{
@@ -1207,7 +1287,6 @@ mod tests {
             "error must be actionable, got: {msg}"
         );
 
-        // Unsupported schema_version
         let bad2 = serde_json::json!({
             "schema_version": 999,
             "instances": []
@@ -1309,7 +1388,6 @@ mod tests {
                 .to_string(),
             tmp_root2.as_str()
         );
-        // Round-trip preserves foreign key
         reg2.store(&path2).unwrap();
         let raw = superai_config::json::load(&path2).unwrap();
         assert_eq!(raw["foreign_key"], serde_json::json!("preserve-me"));
@@ -1326,11 +1404,148 @@ mod tests {
             20,
             "expected 20 chars RFC3339 without millis: {ts}"
         );
-        // Known epoch
         let epoch = unix_secs_to_rfc3339(0);
         assert_eq!(epoch, "1970-01-01T00:00:00Z");
         let known = unix_secs_to_rfc3339(1_728_000_000);
         // 1728000000 secs is 2024-10-02 something; just check format not exact
         assert!(known.starts_with("2024-"), "known ts: {known}");
+    }
+
+    #[test]
+    fn private_host_detection() {
+        assert!(is_private_host("localhost"));
+        assert!(is_private_host("127.0.0.1"));
+        assert!(is_private_host("10.0.0.1"));
+        assert!(is_private_host("192.168.1.1"));
+        assert!(is_private_host("172.16.5.4"));
+        assert!(is_private_host("172.31.255.1"));
+        assert!(!is_private_host("172.32.0.1"));
+        assert!(!is_private_host("8.8.8.8"));
+        assert!(!is_private_host("api.example.com"));
+        // Domain-shaped words that parse as hex are still domains.
+        assert!(!is_private_host("beef"));
+        assert!(!is_private_host("deadbeef.example"));
+    }
+
+    /// SSRF shorthands that bypass prefix-only checks: `inet_aton` digit
+    /// forms, trailing dots, metadata space, and IPv6 private literals.
+    #[test]
+    fn private_host_detection_covers_ssrf_shorthands() {
+        for host in [
+            "127.1",
+            "127.1.2.3",
+            "2130706433",
+            "localhost.",
+            "LOCALHOST.",
+            "169.254.169.254",
+            "0.0.0.0",
+            "::1",
+            "::",
+            "fe80::1",
+            "fd12:3456::1",
+            "fc00::1",
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.5",
+        ] {
+            assert!(is_private_host(host), "{host} must count as private");
+        }
+        assert!(!is_private_host("8.8.4.4"));
+        assert!(!is_private_host("2001:db8::1"));
+    }
+
+    /// The `inet_aton` hex/octal spellings and full-form IPv6 literals that
+    /// the old textual checks missed.
+    #[test]
+    fn private_host_rejects_hex_octal_and_full_form_v6() {
+        for host in [
+            "0x7f.0.0.1",
+            "0x7f000001",
+            "0177.0.0.1",
+            "017700000001",
+            "0x7f.1",
+            "0177.1",
+            "0x7f.0.0.001",
+            // v4-mapped in full form and v4-compatible tails, dotted or hex.
+            "::ffff:a00:1",
+            "0:0:0:0:0:ffff:a00:1",
+            "::ffff:10.0.0.5",
+            "::10.0.0.5",
+            "::a00:1",
+            "0:0:0:0:0:0:10.0.0.5",
+            "::ffff:169.254.169.254",
+        ] {
+            assert!(is_private_host(host), "{host} must count as private");
+        }
+        // Public controls: hex that lands outside private ranges, public
+        // v4-mapped and documentation-space literals, and full public v6.
+        assert!(!is_private_host("0x08080808"));
+        assert!(!is_private_host("::ffff:8.8.8.8"));
+        assert!(!is_private_host("::8.8.8.8"));
+        assert!(!is_private_host("1:2:3:4:5:6:7:8"));
+        assert!(!is_private_host("2001:db8:0:0:0:0:0:1"));
+    }
+
+    /// `extract_host` defeats the decoy spellings: userinfo, brackets,
+    /// delimiters that end the authority early, and extra scheme slashes.
+    #[test]
+    fn extract_host_cuts_the_real_authority() {
+        assert_eq!(
+            extract_host("https://example.com/a"),
+            Some("example.com".to_owned())
+        );
+        assert_eq!(
+            extract_host("http://example.com"),
+            Some("example.com".to_owned())
+        );
+        assert_eq!(
+            extract_host("https://user:pass@10.0.0.5/x"),
+            Some("10.0.0.5".to_owned())
+        );
+        assert_eq!(extract_host("https://[::1]:8443/x"), Some("::1".to_owned()));
+        assert_eq!(
+            extract_host("https://127.0.0.1?@x.example.com/"),
+            Some("127.0.0.1".to_owned())
+        );
+        assert_eq!(
+            extract_host("https://169.254.169.254#@api.example.com/"),
+            Some("169.254.169.254".to_owned())
+        );
+        assert_eq!(
+            extract_host("https://127.0.0.1\\@x.example.com/"),
+            Some("127.0.0.1".to_owned())
+        );
+        // The mirror spelling keeps its public host: the '@' is in the query.
+        assert_eq!(
+            extract_host("https://x.example.com?@127.0.0.1/"),
+            Some("x.example.com".to_owned())
+        );
+        assert_eq!(extract_host("https:///127.0.0.1/"), Some(String::new()));
+        assert_eq!(extract_host("ftp://example.com/"), None);
+    }
+
+    #[test]
+    fn ipv6_parser_accepts_and_rejects_literals() {
+        assert_eq!(parse_ipv6("::"), Some(0));
+        assert_eq!(parse_ipv6("::1"), Some(1));
+        assert_eq!(
+            parse_ipv6("2001:db8::1"),
+            Some(0x2001_0db8_0000_0000_0000_0000_0000_0001)
+        );
+        // Dotted tail without compression, and one compression too many.
+        assert_eq!(parse_ipv6("::ffff:1.2.3.4"), parse_ipv6("::ffff:102:304"));
+        assert_eq!(
+            parse_ipv6("1:2:3:4:5:6:1.2.3.4"),
+            Some(0x0001_0002_0003_0004_0005_0006_0102_0304)
+        );
+        for bad in [
+            "1::2::3",
+            ":::",
+            "12345::",
+            "1:2:3:4:5:6:7:8:9",
+            "gg::1",
+            "1.2.3.4::",
+        ] {
+            assert_eq!(parse_ipv6(bad), None, "{bad} must not parse");
+        }
     }
 }

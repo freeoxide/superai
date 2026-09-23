@@ -1,13 +1,5 @@
-//! `WorkBuddy` / `CodeBuddy` CLI (cbc) adapter — relocated-root via
-//! `CODEBUDDY_CONFIG_DIR` over the shared `~/.codebuddy` JSON tree.
-//!
-//! Research source: `docs/harness-configs/workbuddy.md` (verified 2026-09-08;
-//! catalog freshness recorded as of 2026-09-01). `WorkBuddy` is Tencent's
-//! desktop AI agent; the only documented programmatic surface is the shared
-//! `CodeBuddy` CLI (`cbc`, npm `@tencent-ai/codebuddy-code`). Primary writable
-//! surfaces: `models.json`, `settings.json`, `.mcp.json` under the config
-//! root. The desktop app itself is GUI-only and is documented, never
-//! mutated. Isolation is `relocated-root`.
+//! `WorkBuddy` / `CodeBuddy` CLI (cbc) adapter over the shared `~/.codebuddy`
+//! JSON tree, relocated per instance; the desktop app is GUI-only, never mutated.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -27,10 +19,6 @@ use crate::ids::HarnessId;
 use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence, Isolation};
 use superai_config::document::ValueType;
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
 
 /// Harness identifier for `WorkBuddy` / `CodeBuddy` CLI.
 pub const HARNESS_ID_STR: &str = "workbuddy";
@@ -56,24 +44,19 @@ pub const DEFAULT_CONFIG_ROOT_FALLBACK: &str = "~/.codebuddy";
 /// Research document link.
 pub const RESEARCH_DOC: &str = "docs/harness-configs/workbuddy.md";
 
-/// Catalog-recorded verification date (kept at the ledger's recheck date so
-/// the freshness window stays honest; the research doc itself was verified
-/// 2026-09-08).
+/// Catalog recheck date; the research doc itself was verified 2026-09-08.
 pub const LAST_VERIFIED: &str = "2026-09-01";
 
 /// Schema version for the current config shape.
 pub const SCHEMA_VERSION_STR: &str = "1";
 
-/// cbc version (major, minor, patch) where the autocompact window moved from
-/// `models.json` `maxInputTokens` to the `CODEBUDDY_AUTO_COMPACT_WINDOW` env
-/// var (workbuddy.md §4, workbuddy-bench presets).
+/// cbc version where the autocompact window moved from `models.json` `maxInputTokens` to the `CODEBUDDY_AUTO_COMPACT_WINDOW` env var.
 pub const AUTO_COMPACT_WINDOW_MIN_VERSION: (u64, u64, u64) = (2, 103, 4);
 
 /// Owned selectors for `models.json` mutation.
 pub const MODELS_OWNED_SELECTORS: &[&str] = &["models", "availableModels"];
 
-/// Owned selectors for `settings.json` mutation (verified-only keys; the full
-/// schema is not published, so unmodelled keys are preserved verbatim).
+/// Owned `settings.json` selectors; the full schema is unpublished, so unmodelled keys survive verbatim.
 pub const SETTINGS_OWNED_SELECTORS: &[&str] = &[
     "permissions",
     "alwaysThinkingEnabled",
@@ -89,8 +72,7 @@ pub const SETTINGS_OWNED_SELECTORS: &[&str] = &[
     "endpoint",
 ];
 
-/// Environment variables the harness documents (references only; values are
-/// never stored by superai).
+/// Documented env var names; superai stores references only, never values.
 pub const KNOWN_ENV_VARS: &[&str] = &[
     "CODEBUDDY_AUTH_TOKEN",
     "CODEBUDDY_API_KEY",
@@ -106,19 +88,10 @@ pub const KNOWN_ENV_VARS: &[&str] = &[
     "MAX_MCP_OUTPUT_TOKENS",
 ];
 
-/// Auth env vars in documented priority order (bearer token first, then the
-/// individual API key; the settings `apiKeyHelper` sits between them).
+/// Auth priority: `CODEBUDDY_AUTH_TOKEN`, then settings `apiKeyHelper`, then `CODEBUDDY_API_KEY`.
 pub const AUTH_ENV_VARS: &[&str] = &["CODEBUDDY_AUTH_TOKEN", "CODEBUDDY_API_KEY"];
 
-// ---------------------------------------------------------------------------
-// Adapter struct
-// ---------------------------------------------------------------------------
-
-/// Concrete adapter for `WorkBuddy` / `CodeBuddy` CLI (cbc).
-///
-/// Isolation is `relocated-root` via `CODEBUDDY_CONFIG_DIR`: the wrapper
-/// points the whole `~/.codebuddy` tree at the instance `config_root` and
-/// execs `cbc`.
+/// Concrete adapter for cbc: the wrapper points the whole `~/.codebuddy` tree at the instance `config_root`.
 #[derive(Debug, Clone)]
 pub struct WorkBuddyAdapter {
     id: HarnessId,
@@ -146,34 +119,6 @@ impl WorkBuddyAdapter {
         CONFIG_ENV_VAR
     }
 
-    /// Try to locate `cbc` (then `codebuddy`) via `PATH`.
-    #[expect(clippy::unused_self, reason = "adapter method uses instance constants")]
-    #[expect(clippy::excessive_nesting, reason = "PATH scan branches are explicit")]
-    fn find_binary_in_path(&self) -> Option<PathBuf> {
-        let path_var = std::env::var("PATH").ok()?;
-        let separator = if cfg!(windows) { ';' } else { ':' };
-        for dir in path_var.split(separator) {
-            if dir.is_empty() {
-                continue;
-            }
-            for executable in [EXECUTABLE, ALT_EXECUTABLE] {
-                let candidate = Path::new(dir).join(executable);
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
-                if cfg!(windows) {
-                    let exe_candidate = Path::new(dir).join(format!("{executable}.exe"));
-                    if exe_candidate.is_file() {
-                        return Some(exe_candidate);
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    /// Run `binary` with `args` and a timeout, returning combined
-    /// stdout/stderr.
     fn run_with_timeout(binary: &Path, args: &[&str]) -> Option<String> {
         let binary_owned = binary.to_path_buf();
         let args_owned: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
@@ -206,24 +151,26 @@ impl WorkBuddyAdapter {
         }
     }
 
-    /// Probe the binary for a version string. The exact `cbc --version`
-    /// output format is UNVERIFIED (workbuddy.md §7), so this is best-effort
-    /// and detection falls back to npm package metadata.
+    /// The exact `cbc --version` format is unverified (workbuddy.md §7), so
+    /// this is best-effort; detection falls back to npm metadata.
     fn probe_binary_version(binary: &Path) -> Option<String> {
-        Self::parse_version_output(&Self::run_with_timeout(binary, &["--version"])?)
+        super::parse_version_output(&Self::run_with_timeout(binary, &["--version"])?)
     }
 
-    /// Probe npm global metadata for the installed package version (the
-    /// preferred version source per HAD-02 because the CLI flag format is
-    /// unverified). The package is installed with `npm i -g`, so only the
-    /// global tree can see it.
+    /// Preferred version source (CLI format unverified); the package is global only.
+    /// `npm` resolves to the first PATH match, never cwd; a hostile earlier entry still shadows it.
     fn probe_npm_version() -> Option<String> {
-        let output = Self::run_with_timeout(Path::new("npm"), &["ls", "-g"])?;
+        let path_var = std::env::var_os("PATH")?;
+        Self::probe_npm_version_from(&path_var)
+    }
+
+    /// [`probe_npm_version`] against an explicit PATH value (hermetic seam).
+    fn probe_npm_version_from(path_var: &std::ffi::OsStr) -> Option<String> {
+        let npm = super::find_in_path_within(path_var, &["npm"])?;
+        let output = Self::run_with_timeout(&npm, &["ls", "-g"])?;
         Self::harvest_npm_version(&output)
     }
 
-    /// Harvest the first `@tencent-ai/codebuddy-code@<version>` mention from
-    /// `npm ls -g` tree output.
     fn harvest_npm_version(output: &str) -> Option<String> {
         let needle = format!("{NPM_PACKAGE}@");
         let line = output.lines().find(|l| l.contains(&needle))?;
@@ -240,54 +187,6 @@ impl WorkBuddyAdapter {
         }
     }
 
-    /// Parse version output like `cbc 2.147.0` or
-    /// `@tencent-ai/codebuddy-code 2.147.0` into `2.147.0`.
-    #[expect(
-        clippy::excessive_nesting,
-        reason = "version parsing branches are explicit"
-    )]
-    fn parse_version_output(output: &str) -> Option<String> {
-        let trimmed = output.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        for token in trimmed.split_whitespace() {
-            let mut candidate = token;
-            if let Some(stripped) = candidate.strip_prefix('v') {
-                candidate = stripped;
-            } else if let Some(stripped) = candidate.strip_prefix('V') {
-                candidate = stripped;
-            }
-            let cleaned = candidate.trim_matches(|c: char| c == ',' || c == ')' || c == '(');
-            if cleaned.is_empty() {
-                continue;
-            }
-            let has_dot = cleaned.contains('.');
-            let starts_digit = cleaned.chars().next().is_some_and(|c| c.is_ascii_digit());
-            if has_dot && starts_digit {
-                let is_version_like = cleaned
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+');
-                if is_version_like {
-                    return Some(cleaned.to_owned());
-                }
-                let mut version_part = String::new();
-                for ch in cleaned.chars() {
-                    if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '+' {
-                        version_part.push(ch);
-                    } else {
-                        break;
-                    }
-                }
-                if version_part.contains('.') && !version_part.is_empty() {
-                    return Some(version_part);
-                }
-            }
-        }
-        None
-    }
-
-    /// Parse a `major.minor.patch` triple from a version string.
     fn parse_version_triple(version: &str) -> Option<(u64, u64, u64)> {
         let mut parts = Vec::with_capacity(3);
         for segment in version.split('.') {
@@ -306,9 +205,8 @@ impl WorkBuddyAdapter {
         }
     }
 
-    /// Whether `version` is at or past the autocompact-window era boundary
-    /// (cbc >= 2.103.4). Unparseable versions are conservatively `false`
-    /// (the version gate blocks writes independently).
+    /// At or past the autocompact-window era boundary; unparseable versions
+    /// are conservatively `false` (the version gate blocks writes anyway).
     fn is_auto_compact_window_era(version: &str) -> bool {
         match Self::parse_version_triple(version) {
             Some(triple) => triple >= AUTO_COMPACT_WINDOW_MIN_VERSION,
@@ -316,11 +214,8 @@ impl WorkBuddyAdapter {
         }
     }
 
-    /// Era conflict for `models.json` (HAD-05 step 5): cbc >= 2.103.4 moved
-    /// the compaction window to the `CODEBUDDY_AUTO_COMPACT_WINDOW` env var;
-    /// a string-valued `maxInputTokens` (the workbuddy-bench `${ENV}`
-    /// preset carrier) belongs to the legacy < 2.103.4 era and must not be
-    /// written against a current install.
+    /// cbc >= 2.103.4 carries the window in `CODEBUDDY_AUTO_COMPACT_WINDOW`; string
+    /// `maxInputTokens` is the legacy `${ENV}` preset carrier, never written to a current install.
     fn models_era_conflict(version: &str, content: &[u8]) -> Option<String> {
         if !Self::is_auto_compact_window_era(version) {
             return None;
@@ -347,8 +242,6 @@ impl WorkBuddyAdapter {
         })
     }
 
-    /// Resolve the default config root: `$CODEBUDDY_CONFIG_DIR` or
-    /// `~/.codebuddy`.
     fn default_config_root() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var(CONFIG_ENV_VAR)
             && !dir.trim().is_empty()
@@ -364,7 +257,6 @@ impl WorkBuddyAdapter {
         Some(PathBuf::from(home).join(".codebuddy"))
     }
 
-    /// Build detection evidence about the config root and its files.
     #[expect(
         clippy::excessive_nesting,
         reason = "detection branches are explicit for evidence"
@@ -453,7 +345,7 @@ impl Adapter for WorkBuddyAdapter {
         let mut version: Option<String> = None;
         let mut binary_path: Option<PathBuf> = None;
 
-        match self.find_binary_in_path() {
+        match super::find_in_path_dir_first(&[EXECUTABLE, ALT_EXECUTABLE]) {
             Some(path) => {
                 let name = path.file_name().map_or_else(
                     || EXECUTABLE.to_owned(),
@@ -482,8 +374,6 @@ impl Adapter for WorkBuddyAdapter {
         }
 
         if version.is_none() {
-            // HAD-02: npm metadata is the preferred version source because
-            // the CLI flag format is unverified.
             match Self::probe_npm_version() {
                 Some(v) => {
                     evidence.push(format!("version `{v}` via npm metadata for {NPM_PACKAGE}"));
@@ -548,7 +438,7 @@ impl Adapter for WorkBuddyAdapter {
     fn config_surfaces(&self) -> Vec<ConfigSurface> {
         let mut surfaces = Vec::new();
 
-        // User-scope model catalog (strict JSON, UTF-8 no BOM).
+        // Strict JSON, UTF-8 no BOM.
         let models_resolver = PathResolver::new(
             Some("$CODEBUDDY_CONFIG_DIR/models.json"),
             Some("$CODEBUDDY_CONFIG_DIR/models.json"),
@@ -571,8 +461,8 @@ impl Adapter for WorkBuddyAdapter {
         models.restart_behavior = RestartBehavior::Restart;
         surfaces.push(models);
 
-        // User-scope settings (strict JSON; schema only partially published —
-        // unmodelled keys must be preserved verbatim on write-back).
+        // Schema only partially published: unmodelled keys must survive
+        // write-back verbatim.
         let settings_resolver = PathResolver::new(
             Some("$CODEBUDDY_CONFIG_DIR/settings.json"),
             Some("$CODEBUDDY_CONFIG_DIR/settings.json"),
@@ -595,10 +485,8 @@ impl Adapter for WorkBuddyAdapter {
         settings.restart_behavior = RestartBehavior::Restart;
         surfaces.push(settings);
 
-        // User-scope MCP config. The document format is JSONC-tolerant
-        // (comments + trailing commas allowed); canonical writes are strict
-        // JSON, which is a valid JSONC subset — same treatment as
-        // claude-code's `.mcp.json`.
+        // On-disk format is JSONC-tolerant; canonical writes are strict
+        // JSON, a valid JSONC subset.
         let mcp_resolver = PathResolver::new(
             Some("$CODEBUDDY_CONFIG_DIR/.mcp.json"),
             Some("$CODEBUDDY_CONFIG_DIR/.mcp.json"),
@@ -618,8 +506,7 @@ impl Adapter for WorkBuddyAdapter {
         mcp.restart_behavior = RestartBehavior::Reload;
         surfaces.push(mcp);
 
-        // Project-scope settings (committed) and local settings (gitignored);
-        // documented precedence CLI > local > project > user.
+        // Committed vs gitignored tiers; documented precedence CLI > local > project > user.
         for (id, name, precedence) in [
             ("project.settings.json", ".codebuddy/settings.json", 12u8),
             (
@@ -640,7 +527,6 @@ impl Adapter for WorkBuddyAdapter {
             surfaces.push(surface);
         }
 
-        // Project-scope model overrides (override the user level).
         let mut project_models = ConfigSurface::new(
             "project.models.json",
             PathResolver::fallback_only(".codebuddy/models.json"),
@@ -652,7 +538,6 @@ impl Adapter for WorkBuddyAdapter {
         project_models.backup_required = false;
         surfaces.push(project_models);
 
-        // Project-scope MCP config (recommended `<project>/.mcp.json`).
         let mut project_mcp = ConfigSurface::new(
             "project.mcp.json",
             PathResolver::fallback_only(".mcp.json (project root)"),
@@ -665,10 +550,8 @@ impl Adapter for WorkBuddyAdapter {
         project_mcp.backup_required = false;
         surfaces.push(project_mcp);
 
-        // Deprecated MCP locations (first-existing wins per scope; kept
-        // modelled so scans and mirrors see them, never preferred). The
-        // `~/.codebuddy/*` pair is user scope; the bare project `mcp.json`
-        // is project scope (workbuddy.md §1.1).
+        // Deprecated MCP locations stay modelled so scans/mirrors see them,
+        // never preferred.
         for (id, name, precedence, scope) in [
             (
                 "deprecated.user.mcp.json",
@@ -840,12 +723,8 @@ impl Adapter for WorkBuddyAdapter {
     }
 
     fn surface_schema(&self, surface_id: &str) -> Option<SurfaceSchema> {
-        // HAD-03 root shape + owned-key semantics per workbuddy.md §1.
-        // Rules fire only when the key is present; unmodelled keys are
-        // preserved untouched by design (the settings schema is only
-        // partially published). Note: models.json token caps are documented
-        // as numbers but Tencent's bench preset writes `${ENV}` strings, so
-        // no type rule is declared for them — both eras are legal.
+        // Rules fire only on present keys; token caps carry no type rule
+        // (bench presets write `${ENV}` strings, the docs say numbers).
         match surface_id {
             "models.json" => Some(
                 SurfaceSchema::new()
@@ -919,9 +798,6 @@ impl Adapter for WorkBuddyAdapter {
         ]
     }
 
-    /// EXT-08/09: MCP destination — WRITABLE `.mcp.json` under the config
-    /// root (also manageable via `cbc mcp add/add-json/remove`); canonical
-    /// writes are strict JSON, a valid JSONC subset.
     fn mcp_decl(&self) -> Option<McpAdapterDecl> {
         Some(McpAdapterDecl::new(
             ".mcp.json",
@@ -932,7 +808,6 @@ impl Adapter for WorkBuddyAdapter {
         ))
     }
 
-    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some(
             "no CLI plugin/skill loading path documented and no public skill.yml schema; desktop-app skills are UI-only (workbuddy.md §6/§7)",
@@ -1051,7 +926,7 @@ mod tests {
             ("not a version", None),
         ];
         for (input, expected) in cases {
-            let got = WorkBuddyAdapter::parse_version_output(input);
+            let got = crate::adapters::parse_version_output(input);
             assert_eq!(got.as_deref(), expected, "input: {input:?}");
         }
     }
@@ -1109,9 +984,6 @@ mod tests {
         assert_eq!(mcp.kind, DocumentKind::Json);
         assert_eq!(mcp.owned_selectors, vec!["mcpServers".to_owned()]);
 
-        // Deprecated locations and the keychain stay modelled but secondary;
-        // the bare project `mcp.json` is project scope, the `~/.codebuddy/*`
-        // pair user scope (workbuddy.md §1.1).
         let deprecated_project = surfaces
             .iter()
             .find(|s| s.id == "deprecated.project.mcp.json")
@@ -1129,7 +1001,6 @@ mod tests {
         assert_eq!(keychain.kind, DocumentKind::Keychain);
         assert_eq!(keychain.ownership, SurfaceOwnership::ExternalSecretStore);
 
-        // Settings precedence: local > project > user.
         let precedence = |id: &str| {
             surfaces
                 .iter()
@@ -1380,14 +1251,10 @@ mod tests {
     #[test]
     fn era_conflict_flags_legacy_carrier_on_current_cbc() {
         let legacy = std::fs::read(fixture_path("models.boundary_legacy.json")).unwrap();
-        // Current era (>= 2.103.4) + string maxInputTokens => conflict.
         let reason = WorkBuddyAdapter::models_era_conflict("2.147.0", &legacy);
         assert!(reason.as_deref().is_some_and(|r| r.contains("2.147.0")));
-        // Boundary version itself still conflicts at exactly 2.103.4.
         assert!(WorkBuddyAdapter::models_era_conflict("2.103.4", &legacy).is_some());
-        // Pre-boundary versions accept the legacy carrier.
         assert!(WorkBuddyAdapter::models_era_conflict("2.103.3", &legacy).is_none());
-        // Current-era fixture (maxInputTokens omitted) is clean.
         let current = std::fs::read(fixture_path("models.boundary_current.json")).unwrap();
         assert!(WorkBuddyAdapter::models_era_conflict("2.147.0", &current).is_none());
         // Numeric caps are schema-legal in both eras.
@@ -1462,9 +1329,8 @@ mod tests {
             );
             seen.push(decl.capability);
         }
-        // Every catalog capability is claimed exactly once, including the
-        // deny-list-named tools (WebSearch, ComputerUse) and the
-        // supportsImages-driven image path (Vision).
+        // Every capability is claimed exactly once, deny-list-named tools
+        // included.
         for capability in [
             Capability::Mcp,
             Capability::WebSearch,
@@ -1487,10 +1353,8 @@ mod tests {
             WorkBuddyAdapter::harvest_npm_version(global_tree).as_deref(),
             Some("2.147.0")
         );
-        // Tree without the package: no version claim.
         let without = "/usr/lib\n└── typescript@5.6.2\n";
         assert_eq!(WorkBuddyAdapter::harvest_npm_version(without), None);
-        // Empty or errored output: no version claim.
         assert_eq!(WorkBuddyAdapter::harvest_npm_version(""), None);
         // Trailing tree glyphs after the version do not leak into it.
         let decorated = "└── @tencent-ai/codebuddy-code@2.147.4-beta.1\n";
@@ -1500,9 +1364,38 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // Fixture-backed conformance tests (QAL-02 corpus)
-    // -----------------------------------------------------------------------
+    #[test]
+    #[cfg(unix)]
+    fn npm_probe_resolves_the_first_path_entry_and_never_the_working_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "superai-wb-npm-{}-{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis())
+        ));
+        for (sub, version) in [("a", "1.0.1"), ("b", "2.0.2")] {
+            let bin_dir = dir.join(sub);
+            std::fs::create_dir_all(&bin_dir).unwrap();
+            let npm = bin_dir.join("npm");
+            std::fs::write(
+                &npm,
+                format!("#!/bin/sh\necho \"@tencent-ai/codebuddy-code@{version}\"\n"),
+            )
+            .unwrap();
+            std::fs::set_permissions(&npm, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path_var = format!("{}:{}", dir.join("a").display(), dir.join("b").display());
+        assert_eq!(
+            WorkBuddyAdapter::probe_npm_version_from(path_var.as_ref()).as_deref(),
+            Some("1.0.1"),
+            "the FIRST PATH entry must win the npm resolution"
+        );
+        // Only the given PATH is consulted: no ambient fallback, no cwd.
+        assert_eq!(WorkBuddyAdapter::probe_npm_version_from("".as_ref()), None);
+        drop(std::fs::remove_dir_all(&dir));
+    }
 
     fn fixtures_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/workbuddy")
@@ -1541,7 +1434,6 @@ mod tests {
         let map = superai_config::json::load(&fixture_path("models.minimal.json")).unwrap();
         assert!(map.contains_key("models"));
         assert!(map.contains_key("availableModels"));
-        // Schema-clean: no diagnostics against the declared surface schema.
         let a = adapter();
         let content = std::fs::read(fixture_path("models.minimal.json")).unwrap();
         let diags = crate::adapter::validate_surface_content(
@@ -1579,8 +1471,7 @@ mod tests {
 
     #[test]
     fn fixture_models_boundary_eras_parse_cleanly() {
-        // Both era fixtures must parse and pass the declared schema: token
-        // caps are deliberately untyped (number OR string both valid).
+        // Token caps are deliberately untyped: number or string, both valid.
         let a = adapter();
         for name in [
             "models.boundary_legacy.json",
@@ -1644,7 +1535,6 @@ mod tests {
         );
         let deny = permissions.get("deny").and_then(|v| v.as_array()).unwrap();
         assert!(deny.len() >= 4);
-        // Schema-clean against the declared owned-key rules.
         let a = adapter();
         let content = std::fs::read(fixture_path("settings.populated.json")).unwrap();
         let diags = crate::adapter::validate_surface_content(
@@ -1728,8 +1618,7 @@ mod tests {
                 "missing documented var {name}"
             );
         }
-        // Every fixture key is either a documented var or rejected, and every
-        // value carries an explicit fake/synthetic marker.
+        // Every key is documented and every value carries an explicit fake marker.
         for (key, value) in &populated {
             assert!(
                 KNOWN_ENV_VARS.contains(&key.as_str()),
@@ -1762,7 +1651,7 @@ mod tests {
     #[test]
     fn fixture_version_txt_parses_via_npm_metadata_shape() {
         let text = std::fs::read_to_string(fixture_path("version.txt")).unwrap();
-        let version = WorkBuddyAdapter::parse_version_output(&text);
+        let version = crate::adapters::parse_version_output(&text);
         assert_eq!(version.as_deref(), Some("2.147.0"));
         assert!(WorkBuddyAdapter::is_auto_compact_window_era(
             &version.unwrap()

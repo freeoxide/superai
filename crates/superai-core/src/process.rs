@@ -1,58 +1,16 @@
-//! Duct-backed process execution wrapper (PKG-01, PKG-05).
-//!
-//! # PKG-01 verification report — dependency spike
-//!
-//! Executed 2026-08-26 as part of PKG-01 before adding dependencies.
-//!
-//! * `toride` on crates.io: `cargo search toride` and `cargo info toride` both
-//!   returned "could not find `toride` in registry". `toride` is NOT published
-//!   to crates.io — it is an internal workspace at `github.com/freeoxide/toride`
-//!   with local modular crates `toride-runner`, `toride-mise`, `toride-installer`,
-//!   `toride-status`, etc. verified via `git ls-remote` and local checkout at
-//!   `/home/axent/fo/toride`. No near-miss publish exists, so no supply-chain
-//!   typo risk from adding `toride` as a dependency. superai must depend on the
-//!   underlying public crates (`duct`) and shell out to the `mise` binary, not
-//!   on a published `toride` crate.
-//!
-//! * `duct` crate: verified `duct 1.1.1` on crates.io (`cargo info duct`):
-//!   - license MIT, repository <https://github.com/oconnor663/duct.rs>
-//!   - maintained by Jack O'Connor, last release 2024, actively used by toride
-//!     workspace (`duct = { version = "1", features = ["timeout"] }` at
-//!     `/home/axent/fo/toride/Cargo.toml`)
-//!   - transitive deps `os_pipe 1.2.3`, `shared_child 1.1.1`, `libc` — all MIT,
-//!     no build scripts, MSRV compatible with Rust 1.97 (toride toolchain is
-//!     1.97.1 and uses duct successfully)
-//!   - API `duct::cmd(program, args).stdout_capture().stderr_capture()` plus
-//!     `wait_timeout` with `shared_child/timeout` was prototyped successfully.
-//!     **Chosen.**
-//!
-//! * `mise` integration: `cargo info mise` shows `mise 2026.8.14` (MIT, jdx/mise,
-//!   Rust 1.95+). However `toride-mise` is the typed wrapper crate — it is also
-//!   local/not published. The `mise` crate on crates.io is the CLI itself, not
-//!   a library. Verified against `/home/axent/fo/toride/crates/toride-mise`:
-//!   it wraps the *runtime `mise` binary* via `toride-runner` (duct/tokio).
-//!   `Mise::builder().build()` returns `MiseError::BinaryNotFound` when the
-//!   binary is absent; otherwise it shells out to `mise --version`, `mise ls`,
-//!   `mise current`, etc. Network installs are delegated to the binary and its
-//!   plugins. The `bootstrap` feature can download mise itself via reqwest, but
-//!   the default path **requires a runtime `mise` binary** (ambient
-//!   `~/.local/bin/mise` or `$PATH/mise` or `$MISE_BIN`). superai mirrors this:
-//!   detection shells out to `mise` when present, and never assumes a bundled
-//!   library can manage tools without the binary.
-//!
-//! Decision: add `duct = { version = "1", features = ["timeout"] }`. Do not add
-//! `toride` or `toride-mise` as crates.io dependencies. Use `std::process` as
-//! fallback only if duct were unavailable — it is available, so duct is used.
+//! Duct-backed process execution wrapper (PKG-01, PKG-05): explicit argv,
+//! never a shell; env composed before spawn, bounded capture, timeout kill.
 
 #![expect(
     clippy::excessive_nesting,
     reason = "intentional deep branching for redaction and version parsing"
 )]
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use crate::error::CoreError;
-use std::fmt::Write as _;
 
 /// Maximum combined stdout+stderr captured per command (1 MiB).
 pub const MAX_OUTPUT_BYTES: usize = 1_048_576;
@@ -60,14 +18,8 @@ pub const MAX_OUTPUT_BYTES: usize = 1_048_576;
 /// Default wall-clock timeout for process execution.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Flags whose following value should be redacted in logs/errors.
-///
-/// Mirrors `toride-runner::redact::REDACT_FLAGS` (kept intentionally narrow to
-/// avoid over-redaction). Only long-form flags that unambiguously carry
-/// secrets are included; short flags like `-p` are excluded because they alias
-/// to non-secret meanings (port, profile, etc.) across tools. The list is
-/// deliberately not exhaustive — callers with tool-specific short flags should
-/// extend it locally.
+/// Flags whose following value is redacted; long-form only, since short
+/// flags like `-p` alias to non-secret meanings across tools.
 pub const REDACT_FLAGS: &[&str] = &[
     "--password",
     "--passwd",
@@ -122,11 +74,12 @@ pub struct ExecuteOpts {
     pub timeout: Option<Duration>,
     /// Working directory for the child.
     pub cwd: Option<PathBuf>,
-    /// Extra env vars to set.
+    /// Extra env vars to set; they survive `clear_env`, but a matching
+    /// `env_remove` entry wins.
     pub env: Vec<(String, String)>,
-    /// Env vars to remove.
+    /// Env vars removed after the `env` additions are applied.
     pub env_remove: Vec<String>,
-    /// Start from a clean environment when true.
+    /// Start the child from an empty environment instead of the inherited one.
     pub clear_env: bool,
     /// Combined byte cap on captured stdout+stderr.
     pub output_limit: Option<usize>,
@@ -148,11 +101,8 @@ impl Default for ExecuteOpts {
     }
 }
 
-/// Redact sensitive flag values from a slice of args.
-///
-/// Any arg equal to a flag in `flags` causes the following arg to be replaced
-/// with `"***"`. Args of the form `--flag=value` are redacted to
-/// `--flag=***`.
+/// Redact sensitive flag values: a flag in `flags` redacts the following
+/// arg, and `--flag=value` becomes `--flag=***`.
 pub fn redact_args(args: &[String], flags: &[&str]) -> Vec<String> {
     let mut result = Vec::with_capacity(args.len());
     let mut redact_next = false;
@@ -201,24 +151,13 @@ pub fn display_command(executable: &str, args: &[String], redact: bool) -> Strin
     out
 }
 
-/// Scrub secret-bearing content from captured stderr when redaction is on.
-///
-/// Currently delegates to arg redaction on the stderr string; callers should
-/// set `redact=true` when the command line contained secret flags.
+/// Scrub secret-bearing stderr, best-effort: any redact-flag keyword seen
+/// in the field replaces the whole field with `[REDACTED]`.
 pub fn scrub_stderr(stderr: &str, redact: bool) -> String {
     if redact {
-        // Best-effort: mask flag values that leaked into stderr.
-        // For now, replace occurrences of flag values literally? We redact
-        // output fields uniformly by not preserving raw secrets in errors.
-        // Callers that set redact=true should ensure CoreError's Display never
-        // emits raw stderr when it contains secrets. Here we keep it simple:
-        // return placeholder if redaction requested and stderr looks sensitive.
-        // A more precise implementation would parse stderr for flag patterns.
         let lower = stderr.to_ascii_lowercase();
         for flag in REDACT_FLAGS {
-            // strip leading dashes for substring check
-            let key = flag.trim_start_matches('-');
-            if lower.contains(key) {
+            if lower.contains(flag.trim_start_matches('-')) {
                 return "[REDACTED]".to_owned();
             }
         }
@@ -228,22 +167,137 @@ pub fn scrub_stderr(stderr: &str, redact: bool) -> String {
     }
 }
 
-/// Run a command with explicit argv (no shell interpolation), bounded capture,
-/// timeout, and optional redaction. Uses `duct` when available.
-///
-/// - No shell is ever invoked; `executable` and `args` are passed as argv
-///   tokens directly.
-/// - stdout/stderr are captured up to `output_limit` bytes combined; breach
-///   returns `CoreError::Verification` with output-limit context and the child
-///   is killed.
-/// - Timeout kills the child and returns `CoreError::BinaryDetection` with
-///   timeout context (caller can map to install-specific errors).
+/// Fold ASCII a-z to A-Z across UTF-16 units; every other unit (non-ASCII,
+/// surrogates) passes through. Pure so the Windows fold is tested everywhere.
+#[cfg(any(windows, test))]
+fn fold_wide_ascii_uppercase(units: &[u16]) -> Vec<u16> {
+    units
+        .iter()
+        .map(|&u| match u {
+            // 0x61..=0x7A is ASCII a-z; subtracting 0x20 folds it to A-Z.
+            0x61..=0x7A => u - 0x20,
+            _ => u,
+        })
+        .collect()
+}
+
+/// Canonical env-map key: Windows env names are ASCII-case-insensitive, so
+/// fold them there; other platforms match exactly.
+#[cfg(windows)]
+fn env_map_key(name: &OsStr) -> OsString {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    let wide: Vec<u16> = name.encode_wide().collect();
+    OsString::from_wide(&fold_wide_ascii_uppercase(&wide))
+}
+
+#[cfg(not(windows))]
+fn env_map_key(name: &OsStr) -> OsString {
+    name.to_os_string()
+}
+
+/// Compose the child env: inherited (or empty when `clear_env`), then the
+/// `env` additions, then `env_remove`, which wins on the same key.
+fn compose_child_env(opts: &ExecuteOpts) -> BTreeMap<OsString, OsString> {
+    let mut env: BTreeMap<OsString, OsString> = if opts.clear_env {
+        BTreeMap::new()
+    } else {
+        std::env::vars_os()
+            .map(|(k, v)| (env_map_key(&k), v))
+            .collect()
+    };
+    for (key, val) in &opts.env {
+        env.insert(env_map_key(OsStr::new(key)), OsString::from(val));
+    }
+    for key in &opts.env_remove {
+        env.remove(&env_map_key(OsStr::new(key)));
+    }
+    env
+}
+
+/// Whether `path` names an executable file (unix demands the execute bit;
+/// Windows tests existence only, matching the adapter PATH helpers).
+fn is_executable_file(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::metadata(path).is_ok_and(|m| m.is_file())
+    }
+}
+
+/// First PATH entry holding an executable `name` (`.exe` also probed on
+/// Windows). Empty entries are skipped: POSIX reads them as the cwd.
+fn first_path_match(path_var: &OsStr, name: &str) -> Option<PathBuf> {
+    for dir in std::env::split_paths(path_var) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        let candidate = dir.join(name);
+        if is_executable_file(&candidate) {
+            return Some(candidate);
+        }
+        #[cfg(windows)]
+        {
+            let exe = dir.join(format!("{name}.exe"));
+            if is_executable_file(&exe) {
+                return Some(exe);
+            }
+        }
+    }
+    None
+}
+
+/// Resolve `executable` to what will be spawned: bare names take the first
+/// PATH match from the child's composed PATH; `.`/`..` is refused.
+fn resolve_executable(
+    executable: &str,
+    child_env: &BTreeMap<OsString, OsString>,
+) -> Result<PathBuf, CoreError> {
+    let path = Path::new(executable);
+    if path
+        .components()
+        .any(|c| matches!(c, Component::CurDir | Component::ParentDir))
+    {
+        return Err(CoreError::Validation {
+            field: "executable".to_owned(),
+            reason: format!(
+                "executable `{executable}` must not resolve relative to the working directory"
+            ),
+        });
+    }
+    if path.is_absolute() || executable.contains(std::path::MAIN_SEPARATOR) {
+        return Ok(path.to_path_buf());
+    }
+    #[cfg(windows)]
+    if executable.contains('/') {
+        return Ok(path.to_path_buf());
+    }
+    let path_var = child_env
+        .get(&env_map_key(OsStr::new("PATH")))
+        .cloned()
+        .or_else(|| std::env::var_os("PATH"))
+        .ok_or_else(|| CoreError::BinaryDetection {
+            binary: executable.to_owned(),
+            reason: "PATH is not set; refusing to guess a search path for a bare name".to_owned(),
+        })?;
+    first_path_match(&path_var, executable).ok_or_else(|| CoreError::BinaryDetection {
+        binary: executable.to_owned(),
+        reason: format!(
+            "`{executable}` not found on PATH (first match; the working directory is never searched)"
+        ),
+    })
+}
+
+/// Run a command with explicit argv (no shell), bounded capture, timeout,
+/// redaction. Env: inherited (or empty), additions, then `env_remove` wins.
 pub fn run_command(
     executable: &str,
     args: &[String],
     opts: &ExecuteOpts,
 ) -> Result<ProcessOutput, CoreError> {
-    // Validate executable is not empty and contains no NUL.
     if executable.is_empty() {
         return Err(CoreError::Validation {
             field: "executable".to_owned(),
@@ -265,37 +319,25 @@ pub fn run_command(
         }
     }
 
-    // Build duct expression with explicit argv, env, cwd, stdin = none.
-    let mut cmd = duct::cmd(executable, args);
+    // Compose the env first: bare names resolve against the child's PATH.
+    let child_env = compose_child_env(opts);
+    let resolved = resolve_executable(executable, &child_env)?;
+
+    let mut cmd = duct::cmd(resolved.as_os_str(), args);
 
     if let Some(cwd) = opts.cwd.as_ref() {
         cmd = cmd.dir(cwd);
     }
 
-    // Apply env policy.
-    if opts.clear_env {
-        cmd = cmd.full_env(Vec::<(String, String)>::new());
-    }
-    for key in &opts.env_remove {
-        // duct has no env_remove; emulate by setting to empty and rely on child
-        // ignoring it is not perfect, but toride-runner's apply_env_policy
-        // handles removal via std::env scrubbing. For superai, we pass
-        // env_remove via `env` with explicit removal after spawn is not yet
-        // implemented; we document the limitation and avoid clear_env removal
-        // divergence by not using env_remove in catalog commands (none need it).
-        let _ = key;
-    }
-    for (k, v) in &opts.env {
-        cmd = cmd.env(k, v);
-    }
+    // Duct's env wraps apply in reverse build order; one composed map is
+    // its only env input so compose_child_env decides precedence.
+    cmd = cmd.full_env(child_env);
 
-    // Capture stdout/stderr; do not use shell.
     cmd = cmd.stdout_capture().stderr_capture();
 
     let timeout = opts.timeout.unwrap_or(DEFAULT_TIMEOUT);
     let display = display_command(executable, args, opts.redact);
 
-    // Start unchecked so non-zero exit is captured, not errored.
     let handle = cmd
         .unchecked()
         .start()
@@ -304,31 +346,20 @@ pub fn run_command(
             reason: format!("failed to spawn `{display}`: {e}"),
         })?;
 
-    // Use timeout-aware wait.
     let output = match handle.wait_timeout(timeout) {
+        // wait_timeout borrows the handle; clone unhooks the captured bytes.
         Ok(Some(output)) => output.clone(),
         Ok(None) => {
-            // Timeout expired — kill and reap.
-            let kill_err = handle.kill().err().map(|e| e.to_string());
-            let wait_err = handle.wait().err().map(|e| e.to_string());
-            let mut reason = format!(
-                "command timed out after {}s: `{display}`",
+            let kill_note = handle
+                .kill()
+                .map_or_else(|e| format!(" (kill failed: {e})"), |()| String::new());
+            let wait_note = handle
+                .wait()
+                .map_or_else(|e| format!(" (wait failed: {e})"), |_| String::new());
+            let reason = format!(
+                "command timed out after {}s: `{display}`{kill_note}{wait_note}",
                 timeout.as_secs()
             );
-            if let Some(e) = kill_err {
-                #[expect(
-                    clippy::let_underscore_must_use,
-                    reason = "String write never fails; result intentionally ignored"
-                )]
-                let _ = write!(reason, " (kill failed: {e})");
-            }
-            if let Some(e) = wait_err {
-                #[expect(
-                    clippy::let_underscore_must_use,
-                    reason = "String write never fails; result intentionally ignored"
-                )]
-                let _ = write!(reason, " (wait failed: {e})");
-            }
             return Err(CoreError::BinaryDetection {
                 binary: executable.to_owned(),
                 reason,
@@ -364,11 +395,8 @@ pub fn run_command(
     Ok(ProcessOutput::new(stdout, stderr_scrubbed, exit_code))
 }
 
-/// Convenience helper to run a version probe command and parse the first
-/// semantic-looking token from stdout.
-///
-/// Returns `None` on non-zero exit or empty output; otherwise attempts to
-/// extract a version string.
+/// Run a version probe and parse the first version-like token; `None` on
+/// non-zero exit or empty output.
 pub fn run_version_probe(executable: &str, args: &[String], opts: &ExecuteOpts) -> Option<String> {
     let output = run_command(executable, args, opts).ok()?;
     if !output.success {
@@ -382,10 +410,8 @@ pub fn run_version_probe(executable: &str, args: &[String], opts: &ExecuteOpts) 
     extract_version(&combined)
 }
 
-/// Strip ANSI escape sequences (CSI `ESC[...m`, OSC `ESC]...BEL`, etc.)
-///
-/// Malicious version output may contain escape sequences to hide or inject
-/// content; they must not appear in the extracted version.
+/// Strip ANSI escapes (CSI/OSC): hostile version output must not hide or
+/// inject content in the extracted version.
 fn strip_ansi_escapes(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
@@ -424,38 +450,30 @@ fn strip_ansi_escapes(input: &str) -> String {
     out
 }
 
-/// Extract the first version-like token from text.
-///
-/// Looks for `X.Y.Z` or `vX.Y.Z` patterns. Falls back to the first non-empty
-/// line trimmed to 64 chars if no semver pattern is found (still useful for
-/// probes that emit non-semver strings like `claude-code 1.2.3 (build abc)`).
+/// Extract the first `X.Y.Z`/`vX.Y.Z` token; falls back to the first
+/// non-empty line trimmed to 64 chars.
 pub fn extract_version(text: &str) -> Option<String> {
     let stripped = strip_ansi_escapes(text);
     let trimmed = stripped.trim();
     if trimmed.is_empty() {
         return None;
     }
-    // Try to find semver-like substring.
     for token in trimmed.split_whitespace() {
         let candidate = token
             .trim_start_matches('v')
             .trim_matches(|c: char| c == ',' || c == ')');
         if candidate.chars().any(|c| c == '.') {
-            // Quick semver-ish check: contains digit and dot
             let has_digit = candidate.chars().any(|c| c.is_ascii_digit());
             let has_dot = candidate.contains('.');
             if has_digit && has_dot {
-                // Strip surrounding punctuation/brackets
                 let cleaned = candidate
                     .trim_matches(|c: char| {
                         !c.is_ascii_alphanumeric() && c != '.' && c != '-' && c != '+'
                     })
                     .to_owned();
                 if !cleaned.is_empty() {
-                    // Bound length to avoid pathological capture. The bound
-                    // is BYTES (a multi-byte token must not exceed it even
-                    // when it has fewer than 64 chars), truncated at a
-                    // UTF-8 char boundary.
+                    // The 64 bound is BYTES, not chars, and the cut must
+                    // back off to a UTF-8 char boundary.
                     let bounded = if cleaned.len() > 64 {
                         let mut end = 64;
                         while end > 0 && !cleaned.is_char_boundary(end) {
@@ -470,7 +488,6 @@ pub fn extract_version(text: &str) -> Option<String> {
             }
         }
     }
-    // Fallback: first non-empty line, truncated
     for line in trimmed.lines() {
         let l = line.trim();
         if !l.is_empty() {
@@ -505,10 +522,8 @@ mod tests {
         ];
         let redacted = redact_args(&args, REDACT_FLAGS);
         assert_eq!(redacted.get(1).map(String::as_str), Some("***"));
-        // "--api-key= hunter2" has empty inline value, so next arg would be
-        // redacted if we had one; the value itself here is " hunter2" with
-        // leading space, not matched as inline, so it is kept as-is but the
-        // flag form with value is redacted inline
+        // "--api-key= hunter2" has an empty inline value (leading space),
+        // so it is kept as-is; only the filled form redacts inline.
         assert_eq!(redacted.get(4).map(String::as_str), Some("--api-key=***"));
     }
 
@@ -537,21 +552,19 @@ mod tests {
 
     #[test]
     fn extract_version_fallback_truncates() {
-        let long = "a".repeat(100);
-        let v = extract_version(&long).unwrap();
-        assert!(v.len() <= 64);
-        // UTF-8 boundary test
-        let unicode = "café-".repeat(20);
-        let v2 = extract_version(&unicode).unwrap();
-        assert!(v2.len() <= 64);
-        assert!(v2.is_char_boundary(v2.len()));
+        let v = extract_version(&"a".repeat(100)).unwrap();
+        assert_eq!(v.len(), 64);
+        // 64 bytes lands mid-é (6 bytes per "café-"); the cut backs off to
+        // the previous boundary at 63.
+        let unicode = extract_version(&"café-".repeat(20)).unwrap();
+        assert_eq!(unicode.len(), 63);
     }
 
     #[test]
     fn extract_version_semver_bound_is_bytes_not_chars() {
         // A multi-byte semver-shaped token must be bounded to 64 BYTES, not
         // 64 chars (found by the QAL-04 detection fuzz family).
-        let token = "1.2.3-β".repeat(30); // 6 bytes per rep, 180 bytes, 90 chars
+        let token = "1.2.3-β".repeat(30); // 8 bytes per rep, 240 bytes, 210 chars
         let text = format!("tool {token}");
         let v = extract_version(&text)
             .unwrap_or_else(|| panic!("semver-shaped token must be extracted: {text:?}"));
@@ -560,7 +573,6 @@ mod tests {
             "extracted version must be byte-bounded, got {} bytes: {v:?}",
             v.len()
         );
-        assert!(v.is_char_boundary(v.len()));
     }
 
     #[test]
@@ -585,13 +597,11 @@ mod tests {
 
     #[test]
     fn run_command_bounded_capture_enforced() {
-        // Use yes-like output via printf to generate large output exceeding tiny limit
         let opts = ExecuteOpts {
             timeout: Some(Duration::from_secs(5)),
             output_limit: Some(10),
             ..Default::default()
         };
-        // echo with large arg should exceed 10 bytes combined
         let large = "x".repeat(100);
         let err = run_command("echo", &[large], &opts).unwrap_err();
         assert!(format!("{err}").contains("output limit exceeded"));
@@ -599,8 +609,6 @@ mod tests {
 
     #[test]
     fn run_command_no_shell_interpolation() {
-        // argv token containing shell meta-characters must be passed literally
-        // and not expand. `echo` should print the literal token.
         let opts = ExecuteOpts {
             timeout: Some(Duration::from_secs(5)),
             ..Default::default()
@@ -619,5 +627,199 @@ mod tests {
         };
         let err = run_command("sleep", &["2".to_owned()], &opts).unwrap_err();
         assert!(format!("{err}").contains("timed out"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_command_env_remove_drops_variable_from_child() {
+        let opts = ExecuteOpts {
+            timeout: Some(Duration::from_secs(5)),
+            env: vec![
+                ("SUPERAI_TEST_KEEP".to_owned(), "yes".to_owned()),
+                // Injected so the drop is provable even with no ambient HOME.
+                ("HOME".to_owned(), "must-not-reach-child".to_owned()),
+            ],
+            env_remove: vec!["HOME".to_owned()],
+            ..Default::default()
+        };
+        // /bin/sh -c prints one marker per pinned fact; BSD printenv rejects
+        // multiple operands, so env inspection must not lean on it.
+        let script = "if [ -z \"${HOME+x}\" ]; then echo home-dropped; fi; \
+                      if [ -n \"${SUPERAI_TEST_KEEP+x}\" ]; then echo keep=${SUPERAI_TEST_KEEP}; fi";
+        let out = run_command("/bin/sh", &["-c".to_owned(), script.to_owned()], &opts).unwrap();
+        assert_eq!(
+            out.stdout, "home-dropped\nkeep=yes\n",
+            "HOME must be removed while the other addition reaches the child"
+        );
+    }
+
+    #[test]
+    fn fold_wide_ascii_uppercase_folds_ascii_only() {
+        // Windows env keys match ASCII-case-insensitively: both spellings of
+        // one name must fold to a single key.
+        let lower: Vec<u16> = "path".encode_utf16().collect();
+        let upper: Vec<u16> = "PATH".encode_utf16().collect();
+        assert_eq!(
+            fold_wide_ascii_uppercase(&lower),
+            fold_wide_ascii_uppercase(&upper)
+        );
+        // Non-ASCII units (latin-1, CJK, a lone surrogate) pass through.
+        assert_eq!(
+            fold_wide_ascii_uppercase(&[0xE9, 0x4E2D, 0xD83D, 0x30]),
+            vec![0xE9, 0x4E2D, 0xD83D, 0x30]
+        );
+    }
+
+    #[test]
+    fn compose_child_env_clear_start_adds_then_removes() {
+        let opts = ExecuteOpts {
+            env: vec![
+                ("SUPERAI_TEST_DUP".to_owned(), "leaked".to_owned()),
+                ("SUPERAI_TEST_ADD".to_owned(), "kept".to_owned()),
+            ],
+            env_remove: vec!["SUPERAI_TEST_DUP".to_owned()],
+            clear_env: true,
+            ..Default::default()
+        };
+        let env = compose_child_env(&opts);
+        assert_eq!(
+            env.get(OsStr::new("SUPERAI_TEST_ADD")),
+            Some(&OsString::from("kept"))
+        );
+        assert!(
+            !env.contains_key(OsStr::new("SUPERAI_TEST_DUP")),
+            "env_remove must beat an env addition on the same key"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_command_env_additions_survive_clear_env() {
+        // End-to-end pin: additions survive clear_env, env_remove wins on a
+        // same key. sh fabricates PATH at startup, so the PATH pin uses printenv.
+        let opts = ExecuteOpts {
+            timeout: Some(Duration::from_secs(5)),
+            env: vec![
+                ("SUPERAI_TEST_DUP".to_owned(), "leaked".to_owned()),
+                ("SUPERAI_TEST_ADD".to_owned(), "reaches-child".to_owned()),
+            ],
+            env_remove: vec!["SUPERAI_TEST_DUP".to_owned()],
+            clear_env: true,
+            ..Default::default()
+        };
+        let script = "if [ -n \"${SUPERAI_TEST_ADD+x}\" ]; then echo add=${SUPERAI_TEST_ADD}; fi; \
+                      if [ -z \"${SUPERAI_TEST_DUP+x}\" ]; then echo dup-removed; fi";
+        let out = run_command("/bin/sh", &["-c".to_owned(), script.to_owned()], &opts).unwrap();
+        assert_eq!(
+            out.stdout, "add=reaches-child\ndup-removed\n",
+            "addition must survive clear_env and same-key removal must win"
+        );
+        let out = run_command("printenv", &["PATH".to_owned()], &opts).unwrap();
+        assert!(
+            out.stdout.is_empty(),
+            "inherited PATH must stay cleared, got {:?}",
+            out.stdout
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_command_inherits_ambient_env_when_clear_env_false() {
+        let opts = ExecuteOpts {
+            timeout: Some(Duration::from_secs(5)),
+            env: vec![("SUPERAI_TEST_KEEP".to_owned(), "yes".to_owned())],
+            ..Default::default()
+        };
+        let script =
+            "if [ -n \"${SUPERAI_TEST_KEEP+x}\" ]; then echo keep=${SUPERAI_TEST_KEEP}; fi";
+        let out = run_command("/bin/sh", &["-c".to_owned(), script.to_owned()], &opts).unwrap();
+        assert_eq!(
+            out.stdout, "keep=yes\n",
+            "the addition must reach the child"
+        );
+        // printenv (not a shell probe: sh fabricates PATH) proves the
+        // ambient PATH VALUE reached the child env unchanged.
+        let ambient = std::env::var_os("PATH").expect("the test runner provides PATH");
+        let out = run_command("printenv", &["PATH".to_owned()], &opts).unwrap();
+        assert_eq!(
+            out.stdout.trim(),
+            ambient.to_string_lossy(),
+            "ambient PATH must reach the child unchanged"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_command_resolves_bare_name_to_first_path_match() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_util::temp_dir_unique("path-order");
+        for (sub, marker) in [("a", "from-a"), ("b", "from-b")] {
+            let bin_dir = dir.join(sub);
+            std::fs::create_dir_all(&bin_dir).unwrap();
+            let probe = bin_dir.join("superai-path-order-probe");
+            std::fs::write(&probe, format!("#!/bin/sh\necho {marker}\n")).unwrap();
+            std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // The env addition PATH (not the ambient PATH) governs resolution,
+        // and the FIRST directory wins.
+        let joined = format!("{}:{}", dir.join("a").display(), dir.join("b").display());
+        let opts = ExecuteOpts {
+            timeout: Some(Duration::from_secs(5)),
+            env: vec![("PATH".to_owned(), joined)],
+            ..Default::default()
+        };
+        let out = run_command("superai-path-order-probe", &[], &opts).unwrap();
+        assert_eq!(out.stdout_trimmed(), "from-a");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_command_never_resolves_a_bare_name_from_the_working_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_util::temp_dir_unique("path-cwd");
+        std::fs::create_dir_all(&dir).unwrap();
+        let probe = dir.join("superai-path-cwd-probe");
+        std::fs::write(&probe, "#!/bin/sh\necho ran\n").unwrap();
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // POSIX reads an empty PATH entry as the working directory; the
+        // explicit lookup must skip it even with the probe sitting in cwd.
+        let opts = ExecuteOpts {
+            timeout: Some(Duration::from_secs(5)),
+            cwd: Some(dir),
+            env: vec![("PATH".to_owned(), String::from(":"))],
+            ..Default::default()
+        };
+        let err = run_command("superai-path-cwd-probe", &[], &opts).unwrap_err();
+        assert!(
+            format!("{err}").contains("not found on PATH"),
+            "expected a PATH-resolution refusal, got: {err}"
+        );
+        assert!(probe.exists());
+    }
+
+    #[test]
+    fn run_command_refuses_dot_relative_executable() {
+        let opts = ExecuteOpts {
+            timeout: Some(Duration::from_secs(5)),
+            ..Default::default()
+        };
+        let err = run_command("./probe", &[], &opts).unwrap_err();
+        assert!(
+            format!("{err}").contains("working directory"),
+            "expected a relative-path refusal, got: {err}"
+        );
+    }
+
+    #[test]
+    fn run_command_bare_name_absent_from_path_is_a_typed_error() {
+        let opts = ExecuteOpts {
+            timeout: Some(Duration::from_secs(5)),
+            ..Default::default()
+        };
+        let err = run_command("superai-no-such-tool-xyz", &[], &opts).unwrap_err();
+        assert!(
+            format!("{err}").contains("not found on PATH"),
+            "expected the PATH-resolution error, got: {err}"
+        );
     }
 }

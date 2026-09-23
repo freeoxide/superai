@@ -7,23 +7,22 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::error::{ConfigError, Result};
 use crate::injector::{Injector, Point, run as inject};
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn compute_digest(bytes: &[u8]) -> String {
+/// `SipHash` digest of `bytes` as 16 hex chars. Integrity token only: unkeyed,
+/// so it proves nothing about who wrote the bytes.
+pub(crate) fn compute_digest(bytes: &[u8]) -> String {
     let mut hasher = DefaultHasher::new();
     bytes.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
 }
 
-fn timestamp_millis_now() -> u128 {
+pub(crate) fn timestamp_millis_now() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis())
 }
 
-fn generate_random_suffix(millis: u128) -> String {
+/// Four-hex random suffix from time, pid, and a process-wide counter.
+pub(crate) fn generate_random_suffix(millis: u128) -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let count = u64::from((millis & 0xffff_ffff) as u32)
         .wrapping_add(u64::from(std::process::id()))
@@ -51,14 +50,10 @@ fn generate_temp_path(target: &Path) -> Result<PathBuf> {
     Ok(parent.join(tmp_name))
 }
 
-/// Resolve the permission bits the replacement file must carry.
-///
-/// An explicit `mode` (used by backup restore to reinstate the permissions
-/// recorded in the catalog entry) wins; otherwise the bits are derived from
-/// the current target, falling back to owner-only `0o600` for a target that
-/// does not exist or cannot be read.
+/// Permission bits for the replacement: explicit `mode` wins, else the
+/// target's own, else `0o600` for a new file.
 #[cfg(unix)]
-fn resolve_final_mode(target: &Path, mode: Option<u32>) -> u32 {
+pub(crate) fn resolve_final_mode(target: &Path, mode: Option<u32>) -> u32 {
     use std::os::unix::fs::PermissionsExt;
     if let Some(mode) = mode {
         return mode;
@@ -75,39 +70,35 @@ fn resolve_final_mode(target: &Path, mode: Option<u32>) -> u32 {
 }
 
 #[cfg(not(unix))]
-fn resolve_final_mode(_target: &Path, mode: Option<u32>) -> u32 {
+pub(crate) fn resolve_final_mode(_target: &Path, mode: Option<u32>) -> u32 {
     mode.unwrap_or(0o600)
 }
 
-/// Apply `mode` to `path`, masking to the permission bits and never leaving
-/// the file with no access at all.
+/// Apply `mode` through the open fd so a name swap cannot redirect the chmod
+/// onto a foreign file; masked to the permission bits, never zero.
 #[cfg(unix)]
-fn apply_mode(path: &Path, mode: u32) -> Result<()> {
+pub(crate) fn apply_mode(file: &std::fs::File, label: &Path, mode: u32) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let masked = mode & 0o777;
     let safe_mode = if masked == 0 { 0o600 } else { masked };
     let perm = std::fs::Permissions::from_mode(safe_mode);
-    std::fs::set_permissions(path, perm).map_err(|e| ConfigError::io(path, e))
+    file.set_permissions(perm)
+        .map_err(|e| ConfigError::io(label, e))
 }
 
-/// Windows permission semantics: POSIX mode bits do not exist beyond the
-/// readonly attribute, and the only stable std API is
-/// `Permissions::set_readonly`. The platform-correct projection of `0o600`
-/// hardening is therefore: files we create or replace always carry the
-/// owner-write bit (`0o200`) in the requested mode, which maps to "not
-/// readonly" — the attribute that would block a later rename-over or delete
-/// of the same file is never set by us.
+/// Windows has only the readonly attribute, mapped from the owner-write bit;
+/// the replacement must never be readonly or a later rename-over fails.
 #[cfg(windows)]
-fn apply_mode(path: &Path, mode: u32) -> Result<()> {
+pub(crate) fn apply_mode(file: &std::fs::File, label: &Path, mode: u32) -> Result<()> {
     let masked = mode & 0o777;
     let safe_mode = if masked == 0 { 0o600 } else { masked };
-    let mut perm = std::fs::metadata(path)
+    let mut perm = file
+        .metadata()
         .map(|m| m.permissions())
-        .map_err(|e| ConfigError::io(path, e))?;
-    // Only the owner-write bit has a Windows equivalent: without it the file
-    // is readonly; with it the file is writable.
+        .map_err(|e| ConfigError::io(label, e))?;
     perm.set_readonly(safe_mode & 0o200 == 0);
-    std::fs::set_permissions(path, perm).map_err(|e| ConfigError::io(path, e))
+    file.set_permissions(perm)
+        .map_err(|e| ConfigError::io(label, e))
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -115,25 +106,19 @@ fn apply_mode(path: &Path, mode: u32) -> Result<()> {
     clippy::unnecessary_wraps,
     reason = "no POSIX chmod and no windows readonly bit; keeps call sites uniform"
 )]
-fn apply_mode(path: &Path, _mode: u32) -> Result<()> {
-    let _ = path;
+pub(crate) fn apply_mode(file: &std::fs::File, _label: &Path, _mode: u32) -> Result<()> {
+    let _ = file;
     Ok(())
 }
 
-/// Clear the Windows readonly attribute from `path` if set.
-///
-/// Used only where we are about to replace or delete the file ourselves
-/// (rename-over in an atomic write, cleanup of our own temp/backup files):
-/// a readonly destination makes `MoveFileEx`/delete fail with winerror 5,
-/// so the attribute is cleared right before the replacement lands.
+/// Clear the Windows readonly attribute from a file we are about to replace
+/// or delete ourselves (winerror 5 otherwise).
 #[cfg(windows)]
 pub(crate) fn windows_clear_readonly(path: &Path) {
     if let Ok(meta) = std::fs::metadata(path)
         && meta.permissions().readonly()
     {
         let mut perm = meta.permissions();
-        // Windows-only code path: the readonly attribute is the only bit that
-        // exists there, so clearing it cannot make a unix file world-writable.
         #[expect(
             clippy::permissions_set_readonly_false,
             reason = "windows-only path; the readonly attribute is the only permission bit"
@@ -143,7 +128,9 @@ pub(crate) fn windows_clear_readonly(path: &Path) {
     }
 }
 
-fn sync_parent(path: &Path) -> Result<()> {
+/// Best-effort fsync of `path`'s parent after the file itself is durable.
+/// Windows denies directory-handle syncs and opens on several filesystems.
+pub(crate) fn sync_parent(path: &Path) -> Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     if parent.as_os_str().is_empty() {
         return Ok(());
@@ -152,16 +139,11 @@ fn sync_parent(path: &Path) -> Result<()> {
         Ok(f) => match f.sync_all() {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::Unsupported => Ok(()),
-            // Windows FlushFileBuffers on a directory handle is denied on
-            // several filesystems; the data file itself is already synced,
-            // so the parent sync is best-effort there.
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Ok(()),
             Err(e) => Err(ConfigError::io(parent, e)),
         },
-        // Windows cannot open a directory handle without backup semantics,
-        // so `File::open(parent)` fails with winerror 5 there. The parent
-        // sync is a durability nicety, not a correctness requirement — the
-        // replacement file was flushed and synced before the rename.
+        // Windows cannot open a directory handle without backup semantics
+        // (winerror 5); the file itself was already synced before the rename.
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(ConfigError::io(parent, e)),
@@ -183,42 +165,14 @@ fn is_directory(path: &Path) -> bool {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Atomic write
-// ---------------------------------------------------------------------------
-
-/// Atomically write `bytes` to `path` via a same-directory temporary file.
-///
-/// Crate-internal since the plan-02 fold: this is the low-level replace
-/// primitive used by the crash journal (superai's own bookkeeping file) and
-/// this module's own tests — never a public write path. The ONE public
-/// mutation boundary is [`crate::transaction::commit_file`] (plus the
-/// multi-step [`crate::transaction::Transaction`]); everything else routes
-/// there.
-///
-/// Steps:
-/// 1. Create same-directory temp with exclusive name.
-/// 2. Hold the temp owner-only while it carries bytes.
-/// 3. Write bytes and flush.
-/// 4. Apply the final permission bits (derived from the current target, or
-///    owner-only for a new file) before the rename.
-/// 5. Recheck the original state (detect change since the temp was started).
-/// 6. Atomically rename via `std::fs::rename`.
-/// 7. Sync parent directory where supported.
-/// 8. Read back and verify digest and size.
-///
-/// Never truncates the original in place; the original is only replaced via
-/// atomic rename.
+/// Atomically write `bytes` via a same-directory exclusive temp; the original
+/// is replaced only by rename. The boundary is `transaction::commit_file`.
 pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     atomic_write_expecting(path, bytes, WriteExpectation::Any, None, None)
 }
 
-/// How the current on-disk state of the target must relate to the write.
-///
-/// The expectation is checked before the temporary file is created and again
-/// once its bytes are flushed, so a target that changes anywhere inside the
-/// preparation window aborts the write with `ConcurrentModification` and
-/// leaves the target untouched.
+/// Required on-disk state, checked before the temp is created and again once
+/// its bytes are flushed: a change inside that window aborts untouched.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum WriteExpectation<'a> {
     /// No prior-state requirement; only mid-write change detection applies.
@@ -257,14 +211,8 @@ impl WriteExpectation<'_> {
     }
 }
 
-/// Shared body of the atomic write family (MUT-04).
-///
-/// `mode` selects the permission bits the replacement carries: `None`
-/// derives them from the current target (owner-only `0o600` for a new file);
-/// `Some(mode)` applies the recorded bits verbatim, which is how backup
-/// restore reinstates the original permissions. The temporary file is held
-/// owner-only while it carries bytes, and the final mode is applied before
-/// the rename so the replacement never appears with the interim mode.
+/// The atomic write body (MUT-04): `mode` `None` derives bits from the
+/// target, `Some` lands recorded bits verbatim (backup restore).
 #[expect(
     clippy::too_many_lines,
     reason = "atomic write steps are sequential and clearer together"
@@ -293,53 +241,42 @@ pub(crate) fn atomic_write_expecting(
     expectation.check(path, original_digest.as_deref())?;
 
     inject(injector, Point::TempCreate)?;
-    let mut temp_path: PathBuf = generate_temp_path(path)?;
-    let mut attempts = 0;
-    while temp_path.exists() && attempts < 5 {
-        temp_path = generate_temp_path(path)?;
-        attempts += 1;
-    }
-
-    let create_result: Result<std::fs::File> = (|| {
-        for _ in 0..3 {
-            let p = generate_temp_path(path)?;
-            let open = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&p);
-            match open {
-                Ok(f) => {
-                    temp_path = p;
-                    return Ok(f);
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(e) => return Err(ConfigError::io(&p, e)),
-            }
-        }
-        let f = std::fs::OpenOptions::new()
+    // O_EXCL temp with the handle held open until durable: a pre-planted
+    // symlink cannot redirect this write onto a foreign file.
+    let mut temp_path = PathBuf::new();
+    let mut file: Option<std::fs::File> = None;
+    for _ in 0..5 {
+        let candidate = generate_temp_path(path)?;
+        match std::fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&temp_path)
-            .map_err(|e| ConfigError::io(&temp_path, e))?;
-        Ok(f)
-    })();
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(f) => {
+                temp_path = candidate;
+                file = Some(f);
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(ConfigError::io(&candidate, e)),
+        }
+    }
+    let Some(mut file) = file else {
+        return Err(ConfigError::io(
+            path,
+            std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "temp name collision after repeated attempts",
+            ),
+        ));
+    };
 
-    let mut file = create_result?;
-
-    drop(file);
-    // The temp is held owner-only from creation until the final mode is
-    // known, so payload bytes are never group/world readable regardless of
-    // the process umask.
-    if let Err(e) = apply_mode(&temp_path, 0o600) {
+    // Owner-only while empty (umask cannot widen it); the fd-based chmod
+    // still lands on our inode even if the temp name is swapped.
+    if let Err(e) = apply_mode(&file, &temp_path, 0o600) {
         drop(std::fs::remove_file(&temp_path));
         return Err(e);
     }
-    file = std::fs::OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(&temp_path)
-        .map_err(|e| ConfigError::io(&temp_path, e))?;
 
     inject(injector, Point::TempWrite)?;
     {
@@ -351,19 +288,17 @@ pub(crate) fn atomic_write_expecting(
         file.sync_all()
             .map_err(|e| ConfigError::io(&temp_path, e))?;
     }
-    drop(file);
 
-    // The final mode lands after the bytes are durable but before the
-    // rename, so the replacement never appears with the interim owner-only
-    // mode and a read-only recorded mode cannot block the write itself.
-    if let Err(e) = apply_mode(&temp_path, resolve_final_mode(path, mode)) {
+    // Final mode after the bytes are durable but before the rename: the
+    // replacement never appears with the interim owner-only mode.
+    if let Err(e) = apply_mode(&file, &temp_path, resolve_final_mode(path, mode)) {
         drop(std::fs::remove_file(&temp_path));
         return Err(e);
     }
+    drop(file);
 
-    // §4.2 / MUT-01: the conflict recheck immediately before the rename. A
-    // target that changed anywhere inside the preparation window aborts the
-    // write with ConcurrentModification and leaves the target untouched.
+    // §4.2 / MUT-01: recheck immediately before the rename. A target that
+    // changed anywhere inside the preparation window aborts untouched.
     inject(injector, Point::ConflictRecheck)?;
     let current_digest = read_digest_if_exists(path)?;
     if original_digest != current_digest {
@@ -378,10 +313,6 @@ pub(crate) fn atomic_write_expecting(
     }
 
     inject(injector, Point::AtomicReplace)?;
-    // Windows: a readonly destination makes MoveFileEx-with-replace fail with
-    // winerror 5. We are replacing the target right now, so clear the
-    // attribute first; the replacement itself carries the final mode. Only
-    // the destination is touched — never a file we merely read.
     #[cfg(windows)]
     windows_clear_readonly(path);
     let mut rename_attempts: u64 = 0;
@@ -389,9 +320,8 @@ pub(crate) fn atomic_write_expecting(
         match std::fs::rename(&temp_path, path) {
             Ok(()) => break,
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && rename_attempts < 3 => {
-                // Windows: antivirus/indexer can hold a fresh file briefly;
-                // retry. Clearing readonly again covers the attribute having
-                // been re-applied by another writer mid-window.
+                // Windows: antivirus or an indexer can hold a fresh file
+                // briefly; retry with a growing delay.
                 #[cfg(windows)]
                 windows_clear_readonly(path);
                 rename_attempts += 1;
@@ -430,10 +360,6 @@ pub(crate) fn atomic_write_expecting(
 
     Ok(())
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -573,8 +499,6 @@ mod tests {
         drop(std::fs::remove_file(&path));
     }
 
-    /// Mark `path` readonly the platform-native way (unix mode bits, the
-    /// Windows readonly attribute) for the write-over-readonly test.
     fn mark_readonly(path: &Path) {
         #[cfg(unix)]
         {
@@ -594,12 +518,6 @@ mod tests {
         }
     }
 
-    /// QAL-09 platform case: an atomic write must be able to replace a file
-    /// that currently carries the readonly state. The final state asserts the
-    /// platform truth: unix derives the replacement mode from the existing
-    /// target (0o444 stays 0o444 — the recorded mode is honored); Windows has
-    /// no POSIX bits, the readonly attribute is cleared for the replacement
-    /// and the replacement itself is never readonly.
     #[test]
     fn atomic_write_replaces_readonly_target_with_platform_correct_mode() {
         let path = unique_scratch("atomic-ro");
@@ -626,7 +544,6 @@ mod tests {
                 "windows replacement never carries the readonly attribute"
             );
         }
-        // Restore writability so cleanup can delete the file.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -636,9 +553,6 @@ mod tests {
         drop(std::fs::remove_file(&path));
     }
 
-    /// Files this crate creates are always owner-writable: unix lands
-    /// owner-only `0o600`, Windows never sets the readonly attribute. This is
-    /// the invariant that keeps every later rename-over/delete working.
     #[test]
     fn atomic_write_new_file_is_never_readonly() {
         let path = unique_scratch("atomic-fresh-mode");
@@ -657,35 +571,28 @@ mod tests {
         drop(std::fs::remove_file(&path));
     }
 
-    // ---- QAL-06 fault-injection helpers (test-only) ----
-
-    /// Test injector that either fails at one point or sabotages the
-    /// filesystem at one point, so the later pipeline phases run against the
-    /// sabotaged on-disk state.
     #[derive(Debug)]
     struct Sabotage {
-        /// The pipeline point the sabotage fires at.
         at: Point,
-        /// What happens when it fires.
         action: SabotageAction,
     }
 
     #[derive(Debug)]
     enum SabotageAction {
-        /// Return an injected error at the point.
         Fail,
-        /// chmod the parent directory to read-denied (0o333). Unix-only
-        /// premise (chmod modes); only unix-gated tests construct it.
         #[cfg(unix)]
-        DenyParentRead { parent: PathBuf },
-        /// chmod the parent directory to write-denied (0o555). Unix-only
-        /// premise (chmod modes); only unix-gated tests construct it.
+        DenyParentRead {
+            parent: PathBuf,
+        },
         #[cfg(unix)]
-        DenyParentWrite { parent: PathBuf },
-        /// Remove the landed file and its parent directory.
-        VanishParent { file: PathBuf, parent: PathBuf },
-        /// Replace the parent directory with a symlink loop. Unix-only
-        /// premise (symlinks); only unix-gated tests construct it.
+        DenyParentWrite {
+            parent: PathBuf,
+        },
+        VanishParent {
+            file: PathBuf,
+            parent: PathBuf,
+        },
+        /// Replace the parent directory with a symlink loop (ELOOP).
         #[cfg(unix)]
         LoopParent {
             file: PathBuf,
@@ -729,7 +636,6 @@ mod tests {
         }
     }
 
-    /// chmod `dir` to `mode` (unix; a no-op elsewhere).
     #[cfg(unix)]
     fn set_dir_mode(dir: &Path, mode: u32) {
         use std::os::unix::fs::PermissionsExt;
@@ -739,14 +645,11 @@ mod tests {
         ));
     }
 
-    /// Remove `file` and then its (now empty) parent directory.
     fn remove_file_and_dir(file: &Path, parent: &Path) {
         drop(std::fs::remove_file(file));
         drop(std::fs::remove_dir(parent));
     }
 
-    /// Remove `file` and its parent directory, then leave a symlink loop in
-    /// the parent's place so directory operations fail with ELOOP.
     #[cfg(unix)]
     fn replace_dir_with_symlink_loop(file: &Path, parent: &Path, helper: &Path) {
         remove_file_and_dir(file, parent);
@@ -754,9 +657,7 @@ mod tests {
         std::os::unix::fs::symlink(parent, helper).unwrap();
     }
 
-    /// Whether chmod 0o333 actually denies opening the directory for reading
-    /// for this process. Root bypasses permission checks; callers skip the
-    /// denial-dependent assertions when it does.
+    /// Root bypasses permission checks, so probe whether the chmod actually binds.
     #[cfg(unix)]
     fn perm_denies_dir_read(dir: &Path) -> bool {
         use std::os::unix::fs::PermissionsExt;
@@ -772,8 +673,7 @@ mod tests {
         denied
     }
 
-    /// Whether chmod 0o555 actually denies creating files in the directory
-    /// for this process (root bypasses permission checks).
+    /// Root bypasses permission checks, so probe whether the chmod actually binds.
     #[cfg(unix)]
     fn perm_denies_dir_write(dir: &Path) -> bool {
         use std::os::unix::fs::PermissionsExt;
@@ -791,29 +691,13 @@ mod tests {
         denied
     }
 
-    /// Watchdog bound for calls into the rename-retry loop: the real code
-    /// exhausts its three bounded retries in 10+20+30 = 60ms of sleeps, so
-    /// 5s leaves ~80x headroom over real completion (loaded CI runners
-    /// stretch the pipeline by tens of milliseconds, not seconds) while
-    /// sitting far below cargo-mutants' 30s scenario timeout
-    /// (`minimum_test_timeout`). A non-terminating retry loop therefore
-    /// fails the calling test at ~5s as an ordinary failure instead of
-    /// hanging the suite into the scenario timeout — cargo-mutants scores
-    /// a timed-out mutant as caught but still exits 3 ("tests timed out",
-    /// mutants.rs/exit-codes.html), which fails CI.
+    /// 5s watchdog: the real retries exhaust in 60ms of sleeps, and this
+    /// stays under cargo-mutants' 30s scenario timeout.
     #[cfg(unix)]
     const RENAME_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(5);
 
-    /// Run `op` — a call into the rename-retry loop against a permanently
-    /// write-denied `parent` — on a helper thread and demand its result
-    /// within `RENAME_WATCHDOG`; the real loop exhausts its bounded
-    /// retries and returns in milliseconds, while a mutated loop that
-    /// never terminates sends nothing and fails the calling test fast. On
-    /// the failure paths the parent's write mode is restored FIRST so the
-    /// abandoned retry's next rename succeeds and the helper thread runs
-    /// to completion instead of spinning (or sleeping forever) for the
-    /// rest of the process; only the scratch directory is leaked, and only
-    /// for the remainder of the already-failing test process.
+    /// Run `op` on a helper thread under the watchdog so a non-terminating
+    /// retry mutant fails fast; on timeout the parent is made writable again.
     #[cfg(unix)]
     fn with_rename_watchdog<T: Send + 'static>(
         parent: &Path,
@@ -841,10 +725,6 @@ mod tests {
         }
     }
 
-    // ---- Behaviour tests for the mutation-testing gate ----
-
-    /// An expectation digest that matches the current file must let the
-    /// write through: optimistic concurrency succeeds when nothing changed.
     #[test]
     fn atomic_write_succeeds_when_digest_expectation_matches_unchanged_file() {
         let path = unique_scratch("atomic-digest-ok");
@@ -858,8 +738,6 @@ mod tests {
         drop(std::fs::remove_file(&path));
     }
 
-    /// The write itself creates missing parent directories, so a target in
-    /// not-yet-existing nested directories lands successfully.
     #[test]
     fn atomic_write_creates_missing_parent_directories() {
         let root = crate::test_util::temp_dir_unique("config-atomic-parents");
@@ -869,9 +747,6 @@ mod tests {
         drop(std::fs::remove_dir_all(&root));
     }
 
-    /// A directory target is rejected up front with an `InvalidInput` io
-    /// error (not some later filesystem error from trying to treat it as a
-    /// file).
     #[test]
     fn atomic_write_rejects_directory_with_invalid_input() {
         let dir = crate::test_util::temp_dir_unique("config-atomic-dir");
@@ -887,8 +762,6 @@ mod tests {
         drop(std::fs::remove_dir(&dir));
     }
 
-    /// Replacing an existing file derives the replacement's permission bits
-    /// from the current target: 0o644 in, 0o644 out.
     #[cfg(unix)]
     #[test]
     fn atomic_write_preserves_existing_target_mode() {
@@ -905,8 +778,6 @@ mod tests {
         drop(std::fs::remove_file(&path));
     }
 
-    /// A target that cannot be read at all surfaces an io error instead of
-    /// being silently treated as absent.
     #[cfg(unix)]
     #[test]
     fn atomic_write_reports_io_error_when_target_becomes_unreadable() {
@@ -928,10 +799,6 @@ mod tests {
         drop(std::fs::remove_file(&path));
     }
 
-    /// The temp file name embeds a current epoch-millis value and a compact
-    /// four-hex-char random suffix; both are part of the collision-avoidance
-    /// contract. A failed temp write leaves the temp behind, so the name is
-    /// observable.
     #[test]
     fn lingering_temp_name_carries_recent_millis_and_compact_hex_suffix() {
         let path = unique_scratch("atomic-tempname");
@@ -984,10 +851,6 @@ mod tests {
         drop(std::fs::remove_dir_all(&parent));
     }
 
-    /// The parent-directory sync after the rename tolerates an EACCES on
-    /// opening the parent (Windows opens directories without backup
-    /// semantics); the write as a whole still succeeds and the content is
-    /// readable back.
     #[cfg(unix)]
     #[test]
     fn sync_parent_tolerates_permission_denied_on_parent_open() {
@@ -1016,10 +879,6 @@ mod tests {
         drop(std::fs::remove_dir_all(&parent));
     }
 
-    /// The parent-directory sync tolerates the parent disappearing entirely
-    /// (the replacement itself already landed and was synced): the loss is
-    /// only noticed later, by the read-back of the landed file — reported
-    /// against the file path, never against the parent.
     #[test]
     fn sync_parent_tolerates_vanishing_parent() {
         let path = unique_scratch("atomic-sync-enoent");
@@ -1049,9 +908,6 @@ mod tests {
         assert!(!parent.exists());
     }
 
-    /// A parent-open error that is neither `PermissionDenied` nor `NotFound` is
-    /// surfaced as an io error reported against the parent path (here a
-    /// symlink loop, ELOOP).
     #[cfg(unix)]
     #[test]
     fn sync_parent_surfaces_other_parent_open_errors() {
@@ -1095,34 +951,8 @@ mod tests {
         drop(std::fs::remove_dir(&root));
     }
 
-    /// A rename that fails with `PermissionDenied` is retried on a GROWING
-    /// backoff (`10 * attempt` ms), so a denial that never clears must burn
-    /// the full budget — 10 + 20 + 30 = 60ms of sleeps — before the error
-    /// surfaces. A shrinking schedule such as `10 / attempt` (10 + 5 + 3 =
-    /// 18ms) gives up almost immediately, and a retry loop that never
-    /// retries measures no backoff at all.
-    ///
-    /// Timing-robust discriminator, replacing the earlier 20ms-restorer
-    /// race: loaded CI runners routinely spend more than 20ms on the write
-    /// pipeline before the first rename attempt, so the denial sometimes
-    /// cleared before any attempt and the shrinking-schedule mutant escaped
-    /// (missed on CI run 34895207523). Instead, the denied write is paired
-    /// with a CONTROL write that runs the identical pipeline (temp create,
-    /// write, flush, fsync, mode apply, digest recheck) and fails at the
-    /// very same `Point::AtomicReplace` via an injected error — zero
-    /// retries, zero sleeps. The minimum elapsed over several rounds whose
-    /// measurement order alternates converges both sides to the machine's
-    /// best-case setup, so fsync/scheduler jitter cancels in the
-    /// difference and only the sleep schedule remains. The 40ms threshold
-    /// sits at the midpoint of the 60ms vs 18ms totals: the real code has
-    /// a hard 20ms slack (a sleep never returns early, so its difference
-    /// is always at least 60ms), while the shrinking mutant would need
-    /// more than 22ms of cumulative sleep overshoot in its single best
-    /// round to cross the threshold. Retry-loop mutants that never
-    /// terminate (`guard -> true`, `&& -> ||`, `+= -> *=`) are failed fast
-    /// by the `with_rename_watchdog` wrapper rather than hanging into the
-    /// cargo-mutants scenario timeout, and `-=` panics on the u64
-    /// underflow inside the watched thread, surfacing as a missing result.
+    /// Pair the denied run with a control failing at `AtomicReplace` and take
+    /// alternating minima: the 40ms floor separates real backoff from jitter.
     #[cfg(unix)]
     #[test]
     fn atomic_write_rename_retry_backoff_spends_the_full_delay_budget() {
@@ -1143,8 +973,8 @@ mod tests {
         }
         drop(std::fs::remove_dir_all(&probe_parent));
 
-        // Control measurement: identical pipeline, injected failure exactly
-        // at the point the retry loop starts — no rename attempts, no sleeps.
+        // Control measurement: injected failure exactly at the point the retry
+        // loop starts: no rename attempts, no sleeps.
         let run_control = |round: usize| {
             let path = unique_scratch(&format!("atomic-backoff-ctrl-{round}"));
             let parent = path.parent().unwrap().to_path_buf();
@@ -1168,10 +998,8 @@ mod tests {
             drop(std::fs::remove_dir_all(&parent));
             elapsed
         };
-        // Denied measurement: the rename itself fails with PermissionDenied
-        // and every retry sleeps the backoff delay before the final error.
-        // The call runs under the rename watchdog so a non-terminating
-        // retry mutant fails this test fast instead of hanging the suite.
+        // The rename itself is denied and every retry sleeps the backoff; the
+        // watchdog keeps a runaway mutant from hanging the suite.
         let run_denied = |round: usize| {
             let path = unique_scratch(&format!("atomic-backoff-denied-{round}"));
             let parent = path.parent().unwrap().to_path_buf();
@@ -1212,9 +1040,8 @@ mod tests {
         let mut best_control = Duration::MAX;
         let mut best_denied = Duration::MAX;
         for round in 0..ROUNDS {
-            // Alternating order cancels any run-first-of-the-round bias
-            // (cold caches, journal contention) that a fixed order would
-            // hand to one side's minimum.
+            // Alternating order cancels first-run bias (cold caches, journal
+            // contention) a fixed order would hand to one minimum.
             let (control, denied) = if round % 2 == 0 {
                 let control = run_control(round);
                 let denied = run_denied(round);
@@ -1240,10 +1067,6 @@ mod tests {
         );
     }
 
-    /// A rename denial that never clears is reported as an io
-    /// `PermissionDenied` error, and the target never appears. The call
-    /// runs under the rename watchdog so a non-terminating retry mutant
-    /// fails this test fast instead of hanging the suite.
     #[cfg(unix)]
     #[test]
     fn atomic_write_reports_permanent_rename_permission_error() {
@@ -1286,22 +1109,6 @@ mod tests {
         drop(std::fs::remove_dir_all(&parent));
     }
 
-    /// The rename-retry loop must TERMINATE: a `PermissionDenied` rename
-    /// that never clears exhausts its bounded retries (three) and surfaces
-    /// the io error — never spin forever. Three loop mutants (guard ->
-    /// `true`, `&&` -> `||`, `+=` -> `*=`) make the retry unconditional;
-    /// those used to hang the whole suite until cargo-mutants' 30s
-    /// scenario timeout, which scores the mutant as caught but still makes
-    /// the run exit 3 (mutants.rs/exit-codes.html: "tests timed out"),
-    /// failing CI. This dedicated watchdog asserts the loop's termination
-    /// contract end to end: the write's result must arrive within
-    /// `RENAME_WATCHDOG` AND carry the `PermissionDenied` rename error.
-    /// The earlier permanent-denial tests run under the same
-    /// `with_rename_watchdog` helper, so every suite path that enters the
-    /// retry loop terminates: real code after ~60ms of backoff sleeps
-    /// (~80x inside the 5s bound; loaded CI runners stretch the pipeline
-    /// by tens of milliseconds, not seconds), a non-terminating mutant as
-    /// a fast test failure at ~5s.
     #[cfg(unix)]
     #[test]
     fn atomic_write_rename_retry_loop_terminates() {

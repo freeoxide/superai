@@ -1,15 +1,7 @@
-//! `OpenCode` adapter — JSONC layered config with relocated-root and inline overrides.
-//!
-//! Research source: `docs/harness-configs/opencode.md` (last verified 2026-08-25).
-//! Executable `opencode`, config root `~/.config/opencode` or `$XDG_CONFIG_HOME/opencode`,
-//! primary writable surface `opencode.json` / `opencode.jsonc` (JSONC, layered),
-//! isolation `relocated-root` via `XDG_CONFIG_HOME` plus `OPENCODE_CONFIG` / `OPENCODE_CONFIG_CONTENT`.
+//! `OpenCode` adapter: layered JSONC `opencode.json`/`.jsonc`, relocated via
+//! `XDG_CONFIG_HOME` plus `OPENCODE_CONFIG`/`OPENCODE_CONFIG_CONTENT` overrides.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
 
 use crate::adapter::{
     ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
@@ -22,10 +14,6 @@ use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence, Isolation};
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
 
 /// Harness identifier for `OpenCode`.
 pub const HARNESS_ID_STR: &str = "opencode";
@@ -63,10 +51,8 @@ pub const LAST_VERIFIED: &str = "2026-08-25";
 /// Schema version for current config shape.
 pub const SCHEMA_VERSION_STR: &str = "1";
 
-/// Owned selectors for provider/model mutation inside `opencode.json` (JSONC).
-///
-/// These are top-level keys superai owns; everything else round-trips untouched
-/// via `superai-config::jsonc`.
+/// Owned top-level keys inside `opencode.json`; everything else round-trips
+/// untouched via `superai-config::jsonc`.
 pub const OWNED_SELECTORS: &[&str] = &[
     "model",
     "small_model",
@@ -80,16 +66,8 @@ pub const OWNED_SELECTORS: &[&str] = &[
     "agent",
 ];
 
-// ---------------------------------------------------------------------------
-// Adapter struct
-// ---------------------------------------------------------------------------
-
-/// Concrete adapter for `OpenCode`.
-///
-/// Isolation is `relocated-root` via `XDG_CONFIG_HOME` (full) plus
-/// `OPENCODE_CONFIG` (file) and `OPENCODE_CONFIG_CONTENT` (inline) for
-/// lighter layering. The wrapper sets `XDG_CONFIG_HOME` to the instance
-/// `config_root` and `OPENCODE_CONFIG` to `<root>/opencode.json`.
+/// Concrete adapter for `OpenCode`: `relocated-root` via `XDG_CONFIG_HOME`
+/// plus `OPENCODE_CONFIG` (file) and `OPENCODE_CONFIG_CONTENT` (inline).
 #[derive(Debug, Clone)]
 pub struct OpenCodeAdapter {
     id: HarnessId,
@@ -127,107 +105,6 @@ impl OpenCodeAdapter {
         INLINE_CONFIG_ENV_VAR
     }
 
-    /// Try to locate the `opencode` binary via `PATH`.
-    #[expect(clippy::unused_self, reason = "adapter method uses instance constants")]
-    #[expect(clippy::excessive_nesting, reason = "PATH scan branches are explicit")]
-    fn find_binary_in_path(&self) -> Option<PathBuf> {
-        let path_var = std::env::var("PATH").ok()?;
-        let separator = if cfg!(windows) { ';' } else { ':' };
-        for dir in path_var.split(separator) {
-            if dir.is_empty() {
-                continue;
-            }
-            let candidate = Path::new(dir).join(EXECUTABLE);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-            if cfg!(windows) {
-                let exe_candidate = Path::new(dir).join(format!("{EXECUTABLE}.exe"));
-                if exe_candidate.is_file() {
-                    return Some(exe_candidate);
-                }
-            }
-        }
-        None
-    }
-
-    /// Probe `opencode --version` with a timeout, returning the parsed version string if successful.
-    fn probe_version(binary: &Path) -> Option<String> {
-        let binary_owned = binary.to_path_buf();
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let output = Command::new(&binary_owned)
-                .arg("--version")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output();
-            drop(tx.send(output));
-        });
-        let Ok(Ok(output)) = rx.recv_timeout(Duration::from_secs(2)) else {
-            return None;
-        };
-        if !output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
-            return None;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let combined = if stdout.trim().is_empty() {
-            stderr.into_owned()
-        } else if stderr.trim().is_empty() {
-            stdout.into_owned()
-        } else {
-            format!("{stdout} {stderr}")
-        };
-        Self::parse_version_output(&combined)
-    }
-
-    /// Parse version output like `opencode 0.12.0` or `opencode-ai 1.0.0` into `1.0.0`.
-    #[expect(
-        clippy::excessive_nesting,
-        reason = "version parsing branches are explicit"
-    )]
-    fn parse_version_output(output: &str) -> Option<String> {
-        let trimmed = output.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        for token in trimmed.split_whitespace() {
-            let mut candidate = token;
-            if let Some(stripped) = candidate.strip_prefix('v') {
-                candidate = stripped;
-            } else if let Some(stripped) = candidate.strip_prefix('V') {
-                candidate = stripped;
-            }
-            let cleaned = candidate.trim_matches(|c: char| c == ',' || c == ')' || c == '(');
-            if cleaned.is_empty() {
-                continue;
-            }
-            let has_dot = cleaned.contains('.');
-            let starts_digit = cleaned.chars().next().is_some_and(|c| c.is_ascii_digit());
-            if has_dot && starts_digit {
-                let is_version_like = cleaned
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+');
-                if is_version_like {
-                    return Some(cleaned.to_owned());
-                }
-                let mut version_part = String::new();
-                for ch in cleaned.chars() {
-                    if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '+' {
-                        version_part.push(ch);
-                    } else {
-                        break;
-                    }
-                }
-                if version_part.contains('.') && !version_part.is_empty() {
-                    return Some(version_part);
-                }
-            }
-        }
-        None
-    }
-
-    /// Resolve the default global config root: `$XDG_CONFIG_HOME/opencode` or `~/.config/opencode`.
     fn default_config_root() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var(CONFIG_ENV_VAR)
             && !dir.trim().is_empty()
@@ -240,30 +117,17 @@ impl OpenCodeAdapter {
         if home.trim().is_empty() {
             return None;
         }
-        // Also respect XDG_CONFIG_HOME if set but not via CONFIG_ENV_VAR? CONFIG_ENV_VAR is XDG_CONFIG_HOME.
-        // Fallback to HOME/.config/opencode.
         Some(PathBuf::from(home).join(".config").join("opencode"))
     }
 
-    /// Check if default config root exists on disk.
-    #[expect(clippy::unused_self, reason = "adapter helper")]
-    #[expect(dead_code, reason = "helper for future use")]
-    fn default_config_root_exists(&self) -> Option<PathBuf> {
-        let root = Self::default_config_root()?;
-        if root.exists() { Some(root) } else { None }
-    }
-
-    /// Build the opencode.json path for a given config root.
     fn config_path_for_root(root: &Path) -> PathBuf {
         root.join("opencode.json")
     }
 
-    /// Build the tui.json path for a given config root.
     fn tui_path_for_root(root: &Path) -> PathBuf {
         root.join("tui.json")
     }
 
-    /// Build detection evidence about `OpenCode` config layers.
     #[expect(
         clippy::excessive_nesting,
         reason = "detection branches are explicit for evidence"
@@ -307,7 +171,6 @@ impl OpenCodeAdapter {
                 evidence.push("could not resolve default config root (no HOME)".to_owned());
             }
         }
-        // Custom config env layer.
         if let Ok(custom) = std::env::var(CUSTOM_CONFIG_ENV_VAR)
             && !custom.trim().is_empty()
         {
@@ -334,7 +197,6 @@ impl OpenCodeAdapter {
                 inline.len()
             ));
         }
-        // Project opencode.json heuristic.
         let proj = Path::new("opencode.json");
         let proj_jc = Path::new("opencode.jsonc");
         if proj.exists() {
@@ -345,7 +207,6 @@ impl OpenCodeAdapter {
                 proj_jc.display()
             ));
         }
-        // Extra config dir.
         if let Ok(extra) = std::env::var(CONFIG_DIR_ENV_VAR)
             && !extra.trim().is_empty()
         {
@@ -354,7 +215,6 @@ impl OpenCodeAdapter {
     }
 }
 
-/// Resolve auth.json path: `~/.local/share/opencode/auth.json` or `$XDG_DATA_HOME/opencode/auth.json`.
 fn dirs_auth_path() -> Option<PathBuf> {
     if let Ok(xdg) = std::env::var("XDG_DATA_HOME")
         && !xdg.trim().is_empty()
@@ -422,14 +282,14 @@ impl Adapter for OpenCodeAdapter {
         let mut version: Option<String> = None;
         let mut binary_path: Option<PathBuf> = None;
 
-        match self.find_binary_in_path() {
+        match super::find_in_path(&[EXECUTABLE]) {
             Some(path) => {
                 evidence.push(format!(
                     "found binary `{}` at {}",
                     EXECUTABLE,
                     path.display()
                 ));
-                match Self::probe_version(&path) {
+                match super::probe_version(&path) {
                     Some(v) => {
                         evidence.push(format!("version `{v}` via `{EXECUTABLE} --version`"));
                         version = Some(v);
@@ -455,20 +315,11 @@ impl Adapter for OpenCodeAdapter {
             (None, _) => InstallPresence::Absent,
         };
 
-        let confidence = match (
-            &binary_path,
-            &version,
-            evidence.iter().any(|e| e.contains("config root exists")),
-        ) {
-            (Some(_), None, _) => DetectionConfidence::Medium,
-            (None, _, true) => DetectionConfidence::Low,
-            (Some(_), Some(_), _) | (None, _, false) => DetectionConfidence::High,
-        };
-
-        let confidence = if present == InstallPresence::Absent {
-            DetectionConfidence::High
-        } else {
-            confidence
+        // Absent forces High, so the Low "config root exists" arm can never
+        // survive.
+        let confidence = match (&binary_path, &version) {
+            (Some(_), None) => DetectionConfidence::Medium,
+            (Some(_), Some(_)) | (None, _) => DetectionConfidence::High,
         };
 
         DetectionResult::new(present, version, evidence, confidence)
@@ -495,7 +346,6 @@ impl Adapter for OpenCodeAdapter {
     fn config_surfaces(&self) -> Vec<ConfigSurface> {
         let mut surfaces = Vec::new();
 
-        // Primary writable surface: global opencode.json / opencode.jsonc (JSONC, layered).
         let opencode_resolver = PathResolver::new(
             Some("$XDG_CONFIG_HOME/opencode/opencode.json"),
             Some("$XDG_CONFIG_HOME/opencode/opencode.json"),
@@ -516,7 +366,6 @@ impl Adapter for OpenCodeAdapter {
         opencode_surface.restart_behavior = RestartBehavior::Reload;
         surfaces.push(opencode_surface);
 
-        // JSONC variant — same shape but explicit .jsonc extension for resolvers.
         let opencode_jc_resolver = PathResolver::new(
             Some("$XDG_CONFIG_HOME/opencode/opencode.jsonc"),
             Some("$XDG_CONFIG_HOME/opencode/opencode.jsonc"),
@@ -537,7 +386,6 @@ impl Adapter for OpenCodeAdapter {
         opencode_jc_surface.restart_behavior = RestartBehavior::Reload;
         surfaces.push(opencode_jc_surface);
 
-        // TUI config: tui.json / tui.jsonc
         let tui_resolver = PathResolver::new(
             Some("$XDG_CONFIG_HOME/opencode/tui.json"),
             Some("$XDG_CONFIG_HOME/opencode/tui.json"),
@@ -555,7 +403,6 @@ impl Adapter for OpenCodeAdapter {
         tui_surface.backup_required = true;
         surfaces.push(tui_surface);
 
-        // Auth surface: ~/.local/share/opencode/auth.json — external secret store.
         let auth_resolver = PathResolver::new(
             Some("$XDG_DATA_HOME/opencode/auth.json"),
             Some("$XDG_DATA_HOME/opencode/auth.json"),
@@ -574,7 +421,6 @@ impl Adapter for OpenCodeAdapter {
         auth.restart_behavior = RestartBehavior::ReLogin;
         surfaces.push(auth);
 
-        // Project-local opencode.json — workspace scope, layered after global.
         let project_resolver = PathResolver::fallback_only(
             "opencode.json in cwd or nearest git root (also opencode.jsonc)",
         );
@@ -590,7 +436,6 @@ impl Adapter for OpenCodeAdapter {
         project_surface.backup_required = true;
         surfaces.push(project_surface);
 
-        // Custom config file via OPENCODE_CONFIG (explicit-config).
         let custom_resolver = PathResolver::new(
             Some("$OPENCODE_CONFIG"),
             Some("$OPENCODE_CONFIG"),
@@ -609,7 +454,6 @@ impl Adapter for OpenCodeAdapter {
         custom_surface.backup_required = true;
         surfaces.push(custom_surface);
 
-        // Inline JSON via OPENCODE_CONFIG_CONTENT (session inline, highest).
         let inline_resolver = PathResolver::fallback_only("$OPENCODE_CONFIG_CONTENT (inline JSON)");
         let mut inline_surface = ConfigSurface::new(
             "OPENCODE_CONFIG_CONTENT",
@@ -713,8 +557,8 @@ impl Adapter for OpenCodeAdapter {
             | Isolation::ExplicitConfig
             | Isolation::EnvOnly
             | Isolation::Unknown => {
-                // HAD-03: surface content present under the instance root must
-                // satisfy the declared root shapes / owned-key rules.
+                // Surface content under the instance root must satisfy the
+                // declared root shapes and owned-key rules.
                 crate::adapter::validate_instance_surfaces(self, instance.config_root.as_path())
             }
             other => Err(CoreError::Validation {
@@ -725,9 +569,8 @@ impl Adapter for OpenCodeAdapter {
     }
 
     fn surface_schema(&self, surface_id: &str) -> Option<SurfaceSchema> {
-        // HAD-03: types per the schema top-level keys table in
-        // docs/harness-configs/opencode.md §1. `model` is omitted on purpose:
-        // the documented example uses a string, but model-object forms exist.
+        // `model` is deliberately untyped: the docs show a string but
+        // model-object forms exist too (opencode.md §1).
         match surface_id {
             "opencode.json" | "opencode.jsonc" | "project opencode.json" => Some(
                 SurfaceSchema::new()
@@ -776,7 +619,6 @@ impl Adapter for OpenCodeAdapter {
         ]
     }
 
-    /// EXT-08/09: MCP destination (opencode.md mcp servers: top-level `mcp` object in opencode.json JSONC)
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(crate::adapter::McpAdapterDecl::new(
             "opencode.json",
@@ -787,7 +629,7 @@ impl Adapter for OpenCodeAdapter {
         ).with_read_only("jsonc writes refuse (LossyWrite) until a preserving codec exists; inspect/diff only"))
     }
 
-    /// EXT-06/07: plugin mechanism (opencode.md: npm `plugin` list plus files in `.opencode/plugins/` or `~/.config/opencode/plugins/`)
+    /// npm `plugin` list entries plus files in `.opencode/plugins/` or `~/.config/opencode/plugins/`.
     fn plugin_decl(&self) -> Option<crate::adapter::PluginAdapterDecl> {
         Some(crate::adapter::PluginAdapterDecl::directory_bundle(
             "plugins",
@@ -911,7 +753,7 @@ mod tests {
             ("not a version", None),
         ];
         for (input, expected) in cases {
-            let got = super::OpenCodeAdapter::parse_version_output(input);
+            let got = crate::adapters::parse_version_output(input);
             assert_eq!(got.as_deref(), expected, "input: {input:?}");
         }
     }
@@ -1145,10 +987,6 @@ mod tests {
         assert!(resolver.linux.as_deref().unwrap().contains(CONFIG_ENV_VAR));
     }
 
-    // -----------------------------------------------------------------------
-    // Fixture-backed conformance tests
-    // -----------------------------------------------------------------------
-
     fn fixtures_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/opencode")
     }
@@ -1171,7 +1009,6 @@ mod tests {
         let path = fixture_path("opencode.minimal.json");
         assert!(path.exists(), "fixture missing: {}", path.display());
         let map = superai_config::jsonc::load(&path).unwrap();
-        // Minimal may be empty or contain only $schema.
         assert!(map.is_empty() || map.contains_key("$schema"));
     }
 
@@ -1336,7 +1173,7 @@ mod tests {
 
     #[test]
     fn diff_redaction_does_not_leak_secrets() {
-        use crate::operation::RedactedString as OpRedacted;
+        use crate::error::RedactedString as OpRedacted;
         let secret = OpRedacted::new("super-secret-key");
         let diff_text = format!("set api key to {secret}");
         assert!(!diff_text.contains("super-secret-key"));
@@ -1419,10 +1256,6 @@ mod tests {
         assert!(!boxed.config_surfaces().is_empty());
         assert!(!boxed.plan_mirror_exclusions().is_empty());
     }
-
-    // -------------------------------------------------------------------
-    // HAD-03 surface schema
-    // -------------------------------------------------------------------
 
     #[test]
     fn surface_schema_declares_object_root_and_typed_maps() {

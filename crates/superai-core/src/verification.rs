@@ -1,9 +1,6 @@
-//! Verification harness for plan 13 gates: fixture loading, secret-free checks, platform gates.
-//!
-//! Interface-neutral, no GPUI types. Every check reads fresh from disk and
-//! preserves unmodelled keys. Helpers are deterministic and parallel-safe.
+//! Verification harness for plan 13 gates: fixtures, secret-free checks,
+//! platform gates; fresh reads, deterministic and parallel-safe helpers.
 
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use superai_config::document::{Diagnostic, DocumentKind, SourceDocument};
@@ -11,10 +8,6 @@ use superai_config::raw_editor::{find_redaction_spans, validate};
 
 use crate::adapter::{Adapter, Arch, Os, Platform};
 use crate::harness_catalog;
-
-// ---------------------------------------------------------------------------
-// Secret-free logic
-// ---------------------------------------------------------------------------
 
 /// Markers that indicate a credential is intentionally fake and allowed in fixtures.
 const FAKE_MARKERS: &[&str] = &[
@@ -39,12 +32,8 @@ fn contains_fake_marker(value: &str) -> bool {
         .any(|m| lower.contains(&m.to_ascii_lowercase()))
 }
 
-/// Whether `text` contains a real-looking secret value.
-///
-/// Scans via `find_redaction_spans`; a span is considered real only when the
-/// extracted value does not contain any `FAKE_MARKERS`. Binary or empty is
-/// considered secret-free. Case-insensitive key detection is delegated to the
-/// raw editor's redaction logic.
+/// Whether `text` contains a real-looking secret: a redaction span whose
+/// value carries no `FAKE_MARKERS`; binary/empty counts as secret-free.
 #[expect(clippy::manual_let_else, reason = "explicit match clearer")]
 pub fn contains_real_secret(content: &[u8], kind: DocumentKind) -> bool {
     let spans = find_redaction_spans(content, kind);
@@ -59,19 +48,17 @@ pub fn contains_real_secret(content: &[u8], kind: DocumentKind) -> bool {
         let Some(slice) = text.get(span.start..span.end) else {
             continue;
         };
-        // Trim quotes and whitespace for marker check
         let trimmed = slice.trim().trim_matches('"').trim_matches('\'').trim();
-        if !contains_fake_marker(trimmed) && !trimmed.is_empty() {
-            // Value looks real: no fake marker, non-empty secret-bearing span
-            // Distinguish obviously short placeholder like "" or "x"
-            if trimmed.len() >= 4 && !is_obviously_fake(trimmed) {
-                return true;
-            }
-            // Even short non-fake could be real in fixtures — be conservative
-            // but allow empty/redacted placeholders
-            if !trimmed.eq_ignore_ascii_case("[REDACTED]") && trimmed.len() > 2 {
-                return true;
-            }
+        if trimmed.is_empty() || contains_fake_marker(trimmed) {
+            continue;
+        }
+        if trimmed.len() >= 4 && !is_obviously_fake(trimmed) {
+            return true;
+        }
+        // Short non-fake values can still be real; only the placeholder form
+        // is excused.
+        if !trimmed.eq_ignore_ascii_case("[REDACTED]") && trimmed.len() > 2 {
+            return true;
         }
     }
     false
@@ -86,22 +73,6 @@ fn is_obviously_fake(value: &str) -> bool {
 pub fn is_secret_free_content(content: &[u8], kind: DocumentKind) -> bool {
     !contains_real_secret(content, kind)
 }
-
-/// Whether `content` is secret-free when treated as UTF-8 string.
-/// Wrapper for text-only checks.
-pub fn is_secret_free_str(text: &str) -> bool {
-    // Heuristic: try each kind; if any considers it secret-free, pass.
-    // For str we default to StrictJson scanning which covers json-like secrets.
-    let bytes = text.as_bytes();
-    // Check via generic scan (Env kind widest)
-    !contains_real_secret(bytes, DocumentKind::StrictJson)
-        && !contains_real_secret(bytes, DocumentKind::Env)
-        && !contains_real_secret(bytes, DocumentKind::Yaml)
-}
-
-// ---------------------------------------------------------------------------
-// Fixture loading and verification
-// ---------------------------------------------------------------------------
 
 /// Outcome of checking a single fixture file.
 #[expect(
@@ -158,10 +129,9 @@ pub fn verify_fixture_file(path: &Path) -> FixtureOutcome {
     };
     let diagnostics = validate(&bytes, kind);
     let secret_free = is_secret_free_content(&bytes, kind);
-    // For text kind, also ensure UTF-8 validity via SourceDocument diagnostics
+    // SourceDocument adds encoding diagnostics the plain validator misses.
     let source = SourceDocument::from_bytes(path, bytes);
     let mut all_diagnostics = diagnostics;
-    // Merge encoding diagnostics if any and not already present
     for d in &source.diagnostics {
         if !all_diagnostics.contains(d) {
             all_diagnostics.push(d.clone());
@@ -177,14 +147,6 @@ pub fn verify_fixture_file(path: &Path) -> FixtureOutcome {
         secret_free,
         expected_valid,
     }
-}
-
-/// Load a fixture fresh from disk as `SourceDocument`.
-///
-/// Returns `Err` for missing file; empty file yields `Ok` with zero bytes.
-/// Diagnostics are included in the returned `SourceDocument`.
-pub fn load_fixture(path: &Path) -> Result<SourceDocument, superai_config::ConfigError> {
-    SourceDocument::load(path)
 }
 
 /// Verify all fixtures recursively under `dir`.
@@ -252,10 +214,6 @@ pub fn fixture_report(dir: &Path) -> FixtureReport {
         malformed_count,
     }
 }
-
-// ---------------------------------------------------------------------------
-// Platform gates (QAL-08/09)
-// ---------------------------------------------------------------------------
 
 /// Verdict for a platform gate check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -348,7 +306,6 @@ pub fn platform_gate_for_adapter(adapter: &dyn Adapter) -> PlatformGate {
     } else {
         format!("current {current} not in supported list {supported:?}")
     };
-    // Constrained could be refined per-adapter, but generic check is Supported/Unsupported
     PlatformGate {
         harness: adapter.id().to_string(),
         current,
@@ -361,8 +318,6 @@ pub fn platform_gate_for_adapter(adapter: &dyn Adapter) -> PlatformGate {
 pub fn catalog_platform_gates() -> Vec<PlatformGate> {
     let mut gates = Vec::new();
     for entry in harness_catalog::ENTRIES {
-        // Construct generic adapter for platform check; real adapters may override
-        // but generic covers ledger-level gate.
         let Ok(id) = crate::ids::HarnessId::new(entry.id) else {
             continue;
         };
@@ -381,17 +336,8 @@ pub fn catalog_platform_gates() -> Vec<PlatformGate> {
     gates
 }
 
-// ---------------------------------------------------------------------------
-// Ledger coverage helpers (QAL-13)
-// ---------------------------------------------------------------------------
-
-/// Whether every harness entry has a fixture directory (best-effort check).
-///
-/// Fixture dirs follow adapter module names: the catalog id with `-`
-/// replaced by `_` (`roo-code` -> `roo_code`), with the product-suffix
-/// variants (`-cli`, `-agent`, `-code`) also tried stripped (`junie-cli` ->
-/// `junie`, `kilo-code` -> `kilo`), matching the adapters' own
-/// `fixtures/<module>` references.
+/// Whether every harness entry has a fixture dir: the catalog id
+/// underscored (`roo_code`), raw, or product-suffix-stripped (`junie`).
 pub fn ledger_fixture_coverage(fixtures_root: &Path) -> Vec<(String, bool)> {
     let mut coverage = Vec::new();
     for entry in harness_catalog::ENTRIES {
@@ -411,57 +357,8 @@ pub fn ledger_fixture_coverage(fixtures_root: &Path) -> Vec<(String, bool)> {
     coverage
 }
 
-// ---------------------------------------------------------------------------
-// Isolated filesystem helper (QAL-01)
-// ---------------------------------------------------------------------------
-
-/// Create a unique temporary directory, parallel-safe (production helper).
-///
-/// Uses `std::env::temp_dir` plus a nanosecond timestamp, pid, and `prefix`.
-/// Returns the path; caller is responsible for cleanup. Platform path handling
-/// is explicit; no global `HOME` mutation is performed. Test code should
-/// prefer `crate::test_util::temp_dir_unique`, which also removes the
-/// directory on drop.
-pub fn unique_temp_dir(prefix: &str) -> PathBuf {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    let pid = std::process::id();
-    let dir = std::env::temp_dir().join(format!("superai-verification-{prefix}-{now}-{pid}"));
-    // Best-effort create; caller may check existence.
-    drop(std::fs::create_dir_all(&dir));
-    dir
-}
-
-/// Collect a set of obviously secret-bearing keys for scanning.
-/// Used by QAL-10 sentinel injection tests.
-pub fn secret_key_patterns() -> BTreeSet<String> {
-    let mut s = BTreeSet::new();
-    for k in &[
-        "api_key",
-        "apikey",
-        "secret",
-        "token",
-        "password",
-        "bearer",
-        "authorization",
-        "auth",
-    ] {
-        s.insert((*k).to_owned());
-    }
-    s
-}
-
-// ---------------------------------------------------------------------------
-// QAL-06/07 expansion: failure injection matrix + fake harness checklist
-// ---------------------------------------------------------------------------
-
-/// Required `FailurePoint` variants for the QAL-06 matrix.
-///
-/// The matrix covers every boundary in subplan 02 that must be injectable
-/// via `FailureInjector` (Real vs `TestInjector` at Nth call). This list is
-/// intentionally exhaustive; CI fails if `failure.rs` drops a variant.
+/// Required `FailurePoint` variants for the QAL-06 matrix; the list is
+/// intentionally exhaustive, CI fails if `failure.rs` drops one.
 pub fn required_failure_points() -> Vec<crate::failure::FailurePoint> {
     use crate::failure::FailurePoint;
     vec![
@@ -497,12 +394,8 @@ pub struct FailureMatrixReport {
     pub complete: bool,
 }
 
-/// Build the QAL-06 failure matrix report.
-///
-/// Surfaces per spec: single-file config, multi-file instance creation,
-/// template update, bulk skill/MCP, wrapper replace, daemon start via process
-/// fixtures. Each surface must have at least one test that injects a failure
-/// at a distinct boundary and asserts recovery/rollback.
+/// QAL-06 matrix report: each of the six surfaces must have at least one
+/// failure-injection test asserting recovery or rollback.
 pub fn failure_matrix_report() -> FailureMatrixReport {
     let required = required_failure_points();
     let surfaces = vec![
@@ -536,11 +429,8 @@ pub struct FakeHarnessReport {
     pub complete: bool,
 }
 
-/// Build the QAL-07 fake harness coverage report.
-///
-/// Version fixtures are delegated to `failure::version_output_fixtures`;
-/// network fixtures to `failure::FakeNetworkHarness::with_github_matrix`;
-/// health / redirect cases are enumerated here for CI ledger completeness.
+/// QAL-07 fake harness coverage; version/network fixtures delegate to
+/// `failure`, health/redirect cases enumerated for the CI ledger.
 pub fn fake_harness_report() -> FakeHarnessReport {
     let version_fixtures = crate::failure::version_output_fixtures()
         .into_iter()
@@ -585,22 +475,11 @@ pub fn qal_06_07_complete() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::collections::BTreeSet;
 
     use crate::adapter::{DetectionResult, ProductStatus, VersionResolution};
     use crate::ids::HarnessId;
     use crate::state::AdapterSupport;
-
-    #[expect(dead_code, reason = "helper for ad-hoc debugging")]
-    fn unique_scratch(prefix: &str, suffix: &str) -> PathBuf {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos());
-        let pid = std::process::id();
-        let dir = crate::test_util::temp_dir_unique("verification");
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join(format!("{prefix}-{now}-{pid}{suffix}"))
-    }
 
     #[derive(Debug)]
     struct DummyAdapter {
@@ -671,8 +550,6 @@ mod tests {
         }
     }
 
-    // ---- secret-free ----
-
     #[test]
     fn fake_credentials_are_secret_free() {
         let content = br#"{"api_key":"sk-test-fake-12345","model":"opus"}"#;
@@ -713,8 +590,6 @@ mod tests {
         let content = b"api_key: fake-test-value\nmodel: opus\n";
         assert!(is_secret_free_content(content, DocumentKind::Yaml));
     }
-
-    // ---- fixture loading ----
 
     #[test]
     fn fixture_minimal_json_loads_and_is_valid() {
@@ -794,17 +669,14 @@ mod tests {
     }
 
     #[test]
-    fn load_fixture_returns_source_document() {
+    fn load_fixture_reads_source_document() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/claude_code");
         let path = root.join("settings.minimal.json");
-        let doc = load_fixture(&path).unwrap();
+        let doc = SourceDocument::load(&path).unwrap();
         assert_eq!(doc.kind, DocumentKind::StrictJson);
         assert!(!doc.has_diagnostics());
     }
 
-    // ---- platform gates ----
-
-    /// Platform: Linux, macOS, Windows — `current_platform()` derives from `std::env::consts::OS/ARCH`; deterministic on each host, maps `linux`/`macos`/`windows` and `x86_64`/`aarch64`/`any`.
     #[test]
     fn current_platform_is_deterministic() {
         let a = current_platform();
@@ -812,7 +684,6 @@ mod tests {
         assert_eq!(a, b);
     }
 
-    /// Platform: Linux, macOS, Windows — gate is `Supported` when current `Platform {os, arch}` matches adapter's `supported_platforms` via `platform_matches` (arch `Any` matches any). Valid on each OS.
     #[test]
     fn platform_gate_supported_when_current_in_list() {
         let current = current_platform();
@@ -825,7 +696,6 @@ mod tests {
         assert_eq!(gate.harness, "aider");
     }
 
-    /// Platform: Linux, macOS, Windows — gate is `Unsupported` when current OS not in adapter's list; e.g., Linux host vs Windows-only adapter. Behavior is per-OS, not generalized.
     #[test]
     fn platform_gate_unsupported_when_not_in_list() {
         // Pick a platform that is not current: if current is Linux, use Windows
@@ -844,7 +714,6 @@ mod tests {
         assert_eq!(gate.verdict, PlatformVerdict::Unsupported);
     }
 
-    /// Platform: all — empty `supported_platforms` yields `Unknown` on Linux, macOS, and Windows; adapter must declare platforms.
     #[test]
     fn platform_gate_unknown_when_empty() {
         let adapter = DummyAdapter {
@@ -855,12 +724,11 @@ mod tests {
         assert_eq!(gate.verdict, PlatformVerdict::Unknown);
     }
 
-    /// Platform: Linux, macOS, Windows — `catalog_platform_gates()` runs gate for every catalog entry; at least one is `Supported` on each host because harness `supported_platforms` includes all three OSes.
     #[test]
     fn catalog_gates_cover_all_entries() {
         let gates = catalog_platform_gates();
         assert_eq!(gates.len(), harness_catalog::ENTRIES.len());
-        // At least one gate should be supported on this host (generic has all platforms)
+        // The generic adapter covers every OS, so this host sees a Supported.
         assert!(
             gates
                 .iter()
@@ -868,15 +736,12 @@ mod tests {
         );
     }
 
-    // ---- ledger coverage ----
-
     #[test]
     fn ledger_coverage_has_known_harnesses() {
         let fixtures_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
         let coverage = ledger_fixture_coverage(&fixtures_root);
         assert_eq!(coverage.len(), harness_catalog::ENTRIES.len());
-        // QAL-02: EVERY catalog id must have an on-disk fixture corpus dir;
-        // this fails when a surface loses (or never gets) its corpus.
+        // QAL-02: every catalog id must have an on-disk fixture corpus dir.
         let uncovered: Vec<&str> = coverage
             .iter()
             .filter(|(_, covered)| !covered)
@@ -888,8 +753,6 @@ mod tests {
         );
     }
 
-    // ---- QAL-02: default-vs-isolated path-layout fixture kind ----
-
     /// Read a `key=value` line from a layout fixture file.
     fn layout_value(dir: &Path, file: &str, key: &str) -> Option<String> {
         let text = std::fs::read_to_string(dir.join(file)).ok()?;
@@ -898,14 +761,8 @@ mod tests {
             .map(ToOwned::to_owned)
     }
 
-    /// The default-vs-isolated layout dimension of the fixture corpus: the
-    /// three flagship relocated-root adapters carry BOTH layout variants, and
-    /// each variant is machine-checked against the adapter's own code — the
-    /// default layout root must equal `DEFAULT_CONFIG_ROOT_FALLBACK` and the
-    /// isolated layout env must equal `CONFIG_ENV_VAR`. The isolated root is
-    /// the env-var dir itself, EXCEPT for harnesses whose CLI nests its state
-    /// dir inside the relocation root (gemini-cli creates `.gemini/` inside
-    /// `GEMINI_CLI_HOME`). A drift in either direction fails here.
+    /// The flagship relocated-root adapters carry BOTH layout variants,
+    /// machine-checked against the adapter's own constants; drift fails here.
     #[test]
     fn fixture_layout_variants_match_adapter_constants() {
         let fixtures_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
@@ -962,8 +819,6 @@ mod tests {
         }
     }
 
-    // ---- corpus-less surface corpora (HAD-06 / QAL-02) ----
-
     /// Whether any file in `dir` carries the `.<variant>.` name segment.
     fn dir_has_variant(dir: &Path, variant: &str) -> bool {
         let needle = format!(".{variant}.");
@@ -974,8 +829,8 @@ mod tests {
         })
     }
 
-    /// The 13 surfaces that had no on-disk corpus before this area; each dir
-    /// must carry the standard variant set and pass fixture validation.
+    /// Corpus-less surfaces; each dir must carry the standard variant set
+    /// and pass fixture validation.
     #[test]
     fn corpus_less_surfaces_have_validating_fixture_corpora() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
@@ -1035,28 +890,6 @@ mod tests {
         }
     }
 
-    // ---- isolated temp dir ----
-
-    #[test]
-    fn unique_temp_dir_is_created() {
-        let dir = unique_temp_dir("test-iso");
-        assert!(dir.exists());
-        assert!(dir.is_dir());
-        drop(std::fs::remove_dir_all(&dir));
-    }
-
-    // ---- secret key patterns ----
-
-    #[test]
-    fn secret_patterns_include_expected_keys() {
-        let patterns = secret_key_patterns();
-        assert!(patterns.contains("api_key"));
-        assert!(patterns.contains("token"));
-        assert!(patterns.contains("password"));
-    }
-
-    // ---- raw_editor kind helpers via verification ----
-
     #[test]
     fn validate_each_kind_via_raw_editor() {
         let cases: Vec<(&[u8], DocumentKind, bool)> = vec![
@@ -1084,14 +917,12 @@ mod tests {
 
     #[test]
     fn invalid_rejection_would_be_blocked_by_validate() {
-        // Simulate what commit would do: validate before write
         let invalid = b"{ bad json }";
         let diags = validate(invalid, DocumentKind::StrictJson);
         assert!(
             !diags.is_empty(),
             "invalid json must be caught before commit"
         );
-        // Also for yaml
         let invalid_yaml = b"a: [unclosed\n";
         let diags_y = validate(invalid_yaml, DocumentKind::Yaml);
         assert!(!diags_y.is_empty());
@@ -1117,23 +948,16 @@ mod tests {
 
     #[test]
     fn redaction_is_kind_aware() {
-        // Env
         let env = b"SECRET_TOKEN=realvalue\n";
         let spans = find_redaction_spans(env, DocumentKind::Env);
         assert!(!spans.is_empty());
-        // Toml
         let toml = b"api_key = \"secret123\"\n";
         let spans_t = find_redaction_spans(toml, DocumentKind::Toml);
         assert!(!spans_t.is_empty());
-        // Yaml
         let yaml = b"password: mysecret\n";
         let spans_y = find_redaction_spans(yaml, DocumentKind::Yaml);
         assert!(!spans_y.is_empty());
     }
-
-    // -----------------------------------------------------------------------
-    // QAL-06/07 matrix: failure injection + fake harness checklist
-    // -----------------------------------------------------------------------
 
     #[test]
     fn qal_06_failure_matrix_is_complete() {
@@ -1144,7 +968,6 @@ mod tests {
         );
         assert_eq!(report.required.len(), 18);
         assert_eq!(report.surfaces.len(), 6);
-        // Each required point must be distinct
         let mut distinct = BTreeSet::new();
         for p in &report.required {
             assert!(distinct.insert(*p), "duplicate point {p:?}");
@@ -1158,7 +981,6 @@ mod tests {
             report.complete,
             "fake harness report must be complete: {report:?}"
         );
-        // Version fixtures cover the required variants
         let lower: Vec<String> = report
             .version_fixtures
             .iter()
@@ -1170,7 +992,6 @@ mod tests {
                 "version fixture missing {needle}: {lower:?}"
             );
         }
-        // Network fixtures cover GitHub matrix
         for needle in [
             "catalog_success",
             "digest_mismatch",
@@ -1187,7 +1008,6 @@ mod tests {
                 report.network_fixtures
             );
         }
-        // Health cases
         assert_eq!(report.health_cases.len(), 11);
         assert!(report.cross_host_redirect_covered);
     }
@@ -1281,12 +1101,6 @@ mod tests {
         ));
     }
 
-    // -----------------------------------------------------------------------
-    // QAL-05: mutant-killing guards — each test would fail if its guard were
-    // flipped (true→false or false→true).  They assert observable recovery,
-    // abort, or redaction behavior, not constants.
-    // -----------------------------------------------------------------------
-
     #[test]
     fn mutant_backup_guard_aborts_on_failure_and_allows_success() {
         let dir = crate::test_util::temp_dir_unique("mutant-backup");
@@ -1364,7 +1178,6 @@ mod tests {
             superai_config::snapshot::is_modified(&snap_stale, &snap_current),
             "changed content must be detected"
         );
-        // creation/deletion
         let missing = dir.join("missing.json");
         drop(std::fs::remove_file(&missing));
         let snap_missing = superai_config::snapshot::snapshot(&missing);
@@ -1383,7 +1196,6 @@ mod tests {
         let p2 = dir2.join("file.json");
         std::fs::write(&p2, br#"{"v":1}"#).unwrap();
         let snap_before = superai_config::snapshot::snapshot(&p2);
-        // external concurrent modification
         std::fs::write(&p2, br#"{"v":2}"#).unwrap();
         let res_stale = superai_config::raw_editor::commit_with_snapshot(
             &p2,
@@ -1483,7 +1295,6 @@ mod tests {
         let mut txn2 = superai_config::transaction::Transaction::new(op2, steps2);
         txn2.prepare().unwrap();
         txn2.commit().unwrap();
-        // corrupt backup for a
         let backup_a = txn2
             .backups
             .iter()
@@ -1505,9 +1316,8 @@ mod tests {
     #[test]
     fn mutant_validate_quarantine_target_rejects_broad_roots_and_accepts_valid() {
         use std::path::Path;
-        // broad roots must be rejected (mutant that returns Ok would allow disastrous delete).
-        // The filesystem root is broad on every platform (unix `/` string-match,
-        // windows `C:\` via `windows_shaped_broad_root`).
+        // Broad roots must be rejected (a mutant Ok allows disastrous
+        // deletes); the fs root is broad on every platform.
         let fs_root = if cfg!(windows) {
             PathBuf::from("C:\\")
         } else {
@@ -1566,7 +1376,6 @@ mod tests {
     #[test]
     fn mutant_redacted_string_hides_secret_in_all_channels() {
         let secret = "sk-live-super-secret-12345";
-        // core RedactedString
         let r1 = crate::error::RedactedString::new(secret);
         for out in [
             format!("{r1:?}"),
@@ -1587,24 +1396,6 @@ mod tests {
             secret,
             "expose_secret should return original"
         );
-
-        // operation RedactedString
-        let r2 = crate::operation::RedactedString::new(secret);
-        for out in [
-            format!("{r2:?}"),
-            format!("{r2}"),
-            serde_json::to_string(&r2).unwrap(),
-        ] {
-            assert!(
-                !out.contains(secret),
-                "op redacted must not contain secret: {out}"
-            );
-            assert!(
-                out.contains("[REDACTED]"),
-                "op redacted must contain placeholder: {out}"
-            );
-        }
-        assert_eq!(r2.expose_secret(), secret);
 
         // error containing redacted must not leak via Debug/Display
         let err = crate::error::CoreError::SecretValidation {

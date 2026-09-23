@@ -1,17 +1,7 @@
-//! Antigravity CLI adapter — `HOME` workaround, `ResearchBlocked`.
-//!
+//! Antigravity CLI adapter: `HOME` workaround, `ResearchBlocked`.
 //! Research source: `docs/harness-configs/antigravity-cli.md` (last verified 2026-08-25).
-//! Executable `agy`, config `~/.gemini/antigravity-cli/settings.json` (JSON) plus
-//! `~/.gemini/config/mcp_config.json` and `~/.gemini/antigravity-cli/skills/`,
-//! isolation `os_bound` via `HOME` workaround (no documented config-dir env var),
-//! product status `preview`, support `ResearchBlocked` until full path/auth/MCP
-//! and concurrency gaps are closed. Detect only.
 
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
+use std::path::PathBuf;
 
 use crate::adapter::{
     ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
@@ -22,10 +12,6 @@ use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence};
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
 
 /// Harness identifier for Antigravity CLI.
 pub const HARNESS_ID_STR: &str = "antigravity-cli";
@@ -52,17 +38,9 @@ pub const LAST_VERIFIED: &str = "2026-08-25";
 pub const SCHEMA_VERSION_STR: &str = "1";
 
 /// HOME workaround note.
-pub const HOME_WORKAROUND_NOTE: &str = "no documented AGY_HOME/CONFIG_DIR; HOME relocation is undocumented workaround — verify before relying, especially on macOS keychain";
+pub const HOME_WORKAROUND_NOTE: &str = "no documented AGY_HOME/CONFIG_DIR; HOME relocation is undocumented workaround: verify before relying, especially on macOS keychain";
 
-// ---------------------------------------------------------------------------
-// Adapter struct
-// ---------------------------------------------------------------------------
-
-/// Concrete adapter for Antigravity CLI (`ResearchBlocked`).
-///
-/// Only detection with evidence is supported. Writes are blocked until
-/// research gaps close: full settings schema, auth/keyring behavior per OS,
-/// plugin/skill/MCP paths, sandbox flags, and HOME concurrency.
+/// Detect only; writes blocked pending settings schema, per-OS keyring, and HOME-concurrency verification.
 #[derive(Debug, Clone)]
 pub struct AntigravityAdapter {
     id: HarnessId,
@@ -90,109 +68,6 @@ impl AntigravityAdapter {
         HOME_WORKAROUND_NOTE
     }
 
-    /// Try to locate `agy` binary via PATH, fallback to `antigravity`.
-    #[expect(clippy::unused_self, reason = "adapter method uses instance constants")]
-    #[expect(clippy::excessive_nesting, reason = "PATH scan branches are explicit")]
-    fn find_binary_in_path(&self) -> Option<PathBuf> {
-        let path_var = std::env::var("PATH").ok()?;
-        let separator = if cfg!(windows) { ';' } else { ':' };
-        for dir in path_var.split(separator) {
-            if dir.is_empty() {
-                continue;
-            }
-            for exec in [EXECUTABLE, EXECUTABLE_ALT] {
-                let candidate = Path::new(dir).join(exec);
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
-                if cfg!(windows) {
-                    let exe_candidate = Path::new(dir).join(format!("{exec}.exe"));
-                    if exe_candidate.is_file() {
-                        return Some(exe_candidate);
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    /// Probe `agy --version` with timeout.
-    fn probe_version(binary: &Path) -> Option<String> {
-        let binary_owned = binary.to_path_buf();
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let output = Command::new(&binary_owned)
-                .arg("--version")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output();
-            drop(tx.send(output));
-        });
-        let Ok(Ok(output)) = rx.recv_timeout(Duration::from_secs(2)) else {
-            return None;
-        };
-        if !output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
-            return None;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let combined = if stdout.trim().is_empty() {
-            stderr.into_owned()
-        } else if stderr.trim().is_empty() {
-            stdout.into_owned()
-        } else {
-            format!("{stdout} {stderr}")
-        };
-        Self::parse_version_output(&combined)
-    }
-
-    /// Parse version output.
-    #[expect(
-        clippy::excessive_nesting,
-        reason = "version parsing branches are explicit"
-    )]
-    fn parse_version_output(output: &str) -> Option<String> {
-        let trimmed = output.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        for token in trimmed.split_whitespace() {
-            let mut candidate = token;
-            if let Some(stripped) = candidate.strip_prefix('v') {
-                candidate = stripped;
-            } else if let Some(stripped) = candidate.strip_prefix('V') {
-                candidate = stripped;
-            }
-            let cleaned = candidate.trim_matches(|c: char| c == ',' || c == ')' || c == '(');
-            if cleaned.is_empty() {
-                continue;
-            }
-            let has_dot = cleaned.contains('.');
-            let starts_digit = cleaned.chars().next().is_some_and(|c| c.is_ascii_digit());
-            if has_dot && starts_digit {
-                let is_version_like = cleaned
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+');
-                if is_version_like {
-                    return Some(cleaned.to_owned());
-                }
-                let mut version_part = String::new();
-                for ch in cleaned.chars() {
-                    if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '+' {
-                        version_part.push(ch);
-                    } else {
-                        break;
-                    }
-                }
-                if version_part.contains('.') && !version_part.is_empty() {
-                    return Some(version_part);
-                }
-            }
-        }
-        None
-    }
-
-    /// Resolve default HOME.
     fn default_home() -> Option<PathBuf> {
         if let Ok(home) = std::env::var("HOME")
             && !home.trim().is_empty()
@@ -207,7 +82,6 @@ impl AntigravityAdapter {
         None
     }
 
-    /// Collect evidence including research-blocked explanation.
     #[expect(
         clippy::excessive_nesting,
         reason = "detection branches are explicit for evidence"
@@ -300,14 +174,14 @@ impl Adapter for AntigravityAdapter {
         let mut version: Option<String> = None;
         let mut binary_path: Option<PathBuf> = None;
 
-        match self.find_binary_in_path() {
+        match super::find_in_path_dir_first(&[EXECUTABLE, EXECUTABLE_ALT]) {
             Some(path) => {
                 evidence.push(format!(
                     "found binary `{}` at {}",
                     EXECUTABLE,
                     path.display()
                 ));
-                match Self::probe_version(&path) {
+                match super::probe_version(&path) {
                     Some(v) => {
                         evidence.push(format!("version `{v}` via `{EXECUTABLE} --version`"));
                         version = Some(v);
@@ -351,7 +225,7 @@ impl Adapter for AntigravityAdapter {
         if let Some(v) = detection.version {
             let mut notes = Vec::new();
             notes.push(format!("detected antigravity-cli version {v}"));
-            notes.push(format!("research blocked — {HOME_WORKAROUND_NOTE}"));
+            notes.push(format!("research blocked: {HOME_WORKAROUND_NOTE}"));
             let mut res = VersionResolution::new(Some(v), None, false);
             res.notes = notes;
             res
@@ -472,7 +346,7 @@ impl Adapter for AntigravityAdapter {
             harness: self.id.to_string(),
             surface: "wrapper".to_owned(),
             reason: format!(
-                "ResearchBlocked: {HOME_WORKAROUND_NOTE} — detect only; HOME workaround not verified for concurrent wrappers"
+                "ResearchBlocked: {HOME_WORKAROUND_NOTE}: detect only; HOME workaround not verified for concurrent wrappers"
             ),
         })
     }
@@ -499,7 +373,7 @@ impl Adapter for AntigravityAdapter {
             harness: self.id.to_string(),
             surface: "validate_instance".to_owned(),
             reason: format!(
-                "ResearchBlocked: {HOME_WORKAROUND_NOTE} — validate blocked until HOME isolation verified"
+                "ResearchBlocked: {HOME_WORKAROUND_NOTE}: validate blocked until HOME isolation verified"
             ),
         })
     }
@@ -508,7 +382,6 @@ impl Adapter for AntigravityAdapter {
         Vec::new()
     }
 
-    /// EXT-08/09: MCP destination (antigravity-cli.md: `mcp_config.json` profiles)
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(crate::adapter::McpAdapterDecl::new(
             "mcp_config.json",
@@ -519,7 +392,6 @@ impl Adapter for AntigravityAdapter {
         ).with_read_only("research-blocked harness; remote entries use the serverUrl schema (antigravity-cli.md 5); inspect/diff only"))
     }
 
-    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some(
             "plugin bundles documented (`plugin.json` under ~/.gemini/antigravity-cli/plugins/) but the harness is ResearchBlocked; revisit when research completes (antigravity-cli.md 5)",
@@ -621,7 +493,7 @@ mod tests {
             ("not a version", None),
         ];
         for (input, expected) in cases {
-            let got = AntigravityAdapter::parse_version_output(input);
+            let got = crate::adapters::parse_version_output(input);
             assert_eq!(got.as_deref(), expected, "input: {input:?}");
         }
     }

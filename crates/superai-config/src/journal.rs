@@ -1,23 +1,12 @@
-//! Operation journal and crash recovery (MUT-09).
-//!
-//! The transaction layer writes a small journal file before its mutations and
-//! at every phase transition, and removes it only after verified completion.
-//! A journal left behind at startup marks an abandoned operation; recovery
-//! inspects the actual filesystem state and restores each resource from its
-//! recorded backup — it NEVER replays writes from stale staged content.
-//!
-//! Journals live under `<home>/.superai/journal/<operation-id>.journal.json`
-//! and contain no config contents and no secrets: only paths, backup ids,
-//! phase, and redacted diagnostics.
+//! Operation journal and crash recovery (MUT-09): restores from recorded
+//! backups, never replays staged content; digests are unkeyed and forgeable.
 
 use std::path::{Path, PathBuf};
 
 use crate::backup::{BackupId, find_backup_by_id, restore_verified, verify_backup};
 use crate::error::{ConfigError, Result};
 
-/// Directory holding pending operation journals for `home`.
-///
-/// Sibling of the registry records (`<home>/.superai`).
+/// Pending-operation journals for `home`, under `<home>/.superai/journal`.
 pub fn journal_dir(home: &Path) -> PathBuf {
     home.join(".superai").join("journal")
 }
@@ -37,13 +26,13 @@ pub enum JournalPhase {
     PrepareBackup,
     /// Temps staged and validated; no commits yet.
     StageTemp,
-    /// Committing (or committed) — `completed` lists steps that landed.
+    /// Committing or committed; `completed` lists steps that landed.
     Commit,
     /// Commit finished; verification pending.
     Verify,
     /// Rolling back after a failure.
     Rollback,
-    /// Fully completed and verified (journal is about to be removed).
+    /// Fully completed and verified; the journal is about to be removed.
     Done,
 }
 
@@ -71,7 +60,7 @@ pub struct JournalBackup {
     pub backup_id: String,
 }
 
-/// Minimal journal record written to disk; no secrets and no contents.
+/// Minimal journal record written to disk; no secrets, no contents.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CrashJournal {
     /// Operation id.
@@ -107,10 +96,7 @@ impl CrashJournal {
         }
     }
 
-    /// Serialize and atomically write the journal to `path`.
-    ///
-    /// Uses the crate's production atomic write (temp + rename + read-back),
-    /// so an interrupted journal write can never leave a half-written file.
+    /// Atomically write the journal; an interrupted write cannot leave it half-written.
     pub fn write_to(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
@@ -185,15 +171,8 @@ impl RecoveryReport {
     }
 }
 
-/// Perform startup recovery for `home` (MUT-09).
-///
-/// Scans `<home>/.superai/journal/*.journal.json` and recovers each abandoned
-/// operation by inspecting the actual filesystem: stale staged temps are
-/// removed, resources whose current bytes differ from their recorded backup
-/// are restored (with a fresh backup of the current bytes first, so a
-/// post-crash edit is never lost), committed creations are removed, and the
-/// journal file itself is removed only once nothing residual remains.
-/// Nothing is ever written from stale planned content.
+/// Startup recovery (MUT-09): remove stale temps, restore from recorded
+/// backups, remove committed creations; planned content is never written.
 pub fn recover_pending(home: &Path) -> Result<RecoveryReport> {
     let dir = journal_dir(home);
     let entries = match std::fs::read_dir(&dir) {
@@ -216,22 +195,27 @@ pub fn recover_pending(home: &Path) -> Result<RecoveryReport> {
     Ok(RecoveryReport { journals })
 }
 
-/// Recover one journal file (see [`recover_pending`]).
+/// Recover one journal; an unreadable one is quarantined beside itself and
+/// reported, so it never aborts the remaining journals.
 pub fn recover_journal_file(journal_path: &Path) -> Result<JournalRecovery> {
-    let Some(journal) = CrashJournal::load_from(journal_path)? else {
-        // Nothing to recover; treat as done and remove the stray file.
-        CrashJournal::remove(journal_path)?;
-        return Ok(JournalRecovery {
-            journal_path: journal_path.to_path_buf(),
-            operation_id: String::new(),
-            phase: JournalPhase::Done,
-            recovered: true,
-            removed_temps: Vec::new(),
-            restored: Vec::new(),
-            removed_creations: Vec::new(),
-            residuals: Vec::new(),
-            outcome: "no journal to recover".to_owned(),
-        });
+    let journal = match CrashJournal::load_from(journal_path) {
+        Ok(Some(journal)) => journal,
+        Ok(None) => {
+            // Nothing to recover; treat as done and remove the stray file.
+            CrashJournal::remove(journal_path)?;
+            return Ok(JournalRecovery {
+                journal_path: journal_path.to_path_buf(),
+                operation_id: String::new(),
+                phase: JournalPhase::Done,
+                recovered: true,
+                removed_temps: Vec::new(),
+                restored: Vec::new(),
+                removed_creations: Vec::new(),
+                residuals: Vec::new(),
+                outcome: "no journal to recover".to_owned(),
+            });
+        }
+        Err(cause) => return Ok(quarantine_corrupt_journal(journal_path, &cause)),
     };
 
     let (removed_temps, mut residuals) = remove_stale_temps(&journal);
@@ -271,9 +255,67 @@ pub fn recover_journal_file(journal_path: &Path) -> Result<JournalRecovery> {
     })
 }
 
-/// Remove stale staged temps: the ones the journal recorded, plus unrecorded
-/// `.tmp.` siblings next to each resource (a crash between staging and the
-/// journal update can leave those behind). Returns (removed, residuals).
+/// Rename an unreadable journal aside so the scan can continue; the renamed
+/// file no longer matches the suffix, so later runs leave it for inspection.
+fn quarantine_corrupt_journal(journal_path: &Path, cause: &ConfigError) -> JournalRecovery {
+    let operation_id = journal_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .and_then(|s| s.strip_suffix(".journal"))
+        .unwrap_or_default()
+        .to_owned();
+    let (recovered, outcome) = match quarantine_aside(journal_path) {
+        Ok(aside) => (
+            true,
+            format!(
+                "corrupt journal ({cause}) quarantined aside as {}",
+                aside.display()
+            ),
+        ),
+        Err(e) => (
+            false,
+            format!("corrupt journal ({cause}) could not be quarantined: {e}"),
+        ),
+    };
+    JournalRecovery {
+        journal_path: journal_path.to_path_buf(),
+        operation_id,
+        phase: JournalPhase::Done,
+        recovered,
+        removed_temps: Vec::new(),
+        restored: Vec::new(),
+        removed_creations: Vec::new(),
+        residuals: if recovered {
+            Vec::new()
+        } else {
+            vec![journal_path.to_path_buf()]
+        },
+        outcome,
+    }
+}
+
+/// Fresh `.corrupt.<millis>.<4hex>` aside name so repeat corruption never
+/// overwrites evidence; refuses after repeated collisions rather than clobber.
+fn quarantine_aside(journal_path: &Path) -> std::io::Result<PathBuf> {
+    for _ in 0..5 {
+        let millis = crate::atomic::timestamp_millis_now();
+        let suffix = crate::atomic::generate_random_suffix(millis);
+        let mut aside_name = journal_path.as_os_str().to_os_string();
+        aside_name.push(format!(".corrupt.{millis}.{suffix}"));
+        let aside = PathBuf::from(aside_name);
+        if std::fs::symlink_metadata(&aside).is_ok() {
+            continue;
+        }
+        return std::fs::rename(journal_path, &aside).map(|()| aside);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "no fresh quarantine name after repeated collisions",
+    ))
+}
+
+/// Remove recorded temps plus unrecorded `.tmp.<name>.` siblings of each
+/// resource; foreign `.tmp.*` files are never touched. Returns (removed, residuals).
 fn remove_stale_temps(journal: &CrashJournal) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let mut removed = Vec::new();
     let mut residuals = Vec::new();
@@ -287,7 +329,17 @@ fn remove_stale_temps(journal: &CrashJournal) -> (Vec<PathBuf>, Vec<PathBuf>) {
         }
     }
     for res in &journal.resources {
-        let dir = match PathBuf::from(res).parent() {
+        let resource = PathBuf::from(res);
+        // No file name to tie the pattern to: sweep nothing rather than
+        // everything (a bare `.tmp.` prefix would match foreign temps too).
+        let Some(file_name) = resource.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if file_name.is_empty() {
+            continue;
+        }
+        let prefix = format!(".tmp.{file_name}.");
+        let dir = match resource.parent() {
             Some(parent) => parent.to_path_buf(),
             None => PathBuf::from("."),
         };
@@ -295,7 +347,11 @@ fn remove_stale_temps(journal: &CrashJournal) -> (Vec<PathBuf>, Vec<PathBuf>) {
             continue;
         };
         for ent in entries.flatten() {
-            if !ent.file_name().to_string_lossy().starts_with(".tmp.") {
+            if !ent
+                .file_name()
+                .to_string_lossy()
+                .starts_with(prefix.as_str())
+            {
                 continue;
             }
             let p = ent.path();
@@ -307,10 +363,7 @@ fn remove_stale_temps(journal: &CrashJournal) -> (Vec<PathBuf>, Vec<PathBuf>) {
     (removed, residuals)
 }
 
-/// Restore each resource whose current bytes differ from its recorded
-/// pre-transaction backup (deterministic rollback; `restore_verified` backs
-/// up the current bytes first, so a post-crash edit stays recoverable).
-/// Returns (restored, residuals).
+/// Restore resources whose bytes differ from their recorded backup.
 fn restore_recorded_backups(journal: &CrashJournal) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
     let mut restored = Vec::new();
     let mut residuals = Vec::new();
@@ -334,7 +387,6 @@ fn restore_recorded_backups(journal: &CrashJournal) -> Result<(Vec<PathBuf>, Vec
             .as_deref()
             .is_some_and(|d| d == entry.digest.as_str());
         if current_matches_pre {
-            // Already at pre-transaction bytes: nothing to do.
             continue;
         }
         match restore_verified(&entry) {
@@ -345,10 +397,7 @@ fn restore_recorded_backups(journal: &CrashJournal) -> Result<(Vec<PathBuf>, Vec
     Ok((restored, residuals))
 }
 
-/// Remove committed creations: resources without a recorded backup that the
-/// journal shows as committed. A resource the journal shows as never
-/// committed was not mutated by this operation and is left untouched.
-/// Returns (removed, residuals).
+/// Remove committed creations (no backup); uncommitted paths stay untouched.
 fn remove_committed_creations(journal: &CrashJournal) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let mut removed = Vec::new();
     let mut residuals = Vec::new();
@@ -368,10 +417,6 @@ fn remove_committed_creations(journal: &CrashJournal) -> (Vec<PathBuf>, Vec<Path
     }
     (removed, residuals)
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -397,11 +442,15 @@ mod tests {
         let dir = home_dir();
         let path = dir.join("j.json");
         let mut journal = CrashJournal::new("op-x", JournalPhase::Commit, vec![]);
+        let resource = std::env::temp_dir()
+            .join("a.json")
+            .to_string_lossy()
+            .into_owned();
         journal.backups.push(JournalBackup {
-            resource: "/tmp/a.json".to_owned(),
+            resource: resource.clone(),
             backup_id: "1-0001".to_owned(),
         });
-        journal.completed.push("/tmp/a.json".to_owned());
+        journal.completed.push(resource);
         journal
             .diagnostics
             .push("sk-REDACTED-marker only".to_owned());
@@ -410,7 +459,6 @@ mod tests {
         assert_eq!(loaded, journal);
         CrashJournal::remove(&path).unwrap();
         assert!(CrashJournal::load_from(&path).unwrap().is_none());
-        // Removing twice is fine (NotFound = success).
         CrashJournal::remove(&path).unwrap();
         drop(std::fs::remove_dir_all(&dir));
     }
@@ -457,8 +505,8 @@ mod tests {
     #[test]
     fn recovery_never_removes_uncommitted_foreign_files() {
         let home = home_dir();
-        // A journal claims a creation that was never committed, but the path
-        // exists (someone else put it there): recovery must not delete it.
+        // The journal never committed this creation, but the path exists
+        // (someone else put it there): recovery must not delete it.
         let foreign = home.join("foreign-new.json");
         std::fs::write(&foreign, b"foreign").unwrap();
         let jroot = journal_dir(&home);
@@ -520,9 +568,7 @@ mod tests {
         let home = home_dir();
         let resource = home.join("settings.json");
         std::fs::write(&resource, b"original").unwrap();
-        // Production backup of the pre-op state.
         let entry = crate::backup::backup(&resource).unwrap().unwrap();
-        // The operation committed new bytes before the crash.
         std::fs::write(&resource, b"committed-new").unwrap();
 
         let jroot = journal_dir(&home);
@@ -560,7 +606,7 @@ mod tests {
         let resource = home.join("edited.json");
         std::fs::write(&resource, b"original").unwrap();
         let entry = crate::backup::backup(&resource).unwrap().unwrap();
-        // Committed bytes, then a foreign edit AFTER the crash.
+        // Committed bytes, then a foreign edit after the crash.
         std::fs::write(&resource, b"post-crash-foreign-edit").unwrap();
 
         let jroot = journal_dir(&home);
@@ -580,10 +626,7 @@ mod tests {
 
         let report = recover_pending(&home).unwrap();
         assert!(report.all_recovered());
-        // Deterministic rollback restored the pre-op bytes...
         assert_eq!(std::fs::read(&resource).unwrap(), b"original");
-        // ...and the post-crash edit is recoverable: restore_verified took a
-        // backup of the current bytes before replacing them.
         let backups = crate::backup::list_backups(&resource).unwrap();
         assert!(
             backups.iter().any(|b| b.digest != entry.digest),
@@ -594,14 +637,16 @@ mod tests {
     }
 
     #[test]
-    fn recovery_removes_stray_temp_files_next_to_resources() {
+    fn recovery_sweeps_only_own_temp_pattern_next_to_resources() {
         let home = home_dir();
         let resource = home.join("a.json");
         std::fs::write(&resource, b"x").unwrap();
         let stray = home.join(".tmp.a.json.abcd.123");
         std::fs::write(&stray, b"stale").unwrap();
-        let unrelated = home.join(".tmp.untracked");
-        std::fs::write(&unrelated, b"keep").unwrap();
+        let foreign = home.join(".tmp.untracked");
+        std::fs::write(&foreign, b"other tool's file").unwrap();
+        let other_resource = home.join(".tmp.b.json.beef.9");
+        std::fs::write(&other_resource, b"concurrent neighbor").unwrap();
         let jroot = journal_dir(&home);
         std::fs::create_dir_all(&jroot).unwrap();
         let journal = CrashJournal::new(
@@ -615,19 +660,24 @@ mod tests {
         assert!(report.all_recovered());
         assert!(
             !stray.exists(),
-            "stray transaction temp removed ({:?})",
+            "a stale temp of this resource's replace is removed ({:?})",
             report.journals
         );
         assert!(
-            !unrelated.exists(),
-            "the sibling sweep covers untracked `.tmp.` files in the resource directory"
+            foreign.exists(),
+            "a foreign `.tmp.*` file with no tie to the resource survives"
+        );
+        assert!(
+            other_resource.exists(),
+            "a temp named for a different resource survives"
+        );
+        assert_eq!(
+            std::fs::read(&foreign).unwrap(),
+            b"other tool's file",
+            "foreign temps keep their bytes"
         );
         drop(std::fs::remove_dir_all(&home));
     }
-
-    // -----------------------------------------------------------------
-    // Mutation-hardening behaviour tests (area D).
-    // -----------------------------------------------------------------
 
     #[test]
     fn journal_phase_display_matches_the_recorded_names() {
@@ -690,8 +740,7 @@ mod tests {
         let home = home_dir();
         let superai = home.join(".superai");
         std::fs::create_dir_all(&superai).unwrap();
-        // The journal dir path occupied by a regular file: read_dir fails
-        // with ENOTDIR, which is not NotFound and must surface.
+        // read_dir fails with ENOTDIR, which is not NotFound: must surface.
         std::fs::write(superai.join("journal"), b"not a directory").unwrap();
         assert!(
             recover_pending(&home).is_err(),
@@ -736,12 +785,171 @@ mod tests {
         drop(std::fs::remove_dir_all(&dir));
     }
 
+    #[test]
+    fn one_corrupt_journal_does_not_abort_recovery_of_the_rest() {
+        let home = home_dir();
+        let created = home.join("created.json");
+        std::fs::write(&created, b"committed").unwrap();
+        let jroot = journal_dir(&home);
+        std::fs::create_dir_all(&jroot).unwrap();
+
+        std::fs::write(jroot.join("op-bad.journal.json"), b"not json at all").unwrap();
+        let mut good = CrashJournal::new(
+            "op-good",
+            JournalPhase::Verify,
+            vec![created.to_string_lossy().into_owned()],
+        );
+        good.completed.push(created.to_string_lossy().into_owned());
+        good.write_to(&journal_path(&jroot, "op-good")).unwrap();
+
+        let report = recover_pending(&home).unwrap();
+        assert!(
+            report.all_recovered(),
+            "the quarantined journal leaves no residual: {:?}",
+            report.journals
+        );
+        assert_eq!(report.journals.len(), 2, "both journals get an outcome");
+        let bad = report
+            .journals
+            .iter()
+            .find(|j| j.operation_id == "op-bad")
+            .expect("the corrupt journal has its own reported outcome");
+        assert!(bad.recovered);
+        assert!(
+            bad.outcome.contains("corrupt") && bad.outcome.contains(".corrupt"),
+            "the outcome names the quarantine: {}",
+            bad.outcome
+        );
+        assert!(
+            !jroot.join("op-bad.journal.json").exists(),
+            "the corrupt journal no longer sits in the pending set"
+        );
+        let mut asides = quarantined_files(&jroot, "op-bad.journal.json.corrupt");
+        assert_eq!(asides.len(), 1, "exactly one quarantine evidence file");
+        let aside = asides.swap_remove(0);
+        assert_eq!(
+            std::fs::read(&aside).unwrap(),
+            b"not json at all",
+            "quarantine preserves the corrupt bytes for inspection"
+        );
+        assert!(
+            !created.exists(),
+            "the healthy journal still recovers its committed creation"
+        );
+        assert!(
+            !journal_path(&jroot, "op-good").exists(),
+            "the healthy journal is consumed as usual"
+        );
+        drop(std::fs::remove_dir_all(&home));
+    }
+
+    /// Unreadable quarantines like unparseable; the chmod must actually bind (root reads through).
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_journal_is_quarantined_and_kept_for_inspection() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = home_dir();
+        let jroot = journal_dir(&home);
+        std::fs::create_dir_all(&jroot).unwrap();
+        let path = journal_path(&jroot, "op-denied");
+        std::fs::write(&path, b"never parseable").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let report = recover_pending(&home).unwrap();
+        let rec = report
+            .journals
+            .first()
+            .expect("the unreadable journal is reported, not skipped");
+        assert!(rec.recovered, "{}", rec.outcome);
+        assert!(rec.outcome.contains("corrupt"), "{}", rec.outcome);
+        assert!(!path.exists(), "it is out of the pending set");
+        assert_eq!(
+            quarantined_files(&jroot, "op-denied.journal.json.corrupt").len(),
+            1,
+            "the quarantined file is retained"
+        );
+        drop(std::fs::remove_dir_all(&home));
+    }
+
+    #[test]
+    fn repeat_corruption_of_the_same_journal_name_keeps_both_evidence_files() {
+        let home = home_dir();
+        let jroot = journal_dir(&home);
+        std::fs::create_dir_all(&jroot).unwrap();
+        let pending = jroot.join("op-again.journal.json");
+
+        std::fs::write(&pending, b"first corruption").unwrap();
+        let first = recover_pending(&home).unwrap();
+        assert!(first.all_recovered(), "{:?}", first.journals);
+
+        std::fs::write(&pending, b"second corruption").unwrap();
+        let second = recover_pending(&home).unwrap();
+        assert!(second.all_recovered(), "{:?}", second.journals);
+
+        let asides = quarantined_files(&jroot, "op-again.journal.json.corrupt");
+        assert_eq!(
+            asides.len(),
+            2,
+            "both corruption events leave their own evidence file: {asides:?}"
+        );
+        let mut bodies: Vec<Vec<u8>> = asides.iter().map(|p| std::fs::read(p).unwrap()).collect();
+        bodies.sort();
+        assert_eq!(
+            bodies,
+            vec![b"first corruption".to_vec(), b"second corruption".to_vec()],
+            "each quarantine retains its own bytes"
+        );
+        assert!(!pending.exists(), "nothing stays in the pending set");
+        drop(std::fs::remove_dir_all(&home));
+    }
+
+    fn quarantined_files(dir: &Path, prefix: &str) -> Vec<PathBuf> {
+        let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with(prefix))
+            })
+            .collect();
+        found.sort();
+        found
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_corrupt_journal_that_cannot_be_renamed_is_reported_as_a_residual() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = home_dir();
+        let jroot = journal_dir(&home);
+        std::fs::create_dir_all(&jroot).unwrap();
+        let path = journal_path(&jroot, "op-stuck");
+        std::fs::write(&path, b"corrupt bytes").unwrap();
+        std::fs::set_permissions(&jroot, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let probe = jroot.join("probe-write");
+        let denied = std::fs::File::create(&probe).is_err();
+        let rec = recover_journal_file(&path);
+        std::fs::set_permissions(&jroot, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if !denied {
+            // Root bypasses the rename denial; the arm is unreachable here.
+            assert!(rec.is_ok());
+            drop(std::fs::remove_dir_all(&home));
+            return;
+        }
+        let rec = rec.expect("a failed quarantine is a report, not an error");
+        assert!(!rec.recovered, "{}", rec.outcome);
+        assert_eq!(rec.residuals, vec![path.clone()]);
+        assert!(path.exists(), "the journal is retained for the operator");
+        drop(std::fs::remove_file(&path));
+        drop(std::fs::remove_dir_all(&home));
+    }
+
     #[cfg(unix)]
     #[test]
     fn recovery_removes_staged_broken_symlink_temps() {
         let home = home_dir();
-        // Deliberately NOT named `.tmp.*`: only the staged_temps loop owns it,
-        // so the lstat fallback in the exists() check is exercised directly.
+        // Not named `.tmp.*`: the lstat fallback in exists() is what sees it.
         let broken = home.join("staged-broken-link");
         std::os::unix::fs::symlink("/definitely/not/present", &broken).unwrap();
         let jroot = journal_dir(&home);

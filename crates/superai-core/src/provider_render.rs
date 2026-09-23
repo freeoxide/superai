@@ -1,19 +1,5 @@
 //! Provider → harness rendering, effective-provider inspection, and the
-//! provider lifecycle on an instance (PRV-03, PRV-05, PRV-08).
-//!
-//! Generic provider data never knows file paths. Rendering maps canonical
-//! provider fields onto the adapter's DECLARED owned selectors and produces
-//! typed document-engine operations (area 1's executor types), so the same
-//! provider renders differently per harness: Claude Code gets `env.*` keys
-//! in `settings.json`, Codex gets a `model_providers.<id>` TOML table entry,
-//! Kimi a `providers.<id>` table with `default_model`, OpenCode a
-//! `provider.<id>` JSON object with a `provider/model` default, Zcode a
-//! `provider`/`options` pair. A harness that cannot express the protocol or
-//! endpoint gets a typed Unsupported outcome and no mutation.
-//!
-//! superai never proxies model traffic: rendering writes configuration only.
-//! Auth is rendered as a sink/variable NAME, never a secret value — key
-//! placement stays in [`crate::provider::commit_api_key`].
+//! provider lifecycle (PRV-03/05/08): config writes only, auth as names.
 
 use std::path::PathBuf;
 
@@ -31,10 +17,6 @@ use crate::ids::ProviderId;
 use crate::instance::Instance;
 use crate::provider::{ApiKeySink, Protocol, ProviderDefinition, resolve_api_key_sink};
 use crate::template::Template;
-
-// ---------------------------------------------------------------------------
-// PRV-03 — render outcome types
-// ---------------------------------------------------------------------------
 
 /// A successful render: typed engine operations against one surface, plus
 /// the auth reference the harness expects (name only, never a secret).
@@ -106,10 +88,8 @@ fn is_writable(surface: &ConfigSurface) -> bool {
         )
 }
 
-/// Pick the rendering strategy a surface's owned selectors express.
-///
-/// Pure selector inspection — the same provider data renders differently
-/// per harness because the harnesses declare different owned selectors.
+/// Pick the rendering strategy a surface's owned selectors express; the
+/// same provider data renders differently per harness's selectors.
 fn strategy_for(surface: &ConfigSurface) -> Option<RenderStrategy> {
     if !is_writable(surface) || surface.owned_selectors.is_empty() {
         return None;
@@ -166,9 +146,8 @@ fn remove_op(selector: &str, owned_keys: Vec<String>) -> EngineOperation {
     .with_create_parent(false)
 }
 
-/// Resolve the default model the render should write: the harness-provider
-/// template's `key:model` patch wins (harness-provider template data),
-/// otherwise the provider default.
+/// Resolve the default model to write: the harness-provider template's
+/// `key:model` patch wins, otherwise the provider default.
 fn effective_default_model(
     provider: &ProviderDefinition,
     template: Option<&Template>,
@@ -198,12 +177,8 @@ fn auth_env_var(provider: &ProviderDefinition, warnings: &mut Vec<String>) -> St
     derived
 }
 
-/// Render a provider into typed adapter mutations (PRV-03).
-///
-/// Pure: nothing is written. `instance` only names the destination for the
-/// caller; mutations are content-level engine operations the caller applies
-/// (see [`commit_provider_change`]) or previews. Rendering never emits a
-/// secret — auth appears as a sink/variable name only.
+/// Render a provider into typed adapter mutations (PRV-03): pure, nothing
+/// is written; auth appears as a sink/variable name only, never a secret.
 #[expect(clippy::too_many_lines, reason = "strategy table is deliberate")]
 pub fn render_provider_into_adapter(
     provider: &ProviderDefinition,
@@ -226,10 +201,8 @@ pub fn render_provider_into_adapter(
             tmpl.id, tmpl.provider, provider.id
         ));
     }
-    // Rendering targets the PRIMARY writable surface: the first surface in
-    // adapter declaration order whose owned selectors express a strategy.
-    // (Adapters declare the base config first; per-profile override surfaces
-    // are user-created layers that provider defaults must not hijack.)
+    // Render to the FIRST writable surface in declaration order; per-profile
+    // override layers are user-created and must not be hijacked.
     let surfaces = adapter.config_surfaces();
     let Some((surface, strategy)) = surfaces
         .iter()
@@ -440,10 +413,6 @@ pub fn render_provider_into_adapter(
     })
 }
 
-// ---------------------------------------------------------------------------
-// PRV-05 — effective provider inspection
-// ---------------------------------------------------------------------------
-
 /// Where a detected credential lives (type only, never the secret).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum CredentialSourceKind {
@@ -473,7 +442,7 @@ pub struct ModelRole {
     pub role: String,
     /// Selector the role was read from.
     pub selector: String,
-    /// Value read (model id / provider id — not secret-shaped).
+    /// Value read (model id / provider id, never secret-shaped).
     pub value: String,
     /// Surface the value was read from.
     pub surface: String,
@@ -493,10 +462,8 @@ pub enum CompatVerdict {
     NothingDetected,
 }
 
-/// Effective provider state, read FRESH from the instance config (PRV-05).
-///
-/// Ephemeral by design: never persisted into the registry, never carries a
-/// secret (credential is presence + source type only).
+/// Effective provider state, read FRESH from the instance config (PRV-05);
+/// ephemeral by design, never persisted, never carries a secret.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct EffectiveProviderReport {
     /// Instance whose config was inspected.
@@ -572,7 +539,6 @@ fn load_surface_value(path: &std::path::Path, kind: DocumentKind) -> Result<Opti
     Ok(parsed)
 }
 
-/// Convert a parsed TOML document to the semantic JSON value tree.
 #[expect(clippy::excessive_nesting, reason = "item/value recursion is per-kind")]
 fn toml_to_value(doc: &toml_edit::DocumentMut) -> Value {
     fn item_to_value(item: &toml_edit::Item) -> Value {
@@ -627,12 +593,8 @@ fn normalize_endpoint_for_match(url: &str) -> String {
     url.trim().trim_end_matches('/').to_ascii_lowercase()
 }
 
-/// Inspect the effective provider state of an instance (PRV-05).
-///
-/// Reads every writable surface under `instance.config_root` FRESH (disk is
-/// truth; nothing is cached or persisted), matches endpoint/model values
-/// against the supplied provider definitions, and reports credential
-/// PRESENCE only. Never writes, never persists the report.
+/// Inspect the effective provider state (PRV-05): reads every writable
+/// surface FRESH, reports credential PRESENCE only, never writes.
 #[expect(
     clippy::excessive_nesting,
     reason = "fresh-scan branches over surfaces and selectors"
@@ -668,9 +630,9 @@ pub fn inspect_effective_provider(
         let Some(value) = load_surface_value(&path, surface.kind)? else {
             continue;
         };
-        let Value::Object(map) = value else {
+        if !matches!(value, Value::Object(_)) {
             continue;
-        };
+        }
         let mut surface_has_provider_value = false;
         let match_endpoint = |endpoint: &str| -> Option<DetectedProvider> {
             let normalized = normalize_endpoint_for_match(endpoint);
@@ -689,7 +651,7 @@ pub fn inspect_effective_provider(
         for sel in &surface.owned_selectors {
             let lower = sel.to_ascii_lowercase();
             let segments: Vec<&str> = sel.split('.').collect();
-            let mut current: Option<&Value> = Some(&Value::Object(map.clone()));
+            let mut current: Option<&Value> = Some(&value);
             for segment in &segments {
                 current = current.and_then(|v| v.as_object().and_then(|o| o.get(*segment)));
             }
@@ -763,10 +725,9 @@ pub fn inspect_effective_provider(
                 }
             }
         }
-        // Provider-shaped keys the adapter does NOT own (relevant to
-        // mutation decisions; read-only observation). Unowned tables count
-        // when they or their children look provider-shaped.
-        if let Value::Object(root) = &Value::Object(map.clone()) {
+        // Provider-shaped keys the adapter does NOT own; read-only
+        // observation, unowned tables count via provider-ish children.
+        if let Value::Object(root) = &value {
             let providerish = |name: &str| -> bool {
                 let lower = name.to_ascii_lowercase();
                 lower.contains("model")
@@ -833,10 +794,6 @@ pub fn inspect_effective_provider(
     })
 }
 
-// ---------------------------------------------------------------------------
-// PRV-08 — provider lifecycle
-// ---------------------------------------------------------------------------
-
 /// One lifecycle change to apply to an instance's provider configuration.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProviderChange<'a> {
@@ -864,9 +821,7 @@ pub enum ProviderChange<'a> {
 /// Options for a lifecycle commit.
 #[derive(Debug, Clone, Default)]
 pub struct ProviderChangeOptions {
-    /// Journal root enabling crash-journal recovery for the commit
-    /// (e.g. `superai_config::journal::journal_dir(&home)`). `None` commits
-    /// without a journal.
+    /// Journal root for crash-journal recovery; `None` commits without one.
     pub journal_root: Option<PathBuf>,
 }
 
@@ -878,7 +833,7 @@ pub struct ProviderChangePreview {
     /// File that would change.
     pub path: PathBuf,
     /// Redacted edit descriptions (`selector: old -> new`); secrets never
-    /// appear — auth fields are presence-only.
+    /// appear; auth fields are presence-only.
     pub edits: Vec<String>,
     /// Warnings (dangling references, unsupported notes).
     pub warnings: Vec<String>,
@@ -913,16 +868,40 @@ fn target_surface(adapter: &dyn Adapter) -> Result<(ConfigSurface, RenderStrateg
         })
 }
 
-fn describe_value(value: Option<&Value>) -> String {
+/// Selector names that carry provider secrets. Field semantics decide
+/// redaction; the `sk-` value shape is only a backstop.
+fn is_secret_selector(selector: &str) -> bool {
+    let lower = selector.to_ascii_lowercase();
+    [
+        "api_key", "apikey", "api-key", "secret", "token", "password", "passwd", "auth", "bearer",
+    ]
+    .iter()
+    .any(|pat| lower.contains(pat))
+}
+
+/// Secret-bearing fields display set-ness and length only, never the value.
+fn secret_display(value: &Value) -> String {
     match value {
-        Some(Value::String(s)) => {
-            if s.contains("sk-") {
-                crate::error::RedactedString::placeholder().to_owned()
+        Value::String(s) => format!("[REDACTED len={}]", s.chars().count()),
+        _ => "[REDACTED]".to_owned(),
+    }
+}
+
+fn describe_field(selector: &str, value: Option<&Value>) -> String {
+    match value {
+        Some(v) => {
+            if is_secret_selector(selector) {
+                secret_display(v)
+            } else if let Value::String(s) = v {
+                if s.contains("sk-") {
+                    crate::error::RedactedString::placeholder().to_owned()
+                } else {
+                    s.clone()
+                }
             } else {
-                s.clone()
+                format!("{v}")
             }
         }
-        Some(other) => format!("{other}"),
         None => "(absent)".to_owned(),
     }
 }
@@ -974,8 +953,8 @@ fn plan_change(
         let before = read_selector(selector);
         edits.push(format!(
             "{selector}: {} -> {}",
-            describe_value(before.as_ref()),
-            describe_value(Some(&value))
+            describe_field(selector, before.as_ref()),
+            describe_field(selector, Some(&value))
         ));
         ops.push(set_op(selector, value, owned_keys.to_vec()));
     };
@@ -985,7 +964,6 @@ fn plan_change(
             let outcome = render_provider_into_adapter(provider, None, adapter, instance);
             match outcome {
                 RenderOutcome::Supported(render) => {
-                    // Re-target ops at the same surface the render chose.
                     if render.surface_id != surface.id {
                         return Err(CoreError::Validation {
                             field: "surface".to_owned(),
@@ -1063,9 +1041,8 @@ fn plan_change(
                 RenderStrategy::ProvidersTable => format!("providers.{provider_id}"),
                 RenderStrategy::ProviderMap => format!("provider.{provider_id}"),
                 RenderStrategy::ProviderOptions => {
-                    // Single-provider shape: removal means clearing the
-                    // provider/options pair — only valid when they point at
-                    // the removed provider.
+                    // Single-provider shape: removal clears provider/options,
+                    // valid only when they point at the removed provider.
                     let current_provider = read_selector("provider");
                     let matches_removed = current_provider
                         .as_ref()
@@ -1095,7 +1072,7 @@ fn plan_change(
                     if lower.contains("base_url") {
                         edits.push(format!(
                             "{sel}: {} -> (removed)",
-                            describe_value(read_selector(sel).as_ref())
+                            describe_field(sel, read_selector(sel).as_ref())
                         ));
                         ops.push(remove_op(sel, owned_keys.clone()));
                     }
@@ -1103,13 +1080,13 @@ fn plan_change(
             } else if strategy == RenderStrategy::ProviderOptions {
                 edits.push(format!(
                     "provider: {} -> (removed)",
-                    describe_value(read_selector("provider").as_ref())
+                    describe_field("provider", read_selector("provider").as_ref())
                 ));
                 ops.push(remove_op("provider", owned_keys.clone()));
                 if owned("options") {
                     edits.push(format!(
                         "options: {} -> (removed)",
-                        describe_value(read_selector("options").as_ref())
+                        describe_field("options", read_selector("options").as_ref())
                     ));
                     ops.push(remove_op("options", owned_keys));
                 }
@@ -1149,14 +1126,16 @@ fn plan_change(
                                 };
                                 edits.push(format!(
                                     "{selector}: {} -> {}",
-                                    describe_value(value.as_ref()),
-                                    describe_value(Some(&new_value))
+                                    describe_field(selector, value.as_ref()),
+                                    describe_field(selector, Some(&new_value))
                                 ));
                                 ops.push(set_op(selector, new_value, owned_keys.clone()));
                             }
                             None => {
-                                dangling
-                                    .push(format!("{selector}={}", describe_value(value.as_ref())));
+                                dangling.push(format!(
+                                    "{selector}={}",
+                                    describe_field(selector, value.as_ref())
+                                ));
                             }
                         }
                     }
@@ -1346,13 +1325,8 @@ fn apply_ops_to_toml(doc: &mut toml_edit::DocumentMut, ops: &[EngineOperation]) 
     Ok(())
 }
 
-/// Commit a lifecycle change (PRV-08): fresh read, engine-enforced owned-key
-/// edits, backup + atomic write through a Transaction.
-///
-/// Foreign entries — other providers, unmodelled keys, comments and layout
-/// on TOML surfaces — are preserved. JSONC surfaces with comments are
-/// refused with the typed lossy-write error instead of silently stripping
-/// them (codec honesty). Dangling default references block removal.
+/// Commit a lifecycle change (PRV-08): fresh read, owned-key edits, backup
+/// + atomic Transaction; JSONC with comments refuses the lossy write.
 #[expect(clippy::excessive_nesting, reason = "per-kind serialization branches")]
 #[expect(clippy::too_many_lines, reason = "strategy table is deliberate")]
 pub fn commit_provider_change(
@@ -1491,10 +1465,6 @@ pub fn commit_provider_change(
     })
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1607,7 +1577,6 @@ mod tests {
         assert_eq!(zcode_surface, "config.json");
         assert!(zcode_sels.iter().any(|s| s == "provider"));
         assert!(zcode_sels.iter().any(|s| s == "options"));
-        // All five shapes are distinct.
         let surface_ids: Vec<&String> = shapes.iter().map(|(s, _)| s).collect();
         assert_eq!(
             surface_ids.len(),
@@ -1635,7 +1604,6 @@ mod tests {
             );
             assert!(op.create_parent, "render ops create missing parents");
         }
-        // Operations apply through the executor without touching foreign keys.
         let mut value = serde_json::json!({"foreignRoot": {"keep": 1}});
         for op in &render.operations {
             let path = instance.config_root.as_path().join("config.toml");
@@ -1682,7 +1650,6 @@ mod tests {
                 .contains("no writable provider-owned selectors")
         );
 
-        // Preview surfaces the same reason read-only.
         let preview = preview_provider_change(
             &instance,
             &generic,
@@ -1693,7 +1660,6 @@ mod tests {
         assert!(!preview.supported);
         assert!(preview.unsupported_reason.is_some());
 
-        // Codex cannot speak the anthropic protocol.
         let codex = crate::adapters::codex_cli::CodexCliAdapter::new().unwrap();
         let mut anthropic_only = ProviderDefinition::new(
             ProviderId::new("anthropic-only").unwrap(),
@@ -1764,7 +1730,6 @@ mod tests {
             "comments preserved: {text}"
         );
         assert!(text.contains("[foreign_root]"), "foreign keys preserved");
-        // Backup of the foreign-authored original exists.
         assert!(superai_config::backup::list_backups(&config).is_ok_and(|b| !b.is_empty()));
         drop(std::fs::remove_dir_all(&dir));
     }
@@ -1782,7 +1747,6 @@ mod tests {
         .unwrap();
 
         let removed = ProviderId::new("glm-rm").unwrap();
-        // Without reassignment, the dangling default blocks the removal.
         let err = commit_provider_change(
             &instance,
             &adapter,
@@ -1795,12 +1759,9 @@ mod tests {
         .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("dangling default references"), "got: {msg}");
-        // Nothing was mutated.
         let text = std::fs::read_to_string(&config).unwrap();
         assert!(text.contains("[model_providers.glm-rm]"));
 
-        // With reassignment the defaults switch and the entry disappears;
-        // the foreign provider survives.
         let next = universal_provider("openai");
         commit_provider_change(
             &instance,
@@ -1841,7 +1802,6 @@ mod tests {
             supports_reasoning: false,
         });
 
-        // Unknown model rejected.
         let err = commit_provider_change(
             &instance,
             &adapter,
@@ -1854,7 +1814,6 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("not found in provider"));
 
-        // Alias resolves to the underlying id.
         commit_provider_change(
             &instance,
             &adapter,
@@ -1895,7 +1854,6 @@ mod tests {
             msg.to_lowercase().contains("lossy") || msg.contains("jsonc"),
             "got: {msg}"
         );
-        // Bytes untouched.
         assert_eq!(std::fs::read(&settings).unwrap(), original.to_vec());
 
         // Without comments, the same commit succeeds and preserves foreign keys.
@@ -1941,10 +1899,8 @@ mod tests {
             "unowned provider-shaped fields are flagged"
         );
         assert_eq!(report.compatibility, CompatVerdict::Compatible);
-        // No secret field exists on the report at all.
         let dumped = format!("{report:?}");
         assert!(!dumped.contains("sk-"));
-        // Read-only: bytes unchanged.
         assert!(
             std::fs::read_to_string(&config).is_ok_and(|t| t.contains("model_provider = \"glm\""))
         );
@@ -1968,12 +1924,37 @@ mod tests {
             !dumped.contains("sk-superai-test-sentinel-12345-fake"),
             "report leaked the secret: {dumped}"
         );
-        // The anthropic-compat variant is matched (endpoint variant).
         assert_eq!(
             report.detected_provider.expect("detected").id.as_deref(),
             Some("glm")
         );
         drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// Redaction is decided by field semantics: a secret-typed selector
+    /// shows set-ness and length only, in any key format, not just `sk-`.
+    #[test]
+    fn previews_redact_secret_typed_fields_by_selector() {
+        assert!(is_secret_selector("env.ANTHROPIC_AUTH_TOKEN"));
+        assert!(is_secret_selector("api_key"));
+        assert!(is_secret_selector("providers.glm.api_key"));
+        assert!(!is_secret_selector("model"));
+        assert!(!is_secret_selector("base_url"));
+
+        let ghp = Value::String("ghp_16charssecretvalue".to_owned());
+        let shown = describe_field("env.GITHUB_TOKEN", Some(&ghp));
+        assert!(shown.contains("[REDACTED len="), "shown: {shown}");
+        assert!(!shown.contains("ghp_"), "token leaked: {shown}");
+        let xoxb = Value::String("xoxb-secret-slack-token".to_owned());
+        assert!(!describe_field("api_key", Some(&xoxb)).contains("xoxb-"));
+        assert_eq!(
+            describe_field("model", Some(&Value::String("glm-4".to_owned()))),
+            "glm-4"
+        );
+        assert_eq!(describe_field("api_key", None), "(absent)");
+        // The sk- shape stays redacted even under an innocent selector.
+        let sk = Value::String("sk-live-abc123".to_owned());
+        assert!(!describe_field("model", Some(&sk)).contains("sk-live-abc123"));
     }
 
     #[test]

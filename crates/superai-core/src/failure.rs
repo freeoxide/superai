@@ -1,30 +1,15 @@
-//! Failure and crash injection per QAL-06 + fake process/network harness per QAL-07.
-//!
-//! Provides:
-//! - `FailureInjector` trait with `RealInjector` (always succeeds) and `TestInjector` (fail at Nth call counters).
-//! - Injection points covering backup open/write/flush, temp create/write, parse staged, atomic replace,
-//!   read-back verify, second-file commit, and rollback verify.
-//! - Deterministic fake process harness: version output variants, install wrong version,
-//!   daemon readiness, unrelated PID, timeout/huge output.
-//! - Deterministic fake network harness: GitHub catalog/template success, digest mismatch,
-//!   redirect loop, rate limit, timeout, oversized body, TLS-like error, health classification,
-//!   cross-host redirect stripping.
-//! - Test matrix exercising single-file config, multi-file instance creation, template update,
-//!   bulk skill/MCP, wrapper replace, and daemon start via the fakes.
-//! - Abandoned-journal crash simulation with recovery verification.
-//!
-//! All tests are deterministic and do not require live network or real daemons.
+//! Failure injection per QAL-06 plus fake process/network harness per QAL-07.
+//! Deterministic fail-at-Nth counters thread the REAL transaction boundaries; no live network, no real daemons.
 
 #![expect(
-    clippy::all,
-    reason = "failure harness has intentional deep branching and test asserts"
+    clippy::collapsible_if,
+    clippy::excessive_nesting,
+    clippy::manual_string_new,
+    clippy::match_same_arms,
+    clippy::redundant_clone,
+    clippy::vec_init_then_push,
+    reason = "failure harness keeps deliberate deep branching"
 )]
-#![expect(clippy::pedantic, reason = "failure harness pedantic lints reviewed")]
-#![expect(
-    clippy::restriction,
-    reason = "harness does not need restriction lints"
-)]
-#![expect(clippy::nursery, reason = "nursery lints not critical for harness")]
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -35,12 +20,7 @@ use crate::error::{CoreError, Result as CoreResult};
 use crate::process::{ExecuteOpts, ProcessOutput, extract_version};
 use crate::template_fetch::TemplateFetchError;
 
-// ---------------------------------------------------------------------------
-// Failure points and injector trait
-// ---------------------------------------------------------------------------
-
 /// Enumerates every injectable failure boundary from subplan 02.
-///
 /// Ordering is stable for deterministic counter maps.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
@@ -64,8 +44,7 @@ pub enum FailurePoint {
     /// Validating staged output (parse).
     ParseStaged,
     /// The prepare→commit conflict recheck (master-plan §4.2): comparing the
-    /// current on-disk state to the expectation recorded at prepare time,
-    /// immediately before the replacement.
+    /// current on-disk state to the expectation recorded at prepare time.
     ConflictRecheck,
     /// Atomic rename/replace.
     AtomicReplace,
@@ -114,13 +93,9 @@ impl std::fmt::Display for FailurePoint {
 }
 
 /// Trait for deterministic failure injection.
-///
 /// `RealInjector` never fails; `TestInjector` fails at the Nth call per point.
 pub trait FailureInjector: Send + Sync + std::fmt::Debug {
     /// Inject failure for `point` if the injector is configured to do so.
-    ///
-    /// Returns `Ok(())` when no failure should occur; otherwise returns a
-    /// `CoreError` that simulates the requested boundary.
     fn inject(&self, point: FailurePoint) -> CoreResult<()>;
 
     /// Human label for the injector (e.g. "real", "test").
@@ -131,10 +106,6 @@ pub trait FailureInjector: Send + Sync + std::fmt::Debug {
         self.label() == "real"
     }
 }
-
-// ---------------------------------------------------------------------------
-// Real injector
-// ---------------------------------------------------------------------------
 
 /// No-op injector: every boundary succeeds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,10 +120,6 @@ impl FailureInjector for RealInjector {
         "real"
     }
 }
-
-// ---------------------------------------------------------------------------
-// Test injector: fail at Nth call counters
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 struct Inner {
@@ -178,8 +145,6 @@ impl TestInjector {
     }
 
     /// Configure `point` to fail on the `nth` call (1-indexed).
-    ///
-    /// Overwrites any previous setting for `point`.
     pub fn fail_at(&self, point: FailurePoint, nth: usize) {
         if nth == 0 {
             return;
@@ -325,13 +290,8 @@ fn injected_error(point: FailurePoint, nth: usize) -> CoreError {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Helpers that thread the injector through the REAL config operations (QAL-06)
-// ---------------------------------------------------------------------------
-
 /// Adapter presenting a core [`FailureInjector`] as a
-/// `superai_config::injector::Injector`, mapping config-layer injection
-/// points onto the core failure points.
+/// `superai_config::injector::Injector`.
 #[derive(Debug, Clone, Copy)]
 struct ConfigInjector<'a>(&'a dyn FailureInjector);
 
@@ -372,9 +332,8 @@ impl superai_config::injector::Injector for ConfigInjector<'_> {
     }
 }
 
-/// Owned adapter: attaches a shared core [`FailureInjector`] to a production
-/// `Transaction` via `with_injector` (used by the QAL-06 matrix and by
-/// higher layers that need the fault-injected real transaction paths).
+/// Owned adapter attaching a shared core [`FailureInjector`] to a production
+/// `Transaction` via `with_injector`.
 #[derive(Debug, Clone)]
 pub struct OwnedConfigInjector(std::sync::Arc<dyn FailureInjector>);
 
@@ -418,9 +377,7 @@ pub fn injected_backup(
 }
 
 /// Stage a temp through the REAL production staging primitive with the
-/// injector observing temp create/write/flush and staged parse validation
-/// (QAL-06). Delegates to `superai_config::transaction::stage_temp_file`,
-/// which `Transaction::prepare` itself uses.
+/// injector observing create/write/flush and staged parse (QAL-06).
 pub fn injected_stage_temp(
     target: &Path,
     content: &[u8],
@@ -448,10 +405,8 @@ pub fn injected_stage_temp(
     Ok(temp)
 }
 
-/// Atomic replace through the REAL production commit primitive (QAL-06).
-/// Delegates to `superai_config::transaction::commit_staged_file`, which
-/// `Transaction::commit_write` itself uses, then cross-checks the expected
-/// bytes.
+/// Atomic replace through the REAL production commit primitive (QAL-06):
+/// `commit_staged_file`, then cross-checks the expected bytes.
 pub fn injected_atomic_replace(
     staged: &Path,
     target: &Path,
@@ -477,27 +432,11 @@ pub fn injected_atomic_replace(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Abandoned journal / crash recovery (MUT-09) — production wiring
-// ---------------------------------------------------------------------------
-
-/// Perform startup crash recovery for `home` (MUT-09).
-///
-/// Scans `<home>/.superai/journal` for operation journals left behind by
-/// crashed transactions and recovers each against the actual filesystem
-/// state: stale temps are removed, resources whose current bytes differ from
-/// their recorded backup are restored (with a backup of the current bytes
-/// first), committed creations are removed, and journals are deleted only
-/// after verified recovery. Recovery never replays writes from stale staged
-/// content. The implementation lives in `superai_config::journal`; this is
-/// the layer-3 entry point the CLI calls at startup.
+/// Perform startup crash recovery for `home` (MUT-09): stale temps removed,
+/// differing resources restored (backed up first), journals deleted only after verified recovery.
 pub fn recover_pending(home: &Path) -> CoreResult<superai_config::journal::RecoveryReport> {
     superai_config::journal::recover_pending(home).map_err(CoreError::Config)
 }
-
-// ---------------------------------------------------------------------------
-// Fake process harness
-// ---------------------------------------------------------------------------
 
 /// Describes one version-output fixture.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -555,7 +494,7 @@ pub fn version_output_fixtures() -> Vec<VersionFixture> {
         exit_code: Some(1),
         is_timeout: false,
         is_huge: false,
-        expected_version: Some("error:".to_owned()), // fallback line truncation but non-zero means failure
+        expected_version: Some("error:".to_owned()),
         should_parse: false,
     });
     fixtures.push(VersionFixture {
@@ -567,7 +506,6 @@ pub fn version_output_fixtures() -> Vec<VersionFixture> {
         expected_version: None,
         should_parse: false,
     });
-    // huge 10 MiB
     let huge_body = "x".repeat(10 * 1024 * 1024);
     fixtures.push(VersionFixture {
         name: "huge 10MB".to_owned(),
@@ -575,8 +513,8 @@ pub fn version_output_fixtures() -> Vec<VersionFixture> {
         exit_code: Some(0),
         is_timeout: false,
         is_huge: true,
-        expected_version: Some("x".repeat(64)), // truncated to 64
-        should_parse: false,                    // huge should be rejected by output limit
+        expected_version: Some("x".repeat(64)),
+        should_parse: false,
     });
     fixtures.push(VersionFixture {
         name: "multiline with version on second line".to_owned(),
@@ -613,7 +551,6 @@ pub fn version_output_fixtures() -> Vec<VersionFixture> {
         is_huge: false,
         expected_version: {
             let s = "café-".repeat(30);
-            // extract_version truncates to 64 respecting char boundary
             let mut end = 64usize;
             while end > 0 && !s.is_char_boundary(end) {
                 end -= 1;
@@ -651,18 +588,17 @@ impl FakeProcessHarness {
         for f in version_output_fixtures() {
             let output_limit_exceeded = f.is_huge;
             let timed_out = f.is_timeout;
-            let stdout = if f.is_huge {
-                f.raw_output.clone()
-            } else if f.is_timeout {
+            let stdout = if f.is_timeout {
                 String::new()
             } else {
                 f.raw_output.clone()
             };
             let exit_code = if f.is_timeout { None } else { f.exit_code };
             let success = exit_code.is_some_and(|c| c == 0) && !timed_out && !output_limit_exceeded;
-            let output = ProcessOutput::new(stdout, String::new(), exit_code);
-            // Override success for huge/timeout to false for test clarity
-            let output = ProcessOutput { success, ..output };
+            let output = ProcessOutput {
+                success,
+                ..ProcessOutput::new(stdout, String::new(), exit_code)
+            };
             h.fixtures.insert(
                 f.name.clone(),
                 FakeProcessOutcome {
@@ -853,10 +789,6 @@ impl DaemonFixture {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Fake network harness
-// ---------------------------------------------------------------------------
-
 /// Classification of health/network errors (deterministic, no live TLS).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -942,9 +874,6 @@ pub fn classify_health(status: u16, body_or_error: &str) -> HealthStatus {
     if lower.contains("digest mismatch") {
         return HealthStatus::DigestMismatch;
     }
-    if lower.contains("cross-host") || lower.contains("cross_host") {
-        return HealthStatus::CrossHostRedirect;
-    }
     HealthStatus::Healthy
 }
 
@@ -989,7 +918,6 @@ impl FakeNetworkHarness {
     pub fn with_github_matrix() -> Self {
         let mut h = Self::default();
 
-        // Success: valid catalog JSON (version + templates)
         let catalog_json = br#"{"version":1,"templates":[{"id":"claude-glm","latest_version":"1.0.0","files":[{"version":"1.0.0","path":"claude-glm/1.0.0.json","digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}],"status":"active"}]}"#;
         h.responses.insert(
             "catalog_success".to_owned(),
@@ -1003,7 +931,6 @@ impl FakeNetworkHarness {
             }),
         );
 
-        // Digest mismatch: body is valid but digest header mismatches
         h.responses.insert(
             "digest_mismatch".to_owned(),
             Ok(FakeHttpResponse {
@@ -1013,13 +940,11 @@ impl FakeNetworkHarness {
             }),
         );
 
-        // Redirect loop: status 302 with location that loops, should map to RedirectLimit
         h.responses.insert(
             "redirect_loop".to_owned(),
             Err("redirect limit exceeded after 3 hops".to_owned()),
         );
 
-        // Rate limit: 429
         h.responses.insert(
             "rate_limit".to_owned(),
             Ok(FakeHttpResponse {
@@ -1029,13 +954,11 @@ impl FakeNetworkHarness {
             }),
         );
 
-        // Timeout
         h.responses.insert(
             "timeout".to_owned(),
             Err("timeout after 30s for `https://example.com/timeout`".to_owned()),
         );
 
-        // Oversized body (2 MiB > 1 MiB limit)
         let oversized = vec![b'x'; 2 * 1024 * 1024];
         h.responses.insert(
             "oversized".to_owned(),
@@ -1049,7 +972,6 @@ impl FakeNetworkHarness {
             }),
         );
 
-        // TLS-like error
         h.responses.insert(
             "tls_error".to_owned(),
             Err(
@@ -1058,7 +980,6 @@ impl FakeNetworkHarness {
             ),
         );
 
-        // Cross-host redirect (should strip Authorization)
         h.responses.insert(
             "cross_host_redirect".to_owned(),
             Ok(FakeHttpResponse {
@@ -1098,7 +1019,6 @@ impl FakeNetworkHarness {
                     });
                 }
                 if (300..400).contains(&resp.status) {
-                    // Redirect handling: treat loop specially
                     if key.contains("redirect_loop") {
                         return Err(TemplateFetchError::RedirectLimit {
                             template: key.to_owned(),
@@ -1126,7 +1046,6 @@ impl FakeNetworkHarness {
                         ),
                     });
                 }
-                // Digest-mismatch simulation: if header digest doesn't match body digest, error
                 if let Some(header_digest) = resp.headers.get("x-content-sha256") {
                     use sha2::{Digest as _, Sha256};
                     let mut hasher = Sha256::new();
@@ -1186,11 +1105,17 @@ impl FakeNetworkHarness {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests: deterministic, no live network, parallel-safe via unique temp dirs
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
+#[expect(
+    clippy::assertions_on_result_states,
+    clippy::doc_markdown,
+    clippy::let_underscore_must_use,
+    clippy::manual_assert_eq,
+    clippy::option_map_unit_fn,
+    clippy::uninlined_format_args,
+    clippy::unreachable,
+    reason = "crash-recovery asserts check Result states directly"
+)]
 mod tests {
     use super::*;
     use std::collections::hash_map::DefaultHasher;
@@ -1204,8 +1129,6 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
-
-    // ---- FailureInjector counters ----
 
     #[test]
     fn real_injector_never_fails() {
@@ -1245,8 +1168,6 @@ mod tests {
         assert_eq!(inj.calls_for(FailurePoint::TempCreate), 1);
         assert_eq!(inj.calls_for(FailurePoint::TempWrite), 2);
     }
-
-    // ---- single-file matrix ----
 
     #[test]
     fn single_file_backup_open_fail_leaves_original_intact() {
@@ -1316,7 +1237,6 @@ mod tests {
         let file = dir.join("settings.json");
         std::fs::write(&file, br#"{"a":1}"#).unwrap();
         let inj = TestInjector::new();
-        // Prepare a valid staged temp first, then inject parse failure to simulate validation rejection
         inj.fail_at(FailurePoint::ParseStaged, 1);
         let res = injected_stage_temp(&file, b"{ invalid json }", DocumentKind::StrictJson, &inj);
         // Even with injected parse failure, the function should surface the injection, not leave stray temp
@@ -1332,11 +1252,9 @@ mod tests {
         let dir = test_dir("failure-atomic-replace");
         let file = dir.join("settings.json");
         std::fs::write(&file, br#"{"a":1}"#).unwrap();
-        // Stage a temp manually
         let inj_ok = RealInjector;
         let staged =
             injected_stage_temp(&file, br#"{"a":2}"#, DocumentKind::StrictJson, &inj_ok).unwrap();
-        // Now inject atomic replace failure
         let inj = TestInjector::new();
         inj.fail_at(FailurePoint::AtomicReplace, 1);
         let err = injected_atomic_replace(&staged, &file, br#"{"a":2}"#, &inj).unwrap_err();
@@ -1370,8 +1288,6 @@ mod tests {
         drop(std::fs::remove_file(&file));
         drop(std::fs::remove_dir_all(&dir));
     }
-
-    // ---- multi-file instance creation ----
 
     #[test]
     fn multi_file_second_file_fail_rolls_back_first() {
@@ -1451,7 +1367,6 @@ mod tests {
             ],
         );
         txn.prepare().unwrap();
-        // Break third staged temp
         let third_temp = txn.staged_temps.get(2).cloned().unwrap();
         drop(std::fs::remove_file(&third_temp));
         let res = txn.commit();
@@ -1478,7 +1393,6 @@ mod tests {
         // Perform a transaction that will need rollback, then corrupt backup to force rollback verify fail
         // We do a simpler check: create backup then corrupt it and verify rollback reports residual
         let backup = superai_config::backup::backup(&file).unwrap().unwrap();
-        // Corrupt backup file
         std::fs::write(&backup.backup_path, b"corrupted").unwrap();
         let ok = superai_config::backup::verify_backup(&backup).unwrap();
         assert!(!ok, "corrupted backup must fail verify");
@@ -1487,7 +1401,6 @@ mod tests {
         assert!(restore_res.is_err());
         // Ensure original still intact (we didn't commit)
         assert_eq!(std::fs::read(&file).unwrap(), b"original");
-        // Cleanup
         drop(std::fs::remove_file(&backup.backup_path));
         drop(std::fs::remove_file(&file));
         drop(std::fs::remove_dir_all(&dir));
@@ -1495,24 +1408,18 @@ mod tests {
         assert!(inj.inject(FailurePoint::RollbackVerify).is_err());
     }
 
-    // ---- template update ----
-
     #[test]
     fn template_update_with_staged_parse_fail_and_rollback() {
         let dir = test_dir("failure-template-update");
         let target = dir.join("config.json");
         std::fs::write(&target, br#"{"model":"a"}"#).unwrap();
-        // Backup
         let backup = superai_config::backup::backup(&target).unwrap().unwrap();
-        // Stage new content but inject parse failure
         let inj = TestInjector::new();
         inj.fail_at(FailurePoint::ParseStaged, 1);
         let res = injected_stage_temp(&target, b"{ not json }", DocumentKind::StrictJson, &inj);
         assert!(res.is_err());
-        // Verify original preserved via backup
         assert_eq!(std::fs::read(&target).unwrap(), br#"{"model":"a"}"#);
         assert!(superai_config::backup::verify_backup(&backup).unwrap());
-        // Rollback preserve
         superai_config::backup::restore_entry(&backup).unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), br#"{"model":"a"}"#);
         drop(std::fs::remove_file(backup.backup_path));
@@ -1526,7 +1433,6 @@ mod tests {
         let catalog_path = dir.join("catalog.json");
         let template_path = dir.join("template.json");
         std::fs::write(&template_path, br#"{"id":"claude-glm","version":"1.0.0"}"#).unwrap();
-        // Compute actual digest
         let bytes = std::fs::read(&template_path).unwrap();
         let actual = crate::template::compute_digest(&bytes);
         let wrong = "0".repeat(64);
@@ -1537,13 +1443,11 @@ mod tests {
         std::fs::write(&catalog_path, catalog_content.as_bytes()).unwrap();
         let catalog = crate::template_fetch::fetch_catalog_from_path(&catalog_path).unwrap();
         assert_eq!(catalog.templates.len(), 1);
-        // Simulate digest check via file:// config
         let mut config =
             crate::template::TemplateRepoConfig::new("example.com", "owner", "repo", "main")
                 .unwrap();
         let fake = crate::test_util::tmp_abs("fake-parent").join("fake");
         config.base_url = Some(format!("file://{}", fake.display()));
-        // Direct digest check
         let mismatch = TemplateFetchError::DigestMismatch {
             template: "claude-glm".to_owned(),
             expected: wrong.clone(),
@@ -1554,11 +1458,8 @@ mod tests {
         drop(std::fs::remove_file(&catalog_path));
         drop(std::fs::remove_file(&template_path));
         drop(std::fs::remove_dir_all(&dir));
-        // Ensure config's template_url would fail digest check in real fetch
         drop(config);
     }
-
-    // ---- bulk skill/MCP ----
 
     #[test]
     fn bulk_skill_injected_second_file_fail_restores_first() {
@@ -1591,7 +1492,6 @@ mod tests {
             ],
         );
         txn.prepare().unwrap();
-        // Break second staged temp
         let second = txn.staged_temps.get(1).cloned().unwrap();
         drop(std::fs::remove_file(&second));
         let res = txn.commit();
@@ -1632,7 +1532,6 @@ mod tests {
             ],
         );
         txn.prepare().unwrap();
-        // Fail third
         let third = txn.staged_temps.get(2).cloned().unwrap();
         drop(std::fs::remove_file(&third));
         let res = txn.commit();
@@ -1651,8 +1550,6 @@ mod tests {
         drop(std::fs::remove_dir_all(&dir));
     }
 
-    // ---- wrapper replace ----
-
     #[test]
     fn wrapper_replace_injected_atomic_fail_preserves_backup() {
         let dir = test_dir("failure-wrapper-replace");
@@ -1663,7 +1560,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(superai_config::backup::verify_backup(&backup).unwrap());
-        // Stage new wrapper but inject atomic failure
         let new_content = "#!/bin/sh\nexec claude --new \"$@\"\n";
         let real = RealInjector;
         let staged = injected_stage_temp(
@@ -1681,7 +1577,6 @@ mod tests {
         // Original should still be readable via backup, wrapper may still be original
         let current = std::fs::read_to_string(&wrapper_path).unwrap();
         assert!(current.contains("exec claude"));
-        // Restore from backup to ensure recovery
         superai_config::backup::restore_entry(&backup).unwrap();
         assert_eq!(std::fs::read_to_string(&wrapper_path).unwrap(), initial);
         drop(std::fs::remove_file(backup.backup_path));
@@ -1689,8 +1584,6 @@ mod tests {
         drop(std::fs::remove_file(&staged));
         drop(std::fs::remove_dir_all(&dir));
     }
-
-    // ---- daemon start via process fixtures ----
 
     #[test]
     fn daemon_start_version_variants_all_handled() {
@@ -1716,11 +1609,11 @@ mod tests {
             } else if fixture.is_huge {
                 assert!(res.is_err(), "huge fixture {name} must exceed limit");
             } else if fixture.exit_code.is_some_and(|c| c != 0) {
-                // Non-zero is not an error in run, but version probe should return None
                 let out = res.unwrap();
                 assert!(!out.success, "non-zero fixture {name} must not be success");
                 assert!(
-                    harness.version_for(&name).is_none() || harness.version_for(&name).is_some()
+                    harness.version_for(&name).is_none(),
+                    "failed probe must yield no version"
                 );
             } else if fixture.expected_version.is_none() {
                 assert!(
@@ -1736,17 +1629,10 @@ mod tests {
                 );
             }
         }
-        // Also check huge with larger limit succeeds (but our harness still marks exceeded)
-        let huge_opts = ExecuteOpts {
-            timeout: Some(Duration::from_secs(2)),
-            output_limit: Some(20 * 1024 * 1024),
-            ..Default::default()
-        };
-        // Even with large limit, our fake harness marks huge as should be rejected? But direct extract_version on huge should still truncate
+        // extract_version still byte-bounds huge input regardless of any limit.
         let huge_raw = "x".repeat(10 * 1024 * 1024);
         let ver = extract_version(&huge_raw).unwrap();
         assert_eq!(ver.len(), 64);
-        assert!(huge_opts.output_limit.is_some());
     }
 
     #[test]
@@ -1860,24 +1746,20 @@ mod tests {
     #[test]
     fn github_catalog_matrix_via_fake_network_harness() {
         let harness = FakeNetworkHarness::with_github_matrix();
-        // success
         let ok = harness.fetch("catalog_success").unwrap();
         assert!(!ok.is_empty());
-        // digest mismatch
         let err = harness.fetch("digest_mismatch").unwrap_err();
         assert!(format!("{err}").contains("digest mismatch"));
         assert_eq!(
             classify_health(200, &format!("{err}")),
             HealthStatus::DigestMismatch
         );
-        // redirect loop
         let err = harness.fetch("redirect_loop").unwrap_err();
         assert!(format!("{err}").to_ascii_lowercase().contains("redirect"));
         assert_eq!(
             classify_health(0, &format!("{err}")),
             HealthStatus::RedirectLoop
         );
-        // rate limit
         let err = harness.fetch("rate_limit").unwrap_err();
         assert!(
             format!("{err}").contains("429")
@@ -1889,11 +1771,9 @@ mod tests {
             classify_health(429, &format!("{err}")),
             HealthStatus::RateLimited
         );
-        // timeout
         let err = harness.fetch("timeout").unwrap_err();
         assert!(format!("{err}").to_ascii_lowercase().contains("timeout"));
         assert_eq!(classify_health(0, &format!("{err}")), HealthStatus::Timeout);
-        // oversized
         let err = harness.fetch("oversized").unwrap_err();
         assert!(
             format!("{err}")
@@ -1905,26 +1785,22 @@ mod tests {
             classify_health(200, &format!("{err}")),
             HealthStatus::Oversized
         );
-        // tls
         let err = harness.fetch("tls_error").unwrap_err();
         assert!(format!("{err}").to_ascii_lowercase().contains("tls"));
         assert_eq!(
             classify_health(0, &format!("{err}")),
             HealthStatus::TlsError
         );
-        // cross-host redirect
-        let err = harness.fetch("cross_host_redirect").unwrap_err();
-        // This is a redirect, but we check stripping logic separately
+        // cross-host redirect: stripping is asserted directly
+        harness.fetch("cross_host_redirect").unwrap_err();
         assert!(should_strip_auth_for_redirect(
             "https://github.com/org/catalog.json",
             "https://evil.example.com/other"
         ));
-        let _ = err;
     }
 
     #[test]
     fn cross_host_redirect_header_stripping_is_enforced() {
-        // Simulate request with Authorization header
         let original = "https://github.com/freeoxide/superai/catalog.json";
         let redirect = "https://evil.example.com/malicious";
         assert!(should_strip_auth_for_redirect(original, redirect));
@@ -1947,7 +1823,6 @@ mod tests {
             "auth must be stripped on cross-host redirect"
         );
         assert!(stripped.contains_key("user-agent"));
-        // Same-host preserves auth (if any)
         let same = "https://github.com/other/path";
         assert!(!should_strip_auth_for_redirect(original, same));
         let preserved = if should_strip_auth_for_redirect(original, same) {
@@ -1960,11 +1835,8 @@ mod tests {
         assert!(preserved.contains_key("authorization"));
     }
 
-    // ---- crash / abandoned journal (production journaling, MUT-09) ----
-
-    /// Runs a real two-file transaction with journaling enabled under
-    /// `home/.superai/journal`, crashing at `point`/`nth` via the TestInjector
-    /// mapped onto the production injection points. Returns the journal path.
+    /// Runs a real two-file journaled transaction crashing at `point`/`nth`
+    /// via the TestInjector; returns the journal path.
     fn run_journaled_transaction_crashing_at(
         home: &Path,
         op_id: &str,
@@ -2005,12 +1877,8 @@ mod tests {
     #[test]
     fn abandoned_journal_at_each_phase_recovers_via_production_journal() {
         use superai_config::journal::{JournalPhase, recover_pending};
-        // (expected journal phase, core point that fires at that phase, nth
-        // call for a two-file transaction). The journal-phase points map onto
-        // the historical phase-simulation boundaries; the counts skip the
-        // production calls of the same point that precede the journal write.
-        // Commit nth=3 fires at the intent-journal write of the SECOND step:
-        // the first file is committed on disk, the second is not.
+        // (expected phase, core point firing there, nth for a two-file txn;
+        //  the counts skip earlier production calls of the same point).
         for (phase, point, nth) in [
             (JournalPhase::Plan, FailurePoint::ParseStaged, 1),
             (JournalPhase::PrepareBackup, FailurePoint::BackupWrite, 3),
@@ -2054,10 +1922,8 @@ mod tests {
     #[test]
     fn rollback_phase_journal_recovers() {
         use superai_config::journal::{CrashJournal, JournalBackup, JournalPhase, recover_pending};
-        // The rollback phase is written by `execute` when post-commit
-        // verification fails; the recoverable state (committed foreign bytes
-        // + recorded backup) is reconstructed here exactly as that path
-        // leaves it, then recovered.
+        // The rollback phase leaves committed foreign bytes + a recorded
+        // backup; that recoverable state is reconstructed exactly, then recovered.
         let dir = test_dir("journal-prod-rollback");
         let resource = dir.join("settings.json");
         std::fs::write(&resource, b"original").unwrap();
@@ -2251,7 +2117,6 @@ mod tests {
             }
         });
         txn.prepare().unwrap();
-        // Break second file staged temp to force commit failure
         let second = txn.staged_temps.get(1).cloned().unwrap();
         drop(std::fs::remove_file(&second));
         let res = txn.commit();
@@ -2418,7 +2283,7 @@ mod tests {
     #[test]
     fn all_points_journal_recovery_is_secret_free() {
         // QAL-06: every journal phase must recover without leaking sentinel
-        // via diagnostics — exercised on the production journal + recovery.
+        // via diagnostics, exercised on the production journal + recovery.
         use superai_config::journal::{CrashJournal, JournalPhase, recover_pending};
         let sentinel = "sk-superai-test-sentinel-12345-fake";
         for phase in [
@@ -2462,14 +2327,10 @@ mod tests {
             drop(std::fs::remove_dir_all(&dir));
         }
     }
-    // ---- QAL-06: injector on the REAL production paths ----
-
     #[test]
     fn single_file_matrix_hits_real_transaction_commit_path() {
-        // Every temp/rename boundary here is the production
-        // stage_temp_file + commit_staged_file body — the shared transaction
-        // commit core every write in the workspace now routes through
-        // (plan-02 fold), not a parallel wrapper.
+        // Every temp/rename boundary here is the production stage_temp_file
+        // + commit_staged_file body, not a parallel wrapper.
         let dir = test_dir("failure-real-atomic");
         let file = dir.join("settings.json");
         std::fs::write(&file, br#"{"a":1}"#).unwrap();
@@ -2485,9 +2346,8 @@ mod tests {
             let inj = TestInjector::new();
             inj.fail_at(point, 1);
             let adapter = ConfigInjector(&inj as &dyn FailureInjector);
-            // The §4.2 token mirrors the boundary's own discipline: a fresh
-            // snapshot taken before staging, so a target that changes inside
-            // the preparation window aborts at ConflictRecheck.
+            // The §4.2 token is a fresh snapshot taken before staging, so a
+            // target that changes inside the window aborts at ConflictRecheck.
             let token = superai_config::snapshot::snapshot(&file);
             let res = superai_config::transaction::stage_temp_file(
                 &file,
@@ -2520,9 +2380,8 @@ mod tests {
                     );
                 }
             }
-            // The original survives every injected failure (a failed write
-            // never truncates in place); after AtomicReplace the new bytes
-            // may have landed, so reset for the next iteration.
+            // The original survives every injected failure (no in-place
+            // truncation); after AtomicReplace the new bytes may have landed.
             let cur = std::fs::read(&file).unwrap();
             if cur == br#"{"a":2}"# {
                 std::fs::write(&file, br#"{"a":1}"#).unwrap();

@@ -1,15 +1,7 @@
-//! Amp adapter — explicit-config via `AMP_SETTINGS_FILE` / `--settings-file`.
-//!
+//! Amp adapter: explicit-config via `AMP_SETTINGS_FILE` / `--settings-file`.
 //! Research source: `docs/harness-configs/amp.md` (last verified 2026-08-25).
-//! Executable `amp`, config `~/.config/amp/settings.json` (JSON/JSONC) with
-//! explicit `AMP_SETTINGS_FILE` / `--settings-file`, isolation `explicit-config`.
-//! Hosted model routing and workspace billing are excluded (account constrained).
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
 
 use crate::adapter::{
     ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
@@ -20,10 +12,6 @@ use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence, Isolation};
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
 
 /// Harness identifier for Amp.
 pub const HARNESS_ID_STR: &str = "amp";
@@ -52,11 +40,7 @@ pub const LAST_VERIFIED: &str = "2026-08-25";
 /// Schema version for current settings shape.
 pub const SCHEMA_VERSION_STR: &str = "1";
 
-/// Owned selectors for Amp inside `settings.json` (JSONC).
-///
-/// Hosted features excluded: model routing/BYOK, workspace billing, thread
-/// visibility, and auth storage are not owned. We own only local mcp/skills
-/// and tool gating.
+/// Local mcp/skills and tool gating only; hosted routing/billing/auth stay foreign.
 pub const OWNED_SELECTORS: &[&str] = &[
     "amp.mcpServers",
     "amp.mcpPermissions",
@@ -67,16 +51,7 @@ pub const OWNED_SELECTORS: &[&str] = &[
     "amp.notifications.enabled",
 ];
 
-// ---------------------------------------------------------------------------
-// Adapter struct
-// ---------------------------------------------------------------------------
-
-/// Concrete adapter for Amp.
-///
-/// Isolation is `explicit-config` via `AMP_SETTINGS_FILE` / `--settings-file`.
-/// The wrapper sets `AMP_SETTINGS_FILE` to `<instance>/settings.json` and passes
-/// `--settings-file` explicitly. Hosted model dial and secrets file are not
-/// mutated.
+/// `explicit-config` via `AMP_SETTINGS_FILE`; the secrets file and hosted dials are never mutated.
 #[derive(Debug, Clone)]
 pub struct AmpAdapter {
     id: HarnessId,
@@ -104,112 +79,6 @@ impl AmpAdapter {
         CONFIG_ENV_VAR
     }
 
-    /// API key env var.
-    pub fn api_key_env_var(&self) -> &str {
-        API_KEY_ENV_VAR
-    }
-
-    /// Try to locate the `amp` binary via `PATH`.
-    #[expect(clippy::unused_self, reason = "adapter method uses instance constants")]
-    #[expect(clippy::excessive_nesting, reason = "PATH scan branches are explicit")]
-    fn find_binary_in_path(&self) -> Option<PathBuf> {
-        let path_var = std::env::var("PATH").ok()?;
-        let separator = if cfg!(windows) { ';' } else { ':' };
-        for dir in path_var.split(separator) {
-            if dir.is_empty() {
-                continue;
-            }
-            let candidate = Path::new(dir).join(EXECUTABLE);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-            if cfg!(windows) {
-                let exe_candidate = Path::new(dir).join(format!("{EXECUTABLE}.exe"));
-                if exe_candidate.is_file() {
-                    return Some(exe_candidate);
-                }
-            }
-        }
-        None
-    }
-
-    /// Probe `amp --version` with a timeout.
-    fn probe_version(binary: &Path) -> Option<String> {
-        let binary_owned = binary.to_path_buf();
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let output = Command::new(&binary_owned)
-                .arg("--version")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output();
-            drop(tx.send(output));
-        });
-        let Ok(Ok(output)) = rx.recv_timeout(Duration::from_secs(2)) else {
-            return None;
-        };
-        if !output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
-            return None;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let combined = if stdout.trim().is_empty() {
-            stderr.into_owned()
-        } else if stderr.trim().is_empty() {
-            stdout.into_owned()
-        } else {
-            format!("{stdout} {stderr}")
-        };
-        Self::parse_version_output(&combined)
-    }
-
-    /// Parse version output like `amp 0.1.0` into `0.1.0`.
-    #[expect(
-        clippy::excessive_nesting,
-        reason = "version parsing branches are explicit"
-    )]
-    fn parse_version_output(output: &str) -> Option<String> {
-        let trimmed = output.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        for token in trimmed.split_whitespace() {
-            let mut candidate = token;
-            if let Some(stripped) = candidate.strip_prefix('v') {
-                candidate = stripped;
-            } else if let Some(stripped) = candidate.strip_prefix('V') {
-                candidate = stripped;
-            }
-            let cleaned = candidate.trim_matches(|c: char| c == ',' || c == ')' || c == '(');
-            if cleaned.is_empty() {
-                continue;
-            }
-            let has_dot = cleaned.contains('.');
-            let starts_digit = cleaned.chars().next().is_some_and(|c| c.is_ascii_digit());
-            if has_dot && starts_digit {
-                let is_version_like = cleaned
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+');
-                if is_version_like {
-                    return Some(cleaned.to_owned());
-                }
-                let mut version_part = String::new();
-                for ch in cleaned.chars() {
-                    if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '+' {
-                        version_part.push(ch);
-                    } else {
-                        break;
-                    }
-                }
-                if version_part.contains('.') && !version_part.is_empty() {
-                    return Some(version_part);
-                }
-            }
-        }
-        None
-    }
-
-    /// Resolve the default config root.
     #[expect(clippy::excessive_nesting, reason = "explicit settings path handling")]
     fn default_config_root() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var(CONFIG_ENV_VAR)
@@ -236,12 +105,10 @@ impl AmpAdapter {
         Some(PathBuf::from(home).join(".config").join("amp"))
     }
 
-    /// Build the settings.json path for a given config root.
     fn settings_path_for_root(root: &Path) -> PathBuf {
         root.join("settings.json")
     }
 
-    /// Collect config evidence.
     #[expect(clippy::excessive_nesting, reason = "detection branches are explicit")]
     #[expect(clippy::unused_self, reason = "uses adapter constants via Self")]
     fn collect_config_evidence(&self, evidence: &mut Vec<String>) {
@@ -344,14 +211,14 @@ impl Adapter for AmpAdapter {
         let mut version: Option<String> = None;
         let mut binary_path: Option<PathBuf> = None;
 
-        match self.find_binary_in_path() {
+        match super::find_in_path(&[EXECUTABLE]) {
             Some(path) => {
                 evidence.push(format!(
                     "found binary `{}` at {}",
                     EXECUTABLE,
                     path.display()
                 ));
-                match Self::probe_version(&path) {
+                match super::probe_version(&path) {
                     Some(v) => {
                         evidence.push(format!("version `{v}` via `{EXECUTABLE} --version`"));
                         version = Some(v);
@@ -587,7 +454,6 @@ impl Adapter for AmpAdapter {
         ]
     }
 
-    /// EXT-08/09: MCP destination (amp.md: `amp.mcpServers` under the JSONC settings file; `amp mcp add` is the native writer)
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(crate::adapter::McpAdapterDecl::new(
             "settings.json",
@@ -598,7 +464,6 @@ impl Adapter for AmpAdapter {
         ).with_read_only("jsonc writes refuse (LossyWrite) until a preserving codec exists; inspect/diff only"))
     }
 
-    /// EXT-06/07: plugin mechanism (amp.md: project `.amp/plugins/`, system `~/.config/amp/plugins/`; no bundle manifest documented)
     fn plugin_decl(&self) -> Option<crate::adapter::PluginAdapterDecl> {
         Some(crate::adapter::PluginAdapterDecl::directory_bundle(
             "plugins",
@@ -607,12 +472,7 @@ impl Adapter for AmpAdapter {
         ))
     }
 
-    /// EXT-04: harness-config skill mechanism (amp.md core settings:
-    /// `amp.skills.disableClaudeCodeSkills` boolean switch and the
-    /// `amp.skills.path` skill search path, both inside the JSONC settings
-    /// file). Writes through the engine executor honor the JSONC
-    /// lossy-write gate (comment-free files write; comment-carrying files
-    /// refuse typed `LossyWrite`).
+    /// `amp.skills.*` lives in the JSONC settings file, so writes hit the lossy-write gate.
     fn skill_config_decl(&self) -> Option<crate::adapter::SkillConfigDecl> {
         Some(
             crate::adapter::SkillConfigDecl::new("settings.json")
@@ -630,8 +490,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        API_KEY_ENV_VAR, AmpAdapter, CONFIG_ENV_VAR, DISPLAY_NAME, EXECUTABLE, HARNESS_ID_STR,
-        OWNED_SELECTORS, RESEARCH_DOC,
+        AmpAdapter, CONFIG_ENV_VAR, DISPLAY_NAME, EXECUTABLE, HARNESS_ID_STR, OWNED_SELECTORS,
+        RESEARCH_DOC,
     };
     use crate::adapter::{Adapter, ConfigScope, DocumentKind, ProductStatus, SurfaceOwnership};
     use crate::error::CoreError;
@@ -668,7 +528,6 @@ mod tests {
         assert_eq!(a.display_name(), DISPLAY_NAME);
         assert_eq!(a.executable_name(), EXECUTABLE);
         assert_eq!(a.config_env_var(), CONFIG_ENV_VAR);
-        assert_eq!(a.api_key_env_var(), API_KEY_ENV_VAR);
         assert_eq!(a.product_status(), ProductStatus::Active);
         assert_eq!(a.research_doc_link(), RESEARCH_DOC);
         assert!(!a.last_verified_date().is_empty());
@@ -730,7 +589,7 @@ mod tests {
             ("not a version", None),
         ];
         for (input, expected) in cases {
-            let got = AmpAdapter::parse_version_output(input);
+            let got = crate::adapters::parse_version_output(input);
             assert_eq!(got.as_deref(), expected, "input: {input:?}");
         }
     }
@@ -919,10 +778,6 @@ mod tests {
                 .contains(CONFIG_ENV_VAR)
         );
     }
-
-    // -----------------------------------------------------------------------
-    // Fixture-backed conformance tests
-    // -----------------------------------------------------------------------
 
     fn fixtures_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/amp")

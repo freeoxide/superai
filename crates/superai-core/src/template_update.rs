@@ -1,16 +1,5 @@
-//! Three-way template update and transactional apply (TPL-06, TPL-07).
-//!
-//! Inputs:
-//! - `base`: previously applied `Template`
-//! - `new`: candidate `Template`
-//! - `local`: fresh current harness config (`serde_json::Map`)
-//!
-//! For each owned selector: local==base -> apply new, new==base -> keep local,
-//! local==new -> already applied, both differ -> conflict, missing/type-changed
-//! -> schema conflict. Foreign selectors are untouched.
-//!
-//! Preview contains old/new defaults, local values, auto-applicable edits,
-//! conflicts, wrapper and capability changes, and warnings.
+//! Three-way template update and transactional apply (TPL-06, TPL-07):
+//! local==base applies new, new==base keeps local, both differ conflicts.
 
 #![expect(
     clippy::excessive_nesting,
@@ -21,15 +10,11 @@
     clippy::redundant_clone,
     reason = "preview clones values for ownership clarity"
 )]
-#![expect(clippy::too_many_arguments, reason = "transaction needs many params")]
 #![expect(clippy::uninlined_format_args, reason = "test format explicit")]
-#![expect(clippy::collapsible_if, reason = "nested logic clearer")]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value};
 
@@ -47,10 +32,6 @@ use crate::ids::TemplateVersion;
 use crate::instance::{Instance, TemplateRef};
 use crate::registry::Registry;
 use crate::template::{CapabilityChanges, Template, compute_digest};
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 fn json_type_name(value: &Value) -> &'static str {
     match value {
@@ -102,10 +83,8 @@ fn get_local_value(local: &Map<String, Value>, selector: &str) -> Option<Value> 
     Some(current)
 }
 
-/// Build the engine operation for one auto-applicable edit (DOC-02 caller
-/// migration: three-way edits route through the executor so
-/// `owned_keys`/`expected_old`/`create_parent` are enforced instead of
-/// hand-rolled JSON path editing).
+/// Engine operation for one edit: three-way edits route through the
+/// executor so `owned_keys/expected_old/create_parent` are enforced.
 fn edit_to_engine_operation(edit: &Edit, owned_keys: &[String]) -> Result<EngineOperation> {
     let selector = Selector::parse(&edit.selector).map_err(|e| CoreError::Validation {
         field: "patches.selector".to_owned(),
@@ -124,19 +103,6 @@ fn edit_to_engine_operation(edit: &Edit, owned_keys: &[String]) -> Result<Engine
         .with_create_parent(true))
 }
 
-fn operation_id_string() -> String {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis());
-    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    millis.hash(&mut hasher);
-    count.hash(&mut hasher);
-    let suffix = hasher.finish() & 0xffff;
-    format!("op-{millis:013}-{suffix:04x}-{count:04x}")
-}
-
 fn quarantine_target(path: &Path, op_id: &str) {
     // Best-effort: ignore errors, as quarantine is recovery aid
     let res: std::result::Result<superai_config::quarantine::QuarantineEntry, _> =
@@ -145,40 +111,28 @@ fn quarantine_target(path: &Path, op_id: &str) {
 }
 
 fn resolve_config_path(instance: &Instance, adapter: &dyn Adapter) -> PathBuf {
-    // Prefer primary owned surface fallback; otherwise use settings.json under config_root
-    // For now, use adapter to discover fallback containing settings.json if possible
     for surface in adapter.config_surfaces() {
-        if surface.id == "settings.json" || surface.id.contains("settings") {
-            let fallback = surface.path_resolver.fallback.clone();
-            // fallback like "~/.claude/settings.json" -> take basename
-            if let Some(name) = Path::new(&fallback).file_name().and_then(|n| n.to_str()) {
-                let candidate = instance.config_root.as_path().join(name);
-                // If fallback basename is settings.json, use it
-                if name.to_ascii_lowercase().contains("settings.json") {
-                    return candidate;
-                }
+        if surface.id.contains("settings") {
+            // The surface's fallback basename (settings.json and friends)
+            // resolves inside the instance's relocated root.
+            if let Some(name) = Path::new(&surface.path_resolver.fallback)
+                .file_name()
+                .and_then(|n| n.to_str())
+                && name.to_ascii_lowercase().contains("settings.json")
+            {
+                return instance.config_root.as_path().join(name);
             }
         }
     }
     instance.config_root.as_path().join("settings.json")
 }
 
-/// Load the local config map for a three-way merge, or refuse honestly.
-///
-/// codec-honesty (DOC-05): a missing or empty file legitimately yields an
-/// empty base map, but bytes that fail strict-JSON parsing (JSONC content —
-/// comments/trailing commas, e.g. amp's declared settings kind) must not be
-/// silently swapped for an empty map: the merge would then drop every local
-/// key and write normalized JSON over the file. Refuse with the typed
-/// lossy-write error instead.
+/// Load the local map for a three-way merge, or refuse honestly (DOC-05):
+/// unparseable bytes must not become an empty map; typed lossy-write error.
 fn load_local_map(path: &Path) -> Result<Map<String, Value>> {
     match std::fs::read(path) {
         Ok(bytes) => {
-            #[expect(
-                clippy::redundant_closure_for_method_calls,
-                reason = "explicit closure for &u8"
-            )]
-            if bytes.is_empty() || bytes.iter().all(|b| b.is_ascii_whitespace()) {
+            if bytes.is_empty() || bytes.iter().all(u8::is_ascii_whitespace) {
                 return Ok(Map::new());
             }
             match serde_json::from_slice::<Value>(&bytes) {
@@ -194,10 +148,6 @@ fn load_local_map(path: &Path) -> Result<Map<String, Value>> {
         Err(_) => Ok(Map::new()),
     }
 }
-
-// ---------------------------------------------------------------------------
-// Public edit / conflict types
-// ---------------------------------------------------------------------------
 
 /// One automatically applicable edit from the three-way merge.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -267,10 +217,6 @@ pub struct Conflict {
     /// Human message, redacted (no secrets).
     pub message: String,
 }
-
-// ---------------------------------------------------------------------------
-// Wrapper / capability preview
-// ---------------------------------------------------------------------------
 
 /// Wrapper changes included in the preview.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -351,7 +297,6 @@ fn compute_wrapper_changes(base: &Template, new: &Template) -> WrapperChanges {
             added_assets.push((*a).clone());
         }
     }
-    // Sort for determinism
     added_env.sort();
     removed_env.sort();
     changed_env.sort();
@@ -399,13 +344,8 @@ fn compute_capability_changes(base: &Template, new: &Template) -> CapabilityChan
     }
 }
 
-// ---------------------------------------------------------------------------
-// Preview struct and core three-way
-// ---------------------------------------------------------------------------
-
-/// Resolver-computed capability delta for an update preview (CAP-06):
-/// support and source BEFORE vs AFTER, from real resolution sources rather
-/// than a string diff of the template's capability map.
+/// Resolver-computed capability delta for a preview (CAP-06): support
+/// and source BEFORE vs AFTER, from real resolution sources.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapabilitySupportChange {
     /// Capability whose resolution changed.
@@ -472,23 +412,13 @@ impl UpdatePreview {
     }
 }
 
-/// Compute a three-way preview.
-///
-/// For each owned selector (union of `base` and `new` patches):
-/// - `local == base` -> apply `new`
-/// - `new == base` -> keep `local`
-/// - `local == new` -> already applied
-/// - both differ -> conflict
-/// - missing / type-changed -> schema conflict
-///
-/// Foreign selectors are untouched.
+/// Three-way preview per owned selector: local==base applies new,
+/// new==base keeps local, both differ conflicts; foreign untouched.
 pub fn preview_three_way(
     base: &Template,
     new: &Template,
     local: &Map<String, Value>,
 ) -> UpdatePreview {
-    // Validate that both templates target same harness/id shape? Not strictly required for preview,
-    // but we add a warning if they differ.
     let mut warnings: Vec<String> = Vec::new();
     if base.id != new.id {
         warnings.push(format!("template id mismatch: {} vs {}", base.id, new.id));
@@ -569,10 +499,8 @@ pub fn preview_three_way(
     for selector in &union {
         let base_val = old_defaults.get(selector).cloned();
         let new_val = new_defaults.get(selector).cloned();
-        // Determine if selector is parseable as Key; if not, schema conflict.
         let path_opt = selector_to_path(selector);
         let local_val = if path_opt.is_none() {
-            // Non-Key selectors are schema conflicts if they appear in template
             conflicts.push(Conflict {
                 selector: selector.clone(),
                 base: base_val.clone(),
@@ -590,14 +518,8 @@ pub fn preview_three_way(
         };
         local_values.insert(selector.clone(), local_val.clone());
 
-        // Missing / type-changed -> schema conflict (before equality branches)
-        // Missing: base expected but local absent
+        // Missing: base expected a value the local config does not carry.
         if base_val.is_some() && local_val.is_none() {
-            // If base is Some and local None, that's missing.
-            // Exception: if base is Some and local None but new is also None (both deleted)?
-            // Then local==new? Both None? Not applicable because local None already.
-            // Treat as missing schema conflict unless base is None and local None would be equal.
-            // Since base is Some here, it's missing.
             conflicts.push(Conflict {
                 selector: selector.clone(),
                 base: base_val.clone(),
@@ -610,36 +532,27 @@ pub fn preview_three_way(
             });
             continue;
         }
-        // Type changed: local type differs from base type when both present
-        if let (Some(bv), Some(lv)) = (&base_val, &local_val) {
-            if json_type_name(bv) != json_type_name(lv) {
-                conflicts.push(Conflict {
-                    selector: selector.clone(),
-                    base: base_val.clone(),
-                    local: local_val.clone(),
-                    new: new_val.clone(),
-                    kind: ConflictKind::TypeChanged,
-                    message: format!(
-                        "selector `{selector}` type changed: base is {}, local is {}",
-                        json_type_name(bv),
-                        json_type_name(lv)
-                    ),
-                });
-                continue;
-            }
-        }
-        // For selectors where base is None (added in new) but local type differs from new? Check similar?
-        if base_val.is_none() {
-            if let (Some(nv), Some(lv)) = (&new_val, &local_val) {
-                if json_type_name(nv) != json_type_name(lv) && local_val.is_some() {
-                    // Local already has a value of different type than new's addition; treat as both_modified via type
-                    // Still go through equality checks later; but if types differ and values differ, it's BothModified
-                }
-            }
+        // Type changed: local type differs from base type when both present.
+        if let (Some(bv), Some(lv)) = (&base_val, &local_val)
+            && json_type_name(bv) != json_type_name(lv)
+        {
+            conflicts.push(Conflict {
+                selector: selector.clone(),
+                base: base_val.clone(),
+                local: local_val.clone(),
+                new: new_val.clone(),
+                kind: ConflictKind::TypeChanged,
+                message: format!(
+                    "selector `{selector}` type changed: base is {}, local is {}",
+                    json_type_name(bv),
+                    json_type_name(lv)
+                ),
+            });
+            continue;
         }
 
         // TPL-08: on a major bump, a selector the new template drops must be
-        // resolved explicitly — it is not silently removed (selector reset).
+        // resolved explicitly, it is not silently removed (selector reset).
         if major_bump && new_val.is_none() {
             conflicts.push(Conflict {
                 selector: selector.clone(),
@@ -653,7 +566,6 @@ pub fn preview_three_way(
             });
             continue;
         }
-        // Equality branches
         if local_val == base_val {
             if new_val != base_val {
                 auto_applicable.push(Edit {
@@ -707,19 +619,8 @@ pub fn preview_three_way(
     }
 }
 
-/// Alias for `preview_three_way` kept for task wording compatibility.
-pub fn preview_update(
-    base: &Template,
-    new: &Template,
-    local: &Map<String, Value>,
-) -> UpdatePreview {
-    preview_three_way(base, new, local)
-}
-
-/// Compute the resolver-backed capability delta between two templates
-/// (CAP-06): resolves every catalog capability with the adapter's
-/// declarations, the provider's capability data, and each template's own
-/// capability map, then reports support/source changes.
+/// Resolver-backed capability delta between two templates (CAP-06),
+/// reporting support/source changes from real resolution sources.
 pub fn compute_resolved_capability_delta(
     base: &Template,
     new: &Template,
@@ -761,9 +662,8 @@ pub fn compute_resolved_capability_delta(
     deltas
 }
 
-/// [`preview_three_way`] enriched with the resolver-computed capability
-/// delta (CAP-06): capability changes are visible, with sources, BEFORE any
-/// update commit.
+/// [`preview_three_way`] plus the resolver-computed capability delta
+/// (CAP-06): capability changes visible BEFORE any commit.
 pub fn preview_update_with_capability_resolution(
     base: &Template,
     new: &Template,
@@ -776,10 +676,6 @@ pub fn preview_update_with_capability_resolution(
         compute_resolved_capability_delta(base, new, adapter, provider);
     preview
 }
-
-// ---------------------------------------------------------------------------
-// Apply outcome and transactional apply (TPL-07)
-// ---------------------------------------------------------------------------
 
 /// Outcome of `apply_update`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -798,19 +694,14 @@ pub struct ApplyOutcome {
     pub conflict_token: Option<String>,
 }
 
-/// Re-fetch/verify in-memory template bytes against the template's digest.
-///
-/// The caller holds `bytes` that were supposedly fetched for `expected_digest`
-/// (catalog digest) or for the template's own `digest` field. This verifies
-/// both: the bytes hash matches `expected_digest` (if provided) and matches
-/// `template.digest`.
+/// Verify in-memory template bytes: size cap, id/version agreement,
+/// catalog digest match; the `digest` field is format-checked only.
 fn verify_template_bytes_in_memory(
     template: &Template,
     bytes: &[u8],
     catalog_digest: Option<&str>,
     context: &str,
 ) -> Result<()> {
-    // Verify size
     if bytes.len() > crate::template::MAX_TEMPLATE_BYTES {
         return Err(CoreError::Validation {
             field: "template".to_owned(),
@@ -821,13 +712,10 @@ fn verify_template_bytes_in_memory(
             ),
         });
     }
-    // Verify that bytes parse as the template and that parsed template equals provided template's key fields?
-    // At minimum, verify bytes parse and digest matches.
     let parsed = Template::from_json_bytes(bytes).map_err(|e| CoreError::SchemaValidation {
         path: PathBuf::from(context),
         details: format!("template bytes invalid for `{context}`: {e}"),
     })?;
-    // Check id/version/harness agreement
     if parsed.id != template.id {
         return Err(CoreError::Validation {
             field: "template.id".to_owned(),
@@ -846,10 +734,7 @@ fn verify_template_bytes_in_memory(
             ),
         });
     }
-    // Verify digest matches template field (lenient: only validate format, not equality to file hash, since catalog digest is authoritative)
     let computed = compute_digest(bytes);
-    // Template's own digest field must be valid hex (already validated via Template::validate), but we don't require it to equal file hash.
-    let _ = computed;
     if let Some(expected) = catalog_digest {
         let normalized = expected.trim().to_ascii_lowercase();
         if normalized != computed {
@@ -862,8 +747,6 @@ fn verify_template_bytes_in_memory(
             });
         }
     }
-    // Template's digest field leniency: we only ensure it is 64 hex, not that it equals computed.
-    // verify_digest would fail for placeholder digests used in tests, so skip strict check.
     let digest_field = template.digest.trim();
     if digest_field.len() != 64 || !digest_field.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(CoreError::Validation {
@@ -874,18 +757,8 @@ fn verify_template_bytes_in_memory(
     Ok(())
 }
 
-/// Apply a template update transactionally (TPL-07).
-///
-/// Steps:
-/// 1. re-fetch/verify required template files (in-memory bytes)
-/// 2. fresh-read instance config via snapshot
-/// 3. recompute three-way + conflict token
-/// 4. apply config/wrapper/assets via transaction.rs
-/// 5. validate harness instance via adapter
-/// 6. re-resolve capabilities
-/// 7. write new template version to registry last (only after verification)
-///
-/// Failure retains old version, no registry bump. Quarantine/rollback on failure.
+/// Apply a template update transactionally (TPL-07): verify bytes, fresh
+/// read, recompute three-way, transactional apply, registry written last.
 #[expect(
     clippy::too_many_arguments,
     reason = "transaction requires base/new bytes and adapter"
@@ -928,11 +801,9 @@ pub fn apply_update_with_catalog_digests(
     new_catalog_digest: Option<&str>,
     adapter: &dyn Adapter,
 ) -> Result<ApplyOutcome> {
-    // 1. re-fetch/verify required template files (in-memory bytes)
     verify_template_bytes_in_memory(base, base_bytes, base_catalog_digest, "base")?;
     verify_template_bytes_in_memory(new, new_bytes, new_catalog_digest, "new")?;
 
-    // Validate harness agreement
     if base.harness != instance.harness || new.harness != instance.harness {
         return Err(CoreError::Validation {
             field: "harness".to_owned(),
@@ -943,13 +814,10 @@ pub fn apply_update_with_catalog_digests(
         });
     }
 
-    // CAP-04: incomplete capability coverage blocks the template USE path.
-    // Validating the candidate against the adapter that will receive it
-    // enforces both selector ownership (TPL-02) and capability completeness
-    // before any disk mutation.
+    // CAP-04: validating the candidate against the receiving adapter
+    // enforces selector ownership and completeness before any mutation.
     new.validate_against_adapter(adapter)?;
 
-    // 2. fresh-read instance config via snapshot (and registry)
     let registry = Registry::load(registry_path)?;
     let fresh_instance =
         registry
@@ -968,7 +836,6 @@ pub fn apply_update_with_catalog_digests(
     let conflict_token = snap_before.digest.clone();
     let local_map = load_local_map(&config_path)?;
 
-    // 3. recompute three-way + conflict token
     let preview = preview_three_way(base, new, &local_map);
     if !preview.conflicts.is_empty() {
         let msgs: Vec<String> = preview
@@ -995,10 +862,8 @@ pub fn apply_update_with_catalog_digests(
         });
     }
 
-    // Build new config map by applying auto_applicable edits through the
-    // document engine (DOC-02 executor): owned keys are the template's own
-    // patch selectors, expected_old is each edit's observed `from` value,
-    // and parents may be created to mirror nested patch paths.
+    // Apply edits through the document engine (DOC-02): owned keys are
+    // the patch selectors, expected_old the observed `from`, parents created.
     let owned_keys: Vec<String> = base
         .patches
         .iter()
@@ -1017,7 +882,6 @@ pub fn apply_update_with_catalog_digests(
         });
     };
 
-    // Serialize new config
     let serialized_value = Value::Object(new_local_map.clone());
     let mut new_bytes_serialized =
         serde_json::to_string_pretty(&serialized_value).map_err(|e| {
@@ -1029,8 +893,7 @@ pub fn apply_update_with_catalog_digests(
     new_bytes_serialized.push('\n');
     let new_content = new_bytes_serialized.into_bytes();
 
-    // Prepare file actions
-    let op_id_str = operation_id_string();
+    let op_id_str = crate::registry::unique_operation_string("op");
     let tx_op_id = superai_config::transaction::OperationId::new(&op_id_str).map_err(|e| {
         CoreError::Validation {
             field: "operation_id".to_owned(),
@@ -1039,60 +902,49 @@ pub fn apply_update_with_catalog_digests(
     })?;
 
     let mut steps: Vec<FileAction> = Vec::new();
-    // Config write
     steps.push(FileAction::Write {
         path: config_path.clone(),
         content: new_content.clone(),
         kind: DocumentKind::StrictJson,
     });
 
-    // Wrapper update if needed and instance has wrapper
-    let mut wrapper_step_added = false;
-    if !preview.wrapper_changes.is_empty() {
-        if let Some(wrapper_ref) = &fresh_instance.wrapper {
-            let wrapper_path = wrapper_ref.path.as_path().to_path_buf();
-            // Generate new wrapper content based on fresh_instance and new template's wrapper values
-            // Build wrapper plan from adapter and new template env/args
-            let mut temp_instance = fresh_instance.clone();
-            temp_instance.config_root = fresh_instance.config_root.clone();
-            let plan = adapter.plan_wrapper(&temp_instance).unwrap_or_else(|_| {
-                let mut p = crate::adapter::WrapperPlan::new("wrapper for update");
-                p.env_vars = new.wrapper_env.clone().into_iter().collect();
-                new.wrapper_args.clone_into(&mut p.args);
-                p
-            });
-            // Merge template wrapper_env/args into plan
-            let mut merged_plan = plan;
-            // Ensure template's wrapper_env overrides or adds
-            for (k, v) in &new.wrapper_env {
-                if let Some(entry) = merged_plan.env_vars.iter_mut().find(|(ek, _)| ek == k) {
-                    entry.1.clone_from(v);
-                } else {
-                    merged_plan.env_vars.push((k.clone(), v.clone()));
-                }
+    // Wrapper regeneration when the template changes its env/args and the
+    // instance carries a wrapper.
+    if !preview.wrapper_changes.is_empty()
+        && let Some(wrapper_ref) = &fresh_instance.wrapper
+    {
+        let wrapper_path = wrapper_ref.path.as_path().to_path_buf();
+        let temp_instance = fresh_instance.clone();
+        let plan = adapter.plan_wrapper(&temp_instance).unwrap_or_else(|_| {
+            let mut p = crate::adapter::WrapperPlan::new("wrapper for update");
+            p.env_vars = new.wrapper_env.clone().into_iter().collect();
+            new.wrapper_args.clone_into(&mut p.args);
+            p
+        });
+        // Template wrapper_env/args override or extend the plan.
+        let mut merged_plan = plan;
+        for (k, v) in &new.wrapper_env {
+            if let Some(entry) = merged_plan.env_vars.iter_mut().find(|(ek, _)| ek == k) {
+                entry.1.clone_from(v);
+            } else {
+                merged_plan.env_vars.push((k.clone(), v.clone()));
             }
-            for arg in &new.wrapper_args {
-                if !merged_plan.args.contains(arg) {
-                    merged_plan.args.push(arg.clone());
-                }
-            }
-            let (wrapper_content, _digest) =
-                crate::wrapper::generate_shell_wrapper(&temp_instance, &merged_plan);
-            steps.push(FileAction::Write {
-                path: wrapper_path,
-                content: wrapper_content.into_bytes(),
-                kind: DocumentKind::TextFragment,
-            });
-            wrapper_step_added = true;
-        } else {
-            // No wrapper to update; treat as warning not failure
         }
+        for arg in &new.wrapper_args {
+            if !merged_plan.args.contains(arg) {
+                merged_plan.args.push(arg.clone());
+            }
+        }
+        let (wrapper_content, _digest) =
+            crate::wrapper::generate_shell_wrapper(&temp_instance, &merged_plan)?;
+        steps.push(FileAction::Write {
+            path: wrapper_path,
+            content: wrapper_content.into_bytes(),
+            kind: DocumentKind::TextFragment,
+        });
     }
-    let _ = wrapper_step_added;
 
-    // Asset handling: if template assets added/removed, we could create placeholder files
-    // For TPL-07 we ensure assets via advisory: we just warn; actual asset fetch is out of scope for this transaction skeleton
-    // But we still need to validate asset paths are safe
+    // Asset paths are validated even though fetching them is out of scope.
     for asset in &new.assets {
         if let Err(e) = crate::template::validate_template_path(asset) {
             return Err(CoreError::Validation {
@@ -1102,7 +954,6 @@ pub fn apply_update_with_catalog_digests(
         }
     }
 
-    // 4. apply config/wrapper/assets via transaction.rs
     let mut transaction = Transaction::new(tx_op_id, steps);
     let outcome = transaction.execute().map_err(CoreError::Config)?;
 
@@ -1125,7 +976,6 @@ pub fn apply_update_with_catalog_digests(
         }
         // Ensure config's residuals are also quarantined
         if config_path.exists() {
-            // If verification failed, quarantine config?
             let has_verify_failure = outcome
                 .verification
                 .iter()
@@ -1145,22 +995,11 @@ pub fn apply_update_with_catalog_digests(
             warnings: preview.warnings.clone(),
             conflict_token,
         });
-        // Note: we return Ok with registry_updated false to signal failure retained old version,
-        // but caller may also expect Err. We choose to return Err for transactional failure?
-        // To satisfy "Failure retains old version, no registry bump" we ensure registry not bumped.
-        // However spec says transaction via Result; we will return Err for prepare/commit failures,
-        // and Ok with registry_updated false for verification path.
-        // For now, also consider returning Err for outcome.success false:
-        // But we have already returned Ok; hidden tests may expect Err variant?
-        // We provide alternative: treat as Err if we want strict.
-        // We'll instead return Err to make failure explicit.
     }
-    // Verify that file was not concurrently modified during transaction commit window
+    // Concurrent-modification check: the post-commit snapshot must equal the
+    // digest of the content this transaction just wrote.
     let snap_after = snapshot(&config_path);
     if is_modified(&snap_before, &snap_after) && snap_after.digest.is_some() {
-        // The snapshot after should correspond to new content; is_modified would be true because content changed.
-        // So we check that snap_after digest equals expected new digest, not that it is unchanged.
-        // If another writer modified concurrently, snap_after digest would not match expected.
         let expected_digest = {
             use std::collections::hash_map::DefaultHasher;
             let mut hasher = DefaultHasher::new();
@@ -1168,7 +1007,6 @@ pub fn apply_update_with_catalog_digests(
             format!("{:016x}", hasher.finish())
         };
         if snap_after.digest.as_deref() != Some(expected_digest.as_str()) {
-            // Concurrent modification detected: rollback previous transaction
             drop(transaction.rollback());
             quarantine_target(&config_path, &op_id_str);
             return Err(CoreError::ConcurrentModification {
@@ -1179,7 +1017,6 @@ pub fn apply_update_with_catalog_digests(
         }
     }
 
-    // 5. validate harness instance via adapter
     let mut updated_instance = fresh_instance.clone();
     updated_instance.template = Some(TemplateRef {
         name: new.id.clone(),
@@ -1188,7 +1025,6 @@ pub fn apply_update_with_catalog_digests(
             reason: format!("new version invalid for registry: {e}"),
         })?,
     });
-    // Also update adapter_revision to current?
     crate::adapter::ADAPTER_REVISION.clone_into(&mut updated_instance.adapter_revision);
 
     if let Err(e) = adapter.validate_instance(&updated_instance) {
@@ -1205,7 +1041,6 @@ pub fn apply_update_with_catalog_digests(
         });
     }
 
-    // 6. re-resolve capabilities
     let provider_id = new.provider.clone();
     let resolved = capability_resolver::resolve_all(&updated_instance.harness, &provider_id);
     // If any capability resolution yields Unknown source for required caps, add warning but not block
@@ -1249,37 +1084,14 @@ pub fn apply_update_with_catalog_digests(
             reason: "registry index out of bounds during update".to_owned(),
         });
     }
-    // Need to rebuild Registry with updated instances
-    let mut new_registry = Registry::default();
-    for inst in &instances_vec {
-        new_registry
-            .insert(inst.clone())
-            .map_err(|e| CoreError::Validation {
-                field: "registry".to_owned(),
-                reason: format!("registry insert failed during update: {e}"),
-            })?;
-        // insert will validate duplicates; but we rebuilt from existing + updated, so clone approach is better:
-        // Instead, we will use store via direct JSON edit to preserve foreign keys: Registry::store does edit preserving keys.
-        // So we drop the manual insert and just mutate via load/store with template version edit.
-    }
-    // Instead of rebuilding via insert loop which duplicates, we will directly edit registry via Registry's internal store replacement:
-    // Safer to use fresh_registry as mutable and replace instance via store path that uses Registry::store logic:
-    // Registry::store expects self to contain updated instances; we already have fresh_registry with old instance.
-    // Create a new Registry containing updated_vec by constructing via method that bypasses duplicate checks?
-    // Simpler: we can directly use Registry's private field via replacement using std::mem::replace technique: build a new Registry via Default and insert all, but that is okay because we already have unique ids.
-
-    // However our previous loop attempted to insert into new_registry but failed duplicate due to not clearing? Let's redo correctly:
+    // Rebuild and store; Registry::store preserves foreign keys on disk.
     let mut rebuilt = Registry::default();
-    // Drain instances_vec into rebuilt without duplicate check via insert one-by-one (insert checks duplicates)
-    // Since instances_vec has unique ids, it should succeed.
-    // We already attempted but used to_store clone confusion. Rebuild fresh:
     for inst in instances_vec {
         rebuilt.insert(inst).map_err(|e| CoreError::Validation {
             field: "registry".to_owned(),
             reason: format!("rebuilding registry failed: {e}"),
         })?;
     }
-    // Preserve foreign keys via store: store will merge owned keys, preserving foreign.
     if let Err(e) = rebuilt.store(registry_path) {
         // Rollback transaction on registry failure
         drop(transaction.rollback());
@@ -1287,7 +1099,6 @@ pub fn apply_update_with_catalog_digests(
         return Err(e);
     }
 
-    // Success
     Ok(ApplyOutcome {
         applied: preview.auto_applicable,
         verification: outcome.diagnostics_redacted,
@@ -1297,53 +1108,6 @@ pub fn apply_update_with_catalog_digests(
         conflict_token,
     })
 }
-
-// ---------------------------------------------------------------------------
-// Convenience aliases matching task phrasing
-// ---------------------------------------------------------------------------
-
-/// Alias for `preview_three_way` with the task's expected name.
-pub fn three_way_preview(
-    base: &Template,
-    new: &Template,
-    local: &Map<String, Value>,
-) -> UpdatePreview {
-    preview_three_way(base, new, local)
-}
-
-/// Alias for preview that matches "TPL-06 three-way update" naming.
-pub fn compute_preview(
-    base: &Template,
-    new: &Template,
-    local: &Map<String, Value>,
-) -> UpdatePreview {
-    preview_three_way(base, new, local)
-}
-
-/// Apply via `apply_update` alias expected by some callers.
-pub fn apply_template_update(
-    instance: &Instance,
-    registry_path: &Path,
-    base: &Template,
-    new: &Template,
-    base_bytes: &[u8],
-    new_bytes: &[u8],
-    adapter: &dyn Adapter,
-) -> Result<ApplyOutcome> {
-    apply_update(
-        instance,
-        registry_path,
-        base,
-        new,
-        base_bytes,
-        new_bytes,
-        adapter,
-    )
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -1387,10 +1151,6 @@ mod tests {
             value,
         }
     }
-
-    // -------------------------------------------------------------------
-    // TPL-08 selector reset + CAP-04 completeness + CAP-06 resolved delta
-    // -------------------------------------------------------------------
 
     /// Local adapter declaring only ONE capability transport: the CAP-04
     /// completeness gate must reject templates against it.
@@ -1556,9 +1316,8 @@ mod tests {
 
     #[test]
     fn resolved_capability_delta_uses_sources_not_string_diff() {
-        // claude-code + glm: template override flips vision absent->native.
-        // The string capability_map diff alone cannot express the
-        // source-attributed before/after the resolver produces.
+        // Template override flips vision absent->native; the string diff
+        // alone cannot express the source-attributed before/after.
         let base = minimal_template("1.0.0", vec![patch("key:model", json!("glm-4"))]);
         let mut new = minimal_template("1.2.0", vec![patch("key:model", json!("glm-4.5"))]);
         new.capability_map.insert(
@@ -1610,7 +1369,6 @@ mod tests {
     #[test]
     fn preview_local_override_preserved_when_new_eq_base() {
         let base = minimal_template("1.1.0", vec![patch("key:model", json!("glm-4"))]);
-        // new unchanged for that selector
         let new = minimal_template("1.1.0", vec![patch("key:model", json!("glm-4"))]);
         let mut local = Map::new();
         local.insert("model".to_owned(), json!("my-custom-model"));
@@ -1625,10 +1383,8 @@ mod tests {
 
     #[test]
     fn apply_update_blocked_on_incomplete_capability_coverage() {
-        // FINDING-2 regression: the CAP-04 completeness gate must fire on the
-        // template USE path — an update whose capability coverage does not
-        // resolve against the target adapter is refused before any disk
-        // mutation, and the registry keeps the old version.
+        // CAP-04 on the USE path: an update whose capability coverage does
+        // not resolve is refused before any disk mutation.
         let tmp = crate::test_util::temp_dir_unique("tpl-cap04-apply");
         let registry_path = tmp.join("instances.json");
         let config_root = tmp.join(".partial-work");
@@ -1726,9 +1482,8 @@ mod tests {
 
     #[test]
     fn apply_nested_selector_creates_parent_and_preserves_foreign() {
-        // DOC-02 caller migration: nested patch selectors route through the
-        // engine executor, creating intermediate objects while foreign keys
-        // and untouched siblings survive the apply.
+        // DOC-02: nested patch selectors route through the engine executor,
+        // creating parents while foreign keys and siblings survive.
         let tmp = crate::test_util::temp_dir_unique("tpl-update-nested");
         let registry_path = tmp.join("instances.json");
         let config_root = tmp.join(".claude-nested");
@@ -1873,7 +1628,6 @@ mod tests {
             preview.auto_applicable
         );
         assert_eq!(temp_edit.unwrap().to, None);
-        // model also should be auto
         assert!(
             preview
                 .auto_applicable
@@ -1891,11 +1645,9 @@ mod tests {
         local.insert("foreign_key".to_owned(), json!("keep_me"));
         local.insert("another".to_owned(), json!(123));
         let preview = preview_three_way(&base, &new, &local);
-        // preview only considers owned selectors
         assert_eq!(preview.local_values.len(), 1);
         assert!(preview.local_values.contains_key("key:model"));
         assert!(!preview.local_values.contains_key("foreign_key"));
-        // auto applicable only for owned
         assert_eq!(preview.auto_applicable.len(), 1);
     }
 
@@ -1952,7 +1704,6 @@ mod tests {
 
     #[test]
     fn apply_success_advances_version_and_retains_old_on_failure() {
-        // Prepare temp registry and config root
         let tmp = crate::test_util::temp_dir_unique("tpl-update");
         let registry_path = tmp.join("instances.json");
         let config_root = tmp.join(".claude-work");
@@ -1970,7 +1721,6 @@ mod tests {
         let base_bytes = serde_json::to_vec(&base_tmpl).unwrap();
         let new_bytes = serde_json::to_vec(&new_tmpl).unwrap();
 
-        // Create instance record pointing at base version
         let instance = Instance {
             id: crate::ids::InstanceId::new("test-instance-001").unwrap(),
             name: crate::ids::InstanceName::new("work").unwrap(),
@@ -1992,7 +1742,6 @@ mod tests {
         registry.insert(instance.clone()).unwrap();
         registry.store(&registry_path).unwrap();
 
-        // Write local config equal to base
         let mut local_map = Map::new();
         local_map.insert("model".to_owned(), json!("glm-4"));
         std::fs::write(
@@ -2003,18 +1752,15 @@ mod tests {
 
         let adapter = crate::adapters::claude_code::ClaudeCodeAdapter::new().unwrap();
 
-        // Preview should be auto applicable
-        let preview = preview_three_way(&base_tmpl, &new_tmpl, &Map::new());
-        // Actually preview with empty local would be missing; test with correct local
+        // Preview with empty local would be missing; the real local matches base.
         let local_for_preview = {
             let mut m = Map::new();
             m.insert("model".to_owned(), json!("glm-4"));
             m
         };
-        let preview2 = preview_three_way(&base_tmpl, &new_tmpl, &local_for_preview);
-        assert!(preview2.can_auto_apply());
+        let preview = preview_three_way(&base_tmpl, &new_tmpl, &local_for_preview);
+        assert!(preview.can_auto_apply());
 
-        // Apply should succeed and bump registry version
         let outcome = apply_update(
             &instance,
             &registry_path,
@@ -2027,17 +1773,14 @@ mod tests {
         .unwrap();
         assert!(outcome.registry_updated);
         assert_eq!(outcome.applied.len(), 1);
-        // Verify registry now has new version
         let registry_after = Registry::load(&registry_path).unwrap();
         let updated = registry_after.get_by_id("test-instance-001").unwrap();
         assert_eq!(updated.template.as_ref().unwrap().version.as_str(), "1.2.0");
-        // Verify config file now has new value
         let new_config_text = std::fs::read_to_string(&config_path).unwrap();
         let new_val: Value = serde_json::from_str(&new_config_text).unwrap();
         assert_eq!(new_val["model"], json!("glm-4.5"));
 
-        // Failure case: create conflicting local and try to apply original base->new again
-        // Reset registry to old version for failure test: create a second instance
+        // Failure case: a second instance with a conflicting local value.
         let config_root2 = tmp.join(".claude-work2");
         std::fs::create_dir_all(&config_root2).unwrap();
         let config_path2 = config_root2.join("settings.json");
@@ -2068,10 +1811,8 @@ mod tests {
             serde_json::to_string_pretty(&Value::Object(conflict_local.clone())).unwrap() + "\n",
         )
         .unwrap();
-        // Preview for this should be conflict
         let preview_conflict = preview_three_way(&base_tmpl, &new_tmpl, &conflict_local);
         assert!(!preview_conflict.can_auto_apply());
-        // Apply should fail and retain old version
         let apply_res = apply_update(
             &instance2,
             &registry_path,
@@ -2089,25 +1830,17 @@ mod tests {
         let registry_after_fail = Registry::load(&registry_path).unwrap();
         let still = registry_after_fail.get_by_id("test-instance-002").unwrap();
         assert_eq!(still.template.as_ref().unwrap().version.as_str(), "1.1.0");
-        // Config file should remain conflict value, not overwritten to glm-4.5
         let after_fail_text = std::fs::read_to_string(&config_path2).unwrap();
         let after_fail_val: Value = serde_json::from_str(&after_fail_text).unwrap();
         assert_eq!(after_fail_val["model"], json!("custom-model"));
 
-        // Cleanup
         drop(std::fs::remove_dir_all(&tmp));
-        // Avoid unused warning for preview
-        drop(preview);
     }
 
     #[test]
     fn apply_update_refuses_jsonc_settings_instead_of_normalizing() {
-        // codec-honesty (DOC-05): a settings file carrying JSONC content
-        // (comments/trailing commas — e.g. amp's declared settings surface at
-        // a settings.json path) must make apply_update fail with the typed
-        // lossy-write error. Previously the unparseable bytes were swapped
-        // for an empty map and overwritten with normalized JSON, destroying
-        // every comment and every local (foreign) key.
+        // DOC-05: JSONC settings bytes (comments, trailing commas) must
+        // fail with the typed lossy error, never become an empty map.
         let tmp = crate::test_util::temp_dir_unique("tpl-update-jsonc");
         let registry_path = tmp.join("instances.json");
         let config_root = tmp.join(".claude-jsonc");
@@ -2186,7 +1919,6 @@ mod tests {
         let config_path = config_root.join("settings.json");
         let base = minimal_template("1.1.0", vec![patch("key:model", json!("glm-4"))]);
         let mut new = minimal_template("1.2.0", vec![patch("key:model", json!("glm-4.5"))]);
-        // Set correct digests
         let base_bytes = serde_json::to_vec(&{
             let mut b = base.clone();
             b.digest = "a".repeat(64);
@@ -2196,7 +1928,6 @@ mod tests {
         let mut base_tmp = base.clone();
         base_tmp.digest = compute_digest(&base_bytes);
         let base_bytes = serde_json::to_vec(&base_tmp).unwrap();
-        let base_tmp = base_tmp; // final
         // new with invalid digest format (should trigger validation error)
         new.digest = "not-a-valid-digest".to_owned();
         let new_bytes = serde_json::to_vec(&new).unwrap();
@@ -2252,7 +1983,6 @@ mod tests {
         let config_path = config_root.join("settings.json");
         let base = minimal_template("1.1.0", vec![patch("key:model", json!("glm-4"))]);
         let new = minimal_template("1.2.0", vec![patch("key:model", json!("glm-4.5"))]);
-        // Fix digests
         let base_bytes = {
             let mut b = base.clone();
             let tmp_bytes = serde_json::to_vec(&b).unwrap();
@@ -2300,7 +2030,6 @@ mod tests {
 
         // Take snapshot, then externally edit before commit
         let snap_before = snapshot(&config_path);
-        // External edit
         std::fs::write(
             &config_path,
             serde_json::to_string_pretty(&json!({"model":"externally-changed"})).unwrap() + "\n",
@@ -2317,7 +2046,6 @@ mod tests {
         };
         let preview = preview_three_way(&base_fixed, &new_fixed, &local_after);
         assert_eq!(preview.conflicts.len(), 1); // both modified
-        // Apply should fail due to conflict, retaining old version
         let adapter = crate::adapters::claude_code::ClaudeCodeAdapter::new().unwrap();
         let res = apply_update(
             &instance,

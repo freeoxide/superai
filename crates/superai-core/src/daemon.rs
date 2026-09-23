@@ -1,17 +1,5 @@
-//! Daemon lifecycle machinery (WRP-07).
-//!
-//! Generic start/stop for daemon-class harnesses (`Isolation::DaemonService`,
-//! e.g. openclaw and letta-code): port allocation is probe-and-reserve with a
-//! fresh conflict check at start (a recorded port is never trusted as
-//! unquestionably free), the pid/service identity lives in a superai-owned
-//! file, readiness is a bounded poll of a command probe, and stop signals a
-//! pid only after its start identity has been re-verified — a stale or reused
-//! pid file never authorizes killing a process.
-//!
-//! The machinery is generic on purpose: which harness daemons superai may
-//! actually drive is an adapter research question (openclaw stays
-//! `ResearchBlocked` until its gateway/port facts are verified; see
-//! `adapters::openclaw::daemon_constraints`).
+//! Daemon lifecycle machinery (WRP-07): probe-and-reserve ports, superai-owned
+//! identity, bounded readiness, and stop only after the pid's start identity is re-verified.
 
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, TcpListener};
@@ -27,6 +15,7 @@ use superai_config::transaction::commit_file;
 
 use crate::error::{CoreError, Result};
 use crate::process::{ExecuteOpts, run_command};
+use crate::registry::now_iso8601;
 
 /// Default bind address used when a harness does not pin one.
 pub const DEFAULT_BIND_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
@@ -41,15 +30,8 @@ pub const DEFAULT_PORT_RANGE_END: u16 = 65535;
 /// allocation bounded even over the full ephemeral range).
 const MAX_PORT_PROBES: usize = 512;
 
-// ---------------------------------------------------------------------------
-// Process probing
-// ---------------------------------------------------------------------------
-
 /// Evidence source for the liveness and identity of an OS process.
-///
-/// Production uses [`SystemProcessProbe`]; tests inject deterministic fakes
-/// (the same discipline as `failure::DaemonFixture`, which pinned the
-/// unrelated-pid and pid-reuse classes).
+/// Production uses [`SystemProcessProbe`]; tests inject deterministic fakes.
 pub trait ProcessProbe: Send + Sync {
     /// Whether `pid` names a live process.
     fn is_alive(&self, pid: u32) -> bool;
@@ -62,13 +44,8 @@ pub trait ProcessProbe: Send + Sync {
     fn executable(&self, pid: u32) -> Option<String>;
 }
 
-/// Production probe over the OS process table.
-///
-/// Linux reads `/proc` directly. On platforms without a std-visible process
-/// table the probe reports no evidence (`start_time`/`executable` `None`) and
-/// conservative liveness — which makes identity verification refuse rather
-/// than guess, per the "never kill an unverified pid" rule. Signaling itself
-/// goes through the platform `kill`/`taskkill` binary (no unsafe code).
+/// Production probe over the OS process table. Without a std-visible process
+/// table it reports no evidence, so identity verification refuses, never guesses.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemProcessProbe;
 
@@ -86,13 +63,8 @@ impl ProcessProbe for SystemProcessProbe {
     }
 }
 
-/// Whether `pid` names a live process.
-///
-/// Linux: `/proc/<pid>` existence, with a zombie (state `Z`) counted as dead
-/// — an exited-but-unreaped daemon must not hold locks or ports. Other
-/// platforms: conservatively `true` — liveness can never be disproven with
-/// std alone, and a false "dead" would authorize removing another process's
-/// identity state.
+/// Whether `pid` names a live process. Linux counts zombies as dead; other
+/// platforms answer `true` because liveness cannot be disproven with std alone.
 #[must_use]
 pub fn pid_is_alive(pid: u32) -> bool {
     #[cfg(target_os = "linux")]
@@ -163,10 +135,6 @@ pub fn proc_executable(pid: u32) -> Option<String> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Daemon identity (superai-owned)
-// ---------------------------------------------------------------------------
-
 /// Default superai-owned root for daemon identity files (`<home>/.superai/daemons`).
 #[must_use]
 pub fn default_identity_root(home: &Path) -> PathBuf {
@@ -179,10 +147,102 @@ pub fn identity_path(root: &Path, harness: &str, instance: &str) -> PathBuf {
     root.join(format!("{harness}-{instance}.identity.json"))
 }
 
-/// Recorded service identity of a daemon superai started (WRP-07).
-///
-/// Carries only safe facts: no argv and no environment are recorded, so a
-/// leaked identity file never exposes a secret a daemon was launched with.
+/// Start-lock body: the holder identity, for staleness recovery and conflict
+/// diagnostics.
+#[derive(Serialize, Deserialize)]
+struct StartLockFile {
+    pid: u32,
+    harness: String,
+    acquired_at: String,
+}
+
+/// Exclusive start lock serializing daemon starts per harness/instance, so
+/// the exists-check, spawn, and identity write act as one step.
+struct DaemonStartLock {
+    path: PathBuf,
+}
+
+impl DaemonStartLock {
+    fn acquire(root: &Path, harness: &str, instance: &str) -> Result<Self> {
+        let path = root.join(format!("{harness}-{instance}.start.lock"));
+        if Self::try_create(&path, harness)? {
+            return Ok(Self { path });
+        }
+        if lock_is_stale(&path) {
+            drop(std::fs::remove_file(&path));
+            if Self::try_create(&path, harness)? {
+                return Ok(Self { path });
+            }
+        }
+        let holder_pid = std::fs::read(&path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<StartLockFile>(&b).ok())
+            .map(|l| l.pid);
+        Err(CoreError::Validation {
+            field: "daemon".to_owned(),
+            reason: format!(
+                "daemon start already in progress for {harness}/{instance} (start lock held by \
+                 pid {})",
+                holder_pid.map_or_else(|| "unknown".to_owned(), |p| p.to_string())
+            ),
+        })
+    }
+
+    /// `Ok(true)` = created (acquired); `Ok(false)` = held; `Err` = I/O.
+    fn try_create(path: &Path, harness: &str) -> Result<bool> {
+        use std::io::Write;
+        let mut file = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+            Err(e) => {
+                return Err(CoreError::Validation {
+                    field: "daemon_start_lock".to_owned(),
+                    reason: format!("cannot open start lock {}: {e}", path.display()),
+                });
+            }
+        };
+        let body = serde_json::to_vec(&StartLockFile {
+            pid: std::process::id(),
+            harness: harness.to_owned(),
+            acquired_at: now_iso8601(),
+        })
+        .map_err(|e| CoreError::Validation {
+            field: "daemon_start_lock".to_owned(),
+            reason: format!("cannot serialize start lock: {e}"),
+        })?;
+        file.write_all(&body).map_err(|e| CoreError::Validation {
+            field: "daemon_start_lock".to_owned(),
+            reason: format!("cannot write start lock {}: {e}", path.display()),
+        })?;
+        Ok(true)
+    }
+}
+
+impl Drop for DaemonStartLock {
+    fn drop(&mut self) {
+        drop(std::fs::remove_file(&self.path));
+    }
+}
+
+/// Whether the start lock at `path` is provably stale (dead holder or
+/// unparsable body sitting in the superai-owned root).
+fn lock_is_stale(path: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(path) else {
+        return true;
+    };
+    match serde_json::from_slice::<StartLockFile>(&bytes) {
+        Ok(lock) => lock.pid != std::process::id() && !pid_is_alive(lock.pid),
+        Err(_) => true,
+    }
+}
+
+/// Recorded service identity of a daemon superai started (WRP-07). No argv
+/// and no environment are recorded, so a leaked identity file exposes no secret.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonIdentity {
     /// Harness the daemon belongs to.
@@ -197,7 +257,7 @@ pub struct DaemonIdentity {
     pub bind_addr: String,
     /// Executable path as recorded at start.
     pub executable: String,
-    /// Kernel start time of the pid at start, when the platform provides it —
+    /// Kernel start time of the pid at start, when the platform provides it;
     /// the token that detects pid reuse before any signal is sent.
     pub start_time: Option<u64>,
     /// ISO-8601 start timestamp.
@@ -207,7 +267,6 @@ pub struct DaemonIdentity {
 }
 
 /// Fresh-read one identity file.
-///
 /// Missing files and unparsable content are typed errors, never guessed past.
 pub fn load_identity(path: &Path) -> Result<DaemonIdentity> {
     let bytes = std::fs::read(path).map_err(|e| CoreError::Validation {
@@ -221,9 +280,7 @@ pub fn load_identity(path: &Path) -> Result<DaemonIdentity> {
 }
 
 /// Fresh-scan a superai-owned daemon root for recorded identities.
-///
-/// Unparsable entries are skipped (they carry no authority: every consumer
-/// re-verifies liveness and start identity before acting on a record).
+/// Unparsable entries are skipped; every consumer re-verifies before acting.
 #[must_use]
 pub fn read_identities(root: &Path) -> Vec<(PathBuf, DaemonIdentity)> {
     let mut out = Vec::new();
@@ -242,14 +299,8 @@ pub fn read_identities(root: &Path) -> Vec<(PathBuf, DaemonIdentity)> {
     out
 }
 
-// ---------------------------------------------------------------------------
-// Port allocation
-// ---------------------------------------------------------------------------
-
-/// Whether a TCP port can be bound right now on `addr`.
-///
-/// The probe listener is dropped immediately; per WRP-07 any port derived
-/// here is re-checked at start and never persisted as unquestionably free.
+/// Whether a TCP port can be bound right now on `addr`; any port derived
+/// here is re-checked at start, never persisted as unquestionably free.
 #[must_use]
 pub fn port_is_free(addr: IpAddr, port: u16) -> bool {
     TcpListener::bind((addr, port)).is_ok()
@@ -265,8 +316,7 @@ fn held_ports(root: &Path, probe: &dyn ProcessProbe) -> HashSet<u16> {
 }
 
 /// Verify a port is free now, naming the live recorded daemon that holds it
-/// when one does. Produces the typed [`CoreError::PortConflict`] (INS-02's
-/// daemon precondition and WRP-07's commit/start check both route here).
+/// when one does; the typed [`CoreError::PortConflict`] routes here.
 pub fn check_port_free(
     addr: IpAddr,
     port: u16,
@@ -293,12 +343,8 @@ pub fn check_port_free(
     }
 }
 
-/// Allocate a free port from `range` by probing.
-///
-/// Ports held by live recorded daemons are skipped first; each remaining
-/// candidate is bind-probed. Exhausting the probes yields the typed
-/// [`CoreError::PortConflict`] — allocation never falls back to an unprobed
-/// port.
+/// Allocate a free port from `range` by probing; live recorded daemons' ports
+/// are skipped, and exhaustion yields the typed [`CoreError::PortConflict`].
 pub fn allocate_port(
     addr: IpAddr,
     range: &RangeInclusive<u16>,
@@ -329,10 +375,6 @@ pub fn allocate_port(
         ),
     })
 }
-
-// ---------------------------------------------------------------------------
-// Readiness
-// ---------------------------------------------------------------------------
 
 /// How a daemon announces readiness (WRP-07): a command probe, polled
 /// bounded, executed through the process module (argv tokens, no shell).
@@ -378,9 +420,7 @@ impl ReadinessSpec {
     }
 }
 
-/// Wait until the readiness probe succeeds, within its budget.
-///
-/// Timeout surfaces the typed [`CoreError::DaemonNotReady`] naming the probe.
+/// Wait until the readiness probe succeeds; timeout yields the typed [`CoreError::DaemonNotReady`].
 pub fn wait_for_ready(harness: &str, spec: &ReadinessSpec, port: u16) -> Result<()> {
     let materialized = spec.for_port(port);
     let ReadinessSpec::Command {
@@ -417,10 +457,6 @@ pub fn wait_for_ready(harness: &str, spec: &ReadinessSpec, port: u16) -> Result<
     }
 }
 
-// ---------------------------------------------------------------------------
-// Start / stop
-// ---------------------------------------------------------------------------
-
 /// Everything needed to start one daemon.
 #[derive(Debug, Clone)]
 pub struct DaemonStartConfig {
@@ -450,21 +486,16 @@ pub struct DaemonStartConfig {
     pub readiness: ReadinessSpec,
     /// Superai-owned root for the identity file.
     pub identity_root: PathBuf,
-    /// WRP-07 foreground/background launch. Background (default) spawns the
-    /// daemon detached with nulled stdio and returns once ready; foreground
-    /// spawns it with INHERITED stdio and BLOCKS until it exits, cleaning the
-    /// identity afterwards — the caller's terminal fronts the daemon.
+    /// WRP-07 foreground/background launch. Background (default) spawns
+    /// detached with nulled stdio; foreground inherits stdio and blocks until exit.
     pub foreground: bool,
-    /// WRP-07 graceful shutdown command: when set, [`stop_daemon`] runs this
-    /// argv (a `{port}` placeholder receives the daemon's port) instead of
-    /// signaling the pid first; the TERM/KILL escalation remains the
-    /// fallback when the process does not exit. `None` = signal-only.
+    /// WRP-07 graceful shutdown argv (tokens, `{port}` placeholder) run by
+    /// [`stop_daemon`] instead of signaling first; `None` = signal-only.
     pub shutdown_command: Option<ShutdownCommand>,
 }
 
-/// WRP-07 graceful shutdown command spec: an argv (tokens, never a shell
-/// string) with optional env and a bounded timeout. `{port}` placeholders in
-/// `args` receive the daemon's resolved port at stop time.
+/// WRP-07 graceful shutdown command spec: an argv with optional env and a
+/// bounded timeout; `{port}` placeholders receive the daemon's port.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShutdownCommand {
     /// Shutdown executable (argv token, never a shell string).
@@ -494,9 +525,8 @@ pub enum DaemonLaunch {
     /// Background: daemon running detached; identity recorded; caller holds
     /// a handle for stop.
     Background(DaemonHandle),
-    /// Foreground: daemon ran attached with inherited stdio until it exited
-    /// (superai blocked in [`start_daemon`]); the identity was cleaned up
-    /// after exit. `success` is the process's exit status.
+    /// Foreground: daemon ran attached until it exited (superai blocked in
+    /// [`start_daemon`]); the identity was cleaned up after exit.
     Foreground {
         /// Pid the foreground daemon ran as.
         pid: u32,
@@ -559,40 +589,6 @@ pub enum DaemonStopOutcome {
     },
 }
 
-fn now_iso8601() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    let days = i64::try_from(secs / 86400).unwrap_or(0);
-    let secs_of_day = secs % 86400;
-    let (year, month, day) = days_to_ymd(days);
-    format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
-        secs_of_day / 3600,
-        (secs_of_day % 3600) / 60,
-        secs_of_day % 60
-    )
-}
-
-/// Calendar conversion for the identity timestamp (days since 1970-01-01 to
-/// y/m/d; civil-from-days algorithm).
-fn days_to_ymd(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    (
-        if m <= 2 { y + 1 } else { y },
-        u32::try_from(m).unwrap_or(1),
-        u32::try_from(d).unwrap_or(1),
-    )
-}
-
 fn identity_token(pid: u32) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -606,18 +602,12 @@ fn identity_token(pid: u32) -> String {
     format!("dmt-{:016x}", hasher.finish())
 }
 
-/// Start a daemon: resolve the port (conflict-checked), spawn via duct with
-/// the port in env/args, record the superai-owned identity, and wait bounded
-/// for readiness.
-///
-/// Background launch (the default) spawns detached with nulled stdio and
-/// returns a [`DaemonLaunch::Background`] handle once ready. Foreground
-/// launch (`config.foreground`, WRP-07) spawns with inherited stdio and
-/// BLOCKS until the daemon exits, cleaning the identity afterwards.
-///
-/// On readiness timeout the just-spawned process is killed (it is our own
-/// child, killed by handle — never by pid), the identity file is removed, and
-/// the typed [`CoreError::DaemonNotReady`] is returned.
+/// Start a daemon: resolve the port (conflict-checked), spawn, record the
+/// superai-owned identity, wait bounded for readiness (on timeout: kill by handle, remove identity).
+#[expect(
+    clippy::too_many_lines,
+    reason = "the locked start window reads as one sequential protocol"
+)]
 pub fn start_daemon(config: &DaemonStartConfig, probe: &dyn ProcessProbe) -> Result<DaemonLaunch> {
     if config.executable.is_empty() || config.executable.contains('\0') {
         return Err(CoreError::Validation {
@@ -641,65 +631,76 @@ pub fn start_daemon(config: &DaemonStartConfig, probe: &dyn ProcessProbe) -> Res
         ),
     })?;
 
-    // One live daemon per harness/instance.
+    // One live daemon per harness/instance. The start lock spans the
+    // exists-check, spawn, and identity write so a concurrent start cannot slip.
     let id_path = identity_path(
         &config.identity_root,
         config.harness.as_str(),
         config.instance.as_str(),
     );
-    if id_path.exists()
-        && let Ok(existing) = load_identity(&id_path)
-        && probe.is_alive(existing.pid)
+    let (handle, pid, port);
     {
-        return Err(CoreError::Validation {
-            field: "daemon".to_owned(),
-            reason: format!(
-                "daemon {}/{} already running as pid {} on port {}",
-                config.harness, config.instance, existing.pid, existing.port
-            ),
-        });
-    }
-
-    let port = match config.port {
-        Some(explicit) => {
-            check_port_free(config.bind_addr, explicit, &config.identity_root, probe)?;
-            explicit
-        }
-        None => allocate_port(
-            config.bind_addr,
-            &config.port_range,
+        let _start_lock = DaemonStartLock::acquire(
             &config.identity_root,
-            probe,
-        )?,
-    };
+            config.harness.as_str(),
+            config.instance.as_str(),
+        )?;
+        if id_path.exists()
+            && let Ok(existing) = load_identity(&id_path)
+            && probe.is_alive(existing.pid)
+        {
+            return Err(CoreError::Validation {
+                field: "daemon".to_owned(),
+                reason: format!(
+                    "daemon {}/{} already running as pid {} on port {}",
+                    config.harness, config.instance, existing.pid, existing.port
+                ),
+            });
+        }
 
-    let (handle, pid) = spawn_daemon_process(config, port)?;
-    let identity = DaemonIdentity {
-        harness: config.harness.to_string(),
-        instance: config.instance.to_string(),
-        pid,
-        port,
-        bind_addr: config.bind_addr.to_string(),
-        executable: probe
-            .executable(pid)
-            .unwrap_or_else(|| config.executable.clone()),
-        start_time: probe.start_time(pid),
-        started_at: now_iso8601(),
-        identity_token: identity_token(pid),
-    };
-    let id_bytes = serde_json::to_vec_pretty(&identity).map_err(|e| CoreError::Validation {
-        field: "daemon_identity".to_owned(),
-        reason: format!("cannot serialize daemon identity: {e}"),
-    })?;
-    // Plan-02 fold: the identity record persists through the config crate's
-    // ONE mutation boundary (pretty JSON, staged parse-validation included).
-    commit_file(
-        "daemon-identity",
-        &id_path,
-        &id_bytes,
-        DocumentKind::StrictJson,
-    )
-    .map_err(CoreError::Config)?;
+        port = match config.port {
+            Some(explicit) => {
+                check_port_free(config.bind_addr, explicit, &config.identity_root, probe)?;
+                explicit
+            }
+            None => allocate_port(
+                config.bind_addr,
+                &config.port_range,
+                &config.identity_root,
+                probe,
+            )?,
+        };
+
+        let (spawned_handle, spawned_pid) = spawn_daemon_process(config, port)?;
+        handle = spawned_handle;
+        pid = spawned_pid;
+        let identity = DaemonIdentity {
+            harness: config.harness.to_string(),
+            instance: config.instance.to_string(),
+            pid,
+            port,
+            bind_addr: config.bind_addr.to_string(),
+            executable: probe
+                .executable(pid)
+                .unwrap_or_else(|| config.executable.clone()),
+            start_time: probe.start_time(pid),
+            started_at: now_iso8601(),
+            identity_token: identity_token(pid),
+        };
+        let id_bytes = serde_json::to_vec_pretty(&identity).map_err(|e| CoreError::Validation {
+            field: "daemon_identity".to_owned(),
+            reason: format!("cannot serialize daemon identity: {e}"),
+        })?;
+        // Plan-02 fold: the identity record persists through the config crate's
+        // ONE mutation boundary (pretty JSON, staged parse-validation included).
+        commit_file(
+            "daemon-identity",
+            &id_path,
+            &id_bytes,
+            DocumentKind::StrictJson,
+        )
+        .map_err(CoreError::Config)?;
+    }
 
     if let Err(e) = wait_for_ready(config.harness.as_str(), &config.readiness, port) {
         // Our own child: kill by handle, never by pid; wait reaps it so the
@@ -711,9 +712,8 @@ pub fn start_daemon(config: &DaemonStartConfig, probe: &dyn ProcessProbe) -> Res
     }
 
     if config.foreground {
-        // WRP-07 foreground launch: block until the daemon exits (the
-        // caller's terminal fronts it), then clean the identity. The exit
-        // status reaches the caller; nothing is signaled by superai.
+        // WRP-07 foreground: block until the daemon exits, then clean the
+        // identity; the exit status reaches the caller, nothing is signaled.
         let status = handle.wait().map_err(|e| CoreError::BinaryDetection {
             binary: config.executable.clone(),
             reason: format!("cannot wait for foreground daemon: {e}"),
@@ -733,11 +733,8 @@ pub fn start_daemon(config: &DaemonStartConfig, probe: &dyn ProcessProbe) -> Res
     }))
 }
 
-/// Spawn the daemon process (no capture, no shell), with the resolved port
-/// substituted into args/env per the plan. Foreground launches keep the
-/// daemon's stdio INHERITED (the terminal fronts it); background launches
-/// detach with nulled stdio. Returns the duct handle (for kill-by-handle /
-/// foreground wait) and the pid.
+/// Spawn the daemon (no capture, no shell) with the resolved port substituted
+/// into args/env; foreground inherits stdio, background detaches with nulled stdio.
 fn spawn_daemon_process(config: &DaemonStartConfig, port: u16) -> Result<(duct::Handle, u32)> {
     let mut args: Vec<String> = config
         .args
@@ -754,8 +751,7 @@ fn spawn_daemon_process(config: &DaemonStartConfig, port: u16) -> Result<(duct::
 
     let mut cmd = if config.foreground {
         // WRP-07 foreground: inherited stdio so the daemon fronts the
-        // caller's terminal (stdin stays null — the daemon is not
-        // interactive through superai).
+        // caller's terminal (stdin stays null; not interactive through superai).
         duct::cmd(&config.executable, &args).stdin_null()
     } else {
         duct::cmd(&config.executable, &args)
@@ -830,19 +826,15 @@ fn send_signal(pid: u32, force: bool) -> Result<()> {
     }
 }
 
-/// Re-verify a recorded identity against the live process table.
-///
-/// Requires matching process start times when both are known, falls back to
-/// the executable when start times are unavailable, and refuses when no
-/// platform evidence exists — a stale or reused pid file never authorizes
-/// signaling the process that now owns the pid.
+/// Re-verify a recorded identity against the live process table: matching
+/// start times, else executable, else refuse; a reused pid never authorizes a signal.
 pub fn verify_process_identity(id: &DaemonIdentity, probe: &dyn ProcessProbe) -> Result<()> {
     if let (Some(expected), Some(observed)) = (id.start_time, probe.start_time(id.pid)) {
         if expected != observed {
             return Err(CoreError::ProcessIdentityMismatch {
                 pid: id.pid,
                 reason: format!(
-                    "recorded start time {expected} but observed {observed} — pid reuse suspected"
+                    "recorded start time {expected} but observed {observed} (pid reuse suspected)"
                 ),
             });
         }
@@ -867,14 +859,8 @@ pub fn verify_process_identity(id: &DaemonIdentity, probe: &dyn ProcessProbe) ->
     })
 }
 
-/// Stop a daemon recorded at `identity_path`.
-///
-/// Fresh-reads the identity (disk is truth), refuses when the pid cannot be
-/// proven to still be the process superai started, then — when a graceful
-/// [`ShutdownCommand`] is supplied (WRP-07) — runs that command INSTEAD of
-/// signaling first; the TERM-then-KILL escalation remains the fallback when
-/// the daemon does not exit. The identity file is removed only once the
-/// process is confirmed dead (or was already dead).
+/// Stop a daemon recorded at `identity_path`: fresh-read the identity, refuse
+/// when not provably ours, then graceful command if set, else TERM-then-KILL.
 pub fn stop_daemon(
     identity_path: &Path,
     probe: &dyn ProcessProbe,
@@ -890,10 +876,8 @@ pub fn stop_daemon(
     }
     verify_process_identity(&id, probe)?;
 
-    // WRP-07 graceful shutdown command before any signal: the command runs
-    // bounded; a non-zero exit is not fatal (the exit poll below is the
-    // truth, same discipline as send_signal), and the signal escalation
-    // covers a daemon that ignores it.
+    // WRP-07 graceful shutdown before any signal: bounded run, non-zero exit
+    // not fatal (the exit poll is the truth); signals remain the fallback.
     if let Some(shutdown) = &opts.shutdown {
         let args = shutdown.for_port(id.port);
         let run_opts = ExecuteOpts {
@@ -1017,10 +1001,6 @@ mod tests {
         }
     }
 
-    // ------------------------------------------------------------------
-    // Port allocation / conflict
-    // ------------------------------------------------------------------
-
     #[test]
     fn port_conflict_detected_and_refused_with_live_holder() {
         let dir = tmp_dir("daemon-port-holder");
@@ -1115,9 +1095,8 @@ mod tests {
             }
         }
         let end = base + u16::try_from(listeners.len() - 1).unwrap_or(0);
-        // If the OS did not allocate sequentially the range may include free
-        // ports; then skip the exhaustion assertion (still exercised by the
-        // held-identity test above deterministically).
+        // If the OS did not allocate sequentially the range may include
+        // free ports; skip the exhaustion assertion then.
         let dir = tmp_dir("daemon-alloc-exhaust");
         let result = allocate_port(DEFAULT_BIND_ADDR, &(base..=end), &dir, &SystemProcessProbe);
         let held: HashSet<u16> = listeners
@@ -1134,10 +1113,6 @@ mod tests {
         }
         drop(std::fs::remove_dir_all(&dir));
     }
-
-    // ------------------------------------------------------------------
-    // Identity verification / stop refusals
-    // ------------------------------------------------------------------
 
     #[test]
     fn stop_refuses_when_start_time_mismatched() {
@@ -1249,10 +1224,6 @@ mod tests {
         drop(std::fs::remove_dir_all(&dir));
     }
 
-    // ------------------------------------------------------------------
-    // System probe facts (linux)
-    // ------------------------------------------------------------------
-
     #[cfg(target_os = "linux")]
     #[test]
     fn system_probe_sees_the_current_process_identity() {
@@ -1299,10 +1270,6 @@ mod tests {
         assert!(!SystemProcessProbe.is_alive(u32::MAX));
         assert!(SystemProcessProbe.start_time(u32::MAX).is_none());
     }
-
-    // ------------------------------------------------------------------
-    // Start/stop round trip with a real process (linux)
-    // ------------------------------------------------------------------
 
     #[cfg(target_os = "linux")]
     fn sh_available() -> bool {
@@ -1394,6 +1361,106 @@ mod tests {
         drop(std::fs::remove_dir_all(&dir));
     }
 
+    /// A held start lock refuses the start before anything is spawned: no
+    /// port allocation, no daemon, no identity record.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn daemon_start_lock_refuses_a_live_holder_before_spawning() {
+        if !sh_available() {
+            return;
+        }
+        let dir = tmp_dir("daemon-lock-held");
+        let ready_file = dir.join("ready.flag");
+        let pid_file = dir.join("daemon.pid");
+        let config = default_start_config(&dir, &ready_file, &pid_file);
+
+        let lock_path = config.identity_root.join("daemon-test-t1.start.lock");
+        std::fs::create_dir_all(&config.identity_root).unwrap();
+        std::fs::write(
+            &lock_path,
+            serde_json::to_vec(&StartLockFile {
+                pid: std::process::id(),
+                harness: "daemon-test".to_owned(),
+                acquired_at: now_iso8601(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let err = start_daemon(&config, &SystemProcessProbe).unwrap_err();
+        let reason = format!("{err}");
+        assert!(
+            reason.contains("already in progress"),
+            "expected the start-lock conflict, got: {reason}"
+        );
+        assert!(
+            !ready_file.exists(),
+            "nothing may be spawned while the lock is held"
+        );
+        let id_path = identity_path(
+            &config.identity_root,
+            config.harness.as_str(),
+            config.instance.as_str(),
+        );
+        assert!(!id_path.exists(), "no identity may be recorded");
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// A start lock whose holder is provably dead is recovered exactly once:
+    /// the next start proceeds normally.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn daemon_start_lock_recovers_when_the_holder_is_dead() {
+        if !sh_available() {
+            return;
+        }
+        let dir = tmp_dir("daemon-lock-stale");
+        let ready_file = dir.join("ready.flag");
+        let pid_file = dir.join("daemon.pid");
+        let config = default_start_config(&dir, &ready_file, &pid_file);
+
+        // A genuinely dead pid: a reaped child's own pid, printed by sh.
+        let dead_pid = {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg("echo $$; exit 0")
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .parse::<u32>()
+                .unwrap()
+        };
+        assert!(!pid_is_alive(dead_pid), "fixture pid must be dead");
+
+        std::fs::create_dir_all(&config.identity_root).unwrap();
+        std::fs::write(
+            config.identity_root.join("daemon-test-t1.start.lock"),
+            serde_json::to_vec(&StartLockFile {
+                pid: dead_pid,
+                harness: "daemon-test".to_owned(),
+                acquired_at: now_iso8601(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let probe = SystemProcessProbe;
+        let handle = match start_daemon(&config, &probe).unwrap() {
+            DaemonLaunch::Background(handle) => handle,
+            other @ DaemonLaunch::Foreground { .. } => {
+                panic!("background launch must return a handle, got {other:?}")
+            }
+        };
+        assert!(ready_file.exists(), "recovered start must reach readiness");
+        drop(stop_daemon(
+            &handle.identity_path,
+            &probe,
+            &StopOptions::default(),
+        ));
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
     /// WRP-07 foreground launch: `start_daemon` blocks until the daemon exits,
     /// reports the exit status, and cleans the identity afterwards.
     #[cfg(target_os = "linux")]
@@ -1449,9 +1516,7 @@ mod tests {
     }
 
     /// WRP-07 graceful shutdown command: stop runs the declared command
-    /// INSTEAD of signaling — proven by a daemon that exits on the command's
-    /// own trigger and writes a graceful-exit marker before exiting 0 (a
-    /// TERM'd `sh` never writes it).
+    /// INSTEAD of signaling; a TERM'd `sh` never writes the graceful marker.
     #[cfg(target_os = "linux")]
     #[test]
     fn stop_uses_declared_shutdown_command_before_any_signal() {
@@ -1505,9 +1570,8 @@ mod tests {
             matches!(outcome, DaemonStopOutcome::Stopped { pid, port } if pid == handle.pid && port == handle.port),
             "graceful stop outcome: {outcome:?}"
         );
-        // The graceful marker proves the daemon exited through the shutdown
-        // command's trigger, not through a signal (a TERM'd `sh` dies inside
-        // the loop and never writes the marker).
+        // The marker proves exit through the shutdown command's trigger,
+        // not a signal (a TERM'd `sh` never writes it).
         assert_eq!(
             std::fs::read_to_string(&graceful_log)
                 .unwrap_or_default()
@@ -1520,7 +1584,7 @@ mod tests {
     }
 
     /// WRP-07 fallback: a shutdown command that does NOT stop the daemon is
-    /// not fatal — the TERM/KILL escalation still stops it.
+    /// not fatal; the TERM/KILL escalation still stops it.
     #[cfg(target_os = "linux")]
     #[test]
     fn shutdown_command_that_does_not_stop_falls_back_to_signals() {
@@ -1676,10 +1740,6 @@ mod tests {
         );
         drop(std::fs::remove_dir_all(&dir));
     }
-
-    // ------------------------------------------------------------------
-    // Misc
-    // ------------------------------------------------------------------
 
     #[test]
     fn readiness_substitutes_port_placeholder() {

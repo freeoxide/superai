@@ -1,33 +1,16 @@
-//! Health probe: bounded, redacted, protocol-aware, and opt-in.
-//!
-//! Implements PRV-06 / PRV-07: validates base URL format, bounds timeout and
-//! response size, redacts secrets, classifies DNS/TLS/auth/rate-limit/server
-//! errors without live network via a fake harness, strips auth on cross-host
-//! redirects, and respects private-network policy.
-//!
-//! Probe definitions live in provider data ([`crate::provider::ProbeDefinition`]);
-//! [`execute_probe`] performs the REAL bounded network execution via `ureq`
-//! following the template_fetch discipline (HTTPS-only outside local intent,
-//! manual capped redirect loop with cross-host auth stripping, byte/time
-//! caps, private-host policy). Deterministic tests drive the mock harness and
-//! the pure guard functions; no live-network test exists in the suite.
-//!
-//! No background polling. Result is a timestamped observation, not persisted
-//! truth. Secrets never appear in the result or in errors.
+//! Health probe: bounded, redacted, protocol-aware, and opt-in (PRV-06/07).
+//! Never persisted, never carries a secret; redirects are manual, cross-host auth stripping is real.
 
 use std::collections::BTreeMap;
 use std::io::Read as _;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::{CoreError, RedactedString, Result};
 use crate::failure::{HealthStatus, classify_health, should_strip_auth_for_redirect};
 use crate::provider::{AuthStyle, ProbeDefinition, ProviderDefinition};
-
-// ---------------------------------------------------------------------------
-// Constants — bounded probe parameters
-// ---------------------------------------------------------------------------
+use crate::registry::now_iso8601;
 
 /// Default probe timeout (bounded).
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -43,10 +26,6 @@ pub const MAX_RESPONSE_BYTES: usize = 1_048_576;
 
 /// Maximum redirects followed before classifying as `RedirectLoop`.
 pub const MAX_REDIRECTS: usize = 3;
-
-// ---------------------------------------------------------------------------
-// Config and kinds
-// ---------------------------------------------------------------------------
 
 /// Which endpoint a probe hits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,11 +67,8 @@ pub struct HealthConfig {
     pub max_bytes: usize,
     /// Maximum redirects to follow.
     pub max_redirects: usize,
-    /// Whether loopback / private hosts are allowed.
-    ///
-    /// When `false`, `127.0.0.1`, `localhost`, `10.*`, `192.168.*`,
-    /// `172.16.*` etc. are rejected unless the provider definition
-    /// explicitly opts into local.
+    /// Whether loopback/private hosts are allowed; when `false`, private
+    /// ranges are rejected unless the provider opts into local.
     pub allow_private_network: bool,
 }
 
@@ -136,7 +112,7 @@ impl HealthConfig {
     }
 }
 
-/// Observation returned by a probe — timestamped, redacted, and not persisted.
+/// Observation returned by a probe, timestamped, redacted, and not persisted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HealthCheckResult {
     /// Provider id as string.
@@ -165,13 +141,7 @@ pub struct HealthCheckResult {
     pub stripped_auth_on_redirect: bool,
 }
 
-// ---------------------------------------------------------------------------
-// Timeout bounding
-// ---------------------------------------------------------------------------
-
 /// Ensure `timeout` is within `[MIN_TIMEOUT, MAX_TIMEOUT]`.
-///
-/// Returns the normalized timeout or a validation error.
 pub fn validate_timeout(timeout: Duration) -> Result<Duration> {
     if timeout < MIN_TIMEOUT {
         return Err(CoreError::Validation {
@@ -196,39 +166,6 @@ pub fn validate_timeout(timeout: Duration) -> Result<Duration> {
     Ok(timeout)
 }
 
-// ---------------------------------------------------------------------------
-// URL validation — scheme, host, private policy, secrecy
-// ---------------------------------------------------------------------------
-
-/// Whether `host` is loopback / private / link-local.
-pub fn is_private_host(host: &str) -> bool {
-    let lower = host.to_ascii_lowercase();
-    if lower == "localhost" || lower == "127.0.0.1" || lower == "::1" {
-        return true;
-    }
-    if lower.starts_with("10.") {
-        return true;
-    }
-    if lower.starts_with("192.168.") {
-        return true;
-    }
-    // 172.16.0.0/12
-    if lower.starts_with("172.") {
-        let parts: Vec<&str> = lower.split('.').collect();
-        if let Some(second) = parts.get(1)
-            && let Ok(octet) = second.parse::<u8>()
-            && (16..=31).contains(&octet)
-        {
-            return true;
-        }
-    }
-    if lower == "0.0.0.0" {
-        return true;
-    }
-    false
-}
-
-#[expect(clippy::manual_let_else, reason = "explicit match clearer")]
 fn is_valid_base_url_inner(url: &str) -> (bool, String) {
     if url.trim().is_empty() {
         return (false, "must not be empty".to_owned());
@@ -249,20 +186,13 @@ fn is_valid_base_url_inner(url: &str) -> (bool, String) {
     if scheme_rest.is_empty() {
         return (false, "missing host".to_owned());
     }
-    let host_end = scheme_rest.find('/').unwrap_or(scheme_rest.len());
-    let host_with_port = match scheme_rest.get(0..host_end) {
-        Some(v) => v,
-        None => return (false, "missing host".to_owned()),
-    };
-    let host = match host_with_port.split(':').next() {
-        Some(h) => h,
-        None => return (false, "missing host".to_owned()),
+    let Some(host) = crate::registry::extract_host(url) else {
+        return (false, "missing host".to_owned());
     };
     if host.is_empty() {
         return (false, "missing host".to_owned());
     }
-    let is_local = host == "localhost" || host == "127.0.0.1" || host == "::1";
-    if !is_local && !host.contains('.') {
+    if host != "localhost" && !host.contains('.') {
         return (false, "host must contain '.' or be localhost".to_owned());
     }
     if url.starts_with("file://") {
@@ -272,7 +202,6 @@ fn is_valid_base_url_inner(url: &str) -> (bool, String) {
 }
 
 /// Validate `url` for health probing, respecting private-network policy.
-#[expect(clippy::manual_let_else, reason = "explicit match clearer")]
 pub fn validate_base_url_for_probe(url: &str, allow_private: bool) -> Result<()> {
     let (valid, reason) = is_valid_base_url_inner(url);
     if !valid {
@@ -282,19 +211,13 @@ pub fn validate_base_url_for_probe(url: &str, allow_private: bool) -> Result<()>
         });
     }
     if !allow_private {
-        // Extract host and check private.
-        let after_scheme = match url.split("://").nth(1) {
-            Some(v) => v,
-            None => {
-                return Err(CoreError::Validation {
-                    field: "base_url".to_owned(),
-                    reason: "invalid url scheme extraction".to_owned(),
-                });
-            }
+        let Some(host) = crate::registry::extract_host(url) else {
+            return Err(CoreError::Validation {
+                field: "base_url".to_owned(),
+                reason: "invalid url scheme extraction".to_owned(),
+            });
         };
-        let host_port = after_scheme.split('/').next().unwrap_or_default();
-        let host = host_port.split(':').next().unwrap_or_default();
-        if is_private_host(host) {
+        if crate::registry::is_private_host(&host) {
             return Err(CoreError::Validation {
                 field: "base_url".to_owned(),
                 reason: format!("private host `{host}` requires allow_private_network=true"),
@@ -310,18 +233,14 @@ pub fn validate_base_url_for_probe(url: &str, allow_private: bool) -> Result<()>
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Redaction — never emit raw secrets
-// ---------------------------------------------------------------------------
+// Redaction, never emit raw secrets
 
 const SECRET_QUERY_KEYS: &[&str] = &[
     "api_key", "apikey", "api-key", "key", "token", "secret", "password", "auth", "bearer", "sk-",
 ];
 
-/// Redact query string secrets in a URL.
-///
-/// Any query parameter whose key contains a secret pattern has its value
-/// replaced with `[REDACTED]`. The result never contains the raw value.
+/// Redact query string secrets in a URL: any parameter whose key carries a
+/// secret pattern has its value replaced with `[REDACTED]`.
 #[expect(clippy::manual_let_else, reason = "explicit match clearer")]
 pub fn redact_url(url: &str) -> String {
     let Some(qmark) = url.find('?') else {
@@ -367,10 +286,8 @@ pub fn redact_url(url: &str) -> String {
     }
 }
 
-/// Redact header values that carry auth.
-///
-/// `Authorization`, `x-api-key`, `api-key`, and any header whose name
-/// contains `token`/`secret`/`auth` is redacted.
+/// Redact header values that carry auth: `Authorization`, `x-api-key`,
+/// `api-key`, and any name containing `token`/`secret`/`auth`.
 pub fn redact_headers(headers: &BTreeMap<String, String>) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     for (k, v) in headers {
@@ -385,52 +302,16 @@ pub fn redact_headers(headers: &BTreeMap<String, String>) -> BTreeMap<String, St
         if is_auth {
             out.insert(k.clone(), RedactedString::placeholder().to_owned());
         } else {
-            // Also redact body-like values that look like bearer tokens: value containing sk- or long token
-            let v_str = v.as_str();
-            let looks_secret = v_str.to_ascii_lowercase().contains("sk-")
-                || (v_str.len() > 20
-                    && v_str
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.'));
-            // Only redact if header name is not already generic but value looks like token and header is auth-ish length?
-            // Be conservative: only redact auth headers, not all headers. So keep original unless auth.
-            // To satisfy redaction requirement without over-redacting, only auth headers above.
+            // Only auth headers are redacted; over-redacting other headers
+            // would make the echo useless.
             out.insert(k.clone(), v.clone());
-            // Silence unused variable warning path
-            let _ = looks_secret;
         }
     }
     out
 }
 
-/// Convenience: create redacted string for logs / display (never raw secret).
-pub fn redacted_placeholder() -> &'static str {
-    RedactedString::placeholder()
-}
-
-// ---------------------------------------------------------------------------
-// Timestamp helper
-// ---------------------------------------------------------------------------
-
-fn now_iso8601() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    // Simple deterministic representation: seconds since epoch as string plus Z.
-    // Full RFC3339 without external crate dependency.
-    format!("{secs}s")
-}
-
-// ---------------------------------------------------------------------------
-// Core probe — validation-only (no network) and mock-network variants
-// ---------------------------------------------------------------------------
-
-/// Validate provider base URL, timeout, and private policy, returning a
-/// timestamped, redacted observation without network.
-///
-/// This is the user-invoked probe entry point when no network harness is
-/// supplied. It still bounds timeout, validates URL, and classifies the
-/// local validation as healthy or invalid.
+/// Validate provider base URL, timeout, and private policy; returns a
+/// timestamped, redacted observation without touching the network.
 #[expect(
     clippy::cast_possible_truncation,
     reason = "elapsed bounded to probe timeout"
@@ -438,7 +319,7 @@ fn now_iso8601() -> String {
 pub fn health_probe(provider: &ProviderDefinition, config: &HealthConfig) -> HealthCheckResult {
     let start = Instant::now();
     let redacted = redact_url(&provider.base_url);
-    // Private-network determination: allow when config allows or when provider base_url is loopback and provider auth is None (local)
+    // No-auth providers count as local intent.
     let effective_allow =
         config.allow_private_network || matches!(provider.auth_style, AuthStyle::None);
     let timeout_ok = validate_timeout(config.timeout).is_ok();
@@ -451,7 +332,6 @@ pub fn health_probe(provider: &ProviderDefinition, config: &HealthConfig) -> Hea
         ),
         (true, Ok(())) => (true, HealthStatus::Healthy, "ok".to_owned()),
         (true, Err(e)) => {
-            // Map validation error to health classification.
             let msg = format!("{e}");
             let lower = msg.to_ascii_lowercase();
             let status = if lower.contains("private") {
@@ -481,11 +361,8 @@ pub fn health_probe(provider: &ProviderDefinition, config: &HealthConfig) -> Hea
     }
 }
 
-/// Mock-network probe using a fake harness (no live I/O).
-///
-/// `mock_status` / `mock_body` simulate the HTTP result from
-/// `FakeNetworkHarness`. Secrets in body are never copied to `reason`
-/// verbatim; they are redacted via `RedactedString` classification.
+/// Mock-network probe using a fake harness (no live I/O). Secrets in the
+/// body are never copied to `reason` verbatim.
 #[expect(
     clippy::cast_possible_truncation,
     reason = "elapsed bounded to probe timeout"
@@ -502,7 +379,6 @@ pub fn health_probe_with_mock(
     if !base_validation.valid {
         return base_validation;
     }
-    // Enforce response size cap.
     if mock_body.len() > config.max_bytes {
         return HealthCheckResult {
             provider: provider.id.to_string(),
@@ -523,11 +399,9 @@ pub fn health_probe_with_mock(
             stripped_auth_on_redirect: false,
         };
     }
-    // Redirect handling: if redirect_target present, check cross-host auth stripping.
     let mut stripped = false;
     if let Some(target) = redirect_target {
         stripped = should_strip_auth_for_redirect(&provider.base_url, target);
-        // If cross-host, treat as CrossHostRedirect status for visibility (still valid if within limit)
         if stripped && config.max_redirects == 0 {
             return HealthCheckResult {
                 provider: provider.id.to_string(),
@@ -544,14 +418,10 @@ pub fn health_probe_with_mock(
                 stripped_auth_on_redirect: true,
             };
         }
-        if stripped {
-            // Still healthy but flag.
-        }
     }
     let status = classify_health(mock_status, mock_body);
-    // Redact body secrets from reason: do not include raw mock_body if it contains sentinel-like secrets.
+    // Never echo a body that may carry a secret or run long: summarize it.
     let reason_source = if mock_body.to_ascii_lowercase().contains("sk-") || mock_body.len() > 200 {
-        // Summarize instead of echoing.
         format!(
             "classified as {status} (body redacted, {} bytes)",
             mock_body.len()
@@ -560,7 +430,6 @@ pub fn health_probe_with_mock(
         mock_body.to_owned()
     };
     let valid = matches!(status, HealthStatus::Healthy);
-    // Ensure reason never contains a raw sentinel-like pattern (heuristic: "sk-").
     let reason = if reason_source.contains("sk-") {
         reason_source.replace("sk-", "[REDACTED]-")
     } else {
@@ -582,27 +451,32 @@ pub fn health_probe_with_mock(
     }
 }
 
-// Thin wrappers kept for provider.rs compatibility: single-url validation.
-
 /// Validate a raw URL string via health config (bounded, redacted).
 pub fn health_probe_url(url: &str, config: &HealthConfig) -> HealthCheckResult {
-    let fake_provider = ProviderDefinition::new(
-        crate::ids::ProviderId::new("url-probe").expect("static valid id"),
-        url,
-    );
-    health_probe(&fake_provider, config)
+    let fake_provider =
+        crate::ids::ProviderId::new("url-probe").map(|id| ProviderDefinition::new(id, url));
+    match fake_provider {
+        Ok(provider) => health_probe(&provider, config),
+        // Unreachable for the static id above; kept panic-free regardless.
+        Err(e) => HealthCheckResult {
+            provider: "url-probe".to_owned(),
+            base_url_redacted: redact_url(url),
+            valid: false,
+            status: HealthStatus::NotFound,
+            reason: format!("invalid probe provider id: {e}"),
+            elapsed_ms: 0,
+            timestamp: now_iso8601(),
+            kind: config.kind,
+            timeout_ms: u64::try_from(config.timeout.as_millis()).unwrap_or(u64::MAX),
+            allow_private_network: config.allow_private_network,
+            auth_style: AuthStyle::None,
+            stripped_auth_on_redirect: false,
+        },
+    }
 }
 
-// ---------------------------------------------------------------------------
-// PRV-06 — probe URL derivation from provider data
-// ---------------------------------------------------------------------------
-
-/// Derive the full probe URL from a base endpoint and a probe definition.
-///
-/// The base loses trailing slashes; `path_suffix` must start with `/` and
-/// must not introduce its own query string (queries belong in headers/body
-/// templates so redaction stays centralized). The result must still be a
-/// syntactically valid http(s) URL.
+/// Derive the full probe URL from a base endpoint and probe definition;
+/// `path_suffix` must start with `/` and introduce no query of its own.
 pub fn derive_probe_url(base_url: &str, probe: &ProbeDefinition) -> Result<String> {
     let base = base_url.trim().trim_end_matches('/');
     if base.is_empty() {
@@ -644,13 +518,8 @@ pub fn derive_probe_url(base_url: &str, probe: &ProbeDefinition) -> Result<Strin
 /// Auth placeholder accepted in probe header/body templates.
 const AUTH_PLACEHOLDER: &str = "${AUTH}";
 
-/// Build the raw request headers for a probe execution (secret-bearing).
-///
-/// Header templates may reference `${AUTH}`; any other `${...}` placeholder
-/// fails closed BEFORE any network I/O (no silent half-rendered request).
-/// When `probe.uses_auth` and `auth` is supplied, the auth header is added
-/// per the provider's auth style. Returned map is the wire truth — display
-/// must go through [`redact_headers`].
+/// Build the raw wire headers (secret-bearing). `${AUTH}` resolves; any
+/// other placeholder fails closed before network I/O. Display goes through [`redact_headers`].
 pub fn build_probe_headers(
     provider: &ProviderDefinition,
     probe: &ProbeDefinition,
@@ -658,6 +527,20 @@ pub fn build_probe_headers(
 ) -> Result<BTreeMap<String, String>> {
     let mut headers = BTreeMap::new();
     for (name, template) in &probe.headers {
+        // Control chars in a header name or value are CRLF/header injection;
+        // fail closed before any request is built.
+        if name.chars().any(char::is_control)
+            || template.chars().any(char::is_control)
+            || name.contains(' ')
+        {
+            return Err(CoreError::Validation {
+                field: "probe.headers".to_owned(),
+                reason: format!(
+                    "probe `{}` header `{name}` must not contain control characters or spaces",
+                    probe.id
+                ),
+            });
+        }
         let value = if template.contains(AUTH_PLACEHOLDER) {
             let Some(secret) = auth else {
                 return Err(CoreError::Validation {
@@ -699,23 +582,16 @@ pub fn build_probe_headers(
                 headers.insert("api-key".to_owned(), secret.expose_secret().to_owned());
             }
             AuthStyle::None | AuthStyle::Unknown | AuthStyle::QueryParam => {
-                // No header auth for these styles; provider validation keeps
-                // uses_auth off AuthStyle::None providers.
+                // No header auth; provider validation keeps uses_auth off
+                // AuthStyle::None providers.
             }
         }
     }
     Ok(headers)
 }
 
-// ---------------------------------------------------------------------------
-// PRV-07 — real bounded network execution
-// ---------------------------------------------------------------------------
-
-/// Distinct failure classes for real probe execution (PRV-07: distinguish
-/// DNS/TLS/auth/rate-limit/server/schema/model-not-found failures).
-///
-/// These refine [`HealthStatus`] (which stays the coarse observation class)
-/// and live only on real-execution results.
+/// Distinct failure classes for real probe execution (PRV-07), refining the
+/// coarse [`HealthStatus`] on real-execution results.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HealthFailureClass {
@@ -759,11 +635,8 @@ impl std::fmt::Display for HealthFailureClass {
     }
 }
 
-/// Result of a real probe execution: the bounded observation plus the
-/// execution-specific detail (probe id, method, redacted URL, failure class).
-///
-/// Timestamped, never persisted, and never carries a secret — the URL and
-/// any header echo are redacted before storage.
+/// Result of a real probe execution: the bounded observation plus
+/// execution detail; redacted, timestamped, never persisted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RealProbeResult {
     /// The standard bounded observation.
@@ -782,22 +655,8 @@ pub struct RealProbeResult {
     pub rate_cost_warning: Option<String>,
 }
 
-/// Execute a probe definition for real (PRV-07).
-///
-/// Explicit, user-invoked execution only — core never polls in the
-/// background. Discipline mirrors `template_fetch`:
-/// - URL is derived from the provider endpoint and re-validated (scheme,
-///   host, control characters); `file://` and other schemes never reach the
-///   transport.
-/// - Private/loopback hosts are refused unless local intent is declared
-///   (probe `allow_private_network`, config flag, or a no-auth local
-///   provider).
-/// - Redirects are followed MANUALLY, capped at `config.max_redirects`;
-///   crossing hosts strips every auth header for the follow-up request.
-/// - Response bytes are capped by the probe/config limit; the total budget
-///   (DNS + connect + read) is the bounded timeout.
-/// - The auth key is used for this request only; it never appears in the
-///   returned result (URL and headers are redacted echoes).
+/// Execute a probe definition for real (PRV-07): user-invoked, never polled.
+/// URL re-validated, private hosts need local intent, redirects manual and capped, cross-host strips auth, bytes capped.
 #[expect(
     clippy::too_many_lines,
     reason = "real executor inlines the bounded redirect loop deliberately"
@@ -836,7 +695,6 @@ pub fn execute_probe(
         .unwrap_or_else(|| "GET".to_owned())
         .to_ascii_uppercase();
 
-    // Manual redirect loop with cross-host auth stripping.
     let agent = build_probe_agent(timeout);
     let mut current_url = url;
     let mut send_auth = probe.uses_auth;
@@ -936,7 +794,7 @@ pub fn execute_probe(
             current_url = location;
             continue;
         }
-        // Size cap from Content-Length when advertised.
+        // Content-Length, when advertised, is checked before reading.
         if let Some(len_str) = response.headers().get("Content-Length")
             && let Ok(len) = len_str.to_str().unwrap_or_default().parse::<usize>()
             && len > max_bytes
@@ -1019,8 +877,6 @@ pub fn execute_probe(
 }
 
 /// Classify an HTTP status + body against the probe's accepted predicates.
-///
-/// Pure — unit-testable without network.
 pub fn classify_probe_response(
     probe: &ProbeDefinition,
     status: u16,
@@ -1288,10 +1144,6 @@ fn failed_before_network(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     #![expect(
@@ -1390,16 +1242,12 @@ mod tests {
             allow_private_network: true,
             ..HealthConfig::default()
         };
-        let local = test_provider("http://localhost:8080", AuthStyle::None);
-        let res_deny = health_probe(&local, &cfg_deny);
-        // With auth None, effective_allow becomes true (local provider intent), so should be valid even when deny.
-        // To test deny path, use Bearer auth on localhost where allow_private matters.
         let local_bearer = test_provider("http://localhost:8080", AuthStyle::Bearer);
-        let res_deny2 = health_probe(&local_bearer, &cfg_deny);
+        let res_deny = health_probe(&local_bearer, &cfg_deny);
         assert!(
-            !res_deny2.valid,
+            !res_deny.valid,
             "private should be rejected when not allowed for bearer: {}",
-            res_deny2.reason
+            res_deny.reason
         );
         let res_allow = health_probe(&local_bearer, &cfg_allow);
         assert!(
@@ -1408,27 +1256,73 @@ mod tests {
             res_allow.reason
         );
 
-        // Also test that non-local bearer is valid without private flag.
         let remote = test_provider("https://api.example.com", AuthStyle::Bearer);
         let res_remote = health_probe(&remote, &cfg_deny);
         assert!(res_remote.valid);
-
-        // Silence unused
-        let _ = res_deny;
-        let _ = local;
     }
 
+    /// The probe URL gate refuses SSRF shorthands without local intent:
+    /// digit forms, metadata IPs, userinfo/IPv6 spellings, decoy tails.
     #[test]
-    fn private_host_detection() {
-        assert!(is_private_host("localhost"));
-        assert!(is_private_host("127.0.0.1"));
-        assert!(is_private_host("10.0.0.1"));
-        assert!(is_private_host("192.168.1.1"));
-        assert!(is_private_host("172.16.5.4"));
-        assert!(is_private_host("172.31.255.1"));
-        assert!(!is_private_host("172.32.0.1"));
-        assert!(!is_private_host("8.8.8.8"));
-        assert!(!is_private_host("api.example.com"));
+    fn private_host_detection_covers_ssrf_shorthands() {
+        for url in [
+            "https://127.1:8443",
+            "https://localhost./v1",
+            "https://169.254.169.254/meta",
+            "https://x@169.254.169.254/meta",
+            "https://user:pass@127.0.0.1/",
+            "https://x@2130706433/",
+            "https://[::ffff:127.0.0.1]/",
+            "https://[::ffff:10.0.0.5]:8443/",
+            "https://[::1]/",
+            // The authority ends at '?', '#', or '\': the public-looking
+            // tail after the delimiter is query/fragment/path, not the host.
+            "https://127.0.0.1?@x.example.com/",
+            "https://169.254.169.254#@api.example.com/",
+            "https://127.1?@api.example.com/",
+            "https://127.0.0.1\\@x.example.com/",
+            "https://169.254.169.254\\@api.example.com/",
+            "https://127.1\\@api.example.com/",
+            // Extra slashes after the scheme leave an empty host, which
+            // the gate counts as private and refuses.
+            "https:///127.0.0.1/",
+            "https://\\127.0.0.1/",
+            // Real parsers strip tabs before host parsing; the gate
+            // rejects control chars before extraction instead.
+            "https://127.0.0.1\t?@x.example.com/",
+        ] {
+            assert!(
+                validate_base_url_for_probe(url, false).is_err(),
+                "{url} must be refused without allow_private_network"
+            );
+        }
+        assert!(validate_base_url_for_probe("https://api.example.com", false).is_ok());
+        // Mirror spelling: the '@' is inside the query, so the host really is public.
+        assert!(validate_base_url_for_probe("https://x.example.com?@127.0.0.1/", false).is_ok());
+    }
+
+    /// Every redirect hop re-validates its Location through the same gate
+    /// the redirect loop uses, so private bounces are refused mid-hop.
+    #[test]
+    fn redirect_hop_revalidates_private_host_extraction() {
+        let cfg = HealthConfig::default();
+        let provider = test_provider("https://api.example.com", AuthStyle::Bearer);
+        let probe = model_list_probe();
+        for hop in [
+            "https://x@169.254.169.254/latest/meta-data",
+            "https://attacker@127.0.0.1:8080/",
+            "https://[::ffff:10.0.0.5]/",
+            "https://127.0.0.1?@x.example.com/",
+            "https://169.254.169.254#@api.example.com/",
+            "https://127.0.0.1\\@x.example.com/",
+        ] {
+            let err = validate_execution_url(hop, &provider, &probe, &cfg)
+                .expect_err("{hop} must be refused at the redirect hop");
+            assert!(format!("{err}").contains("private host"), "got: {err}");
+        }
+        assert!(
+            validate_execution_url("https://api.example.com/v2", &provider, &probe, &cfg).is_ok()
+        );
     }
 
     #[test]
@@ -1439,12 +1333,10 @@ mod tests {
         assert!(!redacted.contains("secret123"));
         assert!(redacted.contains("[REDACTED]"));
         assert!(redacted.contains("model=foo"));
-        // No query
         assert_eq!(
             redact_url("https://api.example.com"),
             "https://api.example.com"
         );
-        // Non-secret query preserved
         assert_eq!(
             redact_url("https://api.example.com?foo=bar"),
             "https://api.example.com?foo=bar"
@@ -1530,13 +1422,11 @@ mod tests {
         let sentinel = "sk-superai-test-sentinel-12345-fake";
         let body_with_sentinel = format!("error with {sentinel} leaked");
         let res = health_probe_with_mock(&prov, &cfg, 200, &body_with_sentinel, None);
-        // Reason is redacted summary when body contains sk-
         assert!(
             !res.reason.contains(sentinel),
             "reason leaked sentinel: {}",
             res.reason
         );
-        // Also base redacted should not contain sentinel if base_url had sentinel in query (simulate)
         let prov_sentinel = test_provider(
             &format!("https://api.example.com?api_key={sentinel}"),
             AuthStyle::Bearer,
@@ -1545,10 +1435,6 @@ mod tests {
         assert!(!res2.base_url_redacted.contains(sentinel));
         assert!(res2.base_url_redacted.contains("[REDACTED]") || !res2.valid);
     }
-
-    // -----------------------------------------------------------------------
-    // PRV-06 / PRV-07 — probe derivation + real execution guards
-    // -----------------------------------------------------------------------
 
     fn model_list_probe() -> ProbeDefinition {
         ProbeDefinition {
@@ -1573,7 +1459,6 @@ mod tests {
         let probe = model_list_probe();
         let url = derive_probe_url("https://api.example.com/", &probe).unwrap();
         assert_eq!(url, "https://api.example.com/v1/models");
-        // Multi-segment suffix and no-slash base.
         let mut p2 = probe.clone();
         p2.path_suffix = "/a/b/c".to_owned();
         assert_eq!(
@@ -1588,11 +1473,9 @@ mod tests {
             derive_probe_url("http://localhost:11434", &tcp).unwrap(),
             "http://localhost:11434"
         );
-        // Suffix without leading slash rejected.
         let mut bad = probe.clone();
         bad.path_suffix = "v1/models".to_owned();
         assert!(derive_probe_url("https://api.example.com", &bad).is_err());
-        // Query injection rejected.
         let mut q = probe;
         q.path_suffix = "/v1/models?api_key=1".to_owned();
         let err = derive_probe_url("https://api.example.com", &q)
@@ -1613,7 +1496,6 @@ mod tests {
             .headers
             .insert("X-Auth-Template".to_owned(), "${AUTH}".to_owned());
 
-        // Bearer
         let mut prov = test_provider("https://api.example.com", AuthStyle::Bearer);
         prov.id = ProviderId::new("bearer-prov").unwrap();
         let headers = build_probe_headers(&prov, &probe, Some(&secret)).unwrap();
@@ -1627,11 +1509,9 @@ mod tests {
             headers.get("X-Auth-Template").map(String::as_str),
             Some(sentinel)
         );
-        // Display map is redacted.
         let redacted = redact_headers(&headers);
         assert!(!format!("{redacted:?}").contains(sentinel));
 
-        // XApiKey style
         let mut xprov = test_provider("https://api.example.com", AuthStyle::XApiKey);
         xprov.id = ProviderId::new("xkey-prov").unwrap();
         let headers = build_probe_headers(&xprov, &probe, Some(&secret)).unwrap();
@@ -1644,7 +1524,6 @@ mod tests {
             .to_string();
         assert!(err.contains("no key was supplied"), "got: {err}");
 
-        // Unsupported placeholder fails closed.
         let mut weird = probe.clone();
         weird
             .headers
@@ -1653,6 +1532,18 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("unsupported placeholder"), "got: {err}");
+
+        // CRLF in a header name or value is header injection: refused before
+        // any request exists.
+        let mut injected = probe;
+        injected.headers.insert(
+            "X-Injected".to_owned(),
+            "value\r\nAuthorization: Bearer evil".to_owned(),
+        );
+        let err = build_probe_headers(&prov, &injected, Some(&secret))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("control characters"), "got: {err}");
     }
 
     #[test]
@@ -1677,7 +1568,6 @@ mod tests {
         let res = execute_probe(&file, &probe, &cfg, Some(&secret));
         assert!(!res.base.valid);
 
-        // Private host without local intent fails closed.
         let local = test_provider("http://localhost:8080", AuthStyle::Bearer);
         let res = execute_probe(&local, &probe, &cfg, Some(&secret));
         assert!(!res.base.valid);
@@ -1687,7 +1577,6 @@ mod tests {
             res.base.reason
         );
 
-        // Plain http to a public host without local intent fails closed.
         let http = test_provider("http://api.example.com", AuthStyle::Bearer);
         let res = execute_probe(&http, &probe, &cfg, Some(&secret));
         assert!(!res.base.valid);
@@ -1709,7 +1598,6 @@ mod tests {
             res.base.reason
         );
 
-        // A missing key for an auth-referencing probe fails closed.
         let mut needs_key = probe;
         needs_key
             .headers
@@ -1726,35 +1614,28 @@ mod tests {
     #[test]
     fn classify_probe_response_predicates() {
         let probe = model_list_probe();
-        // Accepted status + body marker -> healthy.
         let (valid, status, _) = classify_probe_response(&probe, 200, r#"{"data": []}"#);
         assert!(valid);
         assert_eq!(status, HealthStatus::Healthy);
-        // Accepted status but body marker missing -> schema mismatch.
         let (valid, _, reason) = classify_probe_response(&probe, 200, r#"{"oops": []}"#);
         assert!(!valid);
         assert!(reason.contains("schema mismatch"), "got: {reason}");
-        // 401 -> auth class.
         assert_eq!(
             response_failure_class(&probe, 401, ""),
             HealthFailureClass::Auth
         );
-        // 429 -> rate limit class.
         assert_eq!(
             response_failure_class(&probe, 429, ""),
             HealthFailureClass::RateLimit
         );
-        // 500 -> server class.
         assert_eq!(
             response_failure_class(&probe, 503, ""),
             HealthFailureClass::Server
         );
-        // 404 on a model-list endpoint mentioning a model -> model-not-found.
         assert_eq!(
             response_failure_class(&probe, 404, "model glm-9 not found"),
             HealthFailureClass::ModelNotFound
         );
-        // 404 elsewhere -> generic not-found status.
         let mut status_probe = probe;
         status_probe.kind = HealthProbeKind::HttpStatus;
         assert_eq!(
@@ -1780,10 +1661,6 @@ mod tests {
             timeout: Duration::from_millis(10),
             ..HealthConfig::default()
         };
-        // health_probe validates timeout internally: we simulate via validate_timeout check path
-        // Our health_probe checks timeout_ok before URL; with 10ms it should be invalid.
-        // But HealthConfig::new would have rejected; direct struct bypasses validation. So health_probe should still classify timeout error.
-        // We constructed bad_cfg manually, so validate_timeout inside health_probe should mark invalid.
         let res = health_probe(&prov, &bad_cfg);
         assert!(!res.valid);
         assert!(res.reason.to_ascii_lowercase().contains("timeout"));

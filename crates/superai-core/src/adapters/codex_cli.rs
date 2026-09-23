@@ -1,15 +1,7 @@
-//! Codex CLI adapter — relocated-root via `CODEX_HOME` with profile isolation.
-//!
+//! Codex CLI adapter: relocated-root via `CODEX_HOME` with profile isolation.
 //! Research source: `docs/harness-configs/codex-cli.md` (last verified 2026-08-25).
-//! Executable `codex`, config root `~/.codex` or `$CODEX_HOME`, primary
-//! writable surface `config.toml` (TOML), isolation `relocated-root` plus
-//! profile files `$CODEX_HOME/<name>.config.toml` (>=0.134).
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
 
 use toml_edit as _;
 
@@ -24,10 +16,6 @@ use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence, Isolation};
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
 
 /// Harness identifier for Codex CLI.
 pub const HARNESS_ID_STR: &str = "codex-cli";
@@ -53,10 +41,7 @@ pub const LAST_VERIFIED: &str = "2026-08-25";
 /// Schema version for current config shape.
 pub const SCHEMA_VERSION_STR: &str = "1";
 
-/// Owned selectors for provider/model mutation — instance-specific fields.
-///
-/// These are the selectors superai owns inside `config.toml`. Everything
-/// else round-trips untouched via `superai-config::toml_file` (`toml_edit`).
+/// Selectors superai owns inside `config.toml`; other keys round-trip untouched.
 pub const OWNED_SELECTORS: &[&str] = &[
     "model",
     "model_provider",
@@ -69,16 +54,7 @@ pub const OWNED_SELECTORS: &[&str] = &[
     "sandbox_mode",
 ];
 
-// ---------------------------------------------------------------------------
-// Adapter struct
-// ---------------------------------------------------------------------------
-
-/// Concrete adapter for Codex CLI.
-///
-/// Isolation is `relocated-root` via `CODEX_HOME`. The wrapper sets
-/// `CODEX_HOME` to the instance `config_root` and execs `codex`. Profile
-/// isolation (>=0.134) is via `$CODEX_HOME/<name>.config.toml` selected
-/// with `codex --profile <name>`, shared under the same relocated root.
+/// `relocated-root` via `CODEX_HOME`; profiles (>=0.134) live in `$CODEX_HOME/<name>.config.toml`.
 #[derive(Debug, Clone)]
 pub struct CodexCliAdapter {
     id: HarnessId,
@@ -106,107 +82,6 @@ impl CodexCliAdapter {
         CONFIG_ENV_VAR
     }
 
-    /// Try to locate the `codex` binary via `PATH`.
-    #[expect(clippy::unused_self, reason = "adapter method uses instance constants")]
-    #[expect(clippy::excessive_nesting, reason = "PATH scan branches are explicit")]
-    fn find_binary_in_path(&self) -> Option<PathBuf> {
-        let path_var = std::env::var("PATH").ok()?;
-        let separator = if cfg!(windows) { ';' } else { ':' };
-        for dir in path_var.split(separator) {
-            if dir.is_empty() {
-                continue;
-            }
-            let candidate = Path::new(dir).join(EXECUTABLE);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-            if cfg!(windows) {
-                let exe_candidate = Path::new(dir).join(format!("{EXECUTABLE}.exe"));
-                if exe_candidate.is_file() {
-                    return Some(exe_candidate);
-                }
-            }
-        }
-        None
-    }
-
-    /// Probe `codex --version` with a timeout, returning the parsed version string if successful.
-    fn probe_version(binary: &Path) -> Option<String> {
-        let binary_owned = binary.to_path_buf();
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let output = Command::new(&binary_owned)
-                .arg("--version")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output();
-            drop(tx.send(output));
-        });
-        let Ok(Ok(output)) = rx.recv_timeout(Duration::from_secs(2)) else {
-            return None;
-        };
-        if !output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
-            return None;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let combined = if stdout.trim().is_empty() {
-            stderr.into_owned()
-        } else if stderr.trim().is_empty() {
-            stdout.into_owned()
-        } else {
-            format!("{stdout} {stderr}")
-        };
-        Self::parse_version_output(&combined)
-    }
-
-    /// Parse version output like `codex-cli 0.134.0` or `0.135.1` into `0.135.1`.
-    #[expect(
-        clippy::excessive_nesting,
-        reason = "version parsing branches are explicit"
-    )]
-    fn parse_version_output(output: &str) -> Option<String> {
-        let trimmed = output.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        for token in trimmed.split_whitespace() {
-            let mut candidate = token;
-            if let Some(stripped) = candidate.strip_prefix('v') {
-                candidate = stripped;
-            } else if let Some(stripped) = candidate.strip_prefix('V') {
-                candidate = stripped;
-            }
-            let cleaned = candidate.trim_matches(|c: char| c == ',' || c == ')' || c == '(');
-            if cleaned.is_empty() {
-                continue;
-            }
-            let has_dot = cleaned.contains('.');
-            let starts_digit = cleaned.chars().next().is_some_and(|c| c.is_ascii_digit());
-            if has_dot && starts_digit {
-                let is_version_like = cleaned
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+');
-                if is_version_like {
-                    return Some(cleaned.to_owned());
-                }
-                let mut version_part = String::new();
-                for ch in cleaned.chars() {
-                    if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '+' {
-                        version_part.push(ch);
-                    } else {
-                        break;
-                    }
-                }
-                if version_part.contains('.') && !version_part.is_empty() {
-                    return Some(version_part);
-                }
-            }
-        }
-        None
-    }
-
-    /// Resolve the default config root: `$CODEX_HOME` or `~/.codex`.
     fn default_config_root() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var(CONFIG_ENV_VAR)
             && !dir.trim().is_empty()
@@ -222,26 +97,10 @@ impl CodexCliAdapter {
         Some(PathBuf::from(home).join(".codex"))
     }
 
-    /// Check if default config root exists on disk.
-    #[expect(dead_code, reason = "helper for future use")]
-    #[expect(clippy::unused_self, reason = "adapter helper")]
-    fn default_config_root_exists(&self) -> Option<PathBuf> {
-        let root = Self::default_config_root()?;
-        if root.exists() { Some(root) } else { None }
-    }
-
-    /// Build the config.toml path for a given config root.
     fn config_path_for_root(root: &Path) -> PathBuf {
         root.join("config.toml")
     }
 
-    /// Build a profile config path for a given root and profile name.
-    #[expect(dead_code, reason = "helper for future use")]
-    fn profile_path_for_root(root: &Path, profile: &str) -> PathBuf {
-        root.join(format!("{profile}.config.toml"))
-    }
-
-    /// Build detection evidence about config root and TOML config.
     #[expect(
         clippy::excessive_nesting,
         reason = "detection branches are explicit for evidence"
@@ -273,7 +132,6 @@ impl CodexCliAdapter {
                     if auth.exists() {
                         evidence.push(format!("auth.json present at {}", auth.display()));
                     }
-                    // Check for profile files (Codex >=0.134)
                     if let Ok(entries) = std::fs::read_dir(&root) {
                         let mut profile_count = 0;
                         for entry in entries.flatten() {
@@ -353,14 +211,14 @@ impl Adapter for CodexCliAdapter {
         let mut version: Option<String> = None;
         let mut binary_path: Option<PathBuf> = None;
 
-        match self.find_binary_in_path() {
+        match super::find_in_path(&[EXECUTABLE]) {
             Some(path) => {
                 evidence.push(format!(
                     "found binary `{}` at {}",
                     EXECUTABLE,
                     path.display()
                 ));
-                match Self::probe_version(&path) {
+                match super::probe_version(&path) {
                     Some(v) => {
                         evidence.push(format!("version `{v}` via `{EXECUTABLE} --version`"));
                         version = Some(v);
@@ -411,7 +269,6 @@ impl Adapter for CodexCliAdapter {
             let mut notes = Vec::new();
             notes.push(format!("detected codex version {v}"));
             notes.push(format!("mapped to schema version {SCHEMA_VERSION_STR}"));
-            // Detect profile era: >=0.134 uses separate profile files.
             let era_note = if is_profile_era(&v) {
                 "profile era >=0.134: separate $CODEX_HOME/<name>.config.toml"
             } else {
@@ -432,7 +289,6 @@ impl Adapter for CodexCliAdapter {
     fn config_surfaces(&self) -> Vec<ConfigSurface> {
         let mut surfaces = Vec::new();
 
-        // Primary writable surface: config.toml under CODEX_HOME or ~/.codex.
         let config_resolver = PathResolver::new(
             Some("$CODEX_HOME/config.toml"),
             Some("$CODEX_HOME/config.toml"),
@@ -452,7 +308,6 @@ impl Adapter for CodexCliAdapter {
         config_surface.restart_behavior = RestartBehavior::Reload;
         surfaces.push(config_surface);
 
-        // Profile surface: $CODEX_HOME/<name>.config.toml (>=0.134)
         let profile_resolver = PathResolver::new(
             Some("$CODEX_HOME/<name>.config.toml"),
             Some("$CODEX_HOME/<name>.config.toml"),
@@ -472,7 +327,6 @@ impl Adapter for CodexCliAdapter {
         profile_surface.restart_behavior = RestartBehavior::Reload;
         surfaces.push(profile_surface);
 
-        // Auth surface: auth.json — external secret store, not writable for provider.
         let auth_resolver = PathResolver::new(
             Some("$CODEX_HOME/auth.json"),
             Some("$CODEX_HOME/auth.json"),
@@ -491,7 +345,6 @@ impl Adapter for CodexCliAdapter {
         auth.restart_behavior = RestartBehavior::ReLogin;
         surfaces.push(auth);
 
-        // Skills surface: SKILL.md files — text fragments.
         let skills_resolver = PathResolver::new(
             Some("$CODEX_HOME/skills/<name>/SKILL.md"),
             Some("$CODEX_HOME/skills/<name>/SKILL.md"),
@@ -509,10 +362,6 @@ impl Adapter for CodexCliAdapter {
         skills.backup_required = false;
         surfaces.push(skills);
 
-        // MCP is inside config.toml under [mcp_servers.*], but also track as logical surface.
-        // We do not add a separate file surface for MCP since it shares config.toml.
-
-        // Project-local config: .codex/config.toml (trusted projects only, read-only for provider keys)
         let project_resolver =
             PathResolver::fallback_only(".codex/config.toml (project root, trusted only)");
         let mut project_surface = ConfigSurface::new(
@@ -601,8 +450,6 @@ impl Adapter for CodexCliAdapter {
         instance.validate()?;
         match instance.isolation {
             Isolation::RelocatedRoot | Isolation::Unknown => {
-                // HAD-03: surface content present under the instance root must
-                // satisfy the declared root shape / owned-key rules.
                 crate::adapter::validate_instance_surfaces(self, instance.config_root.as_path())
             }
             other => Err(CoreError::Validation {
@@ -613,10 +460,8 @@ impl Adapter for CodexCliAdapter {
     }
 
     fn surface_schema(&self, surface_id: &str) -> Option<SurfaceSchema> {
-        // HAD-03: `config.toml` and the >=0.134 per-profile files share the
-        // same top-level shape (docs/harness-configs/codex-cli.md §profiles:
-        // "Use top-level keys in the profile file; do NOT nest under
-        // [profiles.<name>]").
+        // config.toml and profile files share one top-level shape; never nest
+        // the owned keys under [profiles.<name>].
         match surface_id {
             "config.toml" | "profile.config.toml" => Some(
                 SurfaceSchema::new()
@@ -630,8 +475,7 @@ impl Adapter for CodexCliAdapter {
                     .with_owned_key("sandbox_mode", ValueType::String)
                     .with_owned_key("model_providers", ValueType::Object)
                     .with_owned_key("mcp_servers", ValueType::Object)
-                    // Legacy top-level profile selector: no longer supported
-                    // in the >=0.134 profile-file era (research doc §profiles).
+                    // Legacy inline selector; unsupported since 0.134.
                     .with_deprecated(
                         "profile",
                         Some("per-profile $CODEX_HOME/<name>.config.toml via --profile".to_owned()),
@@ -646,10 +490,7 @@ impl Adapter for CodexCliAdapter {
             return None;
         }
         let resolution = self.version_resolution();
-        let Some(version) = resolution.detected_version.as_deref() else {
-            // Unknown era already blocks via the version gate.
-            return None;
-        };
+        let version = resolution.detected_version.as_deref()?;
         profile_era_conflict(version, content)
     }
 
@@ -685,7 +526,6 @@ impl Adapter for CodexCliAdapter {
         ]
     }
 
-    /// EXT-08/09: MCP destination (codex-cli.md MCP servers: `[mcp_servers.<name>]` TOML tables)
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(crate::adapter::McpAdapterDecl::new(
             "config.toml",
@@ -696,13 +536,12 @@ impl Adapter for CodexCliAdapter {
         ))
     }
 
-    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some("codex documents no plugin mechanism (codex-cli.md)")
     }
 }
 
-/// Config era of codex `config.toml` content (HAD-05).
+/// Config era of codex `config.toml` content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigEra {
     /// >=0.134: profiles are separate `$CODEX_HOME/<name>.config.toml` files.
@@ -713,11 +552,7 @@ pub enum ConfigEra {
     Unknown,
 }
 
-/// Classify the config era of raw `config.toml` content.
-///
-/// The documented marker is the legacy inline `[profiles.<name>]` table
-/// (research doc §profiles: legacy (<0.134) uses inline tables; >=0.134 uses
-/// separate files, so current-era configs never contain `[profiles.`).
+/// Legacy inline `[profiles.*]` marks the old era; current-era configs never carry it.
 pub fn config_era(content: &[u8]) -> ConfigEra {
     let text = String::from_utf8_lossy(content);
     if text.contains("[profiles.") {
@@ -727,12 +562,7 @@ pub fn config_era(content: &[u8]) -> ConfigEra {
     }
 }
 
-/// Pure era-conflict check for `config.toml` content against a detected
-/// version (HAD-05 step 5).
-///
-/// The documented era marker is the legacy-only inline `[profiles.*]` table;
-/// current-era configs carry no marker, so the detectable conflict is a
-/// profile-file-era version (>=0.134) paired with legacy inline content.
+/// Conflict when a >=0.134 version is paired with legacy inline `[profiles.*]` content.
 pub fn profile_era_conflict(version: &str, content: &[u8]) -> Option<String> {
     if is_profile_era(version) && config_era(content) == ConfigEra::InlineProfiles {
         return Some(format!(
@@ -742,9 +572,8 @@ pub fn profile_era_conflict(version: &str, content: &[u8]) -> Option<String> {
     None
 }
 
-/// Determine if version is in profile era (>=0.134.0).
 fn is_profile_era(version: &str) -> bool {
-    // Parse leading numeric semver. If parsing fails, assume legacy to be safe.
+    // Unparseable versions count as legacy (fail-safe).
     let mut parts = version.split('.');
     let major = parts
         .next()
@@ -755,7 +584,6 @@ fn is_profile_era(version: &str) -> bool {
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0);
     let patch_str = parts.next().unwrap_or("0");
-    // Strip suffix like -alpha, +build.
     let _patch_clean = patch_str.split(['-', '+']).next().unwrap_or("0");
     if major > 0 {
         return true;
@@ -767,8 +595,6 @@ fn is_profile_era(version: &str) -> bool {
         return true;
     }
     if minor == 0 && major == 0 {
-        // Handle case like "0.134.0" correctly.
-        // The above already handles, but keep fallback.
         return minor >= 134;
     }
     false
@@ -887,7 +713,7 @@ mod tests {
             ("not a version", None),
         ];
         for (input, expected) in cases {
-            let got = CodexCliAdapter::parse_version_output(input);
+            let got = crate::adapters::parse_version_output(input);
             assert_eq!(got.as_deref(), expected, "input: {input:?}");
         }
     }
@@ -1112,10 +938,6 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // Fixture-backed conformance tests
-    // -----------------------------------------------------------------------
-
     fn fixtures_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/codex_cli")
     }
@@ -1136,7 +958,6 @@ mod tests {
         let path = fixture_path("config.minimal.toml");
         assert!(path.exists(), "fixture missing: {}", path.display());
         let doc = superai_config::toml_file::load(&path).unwrap();
-        // Minimal may be empty or contain only a comment.
         assert!(doc.is_empty() || doc.to_string().contains("model") || doc.to_string().is_empty());
     }
 
@@ -1252,7 +1073,6 @@ mod tests {
         })
         .unwrap();
         let after = superai_config::toml_file::load(&path).unwrap();
-        // model should be removed or empty
         assert!(after.get("model").is_none() || after["model"].as_str().is_none());
         drop(std::fs::remove_file(&path));
     }
@@ -1275,7 +1095,7 @@ mod tests {
 
     #[test]
     fn diff_redaction_does_not_leak_secrets() {
-        use crate::operation::RedactedString as OpRedacted;
+        use crate::error::RedactedString as OpRedacted;
         let secret = OpRedacted::new("super-secret-key");
         let diff_text = format!("set api key to {secret}");
         assert!(!diff_text.contains("super-secret-key"));
@@ -1333,10 +1153,6 @@ mod tests {
         assert!(!boxed.plan_mirror_exclusions().is_empty());
     }
 
-    // -------------------------------------------------------------------
-    // HAD-03 surface schema (table root + owned-key semantics)
-    // -------------------------------------------------------------------
-
     #[test]
     fn surface_schema_declares_table_root_and_typed_keys() {
         let a = adapter();
@@ -1348,7 +1164,6 @@ mod tests {
                 "missing rule for {path}"
             );
         }
-        // Profile files share the same top-level schema.
         assert!(a.surface_schema("profile.config.toml").is_some());
         assert!(a.surface_schema("unknown").is_none());
     }
@@ -1392,7 +1207,6 @@ mod tests {
         let dir = crate::test_util::temp_dir_unique("codex-schema");
         std::fs::create_dir_all(&dir).unwrap();
         let inst = sample_instance_with_root(dir.to_str().unwrap());
-        // Missing config: fresh instance validates.
         a.validate_instance(&inst).unwrap();
         std::fs::write(dir.join("config.toml"), b"model = \"gpt-5\"\n").unwrap();
         a.validate_instance(&inst).unwrap();
@@ -1407,10 +1221,6 @@ mod tests {
         drop(std::fs::remove_dir_all(&dir));
     }
 
-    // -------------------------------------------------------------------
-    // HAD-05/HAD-06 version-boundary fixtures (profile era vs pre-profile)
-    // -------------------------------------------------------------------
-
     #[test]
     fn boundary_fixtures_split_profile_eras_per_documented_boundary() {
         let legacy = fixture_path("config.boundary_legacy.toml");
@@ -1421,14 +1231,11 @@ mod tests {
         let legacy_bytes = std::fs::read(&legacy).unwrap();
         let current_bytes = std::fs::read(&current).unwrap();
 
-        // Era markers per docs/harness-configs/codex-cli.md §profiles.
         assert_eq!(config_era(&legacy_bytes), ConfigEra::InlineProfiles);
         assert_eq!(config_era(&current_bytes), ConfigEra::Unknown);
-        // The documented version boundary classifies the paired versions.
         assert!(!is_profile_era("0.133.9"));
         assert!(is_profile_era("0.134.0"));
 
-        // Both eras parse and satisfy the declared schema on read.
         for content in [&legacy_bytes, &current_bytes] {
             let diags = crate::adapter::validate_surface_content(
                 &adapter(),
@@ -1450,7 +1257,7 @@ mod tests {
             .unwrap()
             .trim()
             .to_owned();
-        let parsed = CodexCliAdapter::parse_version_output(&version_text);
+        let parsed = crate::adapters::parse_version_output(&version_text);
         assert_eq!(parsed.as_deref(), Some("0.134.0"));
         assert!(is_profile_era(parsed.as_deref().unwrap_or("")));
     }
@@ -1470,9 +1277,8 @@ mod tests {
         );
     }
 
-    /// Era-conflict refusal through the shared raw-editor boundary: a
-    /// profile-era adapter refuses to write legacy inline-profile content,
-    /// leaving the file untouched (HAD-05 step 5).
+    /// Era-conflict refusal through the raw-editor boundary: a profile-era
+    /// adapter refuses legacy inline-profile content, leaving the file untouched.
     #[test]
     fn commit_refuses_era_conflicting_content() {
         #[derive(Debug)]
@@ -1563,7 +1369,6 @@ mod tests {
             other => panic!("expected UnsupportedVersion, got {other:?}"),
         }
         assert_eq!(std::fs::read(&path).unwrap(), original);
-        // Consistent-era content commits through the same boundary.
         let current: Vec<u8> = std::fs::read(fixture_path("config.boundary_current.toml")).unwrap();
         crate::raw_editor::commit_for_adapter(&path, &current, None, &adapter).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), current);

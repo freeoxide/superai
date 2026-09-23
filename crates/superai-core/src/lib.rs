@@ -1,5 +1,4 @@
-//! Layer 2 — instances, templates, and capabilities.
-//!
+//! Layer 2: instances, templates, and capabilities.
 //! Exposes capabilities upward; harness identity stays below this line.
 
 /// QAL-10/11 secret and path abuse verification.
@@ -9,7 +8,7 @@ pub mod adapter;
 /// Concrete harness adapters.
 pub mod adapters;
 mod capability;
-/// Capability resolver — harness/provider matrix.
+/// Capability resolver: harness/provider matrix.
 pub mod capability_resolver;
 /// Goal-sentence and DoD coverage ledgers as tested artifacts (QAL-13/14).
 pub mod coverage_ledger;
@@ -18,9 +17,9 @@ pub mod discovery;
 mod error;
 /// Failure injection and fake process/network harness per QAL-06/07.
 pub mod failure;
-/// Registered harness catalog — the 51 planned product surfaces.
+/// Registered harness catalog (the 51 planned product surfaces).
 pub mod harness_catalog;
-/// Health probe — bounded, redacted, protocol-aware.
+/// Health probe: bounded, redacted, protocol-aware.
 pub mod health;
 /// Validated identifiers and names.
 pub mod ids;
@@ -31,11 +30,11 @@ pub mod lifecycle;
 pub mod operation;
 /// Validated path and executable reference types.
 pub mod paths;
-/// Provider definitions — data-driven.
+/// Provider definitions, data-driven.
 pub mod provider;
 /// Provider-to-harness rendering, effective inspection, lifecycle (PRV-03/05/08).
 pub mod provider_render;
-/// Raw editor backend — harness-aware wrapper.
+/// Raw editor backend, harness-aware wrapper.
 pub mod raw_editor;
 mod registry;
 /// Lifecycle and ownership states.
@@ -56,13 +55,13 @@ pub mod process;
 /// Install execution, verification receipt, update and uninstall (PKG-05..08).
 pub mod install_execute;
 
-/// Installation catalog — data-driven harness package registry (PKG-02).
+/// Installation catalog, data-driven harness package registry (PKG-02).
 pub mod install_catalog;
 
-/// Install detection — collects all harness matches (PKG-03).
+/// Install detection: collects all harness matches (PKG-03).
 pub mod detect;
 
-/// Install planning — validates and previews harness installs (PKG-04).
+/// Install planning: validates and previews harness installs (PKG-04).
 pub mod install_plan;
 
 /// Template catalog, schema, and repo config (TPL-01, TPL-02).
@@ -87,13 +86,12 @@ pub mod activation;
 /// Daemon lifecycle: port allocation, identity, readiness, start/stop (WRP-07).
 pub mod daemon;
 
-/// Multi-instance alias core: per-alias relocated roots, seeded MCP/plugin
-/// sets, third-party provider overrides, HOME-virtualized desktop
-/// instances, and launch composition (run-4 area a, run-5 area A).
+/// Multi-instance alias core: relocated roots, seeded MCP/plugin sets, and
+/// launch composition.
 pub mod alias;
 
-/// Symlink-swap profiles over parameterized fixed config paths: the
-/// desktop alternative for unrelocatable harnesses (run-5 area A).
+/// Symlink-swap profiles over parameterized fixed config paths, for
+/// harnesses that cannot relocate.
 pub mod profile;
 
 #[cfg(test)]

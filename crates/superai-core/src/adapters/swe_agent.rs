@@ -1,9 +1,5 @@
-//! SWE-agent adapter — composed YAML via `--config` batch.
-//!
-//! Research source: `docs/harness-configs/swe-agent.md` (last verified 2026-08-25).
-//! Executable `sweagent`, composed YAML `config/*.yaml` with repeatable `--config`,
-//! plus `SWE_AGENT_CONFIG_ROOT` and `SWE_AGENT_TRAJECTORY_DIR`, isolation `explicit-config`.
-//! Full for config-run instances; batch/Docker orchestration handled separately.
+//! SWE-agent adapter: composed YAML via repeatable `--config`, isolation
+//! `explicit-config`; full for config-run instances.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -20,10 +16,6 @@ use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence, Isolation};
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
 
 /// Harness identifier for SWE-agent.
 pub const HARNESS_ID_STR: &str = "swe-agent";
@@ -70,16 +62,7 @@ pub const OWNED_SELECTORS: &[&str] = &[
     "environment.deployment",
 ];
 
-// ---------------------------------------------------------------------------
-// Adapter struct
-// ---------------------------------------------------------------------------
-
-/// Concrete adapter for SWE-agent.
-///
-/// Isolation is `explicit-config` via composed `--config` flags. The wrapper
-/// sets `--config <instance>/config.yaml` (and may set env vars for
-/// config/trajectory isolation). Batch sharding is a separate orchestration
-/// concern but uses the same config composition.
+/// Concrete adapter for SWE-agent (`explicit-config` via composed `--config` flags).
 #[derive(Debug, Clone)]
 pub struct SweAgentAdapter {
     id: HarnessId,
@@ -107,33 +90,6 @@ impl SweAgentAdapter {
         CONFIG_DIR_ENV_VAR
     }
 
-    /// Try to locate the `sweagent` binary via `PATH`.
-    #[expect(clippy::unused_self, reason = "adapter method uses instance constants")]
-    #[expect(clippy::excessive_nesting, reason = "PATH scan branches are explicit")]
-    fn find_binary_in_path(&self) -> Option<PathBuf> {
-        let path_var = std::env::var("PATH").ok()?;
-        let separator = if cfg!(windows) { ';' } else { ':' };
-        for exec in [EXECUTABLE, EXECUTABLE_ALT] {
-            for dir in path_var.split(separator) {
-                if dir.is_empty() {
-                    continue;
-                }
-                let candidate = Path::new(dir).join(exec);
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
-                if cfg!(windows) {
-                    let exe_candidate = Path::new(dir).join(format!("{exec}.exe"));
-                    if exe_candidate.is_file() {
-                        return Some(exe_candidate);
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    /// Probe `sweagent --help` / `--version` with a timeout.
     fn probe_version(binary: &Path) -> Option<String> {
         let binary_owned = binary.to_path_buf();
         let (tx, rx) = mpsc::channel();
@@ -172,56 +128,9 @@ impl SweAgentAdapter {
         } else {
             format!("{stdout} {stderr}")
         };
-        Self::parse_version_output(&combined)
+        super::parse_version_output(&combined)
     }
 
-    /// Parse version output like `sweagent 1.0.0` into `1.0.0`.
-    #[expect(
-        clippy::excessive_nesting,
-        reason = "version parsing branches are explicit"
-    )]
-    fn parse_version_output(output: &str) -> Option<String> {
-        let trimmed = output.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        for token in trimmed.split_whitespace() {
-            let mut candidate = token;
-            if let Some(stripped) = candidate.strip_prefix('v') {
-                candidate = stripped;
-            } else if let Some(stripped) = candidate.strip_prefix('V') {
-                candidate = stripped;
-            }
-            let cleaned = candidate.trim_matches(|c: char| c == ',' || c == ')' || c == '(');
-            if cleaned.is_empty() {
-                continue;
-            }
-            let has_dot = cleaned.contains('.');
-            let starts_digit = cleaned.chars().next().is_some_and(|c| c.is_ascii_digit());
-            if has_dot && starts_digit {
-                let is_version_like = cleaned
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+');
-                if is_version_like {
-                    return Some(cleaned.to_owned());
-                }
-                let mut version_part = String::new();
-                for ch in cleaned.chars() {
-                    if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '+' {
-                        version_part.push(ch);
-                    } else {
-                        break;
-                    }
-                }
-                if version_part.contains('.') && !version_part.is_empty() {
-                    return Some(version_part);
-                }
-            }
-        }
-        None
-    }
-
-    /// Resolve the default config root (package config dir).
     fn default_config_root() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var(CONFIG_ROOT_ENV_VAR)
             && !dir.trim().is_empty()
@@ -242,7 +151,6 @@ impl SweAgentAdapter {
         Some(PathBuf::from(home).join(".config").join("swe-agent"))
     }
 
-    /// Collect config evidence.
     #[expect(clippy::excessive_nesting, reason = "detection branches are explicit")]
     #[expect(clippy::unused_self, reason = "uses adapter constants via Self")]
     fn collect_config_evidence(&self, evidence: &mut Vec<String>) {
@@ -343,7 +251,7 @@ impl Adapter for SweAgentAdapter {
         let mut version: Option<String> = None;
         let mut binary_path: Option<PathBuf> = None;
 
-        match self.find_binary_in_path() {
+        match super::find_in_path(&[EXECUTABLE, EXECUTABLE_ALT]) {
             Some(path) => {
                 evidence.push(format!(
                     "found binary `{}` at {}",
@@ -376,14 +284,10 @@ impl Adapter for SweAgentAdapter {
             (None, _) => InstallPresence::Absent,
         };
 
-        let confidence = match (
-            &binary_path,
-            &version,
-            evidence.iter().any(|e| e.contains("config root exists")),
-        ) {
-            (Some(_), None, _) => DetectionConfidence::Medium,
-            (None, _, true) => DetectionConfidence::Low,
-            (Some(_), Some(_), _) | (None, _, false) => DetectionConfidence::High,
+        // Absent forces High, so the Low "config root exists" arm can never fire.
+        let confidence = match (&binary_path, &version) {
+            (Some(_), None) => DetectionConfidence::Medium,
+            (Some(_), Some(_)) | (None, _) => DetectionConfidence::High,
         };
 
         let confidence = if present == InstallPresence::Absent {
@@ -522,8 +426,6 @@ impl Adapter for SweAgentAdapter {
     }
 
     fn supported_operations(&self) -> Vec<(String, AdapterSupport)> {
-        // Full for config-run instances (the HAD-09 wave scope). Batch orchestration
-        // itself is out of scope but uses the same composed config mechanism.
         vec![
             ("detect".to_owned(), AdapterSupport::Full),
             ("read_config".to_owned(), AdapterSupport::Full),
@@ -624,12 +526,10 @@ impl Adapter for SweAgentAdapter {
         ]
     }
 
-    /// EXT-09: explicit MCP absence (corpus-grounded).
     fn mcp_absence_reason(&self) -> Option<&'static str> {
         Some("no MCP mechanism documented (swe-agent.md)")
     }
 
-    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some("no plugin mechanism documented (swe-agent.md)")
     }
@@ -728,7 +628,7 @@ mod tests {
             ("not a version", None),
         ];
         for (input, expected) in cases {
-            let got = SweAgentAdapter::parse_version_output(input);
+            let got = crate::adapters::parse_version_output(input);
             assert_eq!(got.as_deref(), expected, "input: {input:?}");
         }
     }
@@ -917,8 +817,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let tmp = dir.join("swe.foreign.copy.yaml");
         std::fs::copy(&path, &tmp).unwrap();
-        // codec-honesty (DOC-06): changing YAML writes on existing files are
-        // refused outright, so foreign keys survive because nothing is written.
+        // Changing YAML writes on existing files are refused outright, so
+        // foreign keys survive because nothing is written.
         let result = superai_config::yaml::edit(&tmp, |map| {
             map.insert(
                 "tools".to_owned(),

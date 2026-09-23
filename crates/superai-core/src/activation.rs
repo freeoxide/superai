@@ -1,31 +1,11 @@
-//! Fixed-path profile activation (INS-10 / WRP-06).
-//!
-//! Fixed-path harnesses (zcode is the declared `SingleInstance`
-//! `FixedPathSingle` target, `~/.zcode/v2/config.json`) expose exactly one
-//! active config path, so "instances" are modeled as superai-owned saved
-//! profiles stored OUTSIDE the harness's config tree, swapped into the fixed
-//! path through a locked, backed-up, verified transaction:
-//!
-//! 1. `save_active_profile` fresh-reads the current fixed-path config into a
-//!    named profile in the store.
-//! 2. `activate_profile` takes an exclusive lock in the store (create-new
-//!    lockfile, stale locks detected by pid liveness), fresh-reads the current
-//!    file, and — when it was edited externally since the last activation —
-//!    reconciles per an explicit choice (capture as a new profile / discard /
-//!    abort) instead of silently overwriting. It then applies the chosen
-//!    profile through a `superai-config` `Transaction` (backup + atomic
-//!    replace + §4.2 conflict recheck + verify, optionally crash-journaled)
-//!    and records the active identity derived from the applied content
-//!    digest — never an assumed registry flag.
-//! 3. `list_profiles` / `remove_profile` manage the store.
+//! Fixed-path profile activation (INS-10 / WRP-06): superai-owned profiles
+//! swap in through a locked, backed-up, verified transaction; external edits reconcile, never overwrite.
 
 use std::fs::OpenOptions;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 
 use superai_config::document::DocumentKind;
 use superai_config::transaction::{
@@ -35,8 +15,10 @@ use superai_config::transaction::{
 use crate::daemon::pid_is_alive;
 use crate::error::{CoreError, Result};
 use crate::ids::{HarnessId, InstanceName};
+use crate::registry::now_iso8601;
+use crate::template::compute_digest;
 
-/// Default superai-owned store root (`<home>/.superai/fixed-path-profiles`) —
+/// Default superai-owned store root (`<home>/.superai/fixed-path-profiles`),
 /// deliberately outside every harness config tree.
 #[must_use]
 pub fn default_store_root(home: &Path) -> PathBuf {
@@ -54,49 +36,6 @@ const PROFILE_CONTENT_SUFFIX: &str = ".profile.content";
 
 /// Active-identity record name inside the per-harness store directory.
 const ACTIVE_FILE_NAME: &str = "active.json";
-
-fn compute_digest(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hex::encode(hasher.finalize())
-}
-
-fn now_iso8601() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    let days = i64::try_from(secs / 86400).unwrap_or(0);
-    let secs_of_day = secs % 86400;
-    let (year, month, day) = days_to_ymd(days);
-    format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
-        secs_of_day / 3600,
-        (secs_of_day % 3600) / 60,
-        secs_of_day % 60
-    )
-}
-
-/// Days since 1970-01-01 to y/m/d (civil-from-days algorithm).
-fn days_to_ymd(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    (
-        if m <= 2 { y + 1 } else { y },
-        u32::try_from(m).unwrap_or(1),
-        u32::try_from(d).unwrap_or(1),
-    )
-}
-
-// ---------------------------------------------------------------------------
-// Stored types
-// ---------------------------------------------------------------------------
 
 /// Metadata for one saved profile.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,17 +59,15 @@ pub struct ProfileSummary {
 pub struct ActiveIdentity {
     /// Profile name that was applied.
     pub profile: String,
-    /// SHA-256 of the content as applied (hex) — the snapshot external edits
+    /// SHA-256 of the content as applied (hex); the snapshot external edits
     /// are reconciled against.
     pub applied_digest: String,
     /// ISO-8601 activation timestamp.
     pub activated_at: String,
     /// Fixed path the profile was applied to.
     pub fixed_path: String,
-    /// WRP-06 "never auto-swap back while app may still write": when true,
-    /// the app was launched against this active content and has not been
-    /// confirmed stopped — activation refuses until
-    /// [`FixedPathProfileStore::mark_app_writes`] clears the flag.
+    /// WRP-06: when true the app was launched against this content and is
+    /// not confirmed stopped; activation refuses until the flag is cleared.
     #[serde(default)]
     pub app_may_write: bool,
 }
@@ -155,11 +92,8 @@ pub enum ReconcileChoice {
     Abort,
 }
 
-/// Launch instruction for the harness app (WRP-06 "launch app if
-/// requested"): derived from the adapter's invocation plan (WRP-01) —
-/// executable reference, ordered argv, environment set/unset, and
-/// working-directory policy. Guidance is surfaced even when the caller
-/// launches the app themselves.
+/// Launch instruction for the harness app, derived from the adapter's
+/// invocation plan; guidance is surfaced even when the caller launches it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchInstruction {
     /// Executable to run (name or absolute path).
@@ -168,8 +102,6 @@ pub struct LaunchInstruction {
     pub args: Vec<String>,
     /// Environment to set (the plan's isolation env).
     pub env_vars: Vec<(String, String)>,
-    /// Environment to unset before launch (no inherited credentials).
-    pub env_unset: Vec<String>,
     /// Working directory, when the plan pins one.
     pub working_dir: Option<String>,
 }
@@ -185,7 +117,6 @@ impl LaunchInstruction {
                 .unwrap_or_else(|| fallback_executable.to_owned()),
             args: plan.args.clone(),
             env_vars: plan.env_vars.clone(),
-            env_unset: plan.env_unset.clone(),
             working_dir: plan.working_dir.clone(),
         }
     }
@@ -204,9 +135,6 @@ impl LaunchInstruction {
                     .join(" ")
             ),
         ];
-        if !self.env_unset.is_empty() {
-            lines.push(format!("launch unset: {}", self.env_unset.join(" ")));
-        }
         if let Some(dir) = &self.working_dir {
             lines.push(format!("launch cwd: {dir}"));
         }
@@ -225,9 +153,8 @@ pub struct LaunchOutcome {
     pub guidance: Vec<String>,
 }
 
-/// Launch the app per `instruction` (WRP-06 "launch app if requested"):
-/// a clean environment plus exactly the plan's isolation env — inherited
-/// credentials (the plan's unset list) never reach the profile.
+/// Launch the app per `instruction` from a cleared env with only the plan's
+/// isolation variables applied, so no parent credentials reach the child.
 pub fn launch_app(
     instruction: &LaunchInstruction,
     timeout: std::time::Duration,
@@ -251,15 +178,11 @@ pub fn launch_app(
 /// Options for [`FixedPathProfileStore::activate_profile`].
 #[derive(Debug, Clone, Default)]
 pub struct ActivationOptions {
-    /// Superai-owned crash-journal root; when set, activation transactions
-    /// journal there so startup recovery (`failure::recover_pending`) covers
-    /// interrupted swaps (MUT-09 enablement). Use
-    /// [`ActivationOptions::for_home`] for the default location.
+    /// Superai-owned crash-journal root for activation transactions, so
+    /// startup recovery covers interrupted swaps; `for_home` sets the default.
     pub journal_root: Option<PathBuf>,
-    /// WRP-06 "launch app if requested": when set, the verified activation
-    /// also LAUNCHES the harness app per this invocation plan (bounded,
-    /// clean env). The launched app is recorded as possibly-writing, so the
-    /// next activation refuses until the app is confirmed stopped.
+    /// WRP-06: when set, verified activation also launches the app (bounded,
+    /// clean env) and records it as possibly-writing.
     pub launch_plan: Option<crate::adapter::WrapperPlan>,
 }
 
@@ -291,10 +214,6 @@ pub struct ActivationOutcome {
     pub launch: Option<LaunchOutcome>,
 }
 
-// ---------------------------------------------------------------------------
-// Activation lock
-// ---------------------------------------------------------------------------
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct LockFile {
     pid: u32,
@@ -302,15 +221,8 @@ struct LockFile {
     acquired_at: String,
 }
 
-/// Exclusive activation lock held for the duration of one activation
-/// (INS-10: "Concurrent activation is locked/conflict checked").
-///
-/// Create-new semantics: acquiring fails with the typed
-/// [`CoreError::ActivationLockHeld`] when a live holder exists. A lockfile
-/// whose recorded pid is provably dead (or whose content is unparsable —
-/// it sits in the superai-owned store) is stale and gets recovered exactly
-/// once; on platforms without a std-visible process table stale locks are
-/// never guessed away.
+/// Exclusive activation lock (INS-10). Create-new semantics: a live holder
+/// is a typed conflict; a provably-dead pid recovers exactly once, never guessed.
 #[derive(Debug)]
 pub struct ActivationLock {
     path: PathBuf,
@@ -341,11 +253,8 @@ impl ActivationLock {
         Err(CoreError::ActivationLockHeld { path, holder_pid })
     }
 
-    /// Create the lockfile with create-new semantics.
-    ///
-    /// `Ok(true)` means the lockfile was created (lock acquired); `Ok(false)`
-    /// means it already exists (a live or unrecoverable holder); `Err` is an
-    /// I/O failure.
+    /// Create the lockfile with create-new semantics: `Ok(true)` acquired,
+    /// `Ok(false)` a live or unrecoverable holder, `Err` an I/O failure.
     fn try_create(path: &Path, harness: &str) -> Result<bool> {
         let mut file = match OpenOptions::new()
             .read(true)
@@ -396,10 +305,6 @@ fn lock_is_stale(path: &Path) -> bool {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Profile store
-// ---------------------------------------------------------------------------
-
 /// Superai-owned profile store for one fixed-path harness.
 #[derive(Debug, Clone)]
 pub struct FixedPathProfileStore {
@@ -409,13 +314,8 @@ pub struct FixedPathProfileStore {
 }
 
 impl FixedPathProfileStore {
-    /// Open the store for `harness`.
-    ///
-    /// `root` is the superai-owned store location; `harness_root` is the
-    /// harness-owned config tree containing the fixed path (e.g. `~/.zcode`).
-    /// The store refuses to live inside the harness tree — profiles must
-    /// survive activation swaps of the very tree they are stored beside, and
-    /// a store inside the active path would be its own activation victim.
+    /// Open the store. The store refuses to live inside the harness tree:
+    /// it must survive swaps of the very tree it sits beside.
     pub fn new(root: &Path, harness: HarnessId, harness_root: &Path) -> Result<Self> {
         if !root.is_absolute() || !harness_root.is_absolute() {
             return Err(CoreError::Validation {
@@ -481,10 +381,8 @@ impl FixedPathProfileStore {
         Ok(())
     }
 
-    /// Fresh-read the current fixed-path config into profile `name`.
-    ///
-    /// The capture is a fresh disk read; the stored content is verbatim bytes
-    /// (never interpreted, never rewritten in the harness's format).
+    /// Fresh-read the current fixed-path config into profile `name`; the
+    /// stored content is verbatim bytes, never interpreted or rewritten.
     pub fn save_active_profile(
         &self,
         name: &InstanceName,
@@ -521,10 +419,8 @@ impl FixedPathProfileStore {
             saved_at: now_iso8601(),
             fixed_path: fixed_path.display().to_string(),
         };
-        // Plan-02 fold: profile content (opaque — the captured harness
-        // fixed-path bytes, any format) and metadata (pretty JSON,
-        // parse-validated) both persist through the config crate's ONE
-        // mutation boundary.
+        // Content stays opaque; metadata is parse-validated JSON. Both go
+        // through the one mutation boundary.
         commit_file(
             "profile-content",
             &self.content_path(name),
@@ -610,12 +506,8 @@ impl FixedPathProfileStore {
         serde_json::from_slice(&bytes).ok()
     }
 
-    /// Remove a stored profile.
-    ///
-    /// Removing the currently active profile is allowed — the active file on
-    /// disk still carries the applied content and the recorded identity
-    /// derives from that content — but the outcome reports `was_active` so
-    /// callers can surface it.
+    /// Remove a stored profile. Removing the active profile is allowed (the
+    /// on-disk file still carries the content); the outcome reports it.
     pub fn remove_profile(&self, name: &InstanceName) -> Result<RemovedProfile> {
         let meta = self.meta_path(name);
         let content = self.content_path(name);
@@ -636,12 +528,8 @@ impl FixedPathProfileStore {
         })
     }
 
-    /// Activate profile `name` onto the fixed path (INS-10/WRP-06).
-    ///
-    /// Locked end-to-end: lock → fresh-read current state → reconcile an
-    /// external edit per `choice` → backup + transactional apply (atomic
-    /// replace, §4.2 conflict recheck, read-back verify, optional crash
-    /// journal) → verify digest → record the active identity.
+    /// Activate profile `name` onto the fixed path (INS-10/WRP-06): locked
+    /// end-to-end, reconciled, transactional, digest-verified, recorded.
     #[expect(
         clippy::too_many_lines,
         reason = "activation composes lock, reconcile, transaction, verify, and launch"
@@ -656,10 +544,8 @@ impl FixedPathProfileStore {
         self.require_fixed_path(fixed_path)?;
         let _lock = ActivationLock::acquire(&self.harness_dir(), self.harness.as_str())?;
 
-        // WRP-06 "never auto-swap back while app may still write": the
-        // recorded identity says the app was launched against the active
-        // content and has not been confirmed stopped — refuse; the caller
-        // must confirm and clear the flag first.
+        // WRP-06: the app was launched against the active content and is not
+        // confirmed stopped, so refuse until the caller clears the flag.
         if let Some(active) = self.active_identity()
             && active.app_may_write
         {
@@ -754,8 +640,8 @@ impl FixedPathProfileStore {
                 field: "active_identity".to_owned(),
                 reason: format!("cannot serialize active identity: {e}"),
             })?;
-        // Plan-02 fold: the active-identity record persists through the ONE
-        // mutation boundary (pretty JSON, staged parse-validation included).
+        // The identity record persists through the one mutation boundary
+        // (pretty JSON, staged parse-validation included).
         commit_file(
             "active-identity",
             &self.active_path(),
@@ -764,9 +650,8 @@ impl FixedPathProfileStore {
         )
         .map_err(CoreError::Config)?;
 
-        // WRP-06 "launch app if requested": launch only after the swap
-        // verified and the identity (with the possibly-writing marker) is
-        // recorded, so a launch failure never loses the write-window fact.
+        // Launch only after the swap verified and the possibly-writing marker
+        // is recorded, so a launch failure never loses the write-window fact.
         let launch = match &opts.launch_plan {
             Some(plan) => {
                 let instruction = LaunchInstruction::from_plan(
@@ -787,11 +672,8 @@ impl FixedPathProfileStore {
         })
     }
 
-    /// Record whether the app may still be writing the active fixed path
-    /// (WRP-06). Setting `may_write = true` marks the write window open
-    /// (activation then refuses); `false` confirms the app stopped and lets
-    /// the next activation proceed. Fresh-read/modify/atomic-write of the
-    /// superai-owned identity record.
+    /// Record whether the app may still be writing (WRP-06): `true` opens
+    /// the write window, `false` confirms the app stopped.
     pub fn mark_app_writes(&self, may_write: bool) -> Result<ActiveIdentity> {
         let mut identity = self
             .active_identity()
@@ -804,8 +686,6 @@ impl FixedPathProfileStore {
             field: "active_identity".to_owned(),
             reason: format!("cannot serialize active identity: {e}"),
         })?;
-        // Plan-02 fold: the write-window mark persists through the ONE
-        // mutation boundary like every other fixed-path record.
         commit_file(
             "active-identity-mark",
             &self.active_path(),
@@ -816,10 +696,8 @@ impl FixedPathProfileStore {
         Ok(identity)
     }
 
-    /// Reconcile a fixed-path file that changed since the last activation
-    /// (WRP-06): abort with the digest evidence, capture the edit as a new
-    /// profile, or discard it — never a silent overwrite. Unchanged (or
-    /// never-activated) files need no reconciliation.
+    /// Reconcile a fixed-path file changed since the last activation
+    /// (WRP-06): abort, capture, or discard; never a silent overwrite.
     fn reconcile_external_edit(
         &self,
         name: &InstanceName,
@@ -914,20 +792,17 @@ mod tests {
         let fx = Fixture::new("act-swap");
         let opts = ActivationOptions::default();
 
-        // Capture the initial content as profile p1.
         let p1 = fx
             .store
             .save_active_profile(&Fixture::name("p1"), &fx.fixed_path)
             .unwrap();
-        // User moves on to different content; capture it as p2.
         fs::write(&fx.fixed_path, br#"{"provider": "second"}"#).unwrap();
         fx.store
             .save_active_profile(&Fixture::name("p2"), &fx.fixed_path)
             .unwrap();
 
-        // Activate p1: current content differs from the (empty) active
-        // record — first activation, no snapshot to reconcile against, but
-        // the foreign file is still backed up before the swap.
+        // First activation: no snapshot to reconcile against, but the
+        // foreign file is still backed up before the swap.
         let out = fx
             .store
             .activate_profile(
@@ -1004,10 +879,8 @@ mod tests {
             )
             .unwrap();
 
-        // External edit after the last activation.
         fs::write(&fx.fixed_path, br#"{"provider": "user-typed"}"#).unwrap();
 
-        // Abort: typed conflict, file untouched.
         let err = fx
             .store
             .activate_profile(
@@ -1070,7 +943,6 @@ mod tests {
                 .any(|p| p.name == "user-edit")
         );
 
-        // Discard: the external edit is explicitly thrown away.
         fs::write(&fx.fixed_path, br#"{"provider": "user-typed-2"}"#).unwrap();
         fx.store
             .activate_profile(
@@ -1120,8 +992,8 @@ mod tests {
         fx.store
             .save_active_profile(&Fixture::name("p1"), &fx.fixed_path)
             .unwrap();
-        // Simulate a concurrent holder: a lockfile naming a live pid —
-        // this test process itself.
+        // Simulate a concurrent holder: a lockfile naming this test
+        // process's own (live) pid.
         let dir = fx.store.harness_dir();
         fs::create_dir_all(&dir).unwrap();
         fs::write(
@@ -1151,7 +1023,6 @@ mod tests {
             }
             other => panic!("expected ActivationLockHeld, got {other:?}"),
         }
-        // The foreign config is untouched.
         assert_eq!(
             fs::read(&fx.fixed_path).unwrap(),
             br#"{"provider": "initial"}"#
@@ -1196,7 +1067,6 @@ mod tests {
         .unwrap();
         assert!(lock_is_stale(&dir.join(LOCK_FILE_NAME)));
 
-        // Acquisition recovers the stale lock and proceeds.
         let lock = ActivationLock::acquire(&dir, "zcode").unwrap();
         assert!(dir.join(LOCK_FILE_NAME).exists());
         drop(lock);
@@ -1224,7 +1094,6 @@ mod tests {
             }
             other => panic!("expected Validation, got {other:?}"),
         }
-        // And equally for the store root being the harness root itself.
         let err2 = FixedPathProfileStore::new(
             &harness_root,
             HarnessId::new("zcode").unwrap(),
@@ -1369,7 +1238,6 @@ mod tests {
                 .all(|p| p.name != "a")
         );
 
-        // Activating then removing the active profile reports was_active.
         fx.store
             .activate_profile(
                 &Fixture::name("b"),
@@ -1426,17 +1294,42 @@ mod tests {
             Some(home.join(".superai").join("journal"))
         );
     }
-    /// WRP-06 leftovers: "launch app if requested" (bounded, clean-env
-    /// launch after the verified swap) and "never auto-swap back while the
-    /// app may still write" (the recorded write window blocks the next
-    /// activation until `mark_app_writes` clears it).
+    /// The launch env must actually reach the child: `env_vars` ride on top of
+    /// the cleared base (`run_command` composes them; see its env docs).
+    #[cfg(unix)]
+    #[test]
+    fn launch_app_env_vars_reach_child_despite_cleared_env() {
+        let dir = tmp_dir("wrp06_env");
+        let app = dir.join("env-app.sh");
+        fs::write(
+            &app,
+            "#!/bin/sh\nprintf 'iso=%s\\n' \"${SUPERAI_TEST_ISO:-missing}\"\nexit 0\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&app).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&app, perms).unwrap();
+        }
+        let instruction = LaunchInstruction {
+            executable: app.display().to_string(),
+            args: Vec::new(),
+            env_vars: vec![("SUPERAI_TEST_ISO".to_owned(), "delivered".to_owned())],
+            working_dir: None,
+        };
+        let outcome = launch_app(&instruction, std::time::Duration::from_secs(10)).unwrap();
+        assert!(outcome.exited_zero, "stdout: {}", outcome.stdout);
+        assert_eq!(outcome.stdout.trim(), "iso=delivered");
+    }
+
+    /// WRP-06 leftovers: a bounded clean-env launch after the verified swap,
+    /// and the recorded write window blocking the next activation.
     #[test]
     fn activation_launches_app_and_blocks_swap_while_writing() {
         let fx = Fixture::new("wrp06_launch");
         // A fake harness app: proves it ran and saw the swapped content.
-        // Cross-platform lifecycle stub (mirrors provider.rs's fake-claude):
-        // `#!/bin/sh` on unix, a `.bat` answering the same probe via cmd.exe
-        // on Windows, which cannot exec a shebang script (os error 193).
+        // `#!/bin/sh` on unix, a `.bat` on Windows (no shebang exec there).
         #[cfg(unix)]
         let fake_app = {
             let path = fx.home.join("fake-app.sh");
@@ -1516,7 +1409,6 @@ mod tests {
             other => panic!("expected AppMayStillWrite, got {other:?}"),
         }
 
-        // Confirming the app stopped lets activation proceed again.
         let cleared = fx.store.mark_app_writes(false).unwrap();
         assert!(!cleared.app_may_write);
         let third = fx

@@ -1,4 +1,10 @@
-//! Harness adapters — concrete implementations.
+//! Harness adapters: concrete implementations.
+
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 pub mod aider;
 pub mod amazon_q;
@@ -52,13 +58,138 @@ pub mod workbuddy;
 pub mod zcode;
 pub mod zed_acp;
 
+/// First PATH hit for `names`, name-major: an earlier name wins over an
+/// earlier directory.
+pub(crate) fn find_in_path(names: &[&str]) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    find_in_path_within(&path_var, names)
+}
+
+/// [`find_in_path`] against an explicit PATH value, for callers that must
+/// pin exactly what gets resolved before spawning.
+pub(crate) fn find_in_path_within(path_var: &std::ffi::OsStr, names: &[&str]) -> Option<PathBuf> {
+    let path_var = path_var.to_string_lossy();
+    let separator = if cfg!(windows) { ';' } else { ':' };
+    for name in names {
+        for dir in path_var.split(separator) {
+            if let Some(hit) = probe_path_dir(dir, name) {
+                return Some(hit);
+            }
+        }
+    }
+    None
+}
+
+/// First PATH hit for `names`, dir-major: the earliest directory holding any
+/// name wins.
+pub(crate) fn find_in_path_dir_first(names: &[&str]) -> Option<PathBuf> {
+    let path_var = std::env::var("PATH").ok()?;
+    let separator = if cfg!(windows) { ';' } else { ':' };
+    for dir in path_var.split(separator) {
+        for name in names {
+            if let Some(hit) = probe_path_dir(dir, name) {
+                return Some(hit);
+            }
+        }
+    }
+    None
+}
+
+fn probe_path_dir(dir: &str, name: &str) -> Option<PathBuf> {
+    if dir.is_empty() {
+        return None;
+    }
+    let candidate = Path::new(dir).join(name);
+    if candidate.is_file() {
+        return Some(candidate);
+    }
+    if cfg!(windows) {
+        let exe_candidate = Path::new(dir).join(format!("{name}.exe"));
+        if exe_candidate.is_file() {
+            return Some(exe_candidate);
+        }
+    }
+    None
+}
+
+/// Parse the first version-shaped token (`1.2.3`, `v1.2`, `1.0.0-rc1`).
+#[expect(clippy::excessive_nesting, reason = "token fallback chain is explicit")]
+pub(crate) fn parse_version_output(output: &str) -> Option<String> {
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    for token in trimmed.split_whitespace() {
+        let mut candidate = token;
+        if let Some(stripped) = candidate.strip_prefix('v') {
+            candidate = stripped;
+        } else if let Some(stripped) = candidate.strip_prefix('V') {
+            candidate = stripped;
+        }
+        let cleaned = candidate.trim_matches(|c: char| c == ',' || c == ')' || c == '(');
+        if cleaned.is_empty() {
+            continue;
+        }
+        let has_dot = cleaned.contains('.');
+        let starts_digit = cleaned.chars().next().is_some_and(|c| c.is_ascii_digit());
+        if has_dot && starts_digit {
+            let is_version_like = cleaned
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+');
+            if is_version_like {
+                return Some(cleaned.to_owned());
+            }
+            let mut version_part = String::new();
+            for ch in cleaned.chars() {
+                if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '+' {
+                    version_part.push(ch);
+                } else {
+                    break;
+                }
+            }
+            if version_part.contains('.') && !version_part.is_empty() {
+                return Some(version_part);
+            }
+        }
+    }
+    None
+}
+
+/// Run `<binary> --version` under a 2s budget and parse the version from the
+/// combined output. A hung child outlives the budget; its thread dies with it.
+pub(crate) fn probe_version(binary: &Path) -> Option<String> {
+    let owned = binary.to_path_buf();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let output = Command::new(&owned)
+            .arg("--version")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output();
+        drop(tx.send(output));
+    });
+    let Ok(Ok(output)) = rx.recv_timeout(Duration::from_secs(2)) else {
+        return None;
+    };
+    if !output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = if stdout.trim().is_empty() {
+        stderr.into_owned()
+    } else if stderr.trim().is_empty() {
+        stdout.into_owned()
+    } else {
+        format!("{stdout} {stderr}")
+    };
+    parse_version_output(&combined)
+}
+
 #[cfg(test)]
 mod decl_tests {
-    //! EXT-06/09 declaration coverage: every catalog adapter declares exactly
-    //! one of an MCP destination or a corpus-grounded absence (and likewise
-    //! for plugins), the declarations' dest keys match the corpus-documented
-    //! mechanisms, and every WRITABLE declaration actually round-trips
-    //! foreign-preserving server installs through the MCP lifecycle.
+    //! Every catalog adapter declares exactly one of an MCP destination or a
+    //! corpus-grounded absence (likewise plugins); writable dests round-trip.
 
     use crate::adapter::DocumentKind;
     use crate::harness_catalog;
@@ -154,7 +285,6 @@ mod decl_tests {
         }
     }
 
-    /// Build a nested JSON-family seed value for a dotted `dest_key`.
     fn nested_json_seed(dest_key: &str, inner: &serde_json::Value) -> String {
         let segments: Vec<&str> = dest_key.split('.').filter(|s| !s.is_empty()).collect();
         let (last, parents) = segments
@@ -242,12 +372,8 @@ mod decl_tests {
         }
     }
 
-    /// Verified corpus partition of the 51 MCP declarations (round-1 judge
-    /// recount plus workbuddy, corrected round 5 by the live grok-build
-    /// probe and round 6 by the live factory-droid probe; claude-desktop
-    /// added writable round 5, chatgpt-desktop added absent round 5): pins
-    /// the exact writable/read-only/absence split so any drift in either
-    /// direction fails with the real numbers.
+    /// Verified corpus partition of the 51 MCP declarations: any drift in the
+    /// writable/read-only/absence split fails with the real numbers.
     const EXPECTED_MCP_WRITABLE: usize = 19;
     const EXPECTED_MCP_READ_ONLY: usize = 18;
     const EXPECTED_MCP_ABSENT: usize = 14;
@@ -288,7 +414,6 @@ mod decl_tests {
                 writable += usize::from(!is_read_only);
             }
         }
-        // The exact partition: sums to 51 AND matches the verified counts.
         assert_eq!(
             writable + read_only + absent,
             51,
@@ -306,7 +431,6 @@ mod decl_tests {
             absent, EXPECTED_MCP_ABSENT,
             "explicit-absence count drifted (was {absent}, expected {EXPECTED_MCP_ABSENT})"
         );
-        // Every table row is exercised (no stale expectations).
         assert_eq!(
             writable + read_only,
             MCP_DESTS.len(),
@@ -371,10 +495,8 @@ mod decl_tests {
 
     #[test]
     fn writable_mcp_decls_round_trip_foreign_preserving() {
-        // Every WRITABLE declaration must actually work through the MCP
-        // lifecycle in a temp instance root: install an owned server next to
-        // a foreign one, verify both survive, remove the owned one, verify
-        // the foreign entry is untouched.
+        // Writable dests must survive the full lifecycle: install beside a
+        // foreign server, then remove ours without touching the foreign bytes.
         for adapter in harness_catalog::all_adapters() {
             let Some(decl) = adapter.mcp_decl() else {
                 continue;
@@ -402,7 +524,6 @@ mod decl_tests {
             crate::mcp::install_mcp_server(&path, &decl, &owned)
                 .unwrap_or_else(|e| panic!("{id}: install through declared dest failed: {e}"));
 
-            // Both servers inspectable; foreign survived.
             let inspected = crate::mcp::inspect_servers(&path, &decl)
                 .unwrap_or_else(|e| panic!("{id}: inspect failed: {e}"));
             assert!(
@@ -411,7 +532,6 @@ mod decl_tests {
             );
             assert!(inspected.contains_key(&owned.id), "{id}: owned missing");
 
-            // Removal leaves the foreign entry bytes.
             crate::mcp::remove_mcp_server(&path, &decl, &owned.id)
                 .unwrap_or_else(|e| panic!("{id}: remove failed: {e}"));
             let after = std::fs::read_to_string(&path).unwrap();
@@ -444,7 +564,6 @@ mod decl_tests {
         let path = dir.join(&decl.dest_file);
         seed_empty_container(&path, decl);
         let before = std::fs::read(&path).unwrap();
-        // Refusing writes never blinds reads.
         let inspected = crate::mcp::inspect_servers(&path, decl);
         assert!(
             inspected.is_ok(),
@@ -498,8 +617,8 @@ mod decl_tests {
                 continue;
             }
             let id = adapter.id().as_str().to_owned();
-            // Smoke: the declared destination names a directory under the
-            // instance root and staging through it works end to end.
+            // The declared destination must name a real directory under the
+            // instance root.
             let dir = crate::test_util::temp_dir_unique(&format!("plug-decl-{id}"));
             let instance_root = dir.join("instance");
             let source_dir = dir.join("bundle");

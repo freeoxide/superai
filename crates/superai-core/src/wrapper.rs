@@ -1,9 +1,5 @@
-//! Wrapper generation for isolated instances.
-//!
-//! Generates a portable `sh` wrapper that sets relocation env vars and execs
-//! the harness binary. Content is deterministic, quoted safely, and marked
-//! with instance identity and digest for drift detection. Secrets are never
-//! embedded.
+//! Wrapper generation for isolated instances: deterministic, safely
+//! quoted launchers with identity/digest markers; secrets never embedded.
 
 #![expect(
     clippy::manual_pattern_char_comparison,
@@ -22,7 +18,7 @@ use crate::adapter::WrapperPlan;
 use crate::error::{CoreError, Result};
 use crate::ids::HarnessId;
 use crate::instance::Instance;
-use crate::paths::{AbsolutePath, WrapperPath};
+use crate::paths::WrapperPath;
 
 /// Generator version written into wrappers.
 pub const GENERATOR_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -70,19 +66,34 @@ pub fn executable_for_harness(harness: &HarnessId) -> String {
     }
 }
 
-/// Build the wrapper script content deterministically.
-///
-/// The script:
-/// - starts with `#!/bin/sh`
-/// - contains a marker comment with instance id, name, harness, generator, digest placeholder
-/// - uses `set -eu`
-/// - exports each env var from the plan, quoting values safely
-/// - UNSETS each env var in `plan.env_unset` (WRP-02: a global credential
-///   must not leak into an isolated profile through an inherited variable)
-/// - execs the binary with plan args and `"$@"`
-///
-/// Returns `(content, digest)` where digest is hex of the final content.
-pub fn generate_shell_wrapper(instance: &Instance, plan: &WrapperPlan) -> (String, String) {
+/// Env keys reach every launcher dialect unquoted; only identifier-
+/// shaped keys can never inject, so generation refuses the rest.
+fn env_key_is_identifier(key: &str) -> bool {
+    key.chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// First plan env key (set or unset) that is not identifier-shaped.
+fn first_invalid_env_key(plan: &WrapperPlan) -> Option<&str> {
+    plan.env_vars
+        .iter()
+        .map(|(k, _)| k.as_str())
+        .chain(plan.env_unset.iter().map(String::as_str))
+        .find(|k| !env_key_is_identifier(k))
+}
+
+fn invalid_env_key_error(key: &str) -> CoreError {
+    CoreError::Validation {
+        field: "wrapper_env".to_owned(),
+        reason: format!("env key must be an identifier ([A-Za-z_][A-Za-z0-9_]*): `{key}`"),
+    }
+}
+
+/// Build the `sh` wrapper deterministically: marker+digest, quoted env
+/// exports, unsets (WRP-02), `exec` with `"$@"`; returns `(content, digest)`.
+pub fn generate_shell_wrapper(instance: &Instance, plan: &WrapperPlan) -> Result<(String, String)> {
     generate_shell_wrapper_with_version(instance, plan, GENERATOR_VERSION)
 }
 
@@ -120,7 +131,10 @@ pub fn generate_shell_wrapper_with_version(
     instance: &Instance,
     plan: &WrapperPlan,
     generator_version: &str,
-) -> (String, String) {
+) -> Result<(String, String)> {
+    if let Some(key) = first_invalid_env_key(plan) {
+        return Err(invalid_env_key_error(key));
+    }
     let binary_name = plan_executable(instance, plan);
 
     let mut lines: Vec<String> = vec!["#!/bin/sh".to_owned()];
@@ -135,7 +149,6 @@ pub fn generate_shell_wrapper_with_version(
     for key in &plan.env_unset {
         lines.push(format!("unset {key}"));
     }
-    // Build exec line: exec 'binary' 'arg1' ...
     let mut exec_parts: Vec<String> = Vec::new();
     exec_parts.push("exec".to_owned());
     exec_parts.push(shell_quote(&binary_name));
@@ -144,7 +157,7 @@ pub fn generate_shell_wrapper_with_version(
     }
     exec_parts.push("\"$@\"".to_owned());
     lines.push(exec_parts.join(" "));
-    finalize_digest(&lines)
+    Ok(finalize_digest(&lines))
 }
 
 /// Quote a value for PowerShell single-quoted strings (`'` doubles to `''`).
@@ -156,16 +169,12 @@ pub fn powershell_quote(value: &str) -> String {
     format!("'{escaped}'")
 }
 
-/// Build a Windows PowerShell launcher (WRP-02).
-///
-/// Content-parallel to [`generate_shell_wrapper`]: same marker (digest over
-/// the placeholder content), `Set-StrictMode`, env set, env UNSET via
-/// `Remove-Item Env:`, then invoke the executable with plan args and forward
-/// remaining arguments. PowerShell has no `exec` replacement; the launcher
-/// runs the harness in the foreground of the console and propagates its
-/// exit code with `exit $LASTEXITCODE` — the honest closest equivalent,
-/// documented here rather than pretended.
-pub fn generate_powershell_wrapper(instance: &Instance, plan: &WrapperPlan) -> (String, String) {
+/// Windows PowerShell launcher (WRP-02), content-parallel to the sh one;
+/// no `exec` exists, so it runs foreground and exits `$LASTEXITCODE`.
+pub fn generate_powershell_wrapper(
+    instance: &Instance,
+    plan: &WrapperPlan,
+) -> Result<(String, String)> {
     generate_powershell_wrapper_with_version(instance, plan, GENERATOR_VERSION)
 }
 
@@ -174,7 +183,10 @@ pub fn generate_powershell_wrapper_with_version(
     instance: &Instance,
     plan: &WrapperPlan,
     generator_version: &str,
-) -> (String, String) {
+) -> Result<(String, String)> {
+    if let Some(key) = first_invalid_env_key(plan) {
+        return Err(invalid_env_key_error(key));
+    }
     let binary = plan_executable(instance, plan);
     let mut lines: Vec<String> = vec![
         marker_line(instance, generator_version),
@@ -197,7 +209,7 @@ pub fn generate_powershell_wrapper_with_version(
     invoke.push("@args".to_owned());
     lines.push(invoke.join(" "));
     lines.push("exit $LASTEXITCODE".to_owned());
-    finalize_digest(&lines)
+    Ok(finalize_digest(&lines))
 }
 
 /// Quote a value for cmd.exe (`"` doubles; `%` is escaped with `%%` so a
@@ -207,11 +219,15 @@ pub fn cmd_quote(value: &str) -> String {
     format!("\"{escaped}\"")
 }
 
-/// Build a Windows `cmd` launcher (WRP-02): same marker/digest discipline,
-/// env set via `set "VAR=..."`, env UNSET via `set "VAR="`, then run the
-/// executable with plan args and forward `%*`. `cmd` runs the child attached
-/// to the same console; there is no replacement semantic to claim.
-pub fn generate_cmd_wrapper(instance: &Instance, plan: &WrapperPlan) -> (String, String) {
+/// Same escaping as [`cmd_quote`] for `set "VAR=..."`: an unescaped `"`
+/// would chain commands, `%` would expand variables.
+fn cmd_env_value(value: &str) -> String {
+    value.replace('"', "\"\"").replace('%', "%%")
+}
+
+/// Windows `cmd` launcher (WRP-02): same marker/digest discipline, env
+/// via escaped `set`, unsets via `set "VAR="`, forwards `%*`.
+pub fn generate_cmd_wrapper(instance: &Instance, plan: &WrapperPlan) -> Result<(String, String)> {
     generate_cmd_wrapper_with_version(instance, plan, GENERATOR_VERSION)
 }
 
@@ -220,7 +236,10 @@ pub fn generate_cmd_wrapper_with_version(
     instance: &Instance,
     plan: &WrapperPlan,
     generator_version: &str,
-) -> (String, String) {
+) -> Result<(String, String)> {
+    if let Some(key) = first_invalid_env_key(plan) {
+        return Err(invalid_env_key_error(key));
+    }
     let binary = plan_executable(instance, plan);
     let mut lines: Vec<String> = vec![
         "@echo off".to_owned(),
@@ -228,7 +247,7 @@ pub fn generate_cmd_wrapper_with_version(
     ];
     lines.push("rem generated: do not edit manually; edits will be detected as drift".to_owned());
     for (key, value) in &plan.env_vars {
-        lines.push(format!("set \"{key}={value}\""));
+        lines.push(format!("set \"{key}={}\"", cmd_env_value(value)));
     }
     for key in &plan.env_unset {
         lines.push(format!("set \"{key}=\""));
@@ -239,7 +258,7 @@ pub fn generate_cmd_wrapper_with_version(
     }
     run.push("%*".to_owned());
     lines.push(run.join(" "));
-    finalize_digest(&lines)
+    Ok(finalize_digest(&lines))
 }
 
 /// Plan a wrapper for an instance via its adapter when possible, otherwise
@@ -256,14 +275,8 @@ pub fn plan_wrapper_for_instance(instance: &Instance, plan: Option<WrapperPlan>)
     wrapper_plan
 }
 
-/// Write wrapper content atomically to `path`. The file is made executable
-/// on unix. Returns the digest of the written content.
-///
-/// WRP-08 defense in depth: an existing file that is NOT a superai-owned
-/// wrapper is REFUSED with a typed [`CoreError::ForeignOwnership`] — the
-/// user's launcher requires explicit detach, never an overwrite. Replacing
-/// a superai-owned wrapper (repair/rename) backs it up first; a missing
-/// target is a plain create.
+/// Write atomically (executable on unix). WRP-08: a file that is not a
+/// superai-owned wrapper is refused, never overwritten; owned files back up.
 pub fn write_wrapper(path: &WrapperPath, content: &str) -> Result<String> {
     let target = path.as_path();
     if target.exists() {
@@ -306,13 +319,8 @@ pub fn write_wrapper(path: &WrapperPath, content: &str) -> Result<String> {
             })
         })?;
     }
-    // Digest is the value embedded in the marker (hash of content without digest placeholder)
-    let digest = extract_digest(content).unwrap_or_else(|| compute_digest(content.as_bytes()));
-    // Plan-02 fold: launcher writes go through the config crate's ONE
-    // mutation boundary — snapshot, backup-before-foreign-write, §4.2
-    // conflict recheck, atomic replace, read-back verify. The content is a
-    // generated launcher script, so its document kind is opaque (no parse
-    // validation) and the 0o755 marker below still lands after the commit.
+    // Writes go through the config crate's mutation boundary (snapshot,
+    // backup, conflict recheck, atomic replace, read-back verify).
     superai_config::transaction::commit_file(
         "wrapper-install",
         target,
@@ -331,7 +339,6 @@ pub fn write_wrapper(path: &WrapperPath, content: &str) -> Result<String> {
             }));
         }
     }
-    // Verify read-back content matches
     let written = std::fs::read(target).map_err(|e| {
         CoreError::Config(superai_config::ConfigError::Io {
             path: target.to_path_buf(),
@@ -345,7 +352,7 @@ pub fn write_wrapper(path: &WrapperPath, content: &str) -> Result<String> {
             reason: "wrapper content mismatch after write".to_owned(),
         });
     }
-    Ok(digest)
+    Ok(wrapper_digest_for_content(content))
 }
 
 fn extract_digest(content: &str) -> Option<String> {
@@ -362,13 +369,8 @@ fn extract_digest(content: &str) -> Option<String> {
     }
 }
 
-/// Check whether a wrapper file is superai-owned by parsing it against the
-/// generated grammar and verifying its marker (WRP-08: marker + digest —
-/// never a substring match, which any comment could forge).
-///
-/// Ownership requires the content to parse as a generated wrapper AND carry
-/// a `superai wrapper` marker with a digest. When `expected_digest` is
-/// given, the marker digest must equal it exactly.
+/// Whether a wrapper is superai-owned: parseable against the generated
+/// grammar plus marker+digest (WRP-08; never a substring match).
 pub fn is_owned_wrapper(path: &Path, expected_digest: Option<&str>) -> bool {
     let Ok(content) = std::fs::read_to_string(path) else {
         return false;
@@ -389,31 +391,60 @@ pub fn is_owned_wrapper(path: &Path, expected_digest: Option<&str>) -> bool {
     }
 }
 
-/// Render a wrapper path for preview purposes without writing.
-pub fn preview_wrapper_content(
-    instance: &Instance,
-    plan: &WrapperPlan,
-) -> (String, String, AbsolutePath) {
-    let (content, digest) = generate_shell_wrapper(instance, plan);
-    // Compute wrapper path as instance.wrapper if present, else placeholder
-    let placeholder = instance.wrapper.as_ref().map_or_else(
-        || std::env::temp_dir().join("superai-wrapper-preview"),
-        |w| w.path.as_path().to_path_buf(),
-    );
-    let abs = AbsolutePath::from_path(&placeholder).unwrap_or_else(|_| {
-        // Fallback to the platform temp dir
-        #[expect(
-            clippy::unwrap_used,
-            reason = "temp_dir fallback is absolute by construction"
-        )]
-        AbsolutePath::from_path(&std::env::temp_dir().join("superai-wrapper-preview")).unwrap()
-    });
-    (content, digest, abs)
+/// Remove an owned wrapper without a verify-then-remove window: rename
+/// aside, re-verify, delete; raced bytes go back and the removal refuses.
+pub fn remove_owned_wrapper_verified(path: &Path, expected_digest: Option<&str>) -> Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    if !is_owned_wrapper(path, expected_digest) {
+        return Ok(false);
+    }
+    let file_name =
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| CoreError::InvalidPath {
+                kind: "wrapper".to_owned(),
+                value: path.display().to_string(),
+                reason: "wrapper path has no usable file name".to_owned(),
+            })?;
+    let unique = {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis());
+        format!("{millis:013}-{}", std::process::id())
+    };
+    let temp = path.with_file_name(format!(".{file_name}.superai-remove-{unique}"));
+    std::fs::rename(path, &temp).map_err(|e| {
+        CoreError::Config(superai_config::ConfigError::Io {
+            path: path.to_path_buf(),
+            source: e,
+        })
+    })?;
+    if is_owned_wrapper(&temp, expected_digest) {
+        std::fs::remove_file(&temp).map_err(|e| {
+            CoreError::Config(superai_config::ConfigError::Io {
+                path: temp.clone(),
+                source: e,
+            })
+        })?;
+        return Ok(true);
+    }
+    // The moved bytes are not ours: put them back untouched and refuse.
+    std::fs::rename(&temp, path).map_err(|e| CoreError::Commit {
+        path: path.to_path_buf(),
+        reason: format!(
+            "wrapper changed under the removal; foreign bytes now sit at {} and cannot \
+                 be returned: {e}",
+            temp.display()
+        ),
+    })?;
+    Err(CoreError::ForeignOwnership {
+        path: path.to_path_buf(),
+        owner: "wrapper changed under the removal; left in place".to_owned(),
+    })
 }
-
-// ---------------------------------------------------------------------------
-// Wrapper detection, collision handling, and verification (WRP-02..04, WRP-08)
-// ---------------------------------------------------------------------------
 
 /// What a wrapper file on disk appears to be.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -463,29 +494,20 @@ pub struct ParsedWrapper {
 /// Maximum wrapper size that we attempt to parse (bounded parsing per DRF-03).
 const MAX_WRAPPER_BYTES: usize = 32 * 1024;
 
-/// Hex digest of wrapper content (first 16 hex chars of `DefaultHasher`).
-///
-/// Public for drift and verification callers; secrets are never included
-/// in the hashed input because they are never embedded in the wrapper.
+/// Hex digest of wrapper content; secrets never appear because they
+/// are never embedded in the wrapper.
 pub fn content_digest(content: &str) -> String {
     compute_digest(content.as_bytes())
 }
 
-/// Recompute the digest that `generate_shell_wrapper` would embed for this content.
-///
-/// The digest is computed over the content with `PLACEHOLDER` substitution
-/// as done during generation; for already-generated wrappers this equals the
-/// marker digest.
+/// Recompute the digest generation would embed for this content; for
+/// already-generated wrappers this equals the marker digest.
 pub fn wrapper_digest_for_content(content: &str) -> String {
     extract_digest(content).unwrap_or_else(|| compute_digest(content.as_bytes()))
 }
 
-/// Detect what kind of wrapper exists at `path`.
-///
-/// - Never executes the wrapper.
-/// - Shell parsing is bounded to the generated grammar; anything else is `Opaque`.
-/// - File sizes above `MAX_WRAPPER_BYTES` are `Opaque`.
-/// - Permission errors are treated as `Opaque` with a reason.
+/// Detect what sits at `path`; never executes it. Parsing is bounded to
+/// the generated grammar; oversized or unreadable files are `Opaque`.
 pub fn detect_wrapper_kind(path: &Path) -> WrapperKind {
     let meta = match std::fs::symlink_metadata(path) {
         Ok(m) => m,
@@ -566,8 +588,8 @@ fn looks_like_known_recipe(content: &str) -> bool {
 }
 
 fn is_opaque_shell(content: &str) -> bool {
-    // Our generated grammar is small: shebang, marker comment, set -eu, exports, exec line.
-    // Anything with control flow is opaque.
+    // The generated grammar is shebang, marker, set -eu, exports, exec line;
+    // anything with control flow is opaque.
     for token in [
         " if ",
         " for ",
@@ -582,12 +604,8 @@ fn is_opaque_shell(content: &str) -> bool {
             return true;
         }
     }
-    // If file does not start with shebang, treat as opaque (aliases/shims may be binary)
-    if !content.starts_with("#!/bin/sh") && !content.starts_with("#!/usr/bin/env") {
-        // But allow superai-owned wrappers we already handled; foreign wrappers without shebang are opaque
-        return true;
-    }
-    false
+    // Without a shebang it may be a binary shim; never ours.
+    !content.starts_with("#!/bin/sh") && !content.starts_with("#!/usr/bin/env")
 }
 
 fn extract_marker_field(content: &str, key: &str) -> Option<String> {
@@ -604,9 +622,8 @@ fn extract_marker_field(content: &str, key: &str) -> Option<String> {
     }
 }
 
-/// Parse a wrapper that matches the generated grammar, bounded.
-///
-/// Returns `None` if the content does not match the generated grammar (opaque).
+/// Parse a wrapper matching the generated grammar, bounded; `None`
+/// when the content does not match (opaque).
 #[expect(
     clippy::excessive_nesting,
     reason = "wrapper parsing branches are explicit"
@@ -670,7 +687,6 @@ pub fn parse_wrapper_content(content: &str) -> Option<ParsedWrapper> {
                     if arg == "\"$@\"" || arg == "$@" {
                         forwards_args = true;
                     } else {
-                        // Strip single quotes added by shell_quote
                         let unquoted = unquote_shell(arg).unwrap_or_else(|| arg.to_owned());
                         // Skip the "$@" sentinel
                         if unquoted == "$@" || unquoted == "\"$@\"" {
@@ -710,12 +726,10 @@ fn unquote_shell(s: &str) -> Option<String> {
         return Some(String::new());
     }
     if let Some(inner) = t.strip_prefix('\'') {
-        // Single-quoted: ends with ', with '\'' escapes inside (our generator uses this)
-        // Reconstruct: replace '\'' -> '
+        // Our generator escapes ' as '\''; undo that.
         if let Some(end) = inner.rfind('\'') {
             let body = &inner[..end];
-            let unescaped = body.replace("'\\''", "'");
-            return Some(unescaped);
+            return Some(body.replace("'\\''", "'"));
         }
         return None;
     }
@@ -724,7 +738,6 @@ fn unquote_shell(s: &str) -> Option<String> {
     {
         return Some(t.to_owned());
     }
-    // Unquoted single word
     Some(t.to_owned())
 }
 
@@ -733,8 +746,8 @@ fn unquote_shell(s: &str) -> Option<String> {
     reason = "shell split branches are explicit"
 )]
 fn shell_split_exec(line: &str) -> Option<Vec<String>> {
-    // Bounded, minimal splitter for "exec 'bin' 'arg1' \"$@\"" shapes.
-    // Respects single quoting; does not handle full shell grammar — that is why opaque exists.
+    // Minimal splitter for `exec 'bin' 'arg1' "$@"` shapes, single quotes
+    // only; anything richer is opaque by design.
     let mut out: Vec<String> = Vec::new();
     let mut current = String::new();
     let mut in_single = false;
@@ -792,16 +805,8 @@ fn shell_split_exec(line: &str) -> Option<Vec<String>> {
     Some(out)
 }
 
-/// Check whether `name` collides case-folded with any name in `existing`.
-pub fn is_name_collision_case_fold(name: &str, existing: &[&str]) -> bool {
-    let needle = name.to_lowercase();
-    existing.iter().any(|e| e.to_lowercase() == needle)
-}
-
-/// Check wrapper path and command collisions against a registry (case-insensitive).
-///
-/// - Duplicate wrapper paths (case-folded on case-insensitive filesystems) are errors.
-/// - Wrapper command collisions with other wrapper commands or instance names (case-folded) are errors.
+/// Case-insensitive wrapper path/command collisions against a registry:
+/// duplicate paths, commands vs commands, commands vs instance names.
 pub fn check_wrapper_collisions(
     new_path: &WrapperPath,
     new_command: &crate::ids::InstanceName,
@@ -845,10 +850,8 @@ pub fn check_wrapper_collisions(
     Ok(())
 }
 
-/// Check whether `dir` contains a file whose name matches `name` case-insensitively.
-///
-/// Handles Windows extensions (`.exe`, `.cmd`, `.bat`) by also checking those suffixes.
-/// Returns the existing path if found.
+/// Whether `dir` holds a file matching `name` case-insensitively, with
+/// Windows extension folding (`.exe`, `.cmd`, `.bat`, `.ps1`).
 pub fn exists_case_insensitive(dir: &Path, name: &str) -> Option<PathBuf> {
     let entries = std::fs::read_dir(dir).ok()?;
     let needle = name.to_lowercase();
@@ -864,7 +867,6 @@ pub fn exists_case_insensitive(dir: &Path, name: &str) -> Option<PathBuf> {
         if lower == needle {
             return Some(entry.path());
         }
-        // Windows extension folding: if needle is "work" and file is "work.exe", consider collision
         for ext in [".exe", ".cmd", ".bat", ".ps1"] {
             if lower == format!("{needle}{ext}") {
                 return Some(entry.path());
@@ -874,9 +876,8 @@ pub fn exists_case_insensitive(dir: &Path, name: &str) -> Option<PathBuf> {
     None
 }
 
-/// Check for executable collisions on `PATH` for `command_name` (case-insensitive).
-///
-/// Returns the colliding PATH entry if one exists outside `own_wrapper_dir`.
+/// Executable collision on `PATH` for `command_name` (case-insensitive),
+/// skipping `own_wrapper_dir`; returns the colliding entry.
 pub fn check_executable_collision_on_path(
     command_name: &str,
     own_wrapper_dir: Option<&Path>,
@@ -902,36 +903,20 @@ pub fn check_executable_collision_on_path(
     None
 }
 
-/// Resolve the wrapper destination for `command_name` inside `bin_dir`.
-///
-/// - Validates that `command_name` is a legal instance name.
-/// - Refuses to overwrite an unowned file at the destination.
-/// - Checks registry collisions case-insensitively.
-/// - Checks filesystem case-folding collisions.
-/// - Checks PATH executable collisions (warned via `ForeignOwnership`-like error context).
-///
-/// Returns the `WrapperPath` that should be written. The caller must still call `write_wrapper`.
+/// Resolve the wrapper destination: legal name, no unowned overwrite,
+/// case-fold collisions checked against the dir, registry, and PATH.
 pub fn resolve_wrapper_destination(
     bin_dir: &Path,
     command_name: &crate::ids::InstanceName,
     registry: &crate::registry::Registry,
 ) -> Result<WrapperPath> {
     let candidate = bin_dir.join(command_name.as_str());
-    // Validate as wrapper path (absolute)
-    // For preview, handle relative bin_dir via home join? We require absolute for safety.
-    let candidate_abs = if candidate.is_absolute() {
-        candidate.clone()
-    } else {
-        // Treat bin_dir as absolute; if not, join with current dir but require AbsolutePath conversion to fail gracefully
-        candidate.clone()
-    };
     let wrapper_path =
-        WrapperPath::new(&candidate_abs.to_string_lossy()).map_err(|e| CoreError::Validation {
+        WrapperPath::new(&candidate.to_string_lossy()).map_err(|e| CoreError::Validation {
             field: "wrapper.path".to_owned(),
             reason: format!("invalid wrapper path {}: {e}", candidate.display()),
         })?;
 
-    // Filesystem collision: if file exists and is not superai-owned, refuse
     if candidate.exists() {
         match detect_wrapper_kind(&candidate) {
             WrapperKind::SuperaiOwned { .. } | WrapperKind::Missing => {}
@@ -943,7 +928,6 @@ pub fn resolve_wrapper_destination(
             }
         }
     }
-    // Case-insensitive filesystem collision in the same directory
     if let Some(colliding) = exists_case_insensitive(bin_dir, command_name.as_str())
         && colliding != candidate
     {
@@ -957,14 +941,11 @@ pub fn resolve_wrapper_destination(
             ),
         });
     }
-    // Registry collisions
     check_wrapper_collisions(&wrapper_path, command_name, registry)?;
-    // PATH collision is a warning not a hard error unless it would shadow; we surface as Validation
     if let Some(colliding) =
         check_executable_collision_on_path(command_name.as_str(), Some(bin_dir))
     {
-        // Do not hard-fail for PATH shadow in preview? For commit, refuse if the colliding binary is not superai-owned.
-        // Treat as conflict: the effective command resolution would be ambiguous.
+        // The command resolution would be ambiguous, so this is a hard error.
         return Err(CoreError::Validation {
             field: "wrapper.command_name".to_owned(),
             reason: format!(
@@ -977,14 +958,8 @@ pub fn resolve_wrapper_destination(
     Ok(wrapper_path)
 }
 
-/// Verify that a generated wrapper at `path` matches the expected `instance` and `plan`.
-///
-/// - Parses the wrapper with bounded grammar.
-/// - Confirms executable and `config_root` assignments match the plan.
-/// - Compares digest to the value the generator would produce.
-/// - Ensures the file is owned by superai (marker present).
-///
-/// Returns `Ok` when verification succeeds, or a `Verification` error with a reason.
+/// Verify a wrapper against the expected instance/plan: bounded parse,
+/// marker, digest, env/unsets, exec target, `"$@"`, exact content.
 pub fn verify_wrapper(path: &Path, instance: &Instance, plan: &WrapperPlan) -> Result<()> {
     let content = std::fs::read_to_string(path).map_err(|e| CoreError::Verification {
         path: path.to_path_buf(),
@@ -996,7 +971,6 @@ pub fn verify_wrapper(path: &Path, instance: &Instance, plan: &WrapperPlan) -> R
         kind: "parse".to_owned(),
         reason: "wrapper does not match generated grammar (opaque)".to_owned(),
     })?;
-    // Must be superai-owned per marker
     if parsed.marker.is_none() || !content.contains("superai wrapper") {
         return Err(CoreError::Verification {
             path: path.to_path_buf(),
@@ -1004,8 +978,7 @@ pub fn verify_wrapper(path: &Path, instance: &Instance, plan: &WrapperPlan) -> R
             reason: "wrapper missing superai marker".to_owned(),
         });
     }
-    // Verify digest
-    let (expected_content, expected_digest) = generate_shell_wrapper(instance, plan);
+    let (expected_content, expected_digest) = generate_shell_wrapper(instance, plan)?;
     let actual_digest = parsed
         .digest
         .clone()
@@ -1017,7 +990,6 @@ pub fn verify_wrapper(path: &Path, instance: &Instance, plan: &WrapperPlan) -> R
             reason: format!("digest mismatch: expected {expected_digest}, actual {actual_digest}"),
         });
     }
-    // Verify env vars from plan are present exactly
     for (key, expected_value) in &plan.env_vars {
         let found = parsed.env_vars.iter().find(|(k, _)| k == key);
         match found {
@@ -1052,7 +1024,7 @@ pub fn verify_wrapper(path: &Path, instance: &Instance, plan: &WrapperPlan) -> R
         }
     }
     // Verify exec target is the plan's executable (explicit reference,
-    // instance-pinned binary, or the harness default — WRP-01 precedence).
+    // instance-pinned binary, or the harness default; WRP-01 precedence).
     let expected_binary = plan_executable(instance, plan);
     if let Some(actual_target) = parsed.exec_target.as_deref() {
         // Targets are quoted in file; unquote for comparison
@@ -1088,9 +1060,6 @@ pub fn verify_wrapper(path: &Path, instance: &Instance, plan: &WrapperPlan) -> R
     }
     // Verify content matches expected exactly except digest already checked
     if content != expected_content {
-        // For verification, allow the digest to be the only difference; if other diff, report
-        // Do a normalized comparison ignoring digest line?
-        // Simpler: if content not exactly expected, treat as drift
         return Err(CoreError::Verification {
             path: path.to_path_buf(),
             kind: "content".to_owned(),
@@ -1100,22 +1069,24 @@ pub fn verify_wrapper(path: &Path, instance: &Instance, plan: &WrapperPlan) -> R
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// WRP-04 — bounded diagnostic probe + runtime isolation evidence
-// ---------------------------------------------------------------------------
+// WRP-04, bounded diagnostic probe + runtime isolation evidence. Test-only
+// until layer 3 consumes them.
 
 /// Outcome of a bounded, no-auth diagnostic launch of a wrapper (WRP-04).
+/// Unix-only: the sole caller execs a `#!/bin/sh` wrapper.
+#[cfg(all(test, unix))]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DiagnosticProbe {
+struct DiagnosticProbe {
     /// Whether the probe exited zero within the bound.
-    pub exit_ok: bool,
+    exit_ok: bool,
     /// Captured stdout, secret-shaped values redacted, bounded.
-    pub stdout_redacted: String,
+    stdout_redacted: String,
     /// Captured stderr, secret-shaped values redacted, bounded.
-    pub stderr_redacted: String,
+    stderr_redacted: String,
 }
 
 /// Redact secret-shaped tokens (`sk-…` and friends) from probe output.
+#[cfg(all(test, unix))]
 fn redact_probe_output(text: &str) -> String {
     let mut out = text.to_owned();
     for prefix in ["sk-", "ghp_", "xoxb-"] {
@@ -1151,12 +1122,10 @@ fn redact_probe_output(text: &str) -> String {
     bounded
 }
 
-/// Run a bounded, no-auth diagnostic launch of the wrapper at `path`
-/// (WRP-04): executes the wrapper itself with a caller-chosen diagnostic
-/// argument (e.g. `--version`) under a CLEAN environment (the wrapper
-/// installs its own isolation env) with a hard timeout and output cap.
-/// Never passes credentials; output is redacted before return.
-pub fn diagnostic_probe(
+/// Bounded no-auth diagnostic launch of the wrapper (WRP-04): clean env,
+/// hard timeout, output cap; credentials never passed, output redacted.
+#[cfg(all(test, unix))]
+fn diagnostic_probe(
     path: &Path,
     probe_arg: &str,
     timeout: std::time::Duration,
@@ -1177,12 +1146,11 @@ pub fn diagnostic_probe(
     })
 }
 
-/// Runtime verdict on an instance's isolation claim (WRP-04): a claim of
-/// `full` is only marked verified when the split surfaces are actually
-/// observable in the generated invocation AND the plan declares no shared
-/// state that remains joined (keychain, subscription, cloud account).
+/// Runtime verdict on an isolation claim (WRP-04): Full only when split
+/// surfaces are observable and no shared state remains joined.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IsolationVerdict {
+enum IsolationVerdict {
     /// Split surfaces verified and no shared state declared.
     Full,
     /// Surfaces split but shared state remains (the honest constrained
@@ -1190,6 +1158,7 @@ pub enum IsolationVerdict {
     Constrained,
 }
 
+#[cfg(test)]
 impl std::fmt::Display for IsolationVerdict {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
@@ -1201,27 +1170,30 @@ impl std::fmt::Display for IsolationVerdict {
 }
 
 /// Evidence gathered for one isolation claim (WRP-04).
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IsolationEvidence {
+struct IsolationEvidence {
     /// Isolation class the instance record claims.
-    pub claimed: crate::state::Isolation,
+    claimed: crate::state::Isolation,
     /// Verified verdict.
-    pub verdict: IsolationVerdict,
+    verdict: IsolationVerdict,
     /// Split surfaces verified against the generated invocation (each line
     /// names the surface, e.g. `env CLAUDE_CONFIG_DIR=/x/.claude-work`).
-    pub verified_surfaces: Vec<String>,
+    verified_surfaces: Vec<String>,
     /// Shared state the plan honestly declares as still joined.
-    pub shared_state: Vec<String>,
+    shared_state: Vec<String>,
 }
 
-/// Collect runtime isolation evidence for an instance from its wrapper plan
-/// (WRP-04): verifies each declared env/arg split surface appears in the
-/// generated wrapper content, and downgrades the verdict to
-/// [`IsolationVerdict::Constrained`] whenever the plan declares shared
-/// state that no wrapper can split (keychain/subscription/cloud).
-pub fn isolation_evidence(instance: &Instance, plan: &WrapperPlan) -> IsolationEvidence {
-    let (content, _) = generate_shell_wrapper(instance, plan);
-    let parsed = parse_wrapper_content(&content);
+/// Collect isolation evidence (WRP-04): verify declared split surfaces
+/// in the generated wrapper; shared state downgrades to Constrained.
+#[cfg(test)]
+fn isolation_evidence(instance: &Instance, plan: &WrapperPlan) -> IsolationEvidence {
+    // A plan whose keys cannot generate degrades like an unparseable
+    // wrapper: nothing verifies, so the verdict is honestly Constrained.
+    let generated = generate_shell_wrapper(instance, plan).ok();
+    let parsed = generated
+        .as_ref()
+        .and_then(|(content, _)| parse_wrapper_content(content));
     let mut verified: Vec<String> = Vec::new();
     for (key, value) in &plan.env_vars {
         let present = parsed
@@ -1240,7 +1212,10 @@ pub fn isolation_evidence(instance: &Instance, plan: &WrapperPlan) -> IsolationE
         }
     }
     for arg in &plan.args {
-        if content.contains(arg) {
+        if generated
+            .as_ref()
+            .is_some_and(|(content, _)| content.contains(arg))
+        {
             verified.push(format!("arg {arg}"));
         }
     }
@@ -1263,6 +1238,7 @@ mod tests {
     use super::*;
     use crate::adapter::Adapter as _;
     use crate::ids::{InstanceId, InstanceName};
+    use crate::paths::AbsolutePath;
     use crate::state::{InstanceOrigin, Isolation, Ownership};
 
     fn sample_instance_with_root(root: &str) -> Instance {
@@ -1282,15 +1258,14 @@ mod tests {
         }
     }
 
-    /// Platform: Linux and macOS — `#!/bin/sh` wrapper with `CLAUDE_CONFIG_DIR` and `exec`; Windows — same script via `bash`/`sh` (PowerShell/cmd wrapper not yet generated). Determinism holds on all platforms.
     #[test]
     fn generates_deterministic_sh_wrapper() {
         let inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".claude-work"));
         let mut plan = WrapperPlan::new("test");
         plan.env_vars
             .push(("CLAUDE_CONFIG_DIR".to_owned(), inst.config_root.to_string()));
-        let (content1, digest1) = generate_shell_wrapper(&inst, &plan);
-        let (content2, digest2) = generate_shell_wrapper(&inst, &plan);
+        let (content1, digest1) = generate_shell_wrapper(&inst, &plan).unwrap();
+        let (content2, digest2) = generate_shell_wrapper(&inst, &plan).unwrap();
         assert_eq!(content1, content2);
         assert_eq!(digest1, digest2);
         assert!(content1.starts_with("#!/bin/sh\n"));
@@ -1299,14 +1274,11 @@ mod tests {
         assert!(content1.contains("exec"));
         assert!(content1.contains("\"$@\""));
         assert!(content1.contains(&digest1));
-        // No secret leak
         assert!(!content1.contains("sk-"));
-        // Marker contains instance identity
         assert!(content1.contains("work"));
         assert!(content1.contains("test-id-1"));
     }
 
-    /// Platform: Linux, macOS, Windows — paths with spaces/`$`/`'` are single-quoted for POSIX `sh`; Windows `bash` also uses POSIX quoting, PowerShell differs (not covered here).
     #[test]
     fn quotes_special_paths_safely() {
         let root = crate::test_util::tmp_abs_str("my work with $dollar");
@@ -1314,14 +1286,11 @@ mod tests {
         let mut plan = WrapperPlan::new("test");
         plan.env_vars
             .push(("CLAUDE_CONFIG_DIR".to_owned(), inst.config_root.to_string()));
-        let (content, _) = generate_shell_wrapper(&inst, &plan);
-        // Value with space and $ must be single-quoted, not expanded
+        let (content, _) = generate_shell_wrapper(&inst, &plan).unwrap();
         assert!(content.contains(&format!("'{root}'")));
-        // Ensure no unquoted export
         assert!(!content.contains(&format!("export CLAUDE_CONFIG_DIR={root}")));
     }
 
-    /// Platform: Linux/macOS — atomically writes wrapper and sets `0o755` via `PermissionsExt`; Windows — atomic write without Unix perms (`#[cfg(unix)]` gated). Test verifies atomic write on all, exec bit only on Unix.
     #[test]
     fn writes_wrapper_atomically_and_executable() {
         let dir = crate::test_util::temp_dir_unique("wrapper");
@@ -1332,13 +1301,12 @@ mod tests {
         let mut plan = WrapperPlan::new("test");
         plan.env_vars
             .push(("CLAUDE_CONFIG_DIR".to_owned(), inst.config_root.to_string()));
-        let (content, digest) = generate_shell_wrapper(&inst, &plan);
+        let (content, digest) = generate_shell_wrapper(&inst, &plan).unwrap();
         let written_digest = write_wrapper(&wrapper_path, &content).unwrap();
         assert_eq!(written_digest, digest);
         let read_back = std::fs::read_to_string(wrapper_path.as_path()).unwrap();
         assert_eq!(read_back, content);
         assert!(is_owned_wrapper(wrapper_path.as_path(), Some(&digest)));
-        // Check executable bit on unix
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1351,15 +1319,13 @@ mod tests {
         std::fs::remove_file(wrapper_path.as_path()).unwrap_or(());
     }
 
-    /// Platform: all — wrapper content must not embed secrets on Linux, macOS, or Windows; redaction is platform-independent.
     #[test]
     fn never_embeds_secret() {
         let inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".claude-work"));
         let mut plan = WrapperPlan::new("test");
         plan.env_vars
             .push(("CLAUDE_CONFIG_DIR".to_owned(), inst.config_root.to_string()));
-        // Simulate secret not in plan
-        let (content, _) = generate_shell_wrapper(&inst, &plan);
+        let (content, _) = generate_shell_wrapper(&inst, &plan).unwrap();
         let secret = "super-secret-sentinel-xyz";
         assert!(!content.contains(secret));
         assert!(!content.contains("sk-"));
@@ -1367,7 +1333,6 @@ mod tests {
         assert!(!json.contains(secret));
     }
 
-    /// Platform: all — env var mapping (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `XDG_CONFIG_HOME`) is platform-independent; Windows uses same vars via `sh` wrapper, not registry.
     #[test]
     fn env_var_mapping_is_correct() {
         let h = HarnessId::new("claude-code").unwrap();
@@ -1380,7 +1345,6 @@ mod tests {
         assert_eq!(env_var_for_harness(&generic), "MY_HARNESS_CONFIG_DIR");
     }
 
-    /// Platform: Linux/macOS — `SuperaiOwned`/`Foreign`/`Opaque` detection via shebang/marker; Windows — same detection, `is_owned_wrapper` does not check ACL, only marker digest.
     #[test]
     fn wrapper_dtype_detection_and_collision_and_digest() {
         let dir = crate::test_util::temp_dir_unique("wrapper");
@@ -1389,16 +1353,14 @@ mod tests {
         let mut plan = WrapperPlan::new("test");
         plan.env_vars
             .push(("CLAUDE_CONFIG_DIR".to_owned(), inst.config_root.to_string()));
-        let (content, digest) = generate_shell_wrapper(&inst, &plan);
+        let (content, digest) = generate_shell_wrapper(&inst, &plan).unwrap();
         let wrapper_path_str = dir.join("detect-wrapper").to_string_lossy().into_owned();
         let wrapper_path = WrapperPath::new(&wrapper_path_str).unwrap();
         let _ = write_wrapper(&wrapper_path, &content).unwrap();
-        // Detection must be SuperaiOwned
         match detect_wrapper_kind(wrapper_path.as_path()) {
             WrapperKind::SuperaiOwned { digest: d, .. } => assert_eq!(d, digest),
             other => panic!("expected SuperaiOwned, got {other:?}"),
         }
-        // Parse must succeed and contain env
         let parsed = parse_wrapper_content(&content).expect("parse must succeed");
         assert_eq!(parsed.shebang, "#!/bin/sh");
         assert!(parsed.marker.is_some());
@@ -1410,9 +1372,7 @@ mod tests {
         );
         assert!(parsed.forwards_args);
         assert_eq!(parsed.digest.as_deref(), Some(digest.as_str()));
-        // Verification must succeed against the same instance/plan
         verify_wrapper(wrapper_path.as_path(), &inst, &plan).unwrap();
-        // Content digest is deterministic and non-empty
         let d2 = content_digest(&content);
         assert!(!d2.is_empty());
         assert_eq!(wrapper_digest_for_content(&content), digest);
@@ -1447,14 +1407,9 @@ mod tests {
         std::fs::remove_file(&opaque_path).unwrap_or(());
     }
 
-    /// Platform: Linux — case-sensitive FS but `is_name_collision_case_fold` enforces case-insensitive command collision; macOS — typically case-insensitive; Windows — case-insensitive NTFS. Test asserts fold collision on all and `exists_case_insensitive` for FS lookup.
     #[test]
     fn wrapper_collision_case_insensitive_and_path() {
-        use crate::ids::{InstanceId, InstanceName};
-        use crate::instance::Instance;
-        use crate::paths::AbsolutePath;
         use crate::registry::Registry;
-        use crate::state::{InstanceOrigin, Isolation, Ownership};
         let mut reg = Registry::default();
         let bin = crate::test_util::tmp_abs("bin");
         let inst = Instance {
@@ -1478,10 +1433,6 @@ mod tests {
             adapter_revision: "0.1.0".to_owned(),
         };
         reg.insert(inst).unwrap();
-        // Case-fold collision on command
-        assert!(is_name_collision_case_fold("WORK", &["work"]));
-        assert!(!is_name_collision_case_fold("other", &["work"]));
-        // Check wrapper collisions via registry helper
         let new_path = WrapperPath::from_path(&bin.join("WORK")).unwrap();
         let cmd = InstanceName::new("WORK").unwrap();
         let err = check_wrapper_collisions(&new_path, &cmd, &reg).unwrap_err();
@@ -1489,7 +1440,6 @@ mod tests {
             CoreError::Validation { .. } | CoreError::NameCollision { .. } => {}
             other => panic!("expected collision error, got {other:?}"),
         }
-        // Filesystem case-insensitive existence
         let tmp = crate::test_util::temp_dir_unique("wrapper");
         std::fs::create_dir_all(&tmp).unwrap();
         let existing = tmp.join("MyTool");
@@ -1500,7 +1450,6 @@ mod tests {
         std::fs::remove_file(&existing).unwrap_or(());
     }
 
-    /// Platform: Linux, macOS, Windows — tricky chars (spaces, `'`, `$`, `%`, Unicode) are POSIX single-quoted; Windows PowerShell would need different quoting (not covered), `bash` wrapper is used on Windows.
     #[test]
     fn wrapper_special_chars_quoted_and_verified() {
         let dir = crate::test_util::temp_dir_unique("wrapper");
@@ -1512,21 +1461,18 @@ mod tests {
         let mut plan = WrapperPlan::new("test");
         plan.env_vars
             .push(("CLAUDE_CONFIG_DIR".to_owned(), inst.config_root.to_string()));
-        let (content, _) = generate_shell_wrapper(&inst, &plan);
-        // Tricky chars must be quoted safely (single-quoted, dollar not expanded)
+        let (content, _) = generate_shell_wrapper(&inst, &plan).unwrap();
         assert!(content.contains(&format!("'{tricky_prefix}")));
         assert!(content.contains("$dollar"));
-        // Write and verify round-trip
         let wrapper_path_str = dir.join("special-wrapper").to_string_lossy().into_owned();
         let wrapper_path = WrapperPath::new(&wrapper_path_str).unwrap();
         write_wrapper(&wrapper_path, &content).unwrap();
         verify_wrapper(wrapper_path.as_path(), &inst, &plan).unwrap();
-        // Ensure no secret sentinel leaks
         assert!(!content.contains("super-secret"));
         std::fs::remove_file(wrapper_path.as_path()).unwrap_or(());
     }
 
-    /// WRP-02: env UNSET support in the POSIX wrapper — an inherited global
+    /// WRP-02: env UNSET support in the POSIX wrapper; an inherited global
     /// credential must not leak into an isolated profile.
     #[test]
     fn posix_wrapper_unsets_declared_env() {
@@ -1536,25 +1482,22 @@ mod tests {
         plan.env_vars
             .push(("CLAUDE_CONFIG_DIR".to_owned(), tmp_root));
         plan.env_unset.push("ANTHROPIC_API_KEY".to_owned());
-        let (content, digest) = generate_shell_wrapper(&inst, &plan);
+        let (content, digest) = generate_shell_wrapper(&inst, &plan).unwrap();
         assert!(
             content.contains("\nunset ANTHROPIC_API_KEY\n"),
             "wrapper must unset declared vars: {content}"
         );
-        // The unset list parses back out of the generated grammar.
         let parsed = parse_wrapper_content(&content).expect("grammar parses with unset lines");
         assert_eq!(parsed.env_unset, vec!["ANTHROPIC_API_KEY".to_owned()]);
         assert_eq!(parsed.digest.as_deref(), Some(digest.as_str()));
-        // Round-trip: write + verify.
         let dir = crate::test_util::temp_dir_unique("wrapper-unset");
         std::fs::create_dir_all(&dir).unwrap();
         let path = WrapperPath::new(&dir.join("work").to_string_lossy()).unwrap();
         write_wrapper(&path, &content).unwrap();
         verify_wrapper(path.as_path(), &inst, &plan).unwrap();
-        // A wrapper missing the unset fails verification.
         let mut stripped_plan = plan.clone();
         stripped_plan.env_unset.clear();
-        let (stripped_content, _) = generate_shell_wrapper(&inst, &stripped_plan);
+        let (stripped_content, _) = generate_shell_wrapper(&inst, &stripped_plan).unwrap();
         std::fs::write(path.as_path(), &stripped_content).unwrap();
         match verify_wrapper(path.as_path(), &inst, &plan) {
             Err(e) => assert!(e.to_string().contains("unset"), "{e}"),
@@ -1562,10 +1505,68 @@ mod tests {
         }
     }
 
-    /// WRP-02: PowerShell and cmd launchers are deterministic, carry the same
-    /// marker/digest discipline, quote per dialect, unset env, forward args,
-    /// and never embed a secret. Content assertions run on every platform —
-    /// the goldens are strings.
+    /// Env keys (set or unset) reach every dialect unquoted; a
+    /// non-identifier key is refused by all three generators.
+    #[test]
+    fn generators_refuse_non_identifier_env_keys_in_every_dialect() {
+        for hostile in [
+            "X; rm -rf",
+            "A$(cmd)",
+            "1LEADS_WITH_DIGIT",
+            "HAS-DASH",
+            "SP ACE",
+        ] {
+            let inst = sample_instance_with_root(&crate::test_util::tmp_abs_str("wrapper-keys"));
+            let mut set_plan = WrapperPlan::new("test");
+            set_plan
+                .env_vars
+                .push((hostile.to_owned(), "value".to_owned()));
+            for err in [
+                generate_shell_wrapper(&inst, &set_plan).unwrap_err(),
+                generate_powershell_wrapper(&inst, &set_plan).unwrap_err(),
+                generate_cmd_wrapper(&inst, &set_plan).unwrap_err(),
+            ] {
+                assert!(err.to_string().contains("identifier"), "{hostile}: {err}");
+            }
+            let mut unset_plan = WrapperPlan::new("test");
+            unset_plan.env_unset.push(hostile.to_owned());
+            let err = generate_shell_wrapper(&inst, &unset_plan).unwrap_err();
+            assert!(err.to_string().contains("identifier"), "{hostile}: {err}");
+        }
+    }
+
+    /// Values embed with per-dialect escaping: POSIX single quotes,
+    /// PowerShell quote doubling, cmd `"`/`%` doubling in `set "VAR=..."`.
+    #[test]
+    fn env_values_are_escaped_per_dialect() {
+        let inst = sample_instance_with_root(&crate::test_util::tmp_abs_str("wrapper-values"));
+        let tricky = "it's 100% \"quoted\"";
+        let mut plan = WrapperPlan::new("test");
+        plan.env_vars.push(("NOTE".to_owned(), tricky.to_owned()));
+
+        let (sh, _) = generate_shell_wrapper(&inst, &plan).unwrap();
+        assert!(
+            sh.contains(&format!("export NOTE={}", shell_quote(tricky))),
+            "shell line must carry the safely quoted value: {sh}"
+        );
+        assert!(!sh.contains("export NOTE=it's"), "raw value leaked: {sh}");
+
+        let (ps, _) = generate_powershell_wrapper(&inst, &plan).unwrap();
+        assert!(
+            ps.contains(&format!("$env:NOTE = {}", powershell_quote(tricky))),
+            "powershell line must double the quote: {ps}"
+        );
+
+        let (cmd, _) = generate_cmd_wrapper(&inst, &plan).unwrap();
+        let expected_inner = tricky.replace('"', "\"\"").replace('%', "%%");
+        assert!(
+            cmd.contains(&format!("set \"NOTE={expected_inner}\"")),
+            "cmd line must double quotes and percent: {cmd}"
+        );
+    }
+
+    /// PowerShell and cmd launchers keep the same marker/digest discipline,
+    /// quote per dialect, unset env, forward args, and never embed a secret.
     #[test]
     fn powershell_and_cmd_golden_launchers() {
         let tmp_root = crate::test_util::tmp_abs_str("my claude work");
@@ -1576,8 +1577,8 @@ mod tests {
         plan.env_unset.push("ANTHROPIC_API_KEY".to_owned());
         plan.args.push("--settings".to_owned());
 
-        let (ps1, ps1_digest) = generate_powershell_wrapper(&inst, &plan);
-        let (ps1_again, ps1_digest2) = generate_powershell_wrapper(&inst, &plan);
+        let (ps1, ps1_digest) = generate_powershell_wrapper(&inst, &plan).unwrap();
+        let (ps1_again, ps1_digest2) = generate_powershell_wrapper(&inst, &plan).unwrap();
         assert_eq!(ps1, ps1_again, "deterministic");
         assert_eq!(ps1_digest, ps1_digest2);
         assert!(ps1.contains("superai wrapper"), "marker present");
@@ -1598,8 +1599,8 @@ mod tests {
         assert!(ps1.contains("exit $LASTEXITCODE"));
         assert!(!ps1.contains("sk-"));
 
-        let (cmd, cmd_digest) = generate_cmd_wrapper(&inst, &plan);
-        let (cmd_again, cmd_digest2) = generate_cmd_wrapper(&inst, &plan);
+        let (cmd, cmd_digest) = generate_cmd_wrapper(&inst, &plan).unwrap();
+        let (cmd_again, cmd_digest2) = generate_cmd_wrapper(&inst, &plan).unwrap();
         assert_eq!(cmd, cmd_again);
         assert_eq!(cmd_digest, cmd_digest2);
         assert!(cmd.starts_with("@echo off"));
@@ -1625,10 +1626,30 @@ mod tests {
         plan2
             .env_vars
             .push(("CLAUDE_CONFIG_DIR".to_owned(), tricky.clone()));
-        let (ps2, _) = generate_powershell_wrapper(&inst2, &plan2);
+        let (ps2, _) = generate_powershell_wrapper(&inst2, &plan2).unwrap();
         assert!(
             ps2.contains(&format!("'{tricky_prefix}''s here")),
             "PS quote doubling: {ps2}"
+        );
+    }
+
+    /// A cmd env value carrying `"` and `%` must be escaped inside
+    /// `set "VAR=..."`; raw bytes would chain arbitrary commands.
+    #[test]
+    fn cmd_wrapper_escapes_env_values() {
+        let inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".claude-work"));
+        let hostile = "a\" & del /q C:\\ & rem 100%";
+        let mut plan = WrapperPlan::new("test");
+        plan.env_vars
+            .push(("CLAUDE_CONFIG_DIR".to_owned(), hostile.to_owned()));
+        let (cmd, _) = generate_cmd_wrapper(&inst, &plan).unwrap();
+        assert!(
+            cmd.contains("set \"CLAUDE_CONFIG_DIR=a\"\" & del /q C:\\ & rem 100%%\""),
+            "value must be escaped in place: {cmd}"
+        );
+        assert!(
+            !cmd.contains(hostile),
+            "the raw value must never appear verbatim: {cmd}"
         );
     }
 
@@ -1652,7 +1673,7 @@ mod tests {
         let mut plan = WrapperPlan::new("test");
         plan.env_vars
             .push(("CLAUDE_CONFIG_DIR".to_owned(), tmp_root));
-        let (content, _) = generate_shell_wrapper(&inst, &plan);
+        let (content, _) = generate_shell_wrapper(&inst, &plan).unwrap();
 
         match write_wrapper(&wrapper_path, &content) {
             Err(CoreError::ForeignOwnership { path, .. }) => {
@@ -1672,7 +1693,7 @@ mod tests {
         assert!(owned.is_ok(), "owned replacement allowed: {owned:?}");
     }
 
-    /// WRP-08: ownership = parseable marker + digest — a forged comment
+    /// WRP-08: ownership = parseable marker + digest; a forged comment
     /// containing the marker substrings is NOT owned.
     #[test]
     fn is_owned_wrapper_requires_parseable_marker_and_digest() {
@@ -1680,20 +1701,18 @@ mod tests {
         let dir = crate::test_util::temp_dir_unique("wrapper-owned");
         std::fs::create_dir_all(&dir).unwrap();
 
-        // A real generated wrapper verifies by digest.
         let inst = sample_instance_with_root(&tmp_root);
         let mut plan = WrapperPlan::new("test");
         plan.env_vars
             .push(("CLAUDE_CONFIG_DIR".to_owned(), tmp_root));
-        let (content, digest) = generate_shell_wrapper(&inst, &plan);
+        let (content, digest) = generate_shell_wrapper(&inst, &plan).unwrap();
         let real = dir.join("real");
         std::fs::write(&real, &content).unwrap();
         assert!(is_owned_wrapper(&real, Some(&digest)));
         assert!(!is_owned_wrapper(&real, Some("deadbeef")));
 
-        // Forged: the substring test used to accept this — a script whose
-        // BODY carries the digest with no parseable superai marker line must
-        // not count as ownership.
+        // Forged: a body carrying the digest with no parseable superai
+        // marker line must not count as ownership.
         let forged = dir.join("forged");
         std::fs::write(
             &forged,
@@ -1713,19 +1732,14 @@ mod tests {
             "CLAUDE_CONFIG_DIR".to_owned(),
             crate::test_util::tmp_abs_str(".claude-other"),
         ));
-        let (other_content, other_digest) = generate_shell_wrapper(&inst, &other_plan);
+        let (other_content, other_digest) = generate_shell_wrapper(&inst, &other_plan).unwrap();
         assert_ne!(other_digest, digest);
         std::fs::write(&other, other_content).unwrap();
         assert!(!is_owned_wrapper(&other, Some(&digest)));
     }
 
-    /// WRP-04: a bounded no-auth diagnostic launch runs the WRAPPER (which
-    /// installs its own isolation env) against a fake binary, and proves the
-    /// source/target trees are otherwise unchanged.
-    ///
-    /// Platform: Linux/macOS — the probe EXECUTES the POSIX `sh` wrapper
-    /// generated by `generate_shell_wrapper` (Windows generates PowerShell/cmd
-    /// launchers instead and cannot exec `#!/bin/sh`, os error 193).
+    /// WRP-04: a bounded no-auth launch runs the WRAPPER (its own env
+    /// installs) and proves the trees stay unchanged; unix-only (os error 193).
     #[cfg(unix)]
     #[test]
     fn diagnostic_probe_launches_wrapper_bounded_and_clean() {
@@ -1756,7 +1770,7 @@ mod tests {
             "CLAUDE_CONFIG_DIR".to_owned(),
             inst_root.to_string_lossy().into_owned(),
         ));
-        let (content, _) = generate_shell_wrapper(&inst, &plan);
+        let (content, _) = generate_shell_wrapper(&inst, &plan).unwrap();
         let wrapper_file = dir.join("work");
         std::fs::write(&wrapper_file, &content).unwrap();
         #[cfg(unix)]
@@ -1864,7 +1878,6 @@ mod tests {
         let plan_a = cline.plan_wrapper(&inst_a).unwrap();
         let plan_b = cline.plan_wrapper(&inst_b).unwrap();
 
-        // The CLI roots and BOTH editor dirs are distinct per profile.
         let env_a = &plan_a
             .env_vars
             .iter()
@@ -1896,9 +1909,8 @@ mod tests {
             plan_b.state_paths
         );
 
-        // Both wrappers generate, parse, and verify independently.
-        let (content_a, _) = generate_shell_wrapper(&inst_a, &plan_a);
-        let (content_b, _) = generate_shell_wrapper(&inst_b, &plan_b);
+        let (content_a, _) = generate_shell_wrapper(&inst_a, &plan_a).unwrap();
+        let (content_b, _) = generate_shell_wrapper(&inst_b, &plan_b).unwrap();
         assert_ne!(content_a, content_b);
         let parsed_a = parse_wrapper_content(&content_a).expect("a parses");
         let parsed_b = parse_wrapper_content(&content_b).expect("b parses");
@@ -1911,7 +1923,6 @@ mod tests {
         write_wrapper(&path_b, &content_b).unwrap();
         verify_wrapper(path_a.as_path(), &inst_a, &plan_a).unwrap();
         verify_wrapper(path_b.as_path(), &inst_b, &plan_b).unwrap();
-        // Cross-verification fails: the profiles are genuinely distinct.
         assert!(verify_wrapper(path_a.as_path(), &inst_b, &plan_b).is_err());
     }
 }

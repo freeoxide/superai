@@ -1,10 +1,5 @@
-//! Path and executable reference types.
-//!
-//! All stored paths are normalized absolute forms without following symlinks.
-//! Home or platform variable expansion is explicit at the adapter boundary
-//! via [`AbsolutePath::expand_home`] and sibling helpers. Relative paths
-//! containing `..` are always rejected. Symlink policy is handled by the
-//! mutation layer, not by these types.
+//! Path and executable reference types: normalized absolute forms, no
+//! symlink following, `..` always rejected; home expansion at the boundary.
 
 use std::borrow::Borrow;
 use std::fmt;
@@ -15,10 +10,6 @@ use std::str::FromStr;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::error::CoreError;
-
-// ---------------------------------------------------------------------------
-// helpers
-// ---------------------------------------------------------------------------
 
 fn invalid_path(kind: &str, value: &str, reason: &str) -> CoreError {
     CoreError::InvalidPath {
@@ -99,23 +90,19 @@ fn validate_absolute_path(kind: &str, path: &Path, display: &str) -> Result<Path
         return Err(invalid_path(kind, display, "must be absolute"));
     }
     validate_no_traversal(kind, path, display)?;
-    // Reject NUL in path's os string as well (handles non-UTF8)
-    let lossy = path.to_string_lossy();
-    if lossy.contains('\0') {
-        return Err(invalid_path(kind, display, "must not contain NUL"));
-    }
     Ok(normalize_absolute(path))
 }
 
-// ---------------------------------------------------------------------------
-// AbsolutePath
-// ---------------------------------------------------------------------------
+/// Relabel an [`AbsolutePath`] error so it names the wrapping type.
+fn rekind(kind: &str, result: Result<AbsolutePath, CoreError>) -> Result<AbsolutePath, CoreError> {
+    result.map_err(|e| match e {
+        CoreError::InvalidPath { value, reason, .. } => invalid_path(kind, &value, &reason),
+        other => other,
+    })
+}
 
-/// Normalized absolute path without following symlinks.
-///
-/// Construction rejects empty, NUL, non-absolute, and any `..` component.
-/// Lexical normalization removes `.` and duplicate separators but does not
-/// canonicalize or follow links.
+/// Normalized absolute path, no symlink following: rejects empty, NUL,
+/// non-absolute, and `..` components; normalization is lexical only.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AbsolutePath(PathBuf);
 
@@ -135,44 +122,17 @@ impl AbsolutePath {
         Ok(Self(normalized))
     }
 
-    /// Expand a leading `~` or platform home variable using `home`, then
-    /// validate and normalize.
-    ///
-    /// This is the adapter resolution boundary: raw strings containing
-    /// `~`, `$HOME`, `${HOME}`, or `%USERPROFILE%` are expanded only here.
-    /// The stored form is always absolute and normalized.
+    /// Expand a leading `~` or platform home variable via `home`, then
+    /// validate. This is the adapter boundary: raw strings expand only here.
     pub fn expand_home(value: &str, home: &Path) -> Result<Self, CoreError> {
         validate_not_empty("AbsolutePath", value)?;
         if value.contains('\0') {
             return Err(invalid_path("AbsolutePath", value, "must not contain NUL"));
         }
         let expanded = expand_tilde(value, home);
-        // Use original value for error display if expanded fails due to
-        // traversal etc., but report the expanded display for absolute check.
         let display = expanded.to_string_lossy();
-        let display_str = display.as_ref();
-        // If expansion produced a path with `..`, from_path will reject.
-        // Keep kind as AbsolutePath.
-        let normalized = validate_absolute_path("AbsolutePath", &expanded, display_str)?;
+        let normalized = validate_absolute_path("AbsolutePath", &expanded, display.as_ref())?;
         Ok(Self(normalized))
-    }
-
-    /// Instance variant of [`Self::expand_home`] for call sites that already
-    /// hold an [`AbsolutePath`]. If `self` already is absolute, it is
-    /// returned unchanged; if its string form starts with `~`, it is expanded.
-    pub fn expand_home_ref(&self, home: &Path) -> Result<Self, CoreError> {
-        let s = self.0.to_string_lossy();
-        // Only expand if the stored form somehow contains a leading tilde
-        // (defensive; normally AbsolutePath is already absolute).
-        if s.starts_with('~')
-            || s.starts_with("$HOME")
-            || s.starts_with("${HOME}")
-            || s.starts_with("%USERPROFILE%")
-        {
-            Self::expand_home(s.as_ref(), home)
-        } else {
-            Ok(self.clone())
-        }
     }
 
     /// Borrow as [`Path`].
@@ -203,11 +163,7 @@ impl AbsolutePath {
             ));
         }
         validate_no_traversal("AbsolutePath", rel_path, relative)?;
-        let joined = self.0.join(rel_path);
-        // joined is absolute by construction, but re-validate traversal
-        validate_no_traversal("AbsolutePath", &joined, relative)?;
-        let normalized = normalize_absolute(&joined);
-        Ok(Self(normalized))
+        Ok(Self(normalize_absolute(&self.0.join(rel_path))))
     }
 }
 
@@ -225,10 +181,7 @@ impl AsRef<Path> for AbsolutePath {
 
 impl AsRef<str> for AbsolutePath {
     fn as_ref(&self) -> &str {
-        // We only construct from valid UTF-8 via `new(&str)`, but PathBuf
-        // may contain non-UTF8 on some platforms. To avoid panic we return
-        // empty string for non-UTF8. Callers needing the path should use
-        // `as_path`.
+        // Non-UTF-8 paths yield an empty string; use `as_path` for those.
         self.0.to_str().unwrap_or("")
     }
 }
@@ -306,10 +259,6 @@ impl<'de> Deserialize<'de> for AbsolutePath {
     }
 }
 
-// ---------------------------------------------------------------------------
-// ConfigRoot
-// ---------------------------------------------------------------------------
-
 /// Absolute directory that is a harness config root.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct ConfigRoot(AbsolutePath);
@@ -317,34 +266,19 @@ pub struct ConfigRoot(AbsolutePath);
 impl ConfigRoot {
     /// Create a validated config root.
     pub fn new(value: &str) -> Result<Self, CoreError> {
-        let inner = AbsolutePath::new(value).map_err(|e| match e {
-            CoreError::InvalidPath { value, reason, .. } => {
-                invalid_path("ConfigRoot", &value, &reason)
-            }
-            other => other,
-        })?;
+        let inner = rekind("ConfigRoot", AbsolutePath::new(value))?;
         Ok(Self(inner))
     }
 
     /// Create from a [`Path`].
     pub fn from_path(path: &Path) -> Result<Self, CoreError> {
-        let inner = AbsolutePath::from_path(path).map_err(|e| match e {
-            CoreError::InvalidPath { value, reason, .. } => {
-                invalid_path("ConfigRoot", &value, &reason)
-            }
-            other => other,
-        })?;
+        let inner = rekind("ConfigRoot", AbsolutePath::from_path(path))?;
         Ok(Self(inner))
     }
 
     /// Expand home vars at adapter boundary.
     pub fn expand_home(value: &str, home: &Path) -> Result<Self, CoreError> {
-        let inner = AbsolutePath::expand_home(value, home).map_err(|e| match e {
-            CoreError::InvalidPath { value, reason, .. } => {
-                invalid_path("ConfigRoot", &value, &reason)
-            }
-            other => other,
-        })?;
+        let inner = rekind("ConfigRoot", AbsolutePath::expand_home(value, home))?;
         Ok(Self(inner))
     }
 
@@ -429,10 +363,6 @@ impl<'de> Deserialize<'de> for ConfigRoot {
     }
 }
 
-// ---------------------------------------------------------------------------
-// ConfigSurfacePath
-// ---------------------------------------------------------------------------
-
 /// Absolute path to a specific config surface (file) within a [`ConfigRoot`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct ConfigSurfacePath(AbsolutePath);
@@ -440,34 +370,19 @@ pub struct ConfigSurfacePath(AbsolutePath);
 impl ConfigSurfacePath {
     /// Create a validated surface path.
     pub fn new(value: &str) -> Result<Self, CoreError> {
-        let inner = AbsolutePath::new(value).map_err(|e| match e {
-            CoreError::InvalidPath { value, reason, .. } => {
-                invalid_path("ConfigSurfacePath", &value, &reason)
-            }
-            other => other,
-        })?;
+        let inner = rekind("ConfigSurfacePath", AbsolutePath::new(value))?;
         Ok(Self(inner))
     }
 
     /// Create from a [`Path`].
     pub fn from_path(path: &Path) -> Result<Self, CoreError> {
-        let inner = AbsolutePath::from_path(path).map_err(|e| match e {
-            CoreError::InvalidPath { value, reason, .. } => {
-                invalid_path("ConfigSurfacePath", &value, &reason)
-            }
-            other => other,
-        })?;
+        let inner = rekind("ConfigSurfacePath", AbsolutePath::from_path(path))?;
         Ok(Self(inner))
     }
 
     /// Expand home vars at adapter boundary.
     pub fn expand_home(value: &str, home: &Path) -> Result<Self, CoreError> {
-        let inner = AbsolutePath::expand_home(value, home).map_err(|e| match e {
-            CoreError::InvalidPath { value, reason, .. } => {
-                invalid_path("ConfigSurfacePath", &value, &reason)
-            }
-            other => other,
-        })?;
+        let inner = rekind("ConfigSurfacePath", AbsolutePath::expand_home(value, home))?;
         Ok(Self(inner))
     }
 
@@ -547,48 +462,27 @@ impl<'de> Deserialize<'de> for ConfigSurfacePath {
     }
 }
 
-// ---------------------------------------------------------------------------
-// WrapperPath
-// ---------------------------------------------------------------------------
-
-/// Absolute path to a generated wrapper executable.
-///
-/// Symlink policy is handled by the mutation layer; this type does not
-/// follow links.
+/// Absolute path to a generated wrapper executable; does not follow links,
+/// symlink policy lives in the mutation layer.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct WrapperPath(AbsolutePath);
 
 impl WrapperPath {
     /// Create a validated wrapper path.
     pub fn new(value: &str) -> Result<Self, CoreError> {
-        let inner = AbsolutePath::new(value).map_err(|e| match e {
-            CoreError::InvalidPath { value, reason, .. } => {
-                invalid_path("WrapperPath", &value, &reason)
-            }
-            other => other,
-        })?;
+        let inner = rekind("WrapperPath", AbsolutePath::new(value))?;
         Ok(Self(inner))
     }
 
     /// Create from a [`Path`].
     pub fn from_path(path: &Path) -> Result<Self, CoreError> {
-        let inner = AbsolutePath::from_path(path).map_err(|e| match e {
-            CoreError::InvalidPath { value, reason, .. } => {
-                invalid_path("WrapperPath", &value, &reason)
-            }
-            other => other,
-        })?;
+        let inner = rekind("WrapperPath", AbsolutePath::from_path(path))?;
         Ok(Self(inner))
     }
 
     /// Expand home vars at adapter boundary.
     pub fn expand_home(value: &str, home: &Path) -> Result<Self, CoreError> {
-        let inner = AbsolutePath::expand_home(value, home).map_err(|e| match e {
-            CoreError::InvalidPath { value, reason, .. } => {
-                invalid_path("WrapperPath", &value, &reason)
-            }
-            other => other,
-        })?;
+        let inner = rekind("WrapperPath", AbsolutePath::expand_home(value, home))?;
         Ok(Self(inner))
     }
 
@@ -673,10 +567,6 @@ impl<'de> Deserialize<'de> for WrapperPath {
     }
 }
 
-// ---------------------------------------------------------------------------
-// ExecutableRef
-// ---------------------------------------------------------------------------
-
 /// Reference to an executable, either a `PATH`-resolved name or an absolute path.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ExecutableRef {
@@ -692,18 +582,10 @@ impl ExecutableRef {
         validate_not_empty("ExecutableRef", value)?;
         validate_no_nul("ExecutableRef", value)?;
         let path = Path::new(value);
-        // If it looks like an absolute path, treat as absolute.
         if path.is_absolute() {
-            // Validate as absolute path but map kind to ExecutableRef
-            let abs = AbsolutePath::new(value).map_err(|e| match e {
-                CoreError::InvalidPath { value, reason, .. } => {
-                    invalid_path("ExecutableRef", &value, &reason)
-                }
-                other => other,
-            })?;
+            let abs = rekind("ExecutableRef", AbsolutePath::new(value))?;
             return Ok(Self::Absolute(abs));
         }
-        // Otherwise must be a bare name: reject any path-like content
         if value.contains('/') || value.contains('\\') || value.contains(':') {
             return Err(invalid_path(
                 "ExecutableRef",
@@ -718,7 +600,6 @@ impl ExecutableRef {
                 "must not be '.' or '..'",
             ));
         }
-        // Reject traversal components even as name
         for comp in path.components() {
             if matches!(comp, Component::ParentDir | Component::CurDir) {
                 return Err(invalid_path(
@@ -728,8 +609,7 @@ impl ExecutableRef {
                 ));
             }
         }
-        // Also reject if name contains NUL already checked, and control chars
-        if value.chars().any(|c| c == '\0' || c.is_control()) {
+        if value.chars().any(char::is_control) {
             return Err(invalid_path(
                 "ExecutableRef",
                 value,
@@ -739,16 +619,13 @@ impl ExecutableRef {
         Ok(Self::Named(value.to_owned()))
     }
 
-    /// Expand home vars at adapter boundary.
-    ///
-    /// If `value` starts with `~` or `$HOME`, it is expanded and treated as
-    /// absolute. Otherwise the same rules as [`Self::new`] apply.
+    /// Expand home vars at adapter boundary; a `~`/`$HOME` prefix becomes
+    /// absolute, otherwise the rules of [`Self::new`] apply.
     pub fn expand_home(value: &str, home: &Path) -> Result<Self, CoreError> {
         validate_not_empty("ExecutableRef", value)?;
         if value.contains('\0') {
             return Err(invalid_path("ExecutableRef", value, "must not contain NUL"));
         }
-        // If value starts with home var, expand and treat as absolute
         if value == "~"
             || value.starts_with("~/")
             || value.starts_with("~\\")
@@ -758,16 +635,7 @@ impl ExecutableRef {
             || value.starts_with("%USERPROFILE%\\")
         {
             let expanded = expand_tilde(value, home);
-            let display = expanded.to_string_lossy();
-            let abs = AbsolutePath::from_path(&expanded).map_err(|e| match e {
-                CoreError::InvalidPath { value, reason, .. } => {
-                    invalid_path("ExecutableRef", &value, &reason)
-                }
-                other => other,
-            })?;
-            // Confirm expanded is absolute; if not, fall back to name handling
-            // (but expand_tilde with home should produce absolute)
-            let _ = display;
+            let abs = rekind("ExecutableRef", AbsolutePath::from_path(&expanded))?;
             return Ok(Self::Absolute(abs));
         }
         Self::new(value)
@@ -860,18 +728,12 @@ impl<'de> Deserialize<'de> for ExecutableRef {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Platform-absolute literal for posix-style test strings: `C:\a\b` on
-    /// Windows, `/a/b` elsewhere. `/a/b` alone is not absolute on Windows
-    /// (no drive), so assertions like "join rejects an absolute segment"
-    /// must use this helper.
+    /// `/a/b` is not absolute on Windows (no drive), so tests needing an
+    /// absolute literal must go through this helper.
     fn abs(s: &str) -> String {
         if cfg!(windows) {
             format!("C:\\{}", s.replace('/', "\\"))
@@ -880,7 +742,6 @@ mod tests {
         }
     }
 
-    /// Platform: Linux, macOS, Windows — `/`-rooted absolute paths are valid on all hosts via `Component::RootDir` (Windows also accepts `C:\` via `Prefix`). This test exercises the Unix form canonical on Linux/macOS and also accepted on Windows.
     #[test]
     fn absolute_path_valid() {
         let home_like = crate::test_util::tmp_abs_str("user/.claude");
@@ -897,29 +758,24 @@ mod tests {
         assert_eq!(p4.to_string(), opt_like);
     }
 
-    /// Platform: Linux and macOS use `/` with `.` and `//` lexical normalization; Windows uses `\` and drive prefix `C:\` (handled via `Component::Prefix`). This test asserts Unix `/` normalization which holds on all platforms via `normalize_absolute`.
     #[test]
     fn absolute_path_normalizes_dot_and_slash() {
         let base = crate::test_util::tmp_abs_str("home/user");
         let p = AbsolutePath::new(&format!("{base}//.claude/./x/")).unwrap();
-        // Normalized should not contain // or /./
         assert_eq!(p.as_path(), Path::new(&format!("{base}/.claude/x")));
         let p2 = AbsolutePath::new(&format!("{base}/b/./c")).unwrap();
         assert_eq!(p2.as_path(), Path::new(&format!("{base}/b/c")));
-        // Root stays root (`/` on Unix, `C:\` on Windows)
         let root_str = if cfg!(windows) { "C:\\" } else { "/" };
         let root = AbsolutePath::new(root_str).unwrap();
         assert_eq!(root.as_path(), Path::new(root_str));
     }
 
-    /// Platform: all — empty path is invalid on Linux, macOS, and Windows; no platform accepts empty as absolute.
     #[test]
     fn absolute_path_rejects_empty() {
         AbsolutePath::new("").unwrap_err();
         AbsolutePath::from_path(Path::new("")).unwrap_err();
     }
 
-    /// Platform: all — NUL (`\0`) is rejected on Linux, macOS, and Windows (Windows also rejects via OS APIs; we reject explicitly).
     #[test]
     fn absolute_path_rejects_nul() {
         let with_nul = format!("{}\0b", crate::test_util::tmp_abs_str("nul-a"));
@@ -928,7 +784,6 @@ mod tests {
         AbsolutePath::from_path(path).unwrap_err();
     }
 
-    /// Platform: all — relative paths (`relative/path`, `./`, `~/foo`) are rejected on Linux, macOS, and Windows; absolute required.
     #[test]
     fn absolute_path_rejects_relative() {
         AbsolutePath::new("relative/path").unwrap_err();
@@ -937,7 +792,6 @@ mod tests {
         AbsolutePath::new("~/foo").unwrap_err();
     }
 
-    /// Platform: all — `..` traversal is rejected on Linux, macOS, and Windows before normalization; `Component::ParentDir` check is platform-independent.
     #[test]
     fn absolute_path_rejects_traversal() {
         AbsolutePath::new(&format!(
@@ -953,7 +807,6 @@ mod tests {
         AbsolutePath::from_path(p).unwrap_err();
     }
 
-    /// Platform: Linux/macOS — `~/` and `$HOME/` expand via home dir; Windows — `%USERPROFILE%\` and `C:\Users\...` via same helper. This test covers Unix `~`/`$HOME` which is valid on Linux/macOS and mapped on Windows via `%USERPROFILE%` branch.
     #[test]
     fn absolute_path_expand_home_tilde() {
         let home = crate::test_util::tmp_abs("user");
@@ -967,7 +820,6 @@ mod tests {
         assert_eq!(p4.as_path(), home.join("x"));
     }
 
-    /// Platform: all — after `~`/`$HOME`/`%USERPROFILE%` expansion, `..` traversal is still rejected on Linux, macOS, and Windows.
     #[test]
     fn absolute_path_expand_home_rejects_traversal_after_expand() {
         let home = crate::test_util::tmp_abs("user");
@@ -975,7 +827,6 @@ mod tests {
         AbsolutePath::expand_home("~/a/../b", &home).unwrap_err();
     }
 
-    /// Platform: all — empty and NUL after home expansion are rejected on Linux, macOS, and Windows.
     #[test]
     fn absolute_path_expand_home_rejects_nul_and_empty() {
         let home = crate::test_util::tmp_abs("user");
@@ -988,7 +839,6 @@ mod tests {
         AbsolutePath::expand_home("~/a\0b", &home).unwrap_err();
     }
 
-    /// Platform: all — `join` rejects absolute and `..` on Linux, macOS, and Windows; lexical `normalize_absolute` handles both `/` and `\`.
     #[test]
     fn absolute_path_join() {
         let base = AbsolutePath::from_path(&crate::test_util::tmp_abs("user")).unwrap();
@@ -1000,20 +850,17 @@ mod tests {
         base.join("").unwrap_err();
     }
 
-    /// Platform: Linux, macOS, Windows — no symlink resolution/canoncalization; lexical path is stored. Unix symlinks and Windows junctions are not followed, verified via `normalize_absolute` without `canonicalize`.
     #[test]
     fn absolute_path_does_not_follow_symlinks() {
-        // No canonicalization: path is stored as given, not resolved
         let link_path = crate::test_util::tmp_abs_str("link/to/file");
         let p = AbsolutePath::new(&link_path).unwrap();
         assert_eq!(p.as_path(), Path::new(&link_path));
-        // Even if symlink does not exist, we succeed (no canonicalize)
+        // No canonicalize: construction succeeds even when parents do not exist.
         let nonexistent = crate::test_util::tmp_abs_str("nonexistent-parent") + "/path/to/file";
         let p2 = AbsolutePath::new(&nonexistent).unwrap();
         assert_eq!(p2.as_path(), Path::new(&nonexistent));
     }
 
-    /// Platform: all — serde round-trip preserves absolute form; `..` and NUL rejection holds on Linux, macOS, and Windows.
     #[test]
     fn absolute_path_serde_roundtrip() {
         let fixture = crate::test_util::tmp_abs_str("user/.claude");
@@ -1024,7 +871,6 @@ mod tests {
         assert_eq!(json, serde_json::to_string(&fixture).unwrap());
         let decoded: AbsolutePath = serde_json::from_str(&json).unwrap();
         assert_eq!(p, decoded);
-        // Invalid deserialize
         let bad = "\"../etc\"";
         let res: Result<AbsolutePath, _> = serde_json::from_str(bad);
         res.unwrap_err();
@@ -1033,7 +879,6 @@ mod tests {
         res.unwrap_err();
     }
 
-    /// Platform: all — `ConfigRoot` wraps `AbsolutePath`; Linux/macOS use `/home/...`, Windows uses `C:\...` via prefix. Test covers Unix form; Windows prefix path accepted via same `AbsolutePath` validation.
     #[test]
     fn config_root_wraps_absolute() {
         let fixture = crate::test_util::tmp_abs_str("user/.claude");
@@ -1051,7 +896,6 @@ mod tests {
         assert_eq!(r, decoded);
     }
 
-    /// Platform: all — `ConfigSurfacePath` is absolute file path; Linux/macOS `/home/.../settings.json`, Windows `C:\Users\...\settings.json` both via `AbsolutePath`.
     #[test]
     fn config_surface_path() {
         let fixture = crate::test_util::tmp_abs_str("user/.claude/settings.json");
@@ -1067,7 +911,6 @@ mod tests {
         assert_eq!(s, decoded);
     }
 
-    /// Platform: all — `WrapperPath` is absolute wrapper executable; Unix `/usr/local/bin/...` with `+x`, Windows `C:\bin\...\.exe` without Unix perms but same absolute validation.
     #[test]
     fn wrapper_path() {
         let fixture = crate::test_util::tmp_abs_str("local/bin/work");
@@ -1087,7 +930,6 @@ mod tests {
         assert_eq!(w, decoded);
     }
 
-    /// Platform: all — bare `PATH`-resolved names (`claude`, `code`) are platform-independent; Windows also probes `.exe` suffix in `find_binary_in_path`.
     #[test]
     fn executable_ref_named() {
         let e = ExecutableRef::new("claude").unwrap();
@@ -1104,7 +946,6 @@ mod tests {
         assert_eq!(e, decoded);
     }
 
-    /// Platform: Linux/macOS — `/usr/bin/...`; Windows — `C:\Program Files\...\.exe` via `Component::Prefix`. Test covers Unix absolute; Windows absolute validated via same `AbsolutePath` branch.
     #[test]
     fn executable_ref_absolute() {
         let fixture = crate::test_util::tmp_abs_str("usr/bin/claude");
@@ -1119,7 +960,6 @@ mod tests {
         assert_eq!(e, decoded);
     }
 
-    /// Platform: all — rejects `/`, `\`, `:`, `..`, NUL; Windows drive `C:` contains `:` so absolute form must use `AbsolutePath`, not bare name.
     #[test]
     fn executable_ref_rejects_invalid() {
         ExecutableRef::new("").unwrap_err();
@@ -1136,11 +976,9 @@ mod tests {
         ))
         .unwrap_err();
         ExecutableRef::new(&format!("{}\0b", crate::test_util::tmp_abs_str("nul-e"))).unwrap_err();
-        // Traversal in absolute
         ExecutableRef::new("/a/../b").unwrap_err();
     }
 
-    /// Platform: Linux/macOS — `~/bin/...` via `~`/`$HOME`; Windows — `%USERPROFILE%\bin\...` via same `expand_tilde`. Bare names stay `PATH`-resolved on all platforms.
     #[test]
     fn executable_ref_expand_home() {
         let home = crate::test_util::tmp_abs("user");
@@ -1153,26 +991,21 @@ mod tests {
         let e2 = ExecutableRef::expand_home("claude", &home).unwrap();
         assert!(e2.is_named());
         assert_eq!(e2.as_name(), Some("claude"));
-        // Traversal after expand should fail
         ExecutableRef::expand_home("~/../etc", &home).unwrap_err();
         ExecutableRef::expand_home("", &home).unwrap_err();
     }
 
-    /// Platform: Linux, macOS, Windows — no `canonicalize`; Unix symlinks and Windows junctions are preserved lexically. Test asserts lexical storage on all platforms.
     #[test]
     fn paths_preserve_symlink_semantics() {
         // Path types alone do not resolve symlinks; they store the lexical path.
         let link = crate::test_util::tmp_abs_str("mylink");
         let p = AbsolutePath::new(&link).unwrap();
-        // No filesystem check, so this succeeds even if mylink is a symlink
-        // or does not exist.
         assert_eq!(p.as_path(), Path::new(&link));
         let wrapper = crate::test_util::tmp_abs_str("local/bin/my-wrapper");
         let w = WrapperPath::new(&wrapper).unwrap();
         assert_eq!(w.as_path(), Path::new(&wrapper));
     }
 
-    /// Platform: all — NUL, empty, `..` rejected for every path newtype on Linux, macOS, and Windows via shared `validate_no_traversal`/`validate_no_nul`.
     #[test]
     fn all_path_types_reject_nul_and_empty_and_traversal() {
         let nul_abs = format!("{}\0b", crate::test_util::tmp_abs_str("nul-f"));
@@ -1183,14 +1016,12 @@ mod tests {
             ConfigSurfacePath::new(c).unwrap_err();
             WrapperPath::new(c).unwrap_err();
         }
-        // ExecutableRef name cases
         ExecutableRef::new("").unwrap_err();
         ExecutableRef::new("a\0b").unwrap_err();
         ExecutableRef::new("a/b").unwrap_err();
         ExecutableRef::new("/a/../b").unwrap_err();
     }
 
-    /// Platform: all — serde for `ExecutableRef` round-trips both named and absolute forms; Windows `C:\` absolute also via `AbsolutePath`.
     #[test]
     fn executable_ref_serde() {
         let named = ExecutableRef::new("claude").unwrap();
@@ -1203,13 +1034,11 @@ mod tests {
         let back: ExecutableRef = serde_json::from_str(&json).unwrap();
         assert_eq!(abs, back);
 
-        // Invalid deserialize
         let bad = "\"a/b\"";
         let res: Result<ExecutableRef, _> = serde_json::from_str(bad);
         res.unwrap_err();
     }
 
-    /// Platform: all — `Display`/`FromStr` preserve lexical form; Unix `/tmp/...` shown here, Windows `C:\...` via same `Display` impl.
     #[test]
     fn display_and_from_str() {
         let foo = crate::test_util::tmp_abs_str("foo");

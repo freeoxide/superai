@@ -1,31 +1,11 @@
-//! Managed-span codec for `DocumentKind::TextFragment` (DOC-08).
-//!
-//! Non-structured supported files are edited only inside *managed spans*:
-//! regions delimited by stable start/end sentinel lines such as
-//!
-//! ```text
-//! # superai:begin:managed-name
-//! …owned content…
-//! # superai:end:managed-name
-//! ```
-//!
-//! Rules enforced here (all fail closed):
-//! - Every byte outside a managed span is preserved verbatim.
-//! - Duplicate begin or end sentinels for one name are an error.
-//! - Partial (unbalanced) sentinels — a begin without an end or vice versa —
-//!   are an error.
-//! - Nested or overlapping differently-named spans are an error.
-//! - Removal removes exactly one complete owned span (both sentinels and the
-//!   body between them, including the trailing newline).
-//!
-//! Shell quoting inside span bodies is *not* interpreted here. Executable
-//! configs (crushrc-style surfaces) are not eligible for this codec; they
-//! stay command-backed through their adapters.
+//! Managed spans for text fragments (DOC-08): only bytes inside sentinel
+//! spans are editable; everything else is preserved verbatim, fail closed.
+
+use std::collections::HashMap;
 
 use crate::error::{ConfigError, Result};
 
-/// Fail-closed span validation error: the 1-based line of the offending
-/// sentinel when known, plus a reason naming sentinels (never span content).
+/// Fail-closed span error: the 1-based line plus a reason naming sentinels, never content.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("line {line}: {reason}")]
 pub struct SpanError {
@@ -52,11 +32,8 @@ impl SpanError {
     }
 }
 
-/// A sentinel-delimited region of a text fragment.
-///
-/// `begin` is the byte offset of the start of the begin-sentinel line;
-/// `end` is the byte offset just past the end-sentinel line including its
-/// trailing newline when present.
+/// A sentinel-delimited region: `begin` is the begin-sentinel line start;
+/// `end` is just past the end-sentinel line (newline included).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpanRange {
     /// Span name taken from the sentinels.
@@ -67,10 +44,8 @@ pub struct SpanRange {
     pub end: usize,
 }
 
-/// Sentinel style: the comment prefix used to build sentinel lines.
-///
-/// The begin sentinel is `{prefix} superai:begin:{name}` and the end
-/// sentinel is `{prefix} superai:end:{name}`, each on its own line.
+/// Sentinel style: begin `{prefix} superai:begin:{name}`, end
+/// `{prefix} superai:end:{name}`, each on its own line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpanCodec {
     comment_prefix: String,
@@ -83,10 +58,7 @@ impl Default for SpanCodec {
 }
 
 impl SpanCodec {
-    /// Create a codec whose sentinels start with `comment_prefix`
-    /// (e.g. `"#"`, `"//"`, `"<!--"`).
-    ///
-    /// The prefix must be non-empty and contain no newline.
+    /// Sentinels start with `comment_prefix` (non-empty, no newline).
     pub fn new(comment_prefix: &str) -> Self {
         Self {
             comment_prefix: comment_prefix.to_owned(),
@@ -117,13 +89,11 @@ impl SpanCodec {
         Ok(())
     }
 
-    /// Parse and validate all managed spans in `text`.
-    ///
-    /// Fail closed on duplicate, partial, mis-ordered, or overlapping
-    /// sentinels. Returned ranges are ordered by position.
+    /// Parse and validate all spans, failing closed on duplicate, partial,
+    /// mis-ordered, or overlapping sentinels; ranges come back in order.
     pub fn validate(&self, text: &str) -> std::result::Result<Vec<SpanRange>, SpanError> {
-        let mut begins: Vec<(String, usize, usize)> = Vec::new(); // (name, line, offset)
-        let mut ends: Vec<(String, usize, usize, usize)> = Vec::new(); // (name, line, offset, line_end)
+        let mut begins: Vec<(&str, usize, usize)> = Vec::new(); // (name, line, offset)
+        let mut ends: Vec<(&str, usize, usize, usize)> = Vec::new(); // (name, line, offset, line_end)
 
         let begin_marker = format!("{}superai:begin:", prefix_with_space(self));
         let end_marker = format!("{}superai:end:", prefix_with_space(self));
@@ -132,44 +102,52 @@ impl SpanCodec {
         for (idx, line) in text.split_inclusive('\n').enumerate() {
             let line_no = idx.saturating_add(1);
             // Sentinels must start at column 0 so span math stays exact;
-            // trailing whitespace (and the line's `\n`/`\r\n`) is trimmed
-            // from the name.
+            // trailing whitespace and the line terminator trim from the name.
             if let Some(rest) = line.strip_prefix(&begin_marker) {
                 let name = rest.trim_end();
                 Self::validate_name(name).map_err(|e| SpanError::new(line_no, e.reason))?;
-                begins.push((name.to_owned(), line_no, offset));
+                begins.push((name, line_no, offset));
             } else if let Some(rest) = line.strip_prefix(&end_marker) {
                 let name = rest.trim_end();
                 Self::validate_name(name).map_err(|e| SpanError::new(line_no, e.reason))?;
-                ends.push((
-                    name.to_owned(),
-                    line_no,
-                    offset,
-                    offset.saturating_add(line.len()),
-                ));
+                ends.push((name, line_no, offset, offset.saturating_add(line.len())));
             }
             offset = offset.saturating_add(line.len());
         }
 
         // Pair begins with ends, fail closed on every anomaly.
+        let mut ends_by_name: HashMap<&str, Vec<(usize, usize, usize)>> = HashMap::new();
+        for (name, line_no, offset, line_end) in &ends {
+            ends_by_name
+                .entry(name)
+                .or_default()
+                .push((*line_no, *offset, *line_end));
+        }
+        let mut begin_counts: HashMap<&str, usize> = HashMap::new();
+        for (name, _, _) in &begins {
+            *begin_counts.entry(name).or_default() += 1;
+        }
+
         let mut ranges = Vec::new();
         for (name, line_no, begin_offset) in &begins {
-            let range = pair_single_span(name, *line_no, *begin_offset, &ends)?;
-            ranges.push(range);
+            let matching = ends_by_name.get(*name).map_or(&[][..], Vec::as_slice);
+            ranges.push(pair_single_span(name, *line_no, *begin_offset, matching)?);
         }
         for (name, line_no, _, _) in &ends {
-            let count = begins.iter().filter(|(n, _, _)| n == name).count();
-            if count == 0 {
-                return Err(SpanError::new(
-                    *line_no,
-                    format!("unbalanced span `{name}`: end sentinel has no begin sentinel"),
-                ));
-            }
-            if count > 1 {
-                return Err(SpanError::new(
-                    *line_no,
-                    format!("duplicate begin sentinel for span `{name}`"),
-                ));
+            match begin_counts.get(*name).copied().unwrap_or(0) {
+                0 => {
+                    return Err(SpanError::new(
+                        *line_no,
+                        format!("unbalanced span `{name}`: end sentinel has no begin sentinel"),
+                    ));
+                }
+                1 => {}
+                _ => {
+                    return Err(SpanError::new(
+                        *line_no,
+                        format!("duplicate begin sentinel for span `{name}`"),
+                    ));
+                }
             }
         }
 
@@ -219,19 +197,15 @@ impl SpanCodec {
                 let body_end = range.end.saturating_sub(self.end_sentinel(name).len() + 1);
                 let body = text
                     .get(body_start..body_end)
-                    .map(str::to_owned)
+                    .map(|s| s.trim_end_matches(['\r', '\n']).to_owned())
                     .unwrap_or_default();
-                Ok(Some(body.trim_end_matches(['\r', '\n']).to_owned()))
+                Ok(Some(body))
             }
         }
     }
 
-    /// Insert a new span `name` with `body` at the end of `text`.
-    ///
-    /// Fails closed if the span already exists or if the result would carry
-    /// duplicate/partial/nested sentinels (e.g. `body` itself contains
-    /// sentinel lines). All bytes of `text` are preserved as a prefix; a
-    /// separating newline is added when `text` does not end with one.
+    /// Insert a span at the end of `text`, preserving all bytes as a prefix;
+    /// fails closed on duplicates or smuggled sentinel lines.
     pub fn insert_span(
         &self,
         text: &str,
@@ -260,9 +234,7 @@ impl SpanCodec {
         Ok(out)
     }
 
-    /// Replace the body of span `name`; everything outside the span stays
-    /// byte-identical. Fails closed when the span is absent or the new body
-    /// breaks sentinel validation.
+    /// Replace the span body; everything outside stays byte-identical.
     pub fn replace_span(
         &self,
         text: &str,
@@ -282,18 +254,15 @@ impl SpanCodec {
         rebuilt.push_str(body.trim_matches('\n'));
         rebuilt.push('\n');
         rebuilt.push_str(&self.end_sentinel(name));
-        // Terminate the end-sentinel line (canonical form: the end line
-        // always carries a trailing newline, matching [`Self::insert_span`]).
-        // `suffix` starts at the next line; a leading newline inside it is a
-        // blank line after the span and is preserved verbatim.
+        // The end line always carries a trailing newline (canonical form); a
+        // leading newline in `suffix` is a blank line and stays verbatim.
         rebuilt.push('\n');
         rebuilt.push_str(suffix);
         drop(self.validate(&rebuilt)?);
         Ok(rebuilt)
     }
 
-    /// Remove the complete span `name` (sentinels, body, and the span's
-    /// trailing newline). Bytes outside the span are preserved exactly.
+    /// Remove the complete span (sentinels, body, trailing newline).
     pub fn remove_span(&self, text: &str, name: &str) -> std::result::Result<String, SpanError> {
         Self::validate_name(name)?;
         let Some(range) = self.find_span(text, name)? else {
@@ -308,9 +277,7 @@ impl SpanCodec {
         Ok(out)
     }
 
-    /// The text with every complete managed span removed: the bytes that
-    /// live outside all spans. Used to prove that an edit did not touch
-    /// unmanaged content (DOC-08 commit gate).
+    /// The bytes outside all spans; proves an edit touched only managed content.
     pub fn outside_span_bytes(&self, text: &str) -> std::result::Result<String, SpanError> {
         let ranges = self.validate(text)?;
         let mut out = String::with_capacity(text.len());
@@ -324,23 +291,20 @@ impl SpanCodec {
     }
 }
 
-/// `prefix` followed by one space, tolerating the marker's leading space so
-/// `"#"` produces `"# superai:begin:"`.
+/// `prefix` plus one space: `"#"` yields `"# superai:begin:"`.
 fn prefix_with_space(codec: &SpanCodec) -> String {
     format!("{} ", codec.comment_prefix)
 }
 
-/// Pair one begin sentinel with its end, failing closed on duplicates,
-/// missing ends, and mis-ordered sentinels.
+/// Pair one begin with its end, failing closed on duplicates, missing
+/// ends, and mis-ordered sentinels.
 fn pair_single_span(
     name: &str,
     line_no: usize,
     begin_offset: usize,
-    ends: &[(String, usize, usize, usize)],
+    ends: &[(usize, usize, usize)],
 ) -> std::result::Result<SpanRange, SpanError> {
-    let matching: Vec<&(String, usize, usize, usize)> =
-        ends.iter().filter(|(n, _, _, _)| n == name).collect();
-    let one = match matching.as_slice() {
+    let one = match ends {
         [] => {
             return Err(SpanError::new(
                 line_no,
@@ -355,7 +319,7 @@ fn pair_single_span(
             ));
         }
     };
-    if one.2 < begin_offset {
+    if one.1 < begin_offset {
         return Err(SpanError::new(
             line_no,
             format!("unbalanced span `{name}`: end sentinel precedes begin"),
@@ -364,7 +328,7 @@ fn pair_single_span(
     Ok(SpanRange {
         name: name.to_owned(),
         begin: begin_offset,
-        end: one.3,
+        end: one.2,
     })
 }
 
@@ -375,13 +339,29 @@ pub fn ensure_valid_spans(text: &str, path: &std::path::Path) -> Result<Vec<Span
         .map_err(|e| e.into_config_error(path))
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validates_many_distinct_spans_in_position_order() {
+        // Pairing is per-name; a fragment stuffed with sentinel lines must
+        // still report every span, in order, without cross-name confusion.
+        let codec = SpanCodec::default();
+        let mut text = String::new();
+        for i in 0..500 {
+            let name = format!("span{i}");
+            let inserted = codec.insert_span(&text, &name, "body").unwrap();
+            text = inserted;
+        }
+        let ranges = codec.validate(&text).unwrap();
+        assert_eq!(ranges.len(), 500);
+        let offsets: Vec<usize> = ranges.iter().map(|r| r.begin).collect();
+        let mut sorted = offsets.clone();
+        sorted.sort_unstable();
+        assert_eq!(offsets, sorted, "ranges must be position-ordered");
+        assert!(codec.find_span(&text, "span499").unwrap().is_some());
+    }
 
     #[test]
     fn insert_find_and_read_span_body() {
@@ -484,8 +464,6 @@ mod tests {
     fn sentinel_line_smuggled_into_body_fails_on_insert() {
         let codec = SpanCodec::default();
         let base = codec.insert_span("", "x", "body").unwrap();
-        // A body containing another begin sentinel for the same name must be
-        // rejected at insert time (duplicate).
         let err = codec
             .insert_span(&base, "x", "# superai:begin:x\nsmuggle")
             .unwrap_err();
@@ -521,7 +499,6 @@ mod tests {
             replaced,
             "header # keep\n# superai:begin:x\nnew body\n# superai:end:x\ntail\n"
         );
-        // Multiple spans: replacing one leaves the other untouched.
         let two = codec.insert_span(&replaced, "y", "y body").unwrap();
         let replaced_two = codec.replace_span(&two, "y", "changed").unwrap();
         assert!(replaced_two.contains("new body"));

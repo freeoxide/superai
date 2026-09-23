@@ -1,14 +1,7 @@
-//! Trae Agent adapter — explicit-config via `--config-file` / `TRAE_CONFIG_FILE`.
-//!
-//! Research source: `docs/harness-configs/trae-agent.md` (last verified 2026-08-25).
-//! Executable `trae-cli`, YAML config `trae_config.yaml` (or legacy JSON) with
-//! explicit `--config-file`, isolation `explicit-config`.
+//! Trae Agent adapter: explicit-config via `--config-file` / `TRAE_CONFIG_FILE`;
+//! YAML `trae_config.yaml` (or legacy JSON).
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
 
 use crate::adapter::{
     ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
@@ -19,10 +12,6 @@ use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence, Isolation};
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
 
 /// Harness identifier for Trae Agent.
 pub const HARNESS_ID_STR: &str = "trae-agent";
@@ -63,14 +52,7 @@ pub const OWNED_SELECTORS: &[&str] = &[
     "mcp_servers",
 ];
 
-// ---------------------------------------------------------------------------
-// Adapter struct
-// ---------------------------------------------------------------------------
-
 /// Concrete adapter for Trae Agent.
-///
-/// Isolation is `explicit-config` via `--config-file` / `TRAE_CONFIG_FILE`.
-/// The wrapper sets `TRAE_CONFIG_FILE` and passes `--config-file` explicitly.
 #[derive(Debug, Clone)]
 pub struct TraeAgentAdapter {
     id: HarnessId,
@@ -98,109 +80,6 @@ impl TraeAgentAdapter {
         CONFIG_ENV_VAR
     }
 
-    /// Try to locate the `trae-cli` binary via `PATH`.
-    #[expect(clippy::unused_self, reason = "adapter method uses instance constants")]
-    #[expect(clippy::excessive_nesting, reason = "PATH scan branches are explicit")]
-    fn find_binary_in_path(&self) -> Option<PathBuf> {
-        let path_var = std::env::var("PATH").ok()?;
-        let separator = if cfg!(windows) { ';' } else { ':' };
-        for exec in [EXECUTABLE, EXECUTABLE_ALT] {
-            for dir in path_var.split(separator) {
-                if dir.is_empty() {
-                    continue;
-                }
-                let candidate = Path::new(dir).join(exec);
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
-                if cfg!(windows) {
-                    let exe_candidate = Path::new(dir).join(format!("{exec}.exe"));
-                    if exe_candidate.is_file() {
-                        return Some(exe_candidate);
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    /// Probe `trae-cli --version` with a timeout.
-    fn probe_version(binary: &Path) -> Option<String> {
-        let binary_owned = binary.to_path_buf();
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let output = Command::new(&binary_owned)
-                .arg("--version")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output();
-            drop(tx.send(output));
-        });
-        let Ok(Ok(output)) = rx.recv_timeout(Duration::from_secs(2)) else {
-            return None;
-        };
-        if !output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
-            return None;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let combined = if stdout.trim().is_empty() {
-            stderr.into_owned()
-        } else if stderr.trim().is_empty() {
-            stdout.into_owned()
-        } else {
-            format!("{stdout} {stderr}")
-        };
-        Self::parse_version_output(&combined)
-    }
-
-    /// Parse version output like `trae-cli 0.1.0` into `0.1.0`.
-    #[expect(
-        clippy::excessive_nesting,
-        reason = "version parsing branches are explicit"
-    )]
-    fn parse_version_output(output: &str) -> Option<String> {
-        let trimmed = output.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        for token in trimmed.split_whitespace() {
-            let mut candidate = token;
-            if let Some(stripped) = candidate.strip_prefix('v') {
-                candidate = stripped;
-            } else if let Some(stripped) = candidate.strip_prefix('V') {
-                candidate = stripped;
-            }
-            let cleaned = candidate.trim_matches(|c: char| c == ',' || c == ')' || c == '(');
-            if cleaned.is_empty() {
-                continue;
-            }
-            let has_dot = cleaned.contains('.');
-            let starts_digit = cleaned.chars().next().is_some_and(|c| c.is_ascii_digit());
-            if has_dot && starts_digit {
-                let is_version_like = cleaned
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+');
-                if is_version_like {
-                    return Some(cleaned.to_owned());
-                }
-                let mut version_part = String::new();
-                for ch in cleaned.chars() {
-                    if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '+' {
-                        version_part.push(ch);
-                    } else {
-                        break;
-                    }
-                }
-                if version_part.contains('.') && !version_part.is_empty() {
-                    return Some(version_part);
-                }
-            }
-        }
-        None
-    }
-
-    /// Resolve the default config file: `$TRAE_CONFIG_FILE` or `trae_config.yaml` in cwd.
     fn default_config_path() -> PathBuf {
         if let Ok(val) = std::env::var(CONFIG_ENV_VAR)
             && !val.trim().is_empty()
@@ -210,7 +89,6 @@ impl TraeAgentAdapter {
         PathBuf::from(DEFAULT_CONFIG_FILE_FALLBACK)
     }
 
-    /// Collect config evidence.
     #[expect(clippy::unused_self, reason = "uses adapter constants via Self")]
     fn collect_config_evidence(&self, evidence: &mut Vec<String>) {
         let default_path = Self::default_config_path();
@@ -306,14 +184,14 @@ impl Adapter for TraeAgentAdapter {
         let mut version: Option<String> = None;
         let mut binary_path: Option<PathBuf> = None;
 
-        match self.find_binary_in_path() {
+        match super::find_in_path(&[EXECUTABLE, EXECUTABLE_ALT]) {
             Some(path) => {
                 evidence.push(format!(
                     "found binary `{}` at {}",
                     EXECUTABLE,
                     path.display()
                 ));
-                match Self::probe_version(&path) {
+                match super::probe_version(&path) {
                     Some(v) => {
                         evidence.push(format!("version `{v}` via `{EXECUTABLE} --version`"));
                         version = Some(v);
@@ -339,20 +217,10 @@ impl Adapter for TraeAgentAdapter {
             (None, _) => InstallPresence::Absent,
         };
 
-        let confidence = match (
-            &binary_path,
-            &version,
-            evidence.iter().any(|e| e.contains("config file exists")),
-        ) {
-            (Some(_), None, _) => DetectionConfidence::Medium,
-            (None, _, true) => DetectionConfidence::Low,
-            (Some(_), Some(_), _) | (None, _, false) => DetectionConfidence::High,
-        };
-
-        let confidence = if present == InstallPresence::Absent {
-            DetectionConfidence::High
-        } else {
-            confidence
+        // Absent forces High, so the Low "config file exists" arm can never fire.
+        let confidence = match (&binary_path, &version) {
+            (Some(_), None) => DetectionConfidence::Medium,
+            (Some(_), Some(_)) | (None, _) => DetectionConfidence::High,
         };
 
         DetectionResult::new(present, version, evidence, confidence)
@@ -566,7 +434,6 @@ impl Adapter for TraeAgentAdapter {
         ]
     }
 
-    /// EXT-08/09: MCP destination (trae-agent.md: `mcp_servers:` optional map of stdio servers in `trae_config.yaml`)
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(crate::adapter::McpAdapterDecl::new(
             "trae_config.yaml",
@@ -577,7 +444,6 @@ impl Adapter for TraeAgentAdapter {
         ).with_read_only("yaml writes refuse (LossyWrite) until a preserving codec exists; inspect/diff only"))
     }
 
-    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some("no plugin mechanism documented (trae-agent.md)")
     }
@@ -677,7 +543,7 @@ mod tests {
             ("not a version", None),
         ];
         for (input, expected) in cases {
-            let got = TraeAgentAdapter::parse_version_output(input);
+            let got = crate::adapters::parse_version_output(input);
             assert_eq!(got.as_deref(), expected, "input: {input:?}");
         }
     }
@@ -874,8 +740,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let tmp = dir.join("trae.foreign.copy.yaml");
         std::fs::copy(&path, &tmp).unwrap();
-        // codec-honesty (DOC-06): changing YAML writes on existing files are
-        // refused outright, so foreign keys survive because nothing is written.
+        // Changing YAML writes on existing files are refused outright, so
+        // foreign keys survive because nothing is written.
         let result = superai_config::yaml::edit(&tmp, |map| {
             map.insert(
                 "allow_mcp_servers".to_owned(),

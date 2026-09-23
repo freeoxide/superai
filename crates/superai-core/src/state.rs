@@ -1,15 +1,9 @@
-//! Lifecycle and ownership states.
-//!
-//! Explicit enums model every distinct state without collapsing into booleans.
-//! No `isolated` or `supported` boolean may stand in for these enums.
+//! Lifecycle and ownership states: explicit enums, never booleans; no
+//! `isolated` or `supported` boolean may stand in for these enums.
 
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
-
-// ---------------------------------------------------------------------------
-// InstallPresence
-// ---------------------------------------------------------------------------
 
 /// Whether the harness binary is present on this machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,10 +30,6 @@ impl fmt::Display for InstallPresence {
         f.write_str(s)
     }
 }
-
-// ---------------------------------------------------------------------------
-// InstanceOrigin
-// ---------------------------------------------------------------------------
 
 /// How the instance record came to be.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,10 +60,6 @@ impl fmt::Display for InstanceOrigin {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Ownership
-// ---------------------------------------------------------------------------
-
 /// Who owns the config directory on disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -102,10 +88,6 @@ impl fmt::Display for Ownership {
         f.write_str(s)
     }
 }
-
-// ---------------------------------------------------------------------------
-// Lifecycle
-// ---------------------------------------------------------------------------
 
 /// Operational lifecycle state of an instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,10 +120,6 @@ impl fmt::Display for Lifecycle {
         f.write_str(s)
     }
 }
-
-// ---------------------------------------------------------------------------
-// Isolation
-// ---------------------------------------------------------------------------
 
 /// How an instance's config is isolated from the default location.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -186,10 +164,6 @@ impl fmt::Display for Isolation {
         f.write_str(s)
     }
 }
-
-// ---------------------------------------------------------------------------
-// AdapterSupport
-// ---------------------------------------------------------------------------
 
 /// What the adapter can do for a harness on this platform.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -410,7 +384,6 @@ mod tests {
             assert_eq!(v, back);
             assert_eq!(json, format!("\"{v}\""));
         }
-        // Unknown value fails.
         let err: Result<InstallPresence, _> = serde_json::from_str("\"unknown\"");
         err.unwrap_err();
     }
@@ -569,7 +542,6 @@ mod tests {
         let back: Snapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(original, back);
 
-        // Verify snake_case wire format, no PascalCase leakage.
         assert!(json.contains("\"unknown_version\""));
         assert!(json.contains("\"adopted_legacy\""));
         assert!(json.contains("\"explicitly_adopted\""));

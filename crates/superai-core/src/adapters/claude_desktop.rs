@@ -1,16 +1,5 @@
-//! Claude Desktop adapter — platform-gated default root, no relocation.
-//!
-//! Research source: `docs/harness-configs/claude-desktop.md` (verified
-//! 2026-09-18; evidence at `.z-workflow/evidence/desktop-research/`).
-//! Anthropic's desktop app (chat + Cowork + hosted Claude Code), GA since
-//! 2025-10-21 with a Linux BETA (.deb, Ubuntu 22.04+/Debian 12). The one
-//! writable, officially documented surface is `claude_desktop_config.json`
-//! (`mcpServers`, stdio; full app restart required after edit). Config
-//! RELOCATION is verified-absent (no env var, no portable mode, no flag) —
-//! the app reads hardcoded per-OS app-support paths — so isolation is
-//! `fixed_path_single` and `plan_wrapper` honestly declares NO env vars:
-//! the alias core refuses aliasing on exactly that (no fabricated
-//! `CLAUDE_DESKTOP_CONFIG_DIR`).
+//! Claude Desktop adapter: platform-gated default root, no relocation.
+//! Research source: `docs/harness-configs/claude-desktop.md` (verified 2026-09-18).
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -32,19 +21,13 @@ use crate::ids::HarnessId;
 use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence, Isolation};
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
 /// Harness identifier for Claude Desktop.
 pub const HARNESS_ID_STR: &str = "claude-desktop";
 
 /// Human display name.
 pub const DISPLAY_NAME: &str = "Claude Desktop";
 
-/// Linux .deb package/binary name (package `claude-desktop`; the per-platform
-/// GUI binary name is otherwise unverified — detection treats config-root
-/// evidence as primary).
+/// Linux .deb package/binary name; the GUI binary name is otherwise unverified.
 pub const EXECUTABLE: &str = "claude-desktop";
 
 /// Consumer config file name inside the per-OS app-support root.
@@ -53,20 +36,16 @@ pub const CONFIG_FILE: &str = "claude_desktop_config.json";
 /// macOS config root (official, modelcontextprotocol.io quickstart).
 pub const MACOS_CONFIG_ROOT: &str = "~/Library/Application Support/Claude";
 
-/// Windows config root (official; MSIX installs may read the packaged
-/// AppData\Local\Packages path instead — github #26073, claude-desktop.md §1).
+/// Windows config root; MSIX installs may read the packaged Packages path instead (github #26073).
 pub const WINDOWS_CONFIG_ROOT: &str = "%APPDATA%\\Claude";
 
-/// Linux config root (community-corroborated + 3P docs corroborate the
-/// sibling logs dir; NOT yet in official consumer docs — claude-desktop.md §1).
+/// Linux config root, community-corroborated; not yet in official consumer docs.
 pub const LINUX_CONFIG_ROOT: &str = "~/.config/Claude";
 
-/// Personal skills loaded by desktop/Cowork sessions — a surface SHARED with
-/// the claude-code harness (claude-desktop.md §3).
+/// Personal skills loaded by desktop/Cowork sessions; SHARED with the claude-code harness.
 pub const PERSONAL_SKILLS_PATH: &str = "~/.claude/skills";
 
-/// Verified-absent relocation note (claude-desktop.md §4): no env var, no
-/// portable mode, no `--config-dir`; community workaround is a symlink swap.
+/// Verified-absent relocation: no env var, no portable mode, no `--config-dir`.
 pub const NO_RELOCATION_NOTE: &str = "no config-relocation mechanism (verified-absent): \
 no env var, no portable mode, no --config-dir; hardcoded app-support paths";
 
@@ -85,13 +64,7 @@ pub const OWNED_SELECTORS: &[&str] = &["mcpServers"];
 /// MCP container selector.
 pub const MCP_OWNED_SELECTORS: &[&str] = &["mcpServers"];
 
-// ---------------------------------------------------------------------------
-// Third-party inference ("Claude Desktop on 3P") provider surface (run-5)
-// ---------------------------------------------------------------------------
-
-/// Linux local 3P config root (official config reference; the 3P instance
-/// writes here while the 1P instance uses `~/.config/Claude` — the two modes
-/// coexist by design).
+/// Linux local 3P config root; coexists by design with the 1P `~/.config/Claude`.
 pub const THIRD_PARTY_LINUX_ROOT: &str = "~/.config/Claude-3p";
 
 /// macOS local 3P config root.
@@ -100,20 +73,13 @@ pub const THIRD_PARTY_MACOS_ROOT: &str = "~/Library/Application Support/Claude-3
 /// Windows local 3P config root.
 pub const THIRD_PARTY_WINDOWS_ROOT: &str = "%LOCALAPPDATA%\\Claude-3p";
 
-/// Directory inside the 3P root holding the local inference configuration
-/// (official: "local: `~/.config/Claude-3p/configLibrary/`").
+/// Inference-config directory inside the 3P root (official: `configLibrary/`).
 pub const THIRD_PARTY_LIBRARY_DIR: &str = "configLibrary";
 
-/// Default library file name. HONESTY NOTE: the per-OS `configLibrary`
-/// DIRECTORY is officially documented, but the exact file name inside it is
-/// NOT published in the fetched docs (2026-09-19, claude.com
-/// /docs/third-party/claude-desktop/configuration) — the name is therefore
-/// a parameter of [`commit_third_party_inference`] with this default, to be
-/// pinned by live verification (run-5 area C).
+/// Library file name; undocumented, so it stays a parameter of [`commit_third_party_inference`].
 pub const THIRD_PARTY_LIBRARY_FILE: &str = "inference.json";
 
-/// The gateway-group + connection keys superai owns on the 3P surface
-/// (official key names, claude.com third-party configuration reference).
+/// Gateway-group + connection keys superai owns on the 3P surface (official names).
 pub const THIRD_PARTY_OWNED_SELECTORS: &[&str] = &[
     "inferenceGatewayBaseUrl",
     "inferenceGatewayApiKey",
@@ -122,8 +88,7 @@ pub const THIRD_PARTY_OWNED_SELECTORS: &[&str] = &[
     "inferenceModels",
 ];
 
-/// Auth scheme the 3P gateway expects (official enum: `bearer` default |
-/// `x-api-key`).
+/// Auth scheme the 3P gateway expects (official enum: `bearer` default | `x-api-key`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThirdPartyAuthScheme {
     /// `Authorization: Bearer <key>` (the documented default).
@@ -143,21 +108,12 @@ impl ThirdPartyAuthScheme {
     }
 }
 
-/// A third-party inference configuration for Claude Desktop (official
-/// "Deploy Claude Desktop on 3P with an LLM gateway" keys). The gateway must
-/// be Anthropic-Messages-compatible: the app appends `/v1/messages` to the
-/// base URL (Bifrost integration docs).
+/// Third-party inference gateway keys; the gateway must speak the Anthropic Messages API.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThirdPartyInference<'a> {
-    /// Full URL of the inference gateway endpoint
-    /// (`inferenceGatewayBaseUrl`).
+    /// Full URL of the inference gateway endpoint (`inferenceGatewayBaseUrl`).
     pub gateway_base_url: &'a str,
-    /// API key for the gateway (`inferenceGatewayApiKey`). The 3P config
-    /// file is the app's own official credential sink — there is NO env
-    /// mechanism — so this value IS written to that file (hardened 0600,
-    /// backed up, foreign keys preserved), matching how
-    /// [`crate::provider::commit_api_key`] treats harness-declared config
-    /// sinks. It is never written to any manifest, record, or log.
+    /// Gateway key, written into the 3P config (0600, backed up); never reaches a manifest or log.
     pub api_key: &'a crate::error::RedactedString,
     /// Auth scheme (`inferenceGatewayAuthScheme`).
     pub auth_scheme: ThirdPartyAuthScheme,
@@ -192,12 +148,7 @@ impl<'a> ThirdPartyInference<'a> {
     }
 }
 
-/// The 3P inference surface DECLARATION: a standalone, explicitly-reached
-/// surface (NOT part of [`Adapter::config_surfaces`], which is resolved
-/// under `instance.config_root` and pinned by the adapter's five-piece
-/// tests): its root is a SEPARATE fixed path per OS (`Claude-3p`), reached
-/// through the profile mechanism with parameterized paths
-/// (see [`crate::profile`]).
+/// Standalone surface with its own fixed `Claude-3p` root, reached via [`crate::profile`].
 pub fn third_party_inference_surface() -> ConfigSurface {
     let file = format!("{THIRD_PARTY_LIBRARY_DIR}/{THIRD_PARTY_LIBRARY_FILE}");
     let resolver = PathResolver::new(
@@ -225,32 +176,23 @@ pub fn third_party_inference_surface() -> ConfigSurface {
     surface
 }
 
-/// Write a third-party inference configuration into the 3P `configLibrary`
-/// under `config_root` (the Claude-3p-shaped root — a profile's managed tree
-/// in the profile flow, a fake root in tests; never resolved from the real
-/// home here).
-///
-/// Fresh read → backup → atomic write through the config crate's mutation
-/// boundary, preserving every foreign key (managed-settings neighbors like
-/// `inferenceStreamIdleTimeoutSec` or `egressProxyUrl` survive untouched);
-/// the file is hardened to 0600 because it carries the gateway key. Returns
-/// the written file path.
+/// Write the 3P inference config under `config_root` (never the real home):
+/// fresh read, backup, atomic write; foreign keys survive; 0600 for the key.
 pub fn commit_third_party_inference(
     config_root: &Path,
     library_file: &str,
     config: &ThirdPartyInference<'_>,
 ) -> Result<PathBuf, CoreError> {
-    let path = config_root.join(THIRD_PARTY_LIBRARY_DIR).join(library_file);
+    let path = config_root
+        .join(THIRD_PARTY_LIBRARY_DIR)
+        .join(validated_library_file(library_file)?);
     let key = config.api_key.expose_secret().to_owned();
     superai_config::json::edit(&path, |map| {
         map.insert(
             "inferenceGatewayBaseUrl".to_owned(),
             Value::String(config.gateway_base_url.to_owned()),
         );
-        map.insert(
-            "inferenceGatewayApiKey".to_owned(),
-            Value::String(key.clone()),
-        );
+        map.insert("inferenceGatewayApiKey".to_owned(), Value::String(key));
         map.insert(
             "inferenceGatewayAuthScheme".to_owned(),
             Value::String(config.auth_scheme.as_str().to_owned()),
@@ -271,10 +213,53 @@ pub fn commit_third_party_inference(
     Ok(path)
 }
 
-/// Unix: tighten the 3P config to owner-only (0600) — it carries the gateway
-/// key. Windows has no mode bits; the atomic write already creates the file
-/// with user-only defaults. (Same treatment as the provider key sink in
-/// `provider.rs`.)
+/// A plain file name: rejecting separators, drive colons, parent components,
+/// and DOS device basenames keeps the write inside `configLibrary`.
+fn validated_library_file(library_file: &str) -> Result<&str, CoreError> {
+    if is_windows_device_basename(library_file) {
+        return Err(CoreError::InvalidPath {
+            kind: "library_file".to_owned(),
+            value: library_file.to_owned(),
+            reason: "reserved as a Windows device name".to_owned(),
+        });
+    }
+    let is_plain = !library_file.is_empty()
+        && !library_file.contains(['/', '\\', ':'])
+        && library_file != "."
+        && library_file != ".."
+        && Path::new(library_file)
+            .file_name()
+            .is_some_and(|n| n == library_file);
+    if is_plain {
+        Ok(library_file)
+    } else {
+        Err(CoreError::InvalidPath {
+            kind: "library_file".to_owned(),
+            value: library_file.to_owned(),
+            reason: "must be a plain file name inside configLibrary".to_owned(),
+        })
+    }
+}
+
+/// DOS device basenames (`CON`, `COM1`, ...) resolve to devices on Windows
+/// in any case or extension; the key is the stem before the first dot.
+fn is_windows_device_basename(name: &str) -> bool {
+    let stem = name.split_once('.').map_or(name, |(s, _)| s);
+    let key = stem.trim_end_matches(['.', ' ', '\t']).to_ascii_lowercase();
+    let numbered = |prefix: &str| {
+        key.strip_prefix(prefix).is_some_and(|digits| {
+            digits.len() == 1
+                && digits
+                    .as_bytes()
+                    .first()
+                    .is_some_and(|&b| b.is_ascii_digit() && b != b'0')
+        })
+    };
+    matches!(key.as_str(), "aux" | "con" | "nul" | "prn") || numbered("com") || numbered("lpt")
+}
+
+/// Unix: 0600 because the file carries the gateway key; Windows already
+/// creates it user-only. Same treatment as the provider key sink.
 #[cfg(unix)]
 fn harden_file_permissions(path: &Path) -> Result<(), CoreError> {
     use std::os::unix::fs::PermissionsExt as _;
@@ -294,10 +279,6 @@ fn harden_file_permissions(path: &Path) -> Result<(), CoreError> {
 fn harden_file_permissions(_path: &Path) -> Result<(), CoreError> {
     Ok(())
 }
-
-// ---------------------------------------------------------------------------
-// Adapter struct
-// ---------------------------------------------------------------------------
 
 /// Concrete adapter for Claude Desktop.
 #[derive(Debug, Clone)]
@@ -322,32 +303,10 @@ impl ClaudeDesktopAdapter {
         EXECUTABLE
     }
 
-    /// Try to locate the GUI binary via PATH (Linux .deb installs a
-    /// `claude-desktop` command; other platforms typically do not).
-    #[expect(clippy::excessive_nesting, reason = "PATH scan branches are explicit")]
     fn find_binary_in_path() -> Option<PathBuf> {
-        let path_var = std::env::var("PATH").ok()?;
-        let sep = if cfg!(windows) { ';' } else { ':' };
-        for dir in path_var.split(sep) {
-            if dir.is_empty() {
-                continue;
-            }
-            let candidate = Path::new(dir).join(EXECUTABLE);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-            if cfg!(windows) {
-                let exe_candidate = Path::new(dir).join(format!("{EXECUTABLE}.exe"));
-                if exe_candidate.is_file() {
-                    return Some(exe_candidate);
-                }
-            }
-        }
-        None
+        super::find_in_path(&[EXECUTABLE])
     }
 
-    /// Probe `--version` (best effort; no documented version flag for the
-    /// GUI binary — versions are date-stamped builds like v1.2581.0).
     fn probe_version(binary: &Path) -> Option<String> {
         let owned = binary.to_path_buf();
         let (tx, rx) = mpsc::channel();
@@ -375,8 +334,7 @@ impl ClaudeDesktopAdapter {
         harvest_version_token(&combined)
     }
 
-    /// Default config root per OS (platform-gated, cursor.rs pattern): the
-    /// app has NO relocation env var, so this is the only root there is.
+    /// Per-OS default root; the app has no relocation env var, so this is the only root.
     fn default_config_root() -> Option<PathBuf> {
         let home = std::env::var("HOME")
             .ok()
@@ -408,7 +366,6 @@ impl ClaudeDesktopAdapter {
         }
     }
 
-    /// Personal-skills dir (`~/.claude/skills`) — shared with claude-code.
     fn personal_skills_root() -> Option<PathBuf> {
         let home = std::env::var("HOME")
             .ok()
@@ -419,7 +376,6 @@ impl ClaudeDesktopAdapter {
         Some(PathBuf::from(home).join(".claude").join("skills"))
     }
 
-    /// Collect filesystem evidence for detection.
     #[expect(clippy::excessive_nesting, reason = "evidence branches explicit")]
     fn collect_config_evidence(evidence: &mut Vec<String>) {
         match Self::default_config_root() {
@@ -460,7 +416,6 @@ impl ClaudeDesktopAdapter {
     }
 }
 
-/// Extract the first version-like token (`v1.2581.0` / `1.2581.0` shapes).
 fn harvest_version_token(output: &str) -> Option<String> {
     for token in output.split_whitespace() {
         let candidate = token.strip_prefix('v').unwrap_or(token);
@@ -544,9 +499,8 @@ impl Adapter for ClaudeDesktopAdapter {
             }
         }
         Self::collect_config_evidence(&mut evidence);
-        // GUI app: config-root evidence alone counts as a low-confidence
-        // present (zcode pattern) — Linux beta installs the binary, macOS and
-        // Windows installs typically do not expose one on PATH.
+        // GUI apps often expose no binary on PATH; config-root evidence
+        // alone counts as a low-confidence present.
         let config_seen = evidence.iter().any(|e| e.contains("config exists"));
         let present = match (&binary_path, &version) {
             (Some(_), Some(_)) => InstallPresence::Present,
@@ -590,8 +544,6 @@ impl Adapter for ClaudeDesktopAdapter {
     fn config_surfaces(&self) -> Vec<ConfigSurface> {
         let mut surfaces = Vec::new();
 
-        // The one writable consumer surface — per-OS app-support paths
-        // (platform-gated resolvers; no env relocation exists).
         let config_resolver = PathResolver::new(
             Some(&format!("{LINUX_CONFIG_ROOT}/{CONFIG_FILE}")),
             Some(&format!("{MACOS_CONFIG_ROOT}/{CONFIG_FILE}")),
@@ -608,11 +560,9 @@ impl Adapter for ClaudeDesktopAdapter {
         config.precedence = 10;
         config.owned_selectors = OWNED_SELECTORS.iter().map(|s| (*s).to_owned()).collect();
         config.backup_required = true;
-        // Full quit + restart required after editing (MCP quickstart).
         config.restart_behavior = RestartBehavior::Restart;
         surfaces.push(config);
 
-        // Harness-managed MCP logs (detect-only).
         let logs_resolver = PathResolver::new(
             Some("~/.config/Claude/logs (mcp.log, mcp-server-<name>.log)"),
             Some("~/Library/Logs/Claude (mcp.log, mcp-server-<name>.log)"),
@@ -631,7 +581,6 @@ impl Adapter for ClaudeDesktopAdapter {
         logs.restart_behavior = RestartBehavior::None;
         surfaces.push(logs);
 
-        // Personal skills shared with the claude-code harness.
         let skills_resolver = PathResolver::fallback_only(&format!(
             "{PERSONAL_SKILLS_PATH}/<name>/ (SHARED with claude-code)"
         ));
@@ -647,7 +596,6 @@ impl Adapter for ClaudeDesktopAdapter {
         skills.restart_behavior = RestartBehavior::Reload;
         surfaces.push(skills);
 
-        // 3P/enterprise managed settings — separate surface, detect-only.
         let managed_resolver = PathResolver::new(
             Some("/etc/claude-desktop/managed-settings.json"),
             Some("/Library/Managed Preferences/<user>/com.anthropic.claudefordesktop.plist"),
@@ -696,10 +644,8 @@ impl Adapter for ClaudeDesktopAdapter {
         ]
     }
 
-    /// Honest no-relocation plan: the app reads its hardcoded per-OS
-    /// app-support path; there is NO env var to point elsewhere. The empty
-    /// env set is deliberate — the alias core refuses aliasing on exactly
-    /// this (a fabricated `CLAUDE_DESKTOP_CONFIG_DIR` would be a lie).
+    /// The app reads one hardcoded per-OS path; no env var points elsewhere.
+    /// The alias core refuses aliasing on exactly this empty env set.
     fn plan_wrapper(&self, instance: &Instance) -> Result<WrapperPlan, CoreError> {
         if instance.harness != self.id {
             return Err(CoreError::Validation {
@@ -712,12 +658,12 @@ impl Adapter for ClaudeDesktopAdapter {
         }
         instance.validate()?;
         let mut plan =
-            WrapperPlan::new("fixed default root — no relocation mechanism (verified-absent)");
+            WrapperPlan::new("fixed default root: no relocation mechanism (verified-absent)");
         plan.description = format!(
             " claude-desktop reads hardcoded per-OS app-support paths \
              (macOS {MACOS_CONFIG_ROOT}, Windows {WINDOWS_CONFIG_ROOT}, Linux \
              {LINUX_CONFIG_ROOT}); {NO_RELOCATION_NOTE}; config_root {} is \
-             informative only — no env vars are set and aliasing is refused \
+             informative only: no env vars are set and aliasing is refused \
              upstream (claude-desktop.md sections 4-5)",
             instance.config_root
         );
@@ -752,8 +698,6 @@ impl Adapter for ClaudeDesktopAdapter {
         instance.validate()?;
         match instance.isolation {
             Isolation::FixedPathSingle | Isolation::RelocatedRoot | Isolation::Unknown => {
-                // HAD-03: config content present under the root must satisfy
-                // the declared root shape (single documented surface).
                 crate::adapter::validate_instance_surfaces(self, instance.config_root.as_path())
             }
             other => Err(CoreError::Validation {
@@ -787,8 +731,6 @@ impl Adapter for ClaudeDesktopAdapter {
         ]
     }
 
-    /// EXT-08/09: WRITABLE MCP destination — `mcpServers` (stdio) inside
-    /// `claude_desktop_config.json`; same shape as workbuddy's `.mcp.json`.
     /// Remote connectors are UI-managed and intentionally not modeled here.
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(crate::adapter::McpAdapterDecl::new(
@@ -800,9 +742,6 @@ impl Adapter for ClaudeDesktopAdapter {
         ))
     }
 
-    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded): `.mcpb`
-    /// desktop extensions exist, but the per-OS install directory is NOT
-    /// published, so there is no honest file-staging destination.
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some(
             "desktop extensions (.mcpb) exist but the per-OS install directory is not \
@@ -938,7 +877,6 @@ mod tests {
             config.path_resolver.windows.as_deref(),
             Some(format!("{WINDOWS_CONFIG_ROOT}\\{CONFIG_FILE}").as_str())
         );
-        // Shared personal-skills surface is declared.
         assert!(surfaces.iter().any(|s| s.id == "personal skills"));
     }
 
@@ -977,9 +915,8 @@ mod tests {
         }
     }
 
-    /// The alias-contract pin: the plan deliberately declares NO env vars
-    /// (no relocation mechanism exists), so `alias::create_alias` refuses —
-    /// this is the honest outcome, not a missing feature.
+    /// Alias-contract pin: no relocation env vars exist to declare, so
+    /// `alias::create_alias` refuses; the honest outcome, not a missing feature.
     #[test]
     fn plan_wrapper_declares_no_relocation_env_vars() {
         let a = adapter();
@@ -1056,10 +993,6 @@ mod tests {
         assert!(!boxed.config_surfaces().is_empty());
     }
 
-    // -------------------------------------------------------------------
-    // HAD-06: on-disk fixture corpus (QAL-02)
-    // -------------------------------------------------------------------
-
     #[test]
     fn fixture_corpus_validity_and_secret_free() {
         let path =
@@ -1078,8 +1011,7 @@ mod tests {
         assert!(servers.as_object().is_some_and(|m| !m.is_empty()));
     }
 
-    /// Schema round-trip: the populated fixture satisfies the declared root
-    /// shape + owned-key rule, and a non-object root is rejected (HAD-03).
+    /// Corpus satisfies the declared root shape + owned-key rule; a non-object root is rejected.
     #[test]
     fn surface_schema_accepts_corpus_and_rejects_bad_root() {
         let a = adapter();
@@ -1106,10 +1038,6 @@ mod tests {
         );
     }
 
-    // -------------------------------------------------------------------
-    // Run-5: third-party inference ("Claude Desktop on 3P") surface
-    // -------------------------------------------------------------------
-
     #[test]
     fn third_party_surface_declares_official_keys_and_roots() {
         let surface = super::third_party_inference_surface();
@@ -1118,7 +1046,6 @@ mod tests {
         assert_eq!(surface.ownership, SurfaceOwnership::UserEditable);
         assert_eq!(surface.restart_behavior, RestartBehavior::Restart);
         assert!(surface.backup_required);
-        // Official key names, verbatim.
         for key in super::THIRD_PARTY_OWNED_SELECTORS {
             assert!(
                 surface.owned_selectors.contains(&(*key).to_owned()),
@@ -1198,7 +1125,6 @@ mod tests {
             value.get("inferenceModels"),
             Some(&serde_json::json!([{"name": "gateway-default"}]))
         );
-        // Foreign managed-settings neighbors survive.
         assert_eq!(
             value.get("inferenceStreamIdleTimeoutSec"),
             Some(&serde_json::json!(600))
@@ -1207,7 +1133,6 @@ mod tests {
             value.get("coworkEgressAllowedHosts"),
             Some(&serde_json::json!(["example.com"]))
         );
-        // Foreign-authored original was backed up; file hardened to 0600.
         assert!(superai_config::backup::list_backups(&file).is_ok_and(|b| !b.is_empty()));
         #[cfg(unix)]
         {
@@ -1216,7 +1141,6 @@ mod tests {
             assert_eq!(mode & 0o777, 0o600, "gateway key file must be 0600");
         }
 
-        // The x-api-key scheme round-trips its official wire value.
         let xapikey = super::ThirdPartyInference::gateway(
             "http://127.0.0.1:8787",
             &key,
@@ -1232,9 +1156,96 @@ mod tests {
         drop(std::fs::remove_dir_all(&root));
     }
 
-    /// The run-5 area-A reachability requirement: the 3P keys are written
-    /// THROUGH the profile mechanism (the config file's root is fixed-path,
-    /// so a symlink-swap profile puts it in place) — all on fake roots.
+    #[test]
+    fn third_party_library_file_traversal_is_refused() {
+        let root = crate::test_util::temp_dir_unique("claude-3p-traversal");
+        std::fs::create_dir_all(&root).unwrap();
+        let key = crate::error::RedactedString::new("dummy-gateway-token");
+        let config = super::ThirdPartyInference::gateway(
+            "http://127.0.0.1:8787",
+            &key,
+            super::ThirdPartyAuthScheme::Bearer,
+        );
+        for escape in ["../escape.json", "a/b.json", "..", "", "C:con"] {
+            let err = super::commit_third_party_inference(&root, escape, &config).unwrap_err();
+            assert!(
+                matches!(err, CoreError::InvalidPath { .. }),
+                "{escape}: {err:?}"
+            );
+        }
+        assert!(!root.join("escape.json").exists());
+        assert!(
+            superai_config::json::load(&root.join("configLibrary").join("inference.json"))
+                .is_ok_and(|m| m.is_empty())
+        );
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    /// DOS device basenames resolve to devices on Windows with any
+    /// extension and any case; nearby ordinary names stay legal.
+    #[test]
+    fn windows_device_basenames_are_matched_case_folded_with_extensions() {
+        for name in [
+            "con",
+            "CON",
+            "Con",
+            "cOn.json",
+            "aux.cfg",
+            "nul",
+            "nul.tar.gz",
+            "prn.",
+            "com3 .txt",
+            "com1",
+            "COM9.data",
+            "lpt1",
+            "LPT9",
+        ] {
+            assert!(super::is_windows_device_basename(name), "{name}");
+        }
+        for name in [
+            "config.json",
+            "console.log",
+            "com",
+            "com0",
+            "com10",
+            "lpt0",
+            "lptx",
+            "nully",
+            "constants.json",
+            "auxiliary",
+        ] {
+            assert!(!super::is_windows_device_basename(name), "{name}");
+        }
+    }
+
+    /// Writing a 3P library file named after a Windows device is refused
+    /// before any file is created.
+    #[test]
+    fn third_party_library_file_windows_device_names_are_refused() {
+        let root = crate::test_util::temp_dir_unique("claude-3p-devices");
+        std::fs::create_dir_all(&root).unwrap();
+        let key = crate::error::RedactedString::new("dummy-gateway-token");
+        let config = super::ThirdPartyInference::gateway(
+            "http://127.0.0.1:8787",
+            &key,
+            super::ThirdPartyAuthScheme::Bearer,
+        );
+        for name in ["con", "CON.json", "aux", "com1.cfg", "lpt9"] {
+            let err = super::commit_third_party_inference(&root, name, &config).unwrap_err();
+            assert!(
+                matches!(err, CoreError::InvalidPath { .. }),
+                "{name}: {err:?}"
+            );
+            assert!(
+                !root.join("configLibrary").join(name).exists(),
+                "{name} must not be written"
+            );
+        }
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    /// Run-5 area-A reachability: the 3P keys reach the fixed path through a
+    /// symlink-swap profile, all on fake roots.
     #[test]
     fn third_party_keys_reach_the_fixed_path_via_a_profile_swap() {
         use crate::profile;
@@ -1247,7 +1258,6 @@ mod tests {
             ),
         )
         .unwrap();
-        // Seed the 3P inference config INTO the managed profile tree.
         let key = crate::error::RedactedString::new("dummy-gateway-token");
         let config = super::ThirdPartyInference::gateway(
             "http://127.0.0.1:8787",
@@ -1262,8 +1272,8 @@ mod tests {
         )
         .unwrap();
 
-        // Swap the profile in at a FAKE Claude-3p fixed path (never the real
-        // home) and read the keys back through that path.
+        // Swap the profile in at a FAKE Claude-3p path (never the real home)
+        // and read the keys back through it.
         let fake_fixed = crate::test_util::temp_dir_unique("claude-3p-fake-root");
         let fixed_path = fake_fixed.join(".config").join("Claude-3p");
         profile::activate_profile(
