@@ -13,10 +13,10 @@ use crate::ids::HarnessId;
 use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence, Isolation};
 
-/// Harness identifier for Conductor.
+/// Harness id this adapter registers under.
 pub const HARNESS_ID_STR: &str = "conductor";
 
-/// Human display name.
+/// Name the adapter's `display_name()` reports.
 pub const DISPLAY_NAME: &str = "Conductor";
 
 /// Primary executable name (desktop launcher + CLI helper).
@@ -25,13 +25,14 @@ pub const EXECUTABLE: &str = "conductor";
 /// Alternative binary name (mac app helper).
 pub const EXECUTABLE_ALT: &str = "conductor-cli";
 
-/// Research document link.
+/// Research source for the declarations in this file; returned by
+/// `research_doc_link()`.
 pub const RESEARCH_DOC: &str = "docs/harness-configs/orchestrators.md";
 
-/// Last verified date.
+/// Date `last_verified_date()` reports.
 pub const LAST_VERIFIED: &str = "2026-08-25";
 
-/// Schema version.
+/// Settings shape version `version_resolution()` maps detected versions to.
 pub const SCHEMA_VERSION_STR: &str = "1";
 
 /// Constrained note: macOS worktrees/profile scoped.
@@ -68,17 +69,17 @@ impl ConductorAdapter {
         Ok(Self { id })
     }
 
-    /// Borrow the harness id.
+    /// The harness id this adapter validates instances against.
     pub fn harness_id(&self) -> &HarnessId {
         &self.id
     }
 
-    /// Executable name for this harness.
+    /// Primary executable probed during detection.
     pub fn executable_name(&self) -> &str {
         EXECUTABLE
     }
 
-    /// Constrained note.
+    /// Constrained note naming the macOS/worktree scoping the plan enforces.
     pub fn constrained_note(&self) -> &str {
         CONSTRAINED_NOTE
     }
@@ -100,18 +101,18 @@ impl ConductorAdapter {
     #[expect(clippy::unused_self, reason = "uses adapter constants via Self")]
     fn collect_config_evidence(&self, evidence: &mut Vec<String>) {
         evidence.push(format!("constrained: {CONSTRAINED_NOTE}"));
-        evidence.push(
-            "platform macOS only for harnesses: claude-code, codex, cursor, opencode".to_owned(),
-        );
         match Self::default_user_settings() {
             Some(path) => {
                 if path.exists() {
                     evidence.push(format!("user settings.toml found at {}", path.display()));
-                    if let Ok(text) = std::fs::read_to_string(&path)
-                        && (text.contains("claude_provider") || text.contains("models"))
-                    {
-                        evidence
-                            .push("user settings.toml contains claude_provider/models".to_owned());
+                    match std::fs::read_to_string(&path) {
+                        Ok(text) if text.contains("claude_provider") || text.contains("models") => {
+                            evidence.push(
+                                "user settings.toml contains claude_provider/models".to_owned(),
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => evidence.push(format!("user settings.toml unreadable: {e}")),
                     }
                 } else {
                     evidence.push(format!("user settings.toml missing at {}", path.display()));
@@ -187,8 +188,7 @@ impl ConductorAdapter {
 
 impl Default for ConductorAdapter {
     fn default() -> Self {
-        #[expect(clippy::unwrap_used, reason = "conductor is static valid HarnessId")]
-        let id = HarnessId::new(HARNESS_ID_STR).unwrap();
+        let id = HarnessId::from_validated_const(HARNESS_ID_STR);
         Self { id }
     }
 }
@@ -482,11 +482,13 @@ impl Adapter for ConductorAdapter {
             "CONDUCTOR_ROOT_PATH".to_owned(),
             format!("{}/..", instance.config_root),
         ));
+        // Modulo first: the addend is < 1000, well inside u16, so the cast
+        // cannot truncate no matter how long the instance name is.
         #[expect(
             clippy::cast_possible_truncation,
-            reason = "name len < 1000, truncation intentional for deterministic port"
+            reason = "len % 1000 is at most 999, which u16 represents exactly"
         )]
-        let derived_port = 4000u16 + (instance.name.as_str().len() as u16 % 1000);
+        let derived_port = 4000u16 + (instance.name.as_str().len() % 1000) as u16;
         plan.env_vars
             .push(("CONDUCTOR_PORT".to_owned(), derived_port.to_string()));
         plan.env_vars

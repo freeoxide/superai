@@ -241,7 +241,15 @@ impl ActivationLock {
             return Ok(Self { path });
         }
         if lock_is_stale(&path) {
-            drop(std::fs::remove_file(&path));
+            // NotFound means another acquirer cleared the stale file first.
+            if let Err(e) = std::fs::remove_file(&path)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                return Err(CoreError::Validation {
+                    field: "activation_lock".to_owned(),
+                    reason: format!("cannot remove stale lockfile {}: {e}", path.display()),
+                });
+            }
             if Self::try_create(&path, harness)? {
                 return Ok(Self { path });
             }
@@ -290,7 +298,13 @@ impl ActivationLock {
 
 impl Drop for ActivationLock {
     fn drop(&mut self) {
-        drop(std::fs::remove_file(&self.path));
+        // Drop cannot return the error, so release failures go to stderr.
+        if let Err(e) = std::fs::remove_file(&self.path) {
+            eprintln!(
+                "superai-core: lockfile cleanup failed for {}: {e}",
+                self.path.display()
+            );
+        }
     }
 }
 
@@ -499,11 +513,27 @@ impl FixedPathProfileStore {
         Ok(out)
     }
 
-    /// Fresh-read the recorded active identity, if any.
-    #[must_use]
-    pub fn active_identity(&self) -> Option<ActiveIdentity> {
-        let bytes = std::fs::read(self.active_path()).ok()?;
-        serde_json::from_slice(&bytes).ok()
+    /// Fresh-read the recorded active identity, if any. A file that exists
+    /// but cannot be read or parsed is an error: callers must not confuse
+    /// corruption with "nothing is active".
+    pub fn active_identity(&self) -> Result<Option<ActiveIdentity>> {
+        let path = self.active_path();
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(CoreError::Validation {
+                    field: "active_identity".to_owned(),
+                    reason: format!("cannot read {}: {e}", path.display()),
+                });
+            }
+        };
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|e| CoreError::Validation {
+                field: "active_identity".to_owned(),
+                reason: format!("cannot parse {}: {e}", path.display()),
+            })
     }
 
     /// Remove a stored profile. Removing the active profile is allowed (the
@@ -518,10 +548,18 @@ impl FixedPathProfileStore {
             });
         }
         let was_active = self
-            .active_identity()
+            .active_identity()?
             .is_some_and(|a| a.profile == name.as_str());
-        drop(std::fs::remove_file(&meta));
-        drop(std::fs::remove_file(content));
+        for path in [&meta, &content] {
+            if let Err(e) = std::fs::remove_file(path)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                return Err(CoreError::Validation {
+                    field: "profile".to_owned(),
+                    reason: format!("cannot remove {}: {e}", path.display()),
+                });
+            }
+        }
         Ok(RemovedProfile {
             name: name.to_string(),
             was_active,
@@ -546,9 +584,8 @@ impl FixedPathProfileStore {
 
         // WRP-06: the app was launched against the active content and is not
         // confirmed stopped, so refuse until the caller clears the flag.
-        if let Some(active) = self.active_identity()
-            && active.app_may_write
-        {
+        let active = self.active_identity()?;
+        if let Some(active) = active.filter(|a| a.app_may_write) {
             return Err(CoreError::AppMayStillWrite {
                 path: fixed_path.to_path_buf(),
                 reason: format!(
@@ -676,7 +713,7 @@ impl FixedPathProfileStore {
     /// the write window, `false` confirms the app stopped.
     pub fn mark_app_writes(&self, may_write: bool) -> Result<ActiveIdentity> {
         let mut identity = self
-            .active_identity()
+            .active_identity()?
             .ok_or_else(|| CoreError::Validation {
                 field: "active_identity".to_owned(),
                 reason: "no activation recorded yet; nothing to mark".to_owned(),
@@ -708,7 +745,7 @@ impl FixedPathProfileStore {
         let Some(current) = current else {
             return Ok(None);
         };
-        let Some(active) = self.active_identity() else {
+        let Some(active) = self.active_identity()? else {
             return Ok(None);
         };
         let digest = compute_digest(current);
@@ -829,7 +866,7 @@ mod tests {
                     .is_some_and(|n| n.starts_with("config.json.bak."))
             );
         }
-        assert_eq!(fx.store.active_identity().unwrap().profile, "p1");
+        assert_eq!(fx.store.active_identity().unwrap().unwrap().profile, "p1");
 
         // Swap to p2 and back to p1: each swap restores the prior profile's
         // content exactly.

@@ -13,43 +13,45 @@ use crate::ids::HarnessId;
 use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence, Isolation};
 
-/// Harness identifier for Gemini CLI.
+/// Harness id this retired adapter still registers under.
 pub const HARNESS_ID_STR: &str = "gemini-cli";
 
-/// Human display name.
+/// Name the adapter's `display_name()` reports.
 pub const DISPLAY_NAME: &str = "Gemini CLI";
 
-/// Primary executable name.
+/// Primary executable probed during detection.
 pub const EXECUTABLE: &str = "gemini";
 
-/// Environment variable that relocates the config root.
+/// Env var whose presence relocates detection and surfaces to `$var/.gemini`.
 pub const CONFIG_ENV_VAR: &str = "GEMINI_CLI_HOME";
 
-/// Default config root when `GEMINI_CLI_HOME` is unset.
+/// Config root `default_config_root()` falls back to when the env var is unset.
 pub const DEFAULT_CONFIG_ROOT_FALLBACK: &str = "~/.gemini";
 
 /// With `GEMINI_CLI_HOME` set, the CLI creates a `.gemini/` dir inside it (live-verified 0.60.0).
 pub const ISOLATED_CONFIG_ROOT_HINT: &str = "$GEMINI_CLI_HOME/.gemini";
 
-/// Research document link.
+/// Research source for the declarations in this file; returned by
+/// `research_doc_link()`.
 pub const RESEARCH_DOC: &str = "docs/harness-configs/gemini-cli.md";
 
-/// Last verified date.
+/// Date `last_verified_date()` reports.
 pub const LAST_VERIFIED: &str = "2026-08-25";
 
-/// Schema version for current settings shape.
+/// Settings shape version `version_resolution()` maps detected versions to.
 pub const SCHEMA_VERSION_STR: &str = "1";
 
-/// Retirement date for consumer tiers.
+/// Retirement date the migration tip and `MigrationOnly` gating cite.
 pub const RETIREMENT_DATE: &str = "2026-06-18";
 
-/// Successor harness id.
+/// Harness id migration guidance points users to.
 pub const SUCCESSOR_ID: &str = "antigravity-cli";
 
-/// Successor executable.
+/// Executable of the successor harness.
 pub const SUCCESSOR_EXECUTABLE: &str = "agy";
 
-/// Tip shown for migration.
+/// Refusal text every mutating operation returns; names the successor and
+/// the import command.
 pub const MIGRATION_TIP: &str = "Gemini CLI consumer tiers retired 2026-06-18; migrate to Antigravity CLI (agy) via `agy plugin import gemini`: skills .gemini/skills/ -> .gemini/antigravity-cli/skills/, mcpServers url/httpUrl -> serverUrl in mcp_config.json";
 
 /// `MigrationOnly`: detect/inspect/backup/export; every mutating attempt returns the successor tip.
@@ -65,22 +67,22 @@ impl GeminiCliAdapter {
         Ok(Self { id })
     }
 
-    /// Borrow the harness id.
+    /// The harness id this adapter validates instances against.
     pub fn harness_id(&self) -> &HarnessId {
         &self.id
     }
 
-    /// Executable name for this harness.
+    /// Executable probed during detection.
     pub fn executable_name(&self) -> &str {
         EXECUTABLE
     }
 
-    /// Config relocation env var.
+    /// Env var callers may set to relocate the config root.
     pub fn config_env_var(&self) -> &str {
         CONFIG_ENV_VAR
     }
 
-    /// Successor tip.
+    /// Migration text returned in place of every mutating operation.
     pub fn successor_tip(&self) -> &str {
         MIGRATION_TIP
     }
@@ -142,8 +144,7 @@ impl GeminiCliAdapter {
 
 impl Default for GeminiCliAdapter {
     fn default() -> Self {
-        #[expect(clippy::unwrap_used, reason = "gemini-cli is static valid HarnessId")]
-        let id = HarnessId::new(HARNESS_ID_STR).unwrap();
+        let id = HarnessId::from_validated_const(HARNESS_ID_STR);
         Self { id }
     }
 }
@@ -221,9 +222,7 @@ impl Adapter for GeminiCliAdapter {
 
         let confidence = if present == InstallPresence::Absent {
             DetectionConfidence::High
-        } else if binary_path.is_some() && version.is_none()
-            || evidence.iter().any(|e| e.contains("config root exists"))
-        {
+        } else if version.is_none() {
             DetectionConfidence::Medium
         } else {
             DetectionConfidence::High

@@ -1,27 +1,12 @@
 //! Skill registry: acquisition, destination modes, enable/disable, drift
 //! (EXT-01..05). Sources stage and validate first; fetched content never runs.
 
-#![expect(
-    clippy::assigning_clones,
-    clippy::cast_possible_truncation,
-    clippy::cloned_ref_to_slice_refs,
-    clippy::collapsible_if,
-    clippy::doc_markdown,
-    clippy::duration_suboptimal_units,
-    clippy::excessive_nesting,
-    clippy::manual_inspect,
-    clippy::map_unwrap_or,
-    clippy::needless_continue,
-    clippy::question_mark,
-    clippy::redundant_closure,
-    clippy::redundant_closure_for_method_calls,
-    clippy::semicolon_if_nothing_returned,
-    clippy::too_many_lines,
-    clippy::uninlined_format_args,
-    clippy::useless_format,
-    reason = "registry walks keep manual nesting, collapsible guards, incremental formats"
-)]
 #![expect(unused_qualifications, reason = "explicit paths for clarity")]
+#![expect(
+    clippy::excessive_nesting,
+    clippy::too_many_lines,
+    reason = "the transaction builders must read as one ordered step sequence; extracting nested arms into helpers scatters the prepare order the transaction validates"
+)]
 
 use std::collections::{BTreeSet, HashSet};
 use std::hash::{Hash, Hasher};
@@ -267,8 +252,6 @@ pub struct SkillUpdatePreview {
     pub diff: Vec<String>,
     /// Conflicts that block automatic replace.
     pub conflicts: Vec<String>,
-    /// Whether destination for copied skills is clean (can auto-replace) or has drift.
-    pub drift: Option<DriftStatus>,
     /// Whether the update can be applied automatically without conflict.
     pub can_auto_apply: bool,
 }
@@ -327,6 +310,20 @@ fn staging_root(tag: &str) -> PathBuf {
 
 /// Remove a symlink regardless of directory-ness: Windows rejects
 /// `remove_file` on a dir symlink; `remove_dir` removes the link itself.
+/// Hint every symlink-privilege failure must carry: `CopySelected` is the
+/// explicit alternate, never a silent fallback.
+const COPY_SELECTED_HINT: &str = "Use CopySelected as explicit alternate";
+
+/// Whether a symlink error is the Windows privilege failure that must surface
+/// [`COPY_SELECTED_HINT`] instead of a generic error.
+fn is_link_privilege_error(msg: &str) -> bool {
+    let lower = msg.to_lowercase();
+    lower.contains("privilege")
+        || lower.contains("permission")
+        || msg.contains("1314")
+        || msg.contains("requires elevation")
+}
+
 fn remove_symlink_any(path: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
@@ -349,13 +346,17 @@ fn move_tree_to_quarantine(dir: &Path, op_id: &str) -> Result<()> {
             value: op_id.to_owned(),
             reason: format!("quarantine path failed: {e}"),
         })?;
-    drop(std::fs::create_dir_all(
+    let quarantine_base =
         superai_config::quarantine::quarantine_base().map_err(|e| CoreError::InvalidPath {
             kind: "quarantine".to_owned(),
             value: "quarantine_base".to_owned(),
             reason: format!("{e}"),
-        })?,
-    ));
+        })?;
+    std::fs::create_dir_all(&quarantine_base).map_err(|e| CoreError::InvalidPath {
+        kind: "quarantine".to_owned(),
+        value: quarantine_base.display().to_string(),
+        reason: format!("cannot create quarantine base: {e}"),
+    })?;
     match std::fs::rename(dir, &quarantine_dest) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => std::fs::remove_dir_all(dir)
@@ -501,8 +502,29 @@ fn validate_relative_path(rel: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Collect files recursively, with boundary checks, but do not yet validate content.
-fn collect_files_recursive(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+/// Byte-length as `usize`, saturating on 16-bit targets where `usize` is
+/// narrower than `u64` file sizes.
+fn len_as_usize(len: u64) -> usize {
+    usize::try_from(len).unwrap_or(usize::MAX)
+}
+
+/// A walked path with its walk-time `symlink_metadata`.
+struct SkillFile {
+    path: PathBuf,
+    meta: std::fs::Metadata,
+}
+
+/// Best-effort staging/cleanup removal: error paths cannot propagate a second
+/// failure, so removal errors go to stderr instead of vanishing.
+fn cleanup_logged(action: &str, path: &Path, result: std::io::Result<()>) {
+    if let Err(e) = result {
+        eprintln!("superai-core: {action} failed for {}: {e}", path.display());
+    }
+}
+
+/// Collect files recursively, with boundary checks, but do not yet validate
+/// content. The walk-time metadata rides along so callers never re-stat.
+fn collect_files_recursive(root: &Path, out: &mut Vec<SkillFile>) -> Result<()> {
     let entries = std::fs::read_dir(root).map_err(|e| CoreError::InvalidPath {
         kind: "skill_tree".to_owned(),
         value: root.display().to_string(),
@@ -516,10 +538,10 @@ fn collect_files_recursive(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
         })?;
         let path = entry.path();
         // Skip transaction temp files
-        if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-            if file_name.starts_with(".tmp.") {
-                continue;
-            }
+        if let Some(file_name) = path.file_name().and_then(|n| n.to_str())
+            && file_name.starts_with(".tmp.")
+        {
+            continue;
         }
         let meta = std::fs::symlink_metadata(&path).map_err(|e| CoreError::InvalidPath {
             kind: "skill_tree".to_owned(),
@@ -571,7 +593,10 @@ fn collect_files_recursive(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
             }
             // Relative + no ".." already keeps the resolved target inside
             // the skill root; symlinked directories are not recursed into.
-            out.push(path.clone());
+            out.push(SkillFile {
+                path: path.clone(),
+                meta,
+            });
             continue;
         }
         if meta.is_dir() {
@@ -582,7 +607,10 @@ fn collect_files_recursive(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
                     reason: format!("cannot make relative for `{}`", path.display()),
                 })?;
             validate_relative_path(rel)?;
-            out.push(path.clone());
+            out.push(SkillFile {
+                path: path.clone(),
+                meta,
+            });
             collect_files_recursive(&path, out)?;
         } else {
             let rel = path
@@ -592,7 +620,7 @@ fn collect_files_recursive(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
                     reason: format!("cannot make relative for `{}`", path.display()),
                 })?;
             validate_relative_path(rel)?;
-            out.push(path);
+            out.push(SkillFile { path, meta });
         }
     }
     Ok(())
@@ -722,16 +750,11 @@ pub fn validate_skill_tree(skill_dir: &Path) -> Result<SkillMetadata> {
             reason: "skill directory must not be a symlink".to_owned(),
         });
     }
-    let mut all_paths: Vec<PathBuf> = Vec::new();
+    let mut all_paths: Vec<SkillFile> = Vec::new();
     collect_files_recursive(skill_dir, &mut all_paths)?;
     let mut file_count = 0usize;
     let mut total_bytes: u64 = 0;
-    for path in &all_paths {
-        let fm = std::fs::symlink_metadata(path).map_err(|e| CoreError::InvalidPath {
-            kind: "skill_tree".to_owned(),
-            value: path.display().to_string(),
-            reason: format!("metadata failed for `{}`: {e}", path.display()),
-        })?;
+    for SkillFile { path, meta: fm } in &all_paths {
         if fm.is_dir() {
             continue;
         }
@@ -781,7 +804,6 @@ pub fn validate_skill_tree(skill_dir: &Path) -> Result<SkillMetadata> {
 
 /// Compute SHA256 digest over sorted relative paths and file contents.
 pub fn compute_skill_digest(skill_dir: &Path) -> Result<String> {
-    let mut files: Vec<PathBuf> = Vec::new();
     let dir_meta = std::fs::symlink_metadata(skill_dir).map_err(|e| CoreError::InvalidPath {
         kind: "skill_dir".to_owned(),
         value: skill_dir.display().to_string(),
@@ -793,43 +815,34 @@ pub fn compute_skill_digest(skill_dir: &Path) -> Result<String> {
             reason: "skill_dir is not a directory".to_owned(),
         });
     }
-    let mut all: Vec<PathBuf> = Vec::new();
+    let mut all: Vec<SkillFile> = Vec::new();
     collect_files_recursive(skill_dir, &mut all)?;
-    for path in all {
-        let m = std::fs::symlink_metadata(&path).map_err(|e| CoreError::InvalidPath {
-            kind: "skill_tree".to_owned(),
-            value: path.display().to_string(),
-            reason: format!("metadata failed: {e}"),
-        })?;
-        if m.is_file() || m.file_type().is_symlink() {
-            files.push(path);
+    let mut files: Vec<SkillFile> = Vec::new();
+    for entry in all {
+        if entry.meta.is_file() || entry.meta.file_type().is_symlink() {
+            files.push(entry);
         }
     }
     files.sort_by(|a, b| {
-        let ra = a.strip_prefix(skill_dir).unwrap_or(a);
-        let rb = b.strip_prefix(skill_dir).unwrap_or(b);
+        let ra = a.path.strip_prefix(skill_dir).unwrap_or(&a.path);
+        let rb = b.path.strip_prefix(skill_dir).unwrap_or(&b.path);
         ra.cmp(rb)
     });
     let mut hasher = Sha256::new();
-    for path in files {
-        let rel = path.strip_prefix(skill_dir).unwrap_or(&path);
+    for SkillFile { path, meta } in &files {
+        let rel = path.strip_prefix(skill_dir).unwrap_or(path);
         let rel_str = rel.to_string_lossy();
         hasher.update(rel_str.as_bytes());
         hasher.update(b"\0");
         // Symlinks hash their target string, not the pointed-to content.
-        let meta = std::fs::symlink_metadata(&path).map_err(|e| CoreError::InvalidPath {
-            kind: "skill_tree".to_owned(),
-            value: path.display().to_string(),
-            reason: format!("metadata failed: {e}"),
-        })?;
         if meta.file_type().is_symlink() {
-            let target = std::fs::read_link(&path).map_err(|e| CoreError::Validation {
+            let target = std::fs::read_link(path).map_err(|e| CoreError::Validation {
                 field: "symlink".to_owned(),
                 reason: format!("cannot read symlink `{}`: {e}", path.display()),
             })?;
             hasher.update(target.to_string_lossy().as_bytes());
         } else {
-            let bytes = std::fs::read(&path).map_err(|e| CoreError::InvalidPath {
+            let bytes = std::fs::read(path).map_err(|e| CoreError::InvalidPath {
                 kind: "skill_tree".to_owned(),
                 value: path.display().to_string(),
                 reason: format!("cannot read file: {e}"),
@@ -858,11 +871,40 @@ pub fn registry_file_for_root(root: &Path) -> PathBuf {
     root.join(REGISTRY_FILE_NAME)
 }
 
-/// Provenance file path for a copied skill: `<root>/.provenance/<skill_id>/<instance_name>.json`
-pub fn provenance_file_for(root: &Path, skill_id: &SkillId, instance_name: &str) -> PathBuf {
-    root.join(PROVENANCE_DIR_NAME)
-        .join(skill_id.as_str())
-        .join(format!("{instance_name}.json"))
+/// Unmodelled top-level keys from the on-disk registry, freshly read. A
+/// registry that exists but cannot be read or parsed is fatal: the callers'
+/// transactions rewrite this file, and proceeding would silently destroy
+/// those keys.
+fn foreign_keys_from_disk(root: &Path) -> Result<Map<String, Value>> {
+    let registry_file = registry_file_for_root(root);
+    if !registry_file.exists() {
+        return Ok(Map::new());
+    }
+    let bytes = std::fs::read(&registry_file).map_err(|e| CoreError::InvalidPath {
+        kind: "skill_registry".to_owned(),
+        value: registry_file.display().to_string(),
+        reason: format!("cannot read existing registry: {e}"),
+    })?;
+    match serde_json::from_slice::<Value>(&bytes) {
+        Ok(Value::Object(map)) => Ok(map
+            .into_iter()
+            .filter(|(k, _)| k != "schema_version" && k != "skills")
+            .collect()),
+        Ok(_) => Err(CoreError::Validation {
+            field: "skill_registry".to_owned(),
+            reason: format!(
+                "existing registry {} is not a JSON object",
+                registry_file.display()
+            ),
+        }),
+        Err(e) => Err(CoreError::Validation {
+            field: "skill_registry".to_owned(),
+            reason: format!(
+                "existing registry {} cannot be parsed: {e}",
+                registry_file.display()
+            ),
+        }),
+    }
 }
 
 fn backup_before_write(path: &Path) -> Result<()> {
@@ -943,7 +985,7 @@ impl SkillRegistry {
                 ),
             });
         }
-        if bytes.is_empty() || bytes.iter().all(|b| b.is_ascii_whitespace()) {
+        if bytes.is_empty() || bytes.iter().all(u8::is_ascii_whitespace) {
             return Ok(Self {
                 root: root.to_path_buf(),
                 records: Vec::new(),
@@ -993,15 +1035,15 @@ impl SkillRegistry {
             }
         }
         let mut records: Vec<SkillRecord> = Vec::new();
-        if let Some(skills_val) = map.get("skills") {
-            if !skills_val.is_null() {
-                records = serde_json::from_value(skills_val.clone()).map_err(|e| {
-                    CoreError::SchemaValidation {
-                        path: file.clone(),
-                        details: format!("invalid skills array: {e}"),
-                    }
-                })?;
-            }
+        if let Some(skills_val) = map.get("skills")
+            && !skills_val.is_null()
+        {
+            records = serde_json::from_value(skills_val.clone()).map_err(|e| {
+                CoreError::SchemaValidation {
+                    path: file.clone(),
+                    details: format!("invalid skills array: {e}"),
+                }
+            })?;
         }
         let mut seen_ids: HashSet<String> = HashSet::new();
         let mut seen_names: HashSet<String> = HashSet::new();
@@ -1091,12 +1133,11 @@ impl SkillRegistry {
         self.records.iter().find(|record| &record.id == id)
     }
 
-    /// Get by normalized name case-folded.
+    /// Case-insensitive lookup by record name; the first match wins.
     pub fn get_by_name(&self, name: &str) -> Option<&SkillRecord> {
-        let needle = name.to_lowercase();
         self.records
             .iter()
-            .find(|record| record.name.to_lowercase() == needle)
+            .find(|record| record.name.eq_ignore_ascii_case(name))
     }
 
     /// Install from `source`: stage to temp, validate the tree, digest,
@@ -1194,7 +1235,7 @@ impl SkillRegistry {
         })();
 
         let cleanup_staging = |path: &Path| {
-            drop(std::fs::remove_dir_all(path));
+            cleanup_logged("staging cleanup", path, std::fs::remove_dir_all(path));
         };
 
         let metadata = match stage_result {
@@ -1271,24 +1312,14 @@ impl SkillRegistry {
         steps.push(superai_config::transaction::FileAction::CreateDir {
             path: final_skill_dir.clone(),
         });
-        let mut staged_files: Vec<PathBuf> = Vec::new();
-        let mut all_staged: Vec<PathBuf> = Vec::new();
+        let mut all_staged: Vec<SkillFile> = Vec::new();
         if let Err(e) = collect_files_recursive(&staging_skill_dir, &mut all_staged) {
             cleanup_staging(&staging_root);
             return Err(e);
         }
-        for staged_path in &all_staged {
-            let meta = match std::fs::symlink_metadata(staged_path) {
-                Ok(m) => m,
-                Err(e) => {
-                    cleanup_staging(&staging_root);
-                    return Err(CoreError::InvalidPath {
-                        kind: "skill_tree".to_owned(),
-                        value: staged_path.display().to_string(),
-                        reason: format!("metadata failed: {e}"),
-                    });
-                }
-            };
+        for staged in &all_staged {
+            let staged_path = &staged.path;
+            let meta = &staged.meta;
             if meta.is_dir() {
                 let rel = staged_path.strip_prefix(&staging_skill_dir).map_err(|_e| {
                     CoreError::Validation {
@@ -1316,23 +1347,18 @@ impl SkillRegistry {
                     content: bytes,
                     kind: superai_config::document::DocumentKind::Opaque,
                 });
-                staged_files.push(target_file);
             }
         }
 
         let registry_file = registry_file_for_root(&self.root);
         let mut foreign_preserved: Map<String, Value> = self.foreign.clone();
-        // Disk keys missing from the in-memory set are picked up here.
-        if registry_file.exists() {
-            if let Ok(bytes) = std::fs::read(&registry_file) {
-                if let Ok(Value::Object(map)) = serde_json::from_slice::<Value>(&bytes) {
-                    for (k, v) in map {
-                        if k != "schema_version" && k != "skills" {
-                            foreign_preserved.entry(k).or_insert(v);
-                        }
-                    }
-                }
-            }
+        // Disk keys missing from the in-memory set are picked up here; a
+        // registry that cannot be read or parsed is fatal, because the
+        // transaction below would rewrite it and destroy those keys.
+        for (k, v) in foreign_keys_from_disk(&self.root).inspect_err(|_e| {
+            cleanup_staging(&staging_root);
+        })? {
+            foreign_preserved.entry(k).or_insert(v);
         }
         let mut new_records = self.records.clone();
         new_records.push(record.clone());
@@ -1388,11 +1414,8 @@ impl SkillRegistry {
             cleanup_staging(&staging_root);
             CoreError::Config(e)
         });
-        if let Err(e) = prepare {
-            // Prepare may have created recovery backups; they stay.
-            return Err(e);
-        }
-        let outcome = tx.execute().map_err(|e| CoreError::Config(e));
+        prepare?;
+        let outcome = tx.execute().map_err(CoreError::Config);
         let tx_outcome = match outcome {
             Ok(o) => o,
             Err(e) => {
@@ -1447,7 +1470,7 @@ impl SkillRegistry {
         };
         match source.kind {
             SkillSourceKind::GitHub | SkillSourceKind::Marketplace => {
-                validate_fetch_url(&source.locator)?
+                validate_fetch_url(&source.locator)?;
             }
             SkillSourceKind::LocalDir => {}
         }
@@ -1465,21 +1488,32 @@ impl SkillRegistry {
             reason: format!("cannot create staging skill dir: {e}"),
         })?;
         if let Err(e) = stage_skill_source(&source, &staging_dir) {
-            drop(std::fs::remove_dir_all(&staging_root));
+            cleanup_logged(
+                "staging cleanup",
+                &staging_root,
+                std::fs::remove_dir_all(&staging_root),
+            );
             return Err(e);
         }
 
         let new_metadata = match validate_skill_tree(&staging_dir) {
             Ok(meta) => meta,
             Err(e) => {
-                drop(std::fs::remove_dir_all(&staging_root));
+                cleanup_logged(
+                    "staging cleanup",
+                    &staging_root,
+                    std::fs::remove_dir_all(&staging_root),
+                );
                 return Err(e);
             }
         };
 
-        let new_digest = compute_skill_digest(&staging_dir).map_err(|e| {
-            drop(std::fs::remove_dir_all(&staging_root));
-            e
+        let new_digest = compute_skill_digest(&staging_dir).inspect_err(|_e| {
+            cleanup_logged(
+                "staging cleanup",
+                &staging_root,
+                std::fs::remove_dir_all(&staging_root),
+            );
         })?;
         let existing_skill_dir = self.root.join(skill_id.as_str());
         let existing_digest = if existing_skill_dir.exists() {
@@ -1498,14 +1532,12 @@ impl SkillRegistry {
         let existing_files = if existing_skill_dir.exists() {
             let mut v = Vec::new();
             let mut all = Vec::new();
-            drop(collect_files_recursive(&existing_skill_dir, &mut all));
+            collect_files_recursive(&existing_skill_dir, &mut all)?;
             for p in all {
-                if let Ok(m) = std::fs::symlink_metadata(&p) {
-                    if m.is_file() || m.file_type().is_symlink() {
-                        if let Ok(rel) = p.strip_prefix(&existing_skill_dir) {
-                            v.push(rel.to_path_buf());
-                        }
-                    }
+                if (p.meta.is_file() || p.meta.file_type().is_symlink())
+                    && let Ok(rel) = p.path.strip_prefix(&existing_skill_dir)
+                {
+                    v.push(rel.to_path_buf());
                 }
             }
             v
@@ -1513,15 +1545,13 @@ impl SkillRegistry {
             Vec::new()
         };
         let mut new_files: Vec<PathBuf> = Vec::new();
-        let mut all_new: Vec<PathBuf> = Vec::new();
-        drop(collect_files_recursive(&staging_dir, &mut all_new));
+        let mut all_new: Vec<SkillFile> = Vec::new();
+        collect_files_recursive(&staging_dir, &mut all_new)?;
         for p in all_new {
-            if let Ok(m) = std::fs::symlink_metadata(&p) {
-                if m.is_file() || m.file_type().is_symlink() {
-                    if let Ok(rel) = p.strip_prefix(&staging_dir) {
-                        new_files.push(rel.to_path_buf());
-                    }
-                }
+            if (p.meta.is_file() || p.meta.file_type().is_symlink())
+                && let Ok(rel) = p.path.strip_prefix(&staging_dir)
+            {
+                new_files.push(rel.to_path_buf());
             }
         }
         let existing_set: BTreeSet<String> = existing_files
@@ -1533,10 +1563,10 @@ impl SkillRegistry {
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
         for added in new_set.difference(&existing_set) {
-            diff.push(format!("+ {}", added));
+            diff.push(format!("+ {added}"));
         }
         for removed in existing_set.difference(&new_set) {
-            diff.push(format!("- {}", removed));
+            diff.push(format!("- {removed}"));
         }
         for common in existing_set.intersection(&new_set) {
             let existing_path = existing_skill_dir.join(common);
@@ -1544,7 +1574,7 @@ impl SkillRegistry {
             let existing_bytes = std::fs::read(&existing_path).unwrap_or_default();
             let new_bytes = std::fs::read(&new_path).unwrap_or_default();
             if existing_bytes != new_bytes {
-                diff.push(format!("M {}", common));
+                diff.push(format!("M {common}"));
             }
         }
         let mut can_auto_apply = true;
@@ -1555,21 +1585,25 @@ impl SkillRegistry {
             ));
             can_auto_apply = false;
         }
-        if new_metadata.name != existing.name {
-            if new_metadata.name.to_lowercase() != existing.name.to_lowercase() {
-                conflicts.push(format!(
-                    "skill name change from '{}' to '{}' requires explicit migration",
-                    existing.name, new_metadata.name
-                ));
-                can_auto_apply = false;
-            }
+        if new_metadata.name != existing.name
+            && new_metadata.name.to_lowercase() != existing.name.to_lowercase()
+        {
+            conflicts.push(format!(
+                "skill name change from '{}' to '{}' requires explicit migration",
+                existing.name, new_metadata.name
+            ));
+            can_auto_apply = false;
         }
         if new_digest == existing_digest {
             can_auto_apply = true;
             conflicts.clear();
         }
 
-        drop(std::fs::remove_dir_all(&staging_root));
+        cleanup_logged(
+            "staging cleanup",
+            &staging_root,
+            std::fs::remove_dir_all(&staging_root),
+        );
         let can_apply = can_auto_apply && conflicts.is_empty();
         Ok(SkillUpdatePreview {
             skill_id: skill_id.clone(),
@@ -1578,7 +1612,6 @@ impl SkillRegistry {
             has_local_edits,
             diff,
             conflicts,
-            drift: None,
             can_auto_apply: can_apply,
         })
     }
@@ -1639,28 +1672,43 @@ impl SkillRegistry {
             reason: format!("cannot create staging skill dir: {e}"),
         })?;
         if let Err(e) = stage_skill_source(&source, &staging_dir) {
-            drop(std::fs::remove_dir_all(&staging_root));
+            cleanup_logged(
+                "staging cleanup",
+                &staging_root,
+                std::fs::remove_dir_all(&staging_root),
+            );
             return Err(e);
         }
-        validate_skill_tree(&staging_dir).map_err(|e| {
-            drop(std::fs::remove_dir_all(&staging_root));
-            e
+        validate_skill_tree(&staging_dir).inspect_err(|_e| {
+            cleanup_logged(
+                "staging cleanup",
+                &staging_root,
+                std::fs::remove_dir_all(&staging_root),
+            );
         })?;
-        let new_digest = compute_skill_digest(&staging_dir).map_err(|e| {
-            drop(std::fs::remove_dir_all(&staging_root));
-            e
+        let new_digest = compute_skill_digest(&staging_dir).inspect_err(|_e| {
+            cleanup_logged(
+                "staging cleanup",
+                &staging_root,
+                std::fs::remove_dir_all(&staging_root),
+            );
         })?;
-        let new_metadata = parse_skill_metadata(&staging_dir).map_err(|e| {
-            drop(std::fs::remove_dir_all(&staging_root));
-            e
+        let new_metadata = parse_skill_metadata(&staging_dir).inspect_err(|_e| {
+            cleanup_logged(
+                "staging cleanup",
+                &staging_root,
+                std::fs::remove_dir_all(&staging_root),
+            );
         })?;
         let mut new_record = existing;
         new_record.digest = new_digest;
         new_record.installed_at = now_iso8601();
-        new_record.pinned_revision = source.pinned_revision.clone();
-        new_record.source_locator = source.locator.clone();
+        new_record
+            .pinned_revision
+            .clone_from(&source.pinned_revision);
+        new_record.source_locator.clone_from(&source.locator);
         new_record.source_kind = source.kind;
-        new_record.name = new_metadata.name.clone();
+        new_record.name.clone_from(&new_metadata.name);
         new_record.license = source.license.or(new_metadata.license);
         new_record.validate()?;
         let final_skill_dir = self.root.join(skill_id.as_str());
@@ -1670,30 +1718,27 @@ impl SkillRegistry {
             let mut list = Vec::new();
             if final_skill_dir.exists() {
                 let mut all = Vec::new();
-                drop(collect_files_recursive(&final_skill_dir, &mut all));
+                collect_files_recursive(&final_skill_dir, &mut all)?;
                 for p in all {
-                    if let Ok(m) = std::fs::symlink_metadata(&p) {
-                        if m.is_file() || m.file_type().is_symlink() {
-                            list.push(p);
-                        }
+                    if p.meta.is_file() || p.meta.file_type().is_symlink() {
+                        list.push(p.path);
                     }
                 }
             }
             list
         };
-        let mut staged_all: Vec<PathBuf> = Vec::new();
-        collect_files_recursive(&staging_dir, &mut staged_all).map_err(|e| {
-            drop(std::fs::remove_dir_all(&staging_root));
-            e
+        let mut staged_all: Vec<SkillFile> = Vec::new();
+        collect_files_recursive(&staging_dir, &mut staged_all).inspect_err(|_e| {
+            cleanup_logged(
+                "staging cleanup",
+                &staging_root,
+                std::fs::remove_dir_all(&staging_root),
+            );
         })?;
         let new_rel_set: BTreeSet<String> = staged_all
             .iter()
-            .filter(|p| {
-                std::fs::symlink_metadata(p)
-                    .map(|m| m.is_file() || m.file_type().is_symlink())
-                    .unwrap_or(false)
-            })
-            .filter_map(|p| p.strip_prefix(&staging_dir).ok())
+            .filter(|p| p.meta.is_file() || p.meta.file_type().is_symlink())
+            .filter_map(|p| p.path.strip_prefix(&staging_dir).ok())
             .map(|rel| rel.to_string_lossy().into_owned())
             .collect();
         for existing_path in &existing_files {
@@ -1712,34 +1757,28 @@ impl SkillRegistry {
         dirs_to_create.insert(final_skill_dir.clone());
         let mut write_steps: Vec<superai_config::transaction::FileAction> = Vec::new();
         for staged_path in &staged_all {
-            let meta =
-                std::fs::symlink_metadata(staged_path).map_err(|e| CoreError::InvalidPath {
-                    kind: "skill_tree".to_owned(),
-                    value: staged_path.display().to_string(),
-                    reason: format!("metadata failed: {e}"),
-                })?;
+            let meta = &staged_path.meta;
             if meta.is_dir() {
-                if let Ok(rel) = staged_path.strip_prefix(&staging_dir)
+                if let Ok(rel) = staged_path.path.strip_prefix(&staging_dir)
                     && !rel.as_os_str().is_empty()
                 {
                     dirs_to_create.insert(final_skill_dir.join(rel));
                 }
                 continue;
             }
-            let rel =
-                staged_path
-                    .strip_prefix(&staging_dir)
-                    .map_err(|_e| CoreError::Validation {
-                        field: "skill_tree".to_owned(),
-                        reason: format!("cannot make relative for `{}`", staged_path.display()),
-                    })?;
+            let rel = staged_path.path.strip_prefix(&staging_dir).map_err(|_e| {
+                CoreError::Validation {
+                    field: "skill_tree".to_owned(),
+                    reason: format!("cannot make relative for `{}`", staged_path.path.display()),
+                }
+            })?;
             let target = final_skill_dir.join(rel);
             if let Some(parent) = target.parent() {
                 dirs_to_create.insert(parent.to_path_buf());
             }
-            let bytes = std::fs::read(staged_path).map_err(|e| CoreError::InvalidPath {
+            let bytes = std::fs::read(&staged_path.path).map_err(|e| CoreError::InvalidPath {
                 kind: "skill_tree".to_owned(),
-                value: staged_path.display().to_string(),
+                value: staged_path.path.display().to_string(),
                 reason: format!("cannot read staged: {e}"),
             })?;
             write_steps.push(superai_config::transaction::FileAction::Write {
@@ -1755,16 +1794,14 @@ impl SkillRegistry {
         let registry_file = registry_file_for_root(&self.root);
         backup_before_write(&registry_file)?;
         let mut foreign_preserved: Map<String, Value> = self.foreign.clone();
-        if registry_file.exists() {
-            if let Ok(bytes) = std::fs::read(&registry_file) {
-                if let Ok(Value::Object(map)) = serde_json::from_slice::<Value>(&bytes) {
-                    for (k, v) in map {
-                        if k != "schema_version" && k != "skills" {
-                            foreign_preserved.entry(k).or_insert(v);
-                        }
-                    }
-                }
-            }
+        for (k, v) in foreign_keys_from_disk(&self.root).inspect_err(|_| {
+            cleanup_logged(
+                "staging cleanup",
+                &staging_root,
+                std::fs::remove_dir_all(&staging_root),
+            );
+        })? {
+            foreign_preserved.entry(k).or_insert(v);
         }
         let mut new_records = self.records.clone();
         if let Some(slot) = new_records.iter_mut().find(|record| record.id == *skill_id) {
@@ -1772,7 +1809,11 @@ impl SkillRegistry {
         }
         new_records.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
         let skills_val = serde_json::to_value(&new_records).map_err(|e| {
-            drop(std::fs::remove_dir_all(&staging_root));
+            cleanup_logged(
+                "staging cleanup",
+                &staging_root,
+                std::fs::remove_dir_all(&staging_root),
+            );
             CoreError::Validation {
                 field: "skills".to_owned(),
                 reason: format!("serialize failed: {e}"),
@@ -1790,7 +1831,11 @@ impl SkillRegistry {
             }
         }
         let registry_bytes = serde_json::to_vec_pretty(&Value::Object(new_map)).map_err(|e| {
-            drop(std::fs::remove_dir_all(&staging_root));
+            cleanup_logged(
+                "staging cleanup",
+                &staging_root,
+                std::fs::remove_dir_all(&staging_root),
+            );
             CoreError::Validation {
                 field: "registry".to_owned(),
                 reason: format!("serialize failed: {e}"),
@@ -1809,7 +1854,11 @@ impl SkillRegistry {
                 .map_or(0, |d| d.as_millis())
         );
         let op_id = superai_config::transaction::OperationId::new(&op_id_str).map_err(|e| {
-            drop(std::fs::remove_dir_all(&staging_root));
+            cleanup_logged(
+                "staging cleanup",
+                &staging_root,
+                std::fs::remove_dir_all(&staging_root),
+            );
             CoreError::InvalidPath {
                 kind: "operation_id".to_owned(),
                 value: op_id_str.clone(),
@@ -1818,15 +1867,27 @@ impl SkillRegistry {
         })?;
         let mut tx = superai_config::transaction::Transaction::new(op_id, steps);
         tx.prepare().map_err(|e| {
-            drop(std::fs::remove_dir_all(&staging_root));
+            cleanup_logged(
+                "staging cleanup",
+                &staging_root,
+                std::fs::remove_dir_all(&staging_root),
+            );
             CoreError::Config(e)
         })?;
         let outcome = tx.execute().map_err(|e| {
-            drop(std::fs::remove_dir_all(&staging_root));
+            cleanup_logged(
+                "staging cleanup",
+                &staging_root,
+                std::fs::remove_dir_all(&staging_root),
+            );
             CoreError::Config(e)
         })?;
         if !outcome.success {
-            drop(std::fs::remove_dir_all(&staging_root));
+            cleanup_logged(
+                "staging cleanup",
+                &staging_root,
+                std::fs::remove_dir_all(&staging_root),
+            );
             return Err(CoreError::Commit {
                 path: registry_file,
                 reason: format!("transaction failed: {:?}", outcome.verification),
@@ -1834,7 +1895,11 @@ impl SkillRegistry {
         }
         self.records = new_records;
         self.foreign = foreign_preserved;
-        drop(std::fs::remove_dir_all(&staging_root));
+        cleanup_logged(
+            "staging cleanup",
+            &staging_root,
+            std::fs::remove_dir_all(&staging_root),
+        );
         Ok(new_record)
     }
 
@@ -1906,23 +1971,19 @@ impl SkillRegistry {
             move_tree_to_quarantine(&skill_dir, &op_id_str)?;
             let prov_dir = self.root.join(PROVENANCE_DIR_NAME).join(skill_id.as_str());
             if prov_dir.exists() {
-                drop(std::fs::remove_dir_all(&prov_dir));
+                cleanup_logged(
+                    "provenance cleanup",
+                    &prov_dir,
+                    std::fs::remove_dir_all(&prov_dir),
+                );
             }
         }
         let mut new_records = self.records.clone();
         new_records.remove(idx);
         backup_before_write(&registry_file)?;
         let mut foreign_preserved = self.foreign.clone();
-        if registry_file.exists() {
-            if let Ok(bytes) = std::fs::read(&registry_file) {
-                if let Ok(Value::Object(map)) = serde_json::from_slice::<Value>(&bytes) {
-                    for (k, v) in map {
-                        if k != "schema_version" && k != "skills" {
-                            foreign_preserved.entry(k).or_insert(v);
-                        }
-                    }
-                }
-            }
+        for (k, v) in foreign_keys_from_disk(&self.root)? {
+            foreign_preserved.entry(k).or_insert(v);
         }
         let skills_val = serde_json::to_value(&new_records).map_err(|e| CoreError::Validation {
             field: "skills".to_owned(),
@@ -1975,7 +2036,6 @@ impl SkillRegistry {
         }
         self.records = new_records;
         self.foreign = foreign_preserved;
-        // Note: copied destinations remain divergent per spec; we have reported consumers but not auto-removed them
         Ok(consumers)
     }
 }
@@ -2032,12 +2092,11 @@ pub fn apply_skill_mode(
                     }
                 })?;
                 if meta.file_type().is_symlink() {
-                    if let Ok(target) = std::fs::read_link(instance_skills_dir) {
-                        if target == registry.root {
-                            return Ok(Vec::new());
-                        }
+                    if let Ok(target) = std::fs::read_link(instance_skills_dir)
+                        && target == registry.root
+                    {
+                        return Ok(Vec::new());
                     }
-                    // Remove existing symlink before creating new one
                     std::fs::remove_file(instance_skills_dir).map_err(|e| {
                         CoreError::InvalidPath {
                             kind: "instance_skills".to_owned(),
@@ -2071,7 +2130,6 @@ pub fn apply_skill_mode(
                             ),
                         });
                     }
-                    // Empty dir: remove it
                     std::fs::remove_dir(instance_skills_dir).map_err(|e| {
                         CoreError::InvalidPath {
                             kind: "instance_skills".to_owned(),
@@ -2092,17 +2150,12 @@ pub fn apply_skill_mode(
             let symlink_res = create_symlink(registry.root(), instance_skills_dir);
             if let Err(e) = symlink_res {
                 let msg = format!("{e}");
-                let is_privilege = msg.to_lowercase().contains("privilege")
-                    || msg.to_lowercase().contains("permission")
-                    || msg.to_lowercase().contains("privileges")
-                    || msg.contains("1314")
-                    || msg.contains("requires elevation");
-                if is_privilege {
+                if is_link_privilege_error(&msg) {
                     return Err(CoreError::Validation {
                         field: "skill_link".to_owned(),
                         reason: format!(
                             "symlink creation failed due to privilege (Windows): {msg}. \
-                             Use CopySelected as explicit alternate, not silent fallback: mode CopySelected is available"
+                             {COPY_SELECTED_HINT}: mode CopySelected is available"
                         ),
                     });
                 }
@@ -2128,10 +2181,10 @@ pub fn apply_skill_mode(
                             reason: format!("metadata failed: {e}"),
                         })?;
                     if meta.file_type().is_symlink() {
-                        if let Ok(target) = std::fs::read_link(&dest) {
-                            if target == src {
-                                continue;
-                            }
+                        if let Ok(target) = std::fs::read_link(&dest)
+                            && target == src
+                        {
+                            continue;
                         }
                         // Symlink fails on an existing path; remove first.
                         steps.push(superai_config::transaction::FileAction::RemoveFile {
@@ -2176,11 +2229,11 @@ pub fn apply_skill_mode(
             let outcome = tx.execute().map_err(CoreError::Config)?;
             if !outcome.success {
                 let msg = format!("{:?}", outcome.verification);
-                if msg.to_lowercase().contains("privilege") {
+                if is_link_privilege_error(&msg) {
                     return Err(CoreError::Validation {
                         field: "skill_link".to_owned(),
                         reason: format!(
-                            "symlink creation failed due to privilege: {msg}. Use CopySelected as explicit alternate"
+                            "symlink creation failed due to privilege: {msg}. {COPY_SELECTED_HINT}"
                         ),
                     });
                 }
@@ -2236,9 +2289,9 @@ pub fn apply_skill_mode(
                     }
                     // EXT-05 drift-checked re-copy: a locally-modified copy
                     // is a conflict; clean copies replace, missing reinstalls.
-                    if let Some(provenance) =
-                        load_provenance(&registry.root, skill_id, instance_skills_dir)
-                        && meta.is_dir()
+                    if meta.is_dir()
+                        && let Some(provenance) =
+                            load_provenance(&registry.root, skill_id, instance_skills_dir)?
                     {
                         if check_drift(&provenance, registry, &dest_dir)?
                             == DriftStatus::LocallyModified
@@ -2264,32 +2317,26 @@ pub fn apply_skill_mode(
                     );
                     move_tree_to_quarantine(&dest_dir, &quarantine_op)?;
                 }
-                let mut all_src: Vec<PathBuf> = Vec::new();
+                let mut all_src: Vec<SkillFile> = Vec::new();
                 collect_files_recursive(&src_dir, &mut all_src)?;
                 let mut dirs_to_create: std::collections::BTreeSet<PathBuf> =
                     std::collections::BTreeSet::new();
                 let mut file_writes: Vec<superai_config::transaction::FileAction> = Vec::new();
                 for src_path in &all_src {
-                    let meta = std::fs::symlink_metadata(src_path).map_err(|e| {
-                        CoreError::InvalidPath {
-                            kind: "skill_tree".to_owned(),
-                            value: src_path.display().to_string(),
-                            reason: format!("metadata failed: {e}"),
-                        }
-                    })?;
+                    let meta = &src_path.meta;
                     if meta.is_dir() {
-                        if let Ok(rel) = src_path.strip_prefix(&src_dir) {
-                            if !rel.as_os_str().is_empty() {
-                                dirs_to_create.insert(dest_dir.join(rel));
-                            }
+                        if let Ok(rel) = src_path.path.strip_prefix(&src_dir)
+                            && !rel.as_os_str().is_empty()
+                        {
+                            dirs_to_create.insert(dest_dir.join(rel));
                         }
                     } else {
-                        let rel = src_path.strip_prefix(&src_dir).map_err(|_e| {
+                        let rel = src_path.path.strip_prefix(&src_dir).map_err(|_e| {
                             CoreError::Validation {
                                 field: "skill_tree".to_owned(),
                                 reason: format!(
                                     "cannot make relative for `{}`",
-                                    src_path.display()
+                                    src_path.path.display()
                                 ),
                             }
                         })?;
@@ -2298,9 +2345,9 @@ pub fn apply_skill_mode(
                             dirs_to_create.insert(parent.to_path_buf());
                         }
                         let bytes =
-                            std::fs::read(src_path).map_err(|e| CoreError::InvalidPath {
+                            std::fs::read(&src_path.path).map_err(|e| CoreError::InvalidPath {
                                 kind: "skill_tree".to_owned(),
-                                value: src_path.display().to_string(),
+                                value: src_path.path.display().to_string(),
                                 reason: format!("cannot read src: {e}"),
                             })?;
                         file_writes.push(superai_config::transaction::FileAction::Write {
@@ -2426,21 +2473,18 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
         value: dest.display().to_string(),
         reason: format!("cannot create dest dir: {e}"),
     })?;
-    let mut all: Vec<PathBuf> = Vec::new();
+    let mut all: Vec<SkillFile> = Vec::new();
     collect_files_recursive(src, &mut all)?;
     for src_path in &all {
         let rel = src_path
+            .path
             .strip_prefix(src)
             .map_err(|_e| CoreError::Validation {
                 field: "copy_dir".to_owned(),
-                reason: format!("cannot make relative for `{}`", src_path.display()),
+                reason: format!("cannot make relative for `{}`", src_path.path.display()),
             })?;
         let dest_path = dest.join(rel);
-        let meta = std::fs::symlink_metadata(src_path).map_err(|e| CoreError::InvalidPath {
-            kind: "copy_dir".to_owned(),
-            value: src_path.display().to_string(),
-            reason: format!("metadata failed: {e}"),
-        })?;
+        let meta = &src_path.meta;
         if meta.is_dir() {
             std::fs::create_dir_all(&dest_path).map_err(|e| CoreError::InvalidPath {
                 kind: "copy_dir".to_owned(),
@@ -2449,13 +2493,17 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
             })?;
         } else if meta.file_type().is_symlink() {
             // Validated symlinks are recreated as links, not followed.
-            let target = std::fs::read_link(src_path).map_err(|e| CoreError::Validation {
+            let target = std::fs::read_link(&src_path.path).map_err(|e| CoreError::Validation {
                 field: "symlink".to_owned(),
-                reason: format!("cannot read symlink `{}`: {e}", src_path.display()),
+                reason: format!("cannot read symlink `{}`: {e}", src_path.path.display()),
             })?;
             if dest_path.exists() {
-                drop(std::fs::remove_file(&dest_path));
-                drop(std::fs::remove_dir_all(&dest_path));
+                cleanup_logged("dest cleanup", &dest_path, std::fs::remove_file(&dest_path));
+                cleanup_logged(
+                    "dest cleanup",
+                    &dest_path,
+                    std::fs::remove_dir_all(&dest_path),
+                );
             }
             create_symlink(&target, &dest_path)?;
         } else {
@@ -2466,9 +2514,9 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
                     reason: format!("cannot create parent: {e}"),
                 })?;
             }
-            let bytes = std::fs::read(src_path).map_err(|e| CoreError::InvalidPath {
+            let bytes = std::fs::read(&src_path.path).map_err(|e| CoreError::InvalidPath {
                 kind: "copy_dir".to_owned(),
-                value: src_path.display().to_string(),
+                value: src_path.path.display().to_string(),
                 reason: format!("cannot read src file: {e}"),
             })?;
             std::fs::write(&dest_path, &bytes).map_err(|e| CoreError::InvalidPath {
@@ -2496,7 +2544,7 @@ fn fetch_https_to_staging(url: &str, staging_dir: &Path) -> Result<()> {
         locator: url.to_owned(),
         reason: e,
     })?;
-    if bytes.len() > MAX_SINGLE_FILE_BYTES as usize {
+    if bytes.len() > len_as_usize(MAX_SINGLE_FILE_BYTES) {
         return Err(CoreError::Validation {
             field: "skill_fetch".to_owned(),
             reason: format!("fetched bytes exceed limit: {}", bytes.len()),
@@ -2513,7 +2561,7 @@ fn fetch_https_to_staging(url: &str, staging_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Stage `source` (EXT-02): LocalDir copies; a pinned git source clones via
+/// Stage `source` (EXT-02): `LocalDir` copies; a pinned git source clones via
 /// argv tokens (HEAD verified, `.git` dropped); unpinned downloads over HTTPS.
 fn stage_skill_source(source: &SkillSource, staging_dir: &Path) -> Result<()> {
     match source.kind {
@@ -2559,7 +2607,7 @@ fn stage_file_url(locator: &str, staging_dir: &Path) -> Result<()> {
             value: src.display().to_string(),
             reason: format!("cannot read file url: {e}"),
         })?;
-        if bytes.len() > MAX_SINGLE_FILE_BYTES as usize {
+        if bytes.len() > len_as_usize(MAX_SINGLE_FILE_BYTES) {
             return Err(CoreError::Validation {
                 field: "skill_fetch".to_owned(),
                 reason: format!("file url exceeds size limit: {}", bytes.len()),
@@ -2585,7 +2633,7 @@ fn stage_file_url(locator: &str, staging_dir: &Path) -> Result<()> {
 }
 
 /// Bounded timeout for each git command during staged checkout.
-const GIT_STAGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const GIT_STAGE_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(1);
 
 fn git_stage_opts(cwd: Option<&Path>) -> crate::process::ExecuteOpts {
     crate::process::ExecuteOpts {
@@ -2743,7 +2791,12 @@ fn stage_git_revision(url: &str, rev: &str, staging_dir: &Path) -> Result<()> {
         });
     }
     // Plain skill content in staging: drop the repository metadata.
-    drop(std::fs::remove_dir_all(staging_dir.join(".git")));
+    let git_dir = staging_dir.join(".git");
+    cleanup_logged(
+        "repo metadata cleanup",
+        &git_dir,
+        std::fs::remove_dir_all(&git_dir),
+    );
     Ok(())
 }
 
@@ -2787,7 +2840,7 @@ fn fetch_bytes_ureq(url: &str) -> std::result::Result<Vec<u8>, String> {
                 .headers()
                 .get("Location")
                 .and_then(|v| v.to_str().ok())
-                .ok_or_else(|| format!("redirect without a valid Location header"))?
+                .ok_or_else(|| "redirect without a valid Location header".to_owned())?
                 .to_owned();
             current = resolve_redirect(&current, &location)?;
             validate_fetch_url(&current).map_err(|e| e.to_string())?;
@@ -2808,7 +2861,7 @@ fn fetch_bytes_ureq(url: &str) -> std::result::Result<Vec<u8>, String> {
         let mut reader = resp.body_mut().as_reader();
         let mut limited = (&mut reader).take(MAX_TOTAL_BYTES.saturating_add(1));
         limited.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
-        if bytes.len() > MAX_TOTAL_BYTES as usize {
+        if bytes.len() > len_as_usize(MAX_TOTAL_BYTES) {
             return Err(format!("size limit exceeded for `{url}`"));
         }
         return Ok(bytes);
@@ -2864,7 +2917,7 @@ pub fn enable_skill(
                 registry,
                 instance_skills_dir,
                 mode,
-                &[skill_id.clone()],
+                std::slice::from_ref(skill_id),
                 adapter,
             )?;
         }
@@ -2948,13 +3001,17 @@ pub fn disable_skill(
                     reason: format!("{e}"),
                 }
             })?;
-        drop(std::fs::create_dir_all(
+        let quarantine_base =
             superai_config::quarantine::quarantine_base().map_err(|e| CoreError::InvalidPath {
                 kind: "quarantine".to_owned(),
                 value: "quarantine_base".to_owned(),
                 reason: format!("{e}"),
-            })?,
-        ));
+            })?;
+        std::fs::create_dir_all(&quarantine_base).map_err(|e| CoreError::InvalidPath {
+            kind: "quarantine".to_owned(),
+            value: quarantine_base.display().to_string(),
+            reason: format!("cannot create quarantine base: {e}"),
+        })?;
         match std::fs::rename(&dest, &quarantine_dest) {
             Ok(()) => {}
             // Cross-device quarantine targets cannot be renamed into.
@@ -3022,8 +3079,9 @@ pub fn set_skill_enabled_via_config(
     let surface_path = config_root.join(&decl.surface_id);
     // The adapter's declared surface kind wins over extension inference
     // (e.g. amp's `settings.json` is a JSONC document).
-    let kind = crate::raw_editor::surface_for_path(adapter, &surface_path)
-        .map(|surface| match surface.kind {
+    let kind = crate::raw_editor::surface_for_path(adapter, &surface_path).map_or_else(
+        || superai_config::document::DocumentKind::from_path(&surface_path),
+        |surface| match surface.kind {
             crate::adapter::DocumentKind::Json => {
                 superai_config::document::DocumentKind::StrictJson
             }
@@ -3035,8 +3093,8 @@ pub fn set_skill_enabled_via_config(
                 superai_config::document::DocumentKind::TextFragment
             }
             _ => superai_config::document::DocumentKind::from_path(&surface_path),
-        })
-        .unwrap_or_else(|| superai_config::document::DocumentKind::from_path(&surface_path));
+        },
+    );
     // Fresh semantic read of the surface (disk is truth).
     let current = load_surface_value_for_config(&surface_path, kind)?;
     let mut changes = Vec::new();
@@ -3249,32 +3307,29 @@ pub fn find_consumers(
     let mut consumers = Vec::new();
     let src = registry.root.join(skill_id.as_str());
     for dir in instance_skills_dirs {
-        if let Ok(meta) = std::fs::symlink_metadata(dir) {
-            if meta.file_type().is_symlink() {
-                if let Ok(target) = std::fs::read_link(dir) {
-                    if target == registry.root {
-                        consumers.push(Consumer {
-                            display: dir.display().to_string(),
-                            path: dir.clone(),
-                            mode: "LinkAll".to_owned(),
-                        });
-                        continue;
-                    }
-                }
-            }
+        if let Ok(meta) = std::fs::symlink_metadata(dir)
+            && meta.file_type().is_symlink()
+            && let Ok(target) = std::fs::read_link(dir)
+            && target == registry.root
+        {
+            consumers.push(Consumer {
+                display: dir.display().to_string(),
+                path: dir.clone(),
+                mode: "LinkAll".to_owned(),
+            });
+            continue;
         }
         let candidate = dir.join(skill_id.as_str());
         if let Ok(meta) = std::fs::symlink_metadata(&candidate) {
             if meta.file_type().is_symlink() {
-                if let Ok(target) = std::fs::read_link(&candidate) {
-                    if target == src {
-                        consumers.push(Consumer {
-                            display: candidate.display().to_string(),
-                            path: candidate,
-                            mode: "LinkSelected".to_owned(),
-                        });
-                        continue;
-                    }
+                if let Ok(target) = std::fs::read_link(&candidate)
+                    && target == src
+                {
+                    consumers.push(Consumer {
+                        display: candidate.display().to_string(),
+                        path: candidate,
+                        mode: "LinkSelected".to_owned(),
+                    });
                 }
                 // A symlink elsewhere is foreign, not a consumer.
             } else if meta.is_dir() {
@@ -3364,14 +3419,32 @@ pub fn provenance_path_for(
 }
 
 /// Load the recorded provenance for `(skill, destination)`, if any (EXT-05).
+/// A file that exists but cannot be read or parsed is an error: treating it
+/// as absent would skip the drift guard and overwrite local edits.
 fn load_provenance(
     registry_root: &Path,
     skill_id: &SkillId,
     instance_skills_dir: &Path,
-) -> Option<CopyProvenance> {
+) -> Result<Option<CopyProvenance>> {
     let path = provenance_path_for(registry_root, skill_id, instance_skills_dir);
-    let bytes = std::fs::read(path).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(CoreError::InvalidPath {
+                kind: "skill_provenance".to_owned(),
+                value: path.display().to_string(),
+                reason: format!("read failed: {e}"),
+            });
+        }
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|e| CoreError::InvalidPath {
+            kind: "skill_provenance".to_owned(),
+            value: path.display().to_string(),
+            reason: format!("parse failed: {e}"),
+        })
 }
 
 /// Drift preview for re-copying selected skills to a destination (EXT-05).
@@ -3403,7 +3476,7 @@ pub fn preview_reapply_copies(
             });
         }
         let dest = instance_skills_dir.join(skill_id.as_str());
-        let Some(provenance) = load_provenance(&registry.root, skill_id, instance_skills_dir)
+        let Some(provenance) = load_provenance(&registry.root, skill_id, instance_skills_dir)?
         else {
             previews.push(CopyUpdatePreview {
                 skill_id: skill_id.clone(),
@@ -3452,45 +3525,7 @@ pub fn preview_reapply_copies(
     Ok(previews)
 }
 
-/// Install a skill from `source` into the registry rooted at `root`:
-/// `SkillRegistry::load` + `install_skill` in one call.
-pub fn install_skill(root: &Path, source: &SkillSource) -> Result<SkillRecord> {
-    let mut registry = SkillRegistry::load(root)?;
-    registry.install_skill(source, true)
-}
-
-/// List all skills in the registry at `root`.
-pub fn list_skills(root: &Path) -> Result<Vec<SkillRecord>> {
-    let registry = SkillRegistry::load(root)?;
-    Ok(registry.list().to_vec())
-}
-
-/// Get a skill by its string id from the registry at `root`, `Ok(None)` if
-/// not found.
-pub fn get_skill(root: &Path, id: &str) -> Result<Option<SkillRecord>> {
-    let registry = SkillRegistry::load(root)?;
-    Ok(registry.get(id).cloned())
-}
-
-/// Update a skill at `root`; a `None` source re-fetches the recorded
-/// locator. Preview and commit run with conflict detection.
-pub fn update_skill(
-    root: &Path,
-    skill_id: &SkillId,
-    new_source: Option<&SkillSource>,
-) -> Result<SkillRecord> {
-    let mut registry = SkillRegistry::load(root)?;
-    registry.update_skill(skill_id, new_source)
-}
-
 #[cfg(test)]
-#[expect(
-    clippy::if_not_else,
-    clippy::needless_borrows_for_generic_args,
-    clippy::similar_names,
-    clippy::unnecessary_map_or,
-    reason = "staging fixtures keep short local names and explicit conditionals"
-)]
 mod tests {
     use super::*;
     use crate::adapter::{GenericAdapter, ProductStatus};
@@ -3508,8 +3543,30 @@ mod tests {
         std::fs::write(dir.join(SKILL_MD_NAME), content).unwrap();
     }
 
+    /// One-shot registry ops against `root` (the deleted free-fn wrappers,
+    /// kept as test-local helpers over the single public path).
+    fn install_skill(root: &Path, source: &SkillSource) -> Result<SkillRecord> {
+        SkillRegistry::load(root)?.install_skill(source, true)
+    }
+
+    fn list_skills(root: &Path) -> Result<Vec<SkillRecord>> {
+        Ok(SkillRegistry::load(root)?.list().to_vec())
+    }
+
+    fn get_skill(root: &Path, id: &str) -> Result<Option<SkillRecord>> {
+        Ok(SkillRegistry::load(root)?.get(id).cloned())
+    }
+
+    fn update_skill(
+        root: &Path,
+        skill_id: &SkillId,
+        new_source: Option<&SkillSource>,
+    ) -> Result<SkillRecord> {
+        SkillRegistry::load(root)?.update_skill(skill_id, new_source)
+    }
+
     fn make_skill_dir(parent: &Path, name: &str) -> PathBuf {
-        let dir = parent.join(format!("src-{}", name));
+        let dir = parent.join(format!("src-{name}"));
         drop(std::fs::remove_dir_all(&dir));
         std::fs::create_dir_all(&dir).unwrap();
         write_skill_md(&dir, name, &format!("description for {name}"));
@@ -3523,11 +3580,8 @@ mod tests {
         collect_files_recursive(root, &mut all).unwrap();
         let mut snap: Vec<(PathBuf, Vec<u8>)> = Vec::new();
         for p in all {
-            if std::fs::symlink_metadata(&p)
-                .map(|m| m.is_file())
-                .unwrap_or(false)
-            {
-                snap.push((p.clone(), std::fs::read(&p).unwrap()));
+            if p.meta.is_file() {
+                snap.push((p.path.clone(), std::fs::read(&p.path).unwrap()));
             }
         }
         snap.sort_by(|a, b| a.0.cmp(&b.0));
@@ -3758,10 +3812,7 @@ mod tests {
         drop(std::fs::remove_dir_all(&root));
         drop(std::fs::remove_dir_all(&src_parent));
         if instance_dir.exists() {
-            if std::fs::symlink_metadata(&instance_dir)
-                .map(|m| m.file_type().is_symlink())
-                .unwrap_or(false)
-            {
+            if std::fs::symlink_metadata(&instance_dir).is_ok_and(|m| m.file_type().is_symlink()) {
                 drop(std::fs::remove_file(&instance_dir));
             } else {
                 drop(std::fs::remove_dir_all(&instance_dir));
@@ -3794,7 +3845,7 @@ mod tests {
             &reg,
             &instance_dir,
             SkillMode::LinkSelected,
-            &[id_a.clone()],
+            std::slice::from_ref(&id_a),
             &adapter,
         )
         .unwrap();
@@ -3910,7 +3961,7 @@ mod tests {
             &reg,
             &instance_dir,
             SkillMode::LinkSelected,
-            &[id.clone()],
+            std::slice::from_ref(&id),
             &adapter,
         )
         .unwrap();
@@ -3923,7 +3974,7 @@ mod tests {
             &reg,
             &instance_dir,
             SkillMode::CopySelected,
-            &[id.clone()],
+            std::slice::from_ref(&id),
             &adapter,
         )
         .unwrap();
@@ -3935,11 +3986,11 @@ mod tests {
             &reg,
             &instance_dir,
             SkillMode::CopySelected,
-            &[id.clone()],
+            std::slice::from_ref(&id),
             &adapter,
         )
         .unwrap();
-        let consumers = find_consumers(&reg, &id, &[instance_dir.clone()]);
+        let consumers = find_consumers(&reg, &id, std::slice::from_ref(&instance_dir));
         assert!(!consumers.is_empty());
         assert_eq!(consumers[0].mode, "CopySelected");
         let err = reg.remove_skill(&id, false, &consumers).unwrap_err();
@@ -3976,7 +4027,7 @@ mod tests {
             &reg,
             &instance_dir,
             SkillMode::CopySelected,
-            &[id.clone()],
+            std::slice::from_ref(&id),
             &adapter,
         )
         .unwrap();
@@ -3992,60 +4043,51 @@ mod tests {
             check_drift(&prov, &reg, &dest).unwrap(),
             DriftStatus::LocallyModified
         );
-        let _src2 = make_skill_dir(&src_parent, "drift-skill-v2");
-        let src_updated = src_parent.join("drift-skill-updated");
-        drop(std::fs::remove_dir_all(&src_updated));
-        std::fs::create_dir_all(&src_updated).unwrap();
-        write_skill_md(
-            &src_updated,
-            "drift-skill",
-            "updated description for drift-skill",
-        );
-        std::fs::write(src_updated.join("newfile.txt"), "new").unwrap();
-        let new_source = SkillSource::local_dir(src_updated.to_str().unwrap());
-        let preview = reg.preview_update(&id, Some(&new_source)).unwrap();
-        assert!(
-            preview.has_local_edits
-                || !preview.conflicts.is_empty()
-                || !preview.can_auto_apply
-                || preview.diff.iter().any(|d| d.contains("newfile"))
-        );
-        if !preview.can_auto_apply {
-            let err = reg
-                .commit_update(&id, Some(&new_source), &preview)
-                .unwrap_err();
-            let msg = format!("{err:?}");
-            assert!(msg.contains("conflict") || msg.contains("local"));
-        } else {
-            // if no conflict, it would auto-apply (maybe dest digest already equals new? but we changed dest so should be conflict)
-            // This branch is okay
-        }
-        let root2 = unique_root("drift_already_root");
-        std::fs::create_dir_all(&root2).unwrap();
-        let src_a = make_skill_dir(&src_parent, "already-skill");
-        let mut reg2 = SkillRegistry::load(&root2).unwrap();
-        let rec2 = reg2
-            .install_skill(&SkillSource::local_dir(src_a.to_str().unwrap()), true)
-            .unwrap();
-        let id2 = rec2.id;
-        let provs2 = apply_skill_mode(
-            &reg2,
+        // Re-applying over the locally modified copy must be a typed
+        // conflict, never a silent overwrite (EXT-05).
+        let err = apply_skill_mode(
+            &reg,
             &instance_dir,
             SkillMode::CopySelected,
-            &[id2],
+            std::slice::from_ref(&id),
+            &adapter,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, CoreError::ConcurrentModification { .. }),
+            "expected ConcurrentModification for locally modified copy, got {err:?}"
+        );
+        // The user's modification survived the refused apply.
+        assert_eq!(
+            std::fs::read_to_string(dest.join(SKILL_MD_NAME)).unwrap(),
+            "---\nname: drift-skill\ndescription: modified\n---\nmodified\n"
+        );
+
+        let second_root = unique_root("drift_already_root");
+        std::fs::create_dir_all(&second_root).unwrap();
+        let src_a = make_skill_dir(&src_parent, "already-skill");
+        let mut second_reg = SkillRegistry::load(&second_root).unwrap();
+        let already_rec = second_reg
+            .install_skill(&SkillSource::local_dir(src_a.to_str().unwrap()), true)
+            .unwrap();
+        let provs = apply_skill_mode(
+            &second_reg,
+            &instance_dir,
+            SkillMode::CopySelected,
+            std::slice::from_ref(&already_rec.id),
             &adapter,
         )
         .unwrap();
-        // The AlreadyUpdated case would need provenance surgery; check the missing case here.
-        drop(std::fs::remove_dir_all(&instance_dir.join("already-skill")));
-        let prov2 = &provs2[0];
+        // The AlreadyUpdated case would need provenance surgery; check the
+        // missing case here.
+        drop(std::fs::remove_dir_all(instance_dir.join("already-skill")));
         assert_eq!(
-            check_drift(prov2, &reg2, &instance_dir.join("already-skill")).unwrap(),
+            check_drift(&provs[0], &second_reg, &instance_dir.join("already-skill")).unwrap(),
             DriftStatus::Missing
         );
 
         drop(std::fs::remove_dir_all(&root));
-        drop(std::fs::remove_dir_all(&root2));
+        drop(std::fs::remove_dir_all(&second_root));
         drop(std::fs::remove_dir_all(&src_parent));
         drop(std::fs::remove_dir_all(&instance_dir));
         // keep rec unused warning
@@ -4075,7 +4117,7 @@ mod tests {
         std::fs::create_dir_all(&src_big).unwrap();
         write_skill_md(&src_big, "big-file-skill", "test big file");
         let big_path = src_big.join("big.bin");
-        let size = (MAX_SINGLE_FILE_BYTES + 1) as usize;
+        let size = usize::try_from(MAX_SINGLE_FILE_BYTES + 1).unwrap();
         let big_bytes = vec![b'a'; size];
         std::fs::write(&big_path, &big_bytes).unwrap();
         let source_big = SkillSource::local_dir(src_big.to_str().unwrap());
@@ -4087,7 +4129,7 @@ mod tests {
         std::fs::create_dir_all(&src_exact).unwrap();
         write_skill_md(&src_exact, "exact-file-skill", "exact");
         let exact_path = src_exact.join("exact.bin");
-        let exact_bytes = vec![b'b'; MAX_SINGLE_FILE_BYTES as usize];
+        let exact_bytes = vec![b'b'; usize::try_from(MAX_SINGLE_FILE_BYTES).unwrap()];
         std::fs::write(&exact_path, &exact_bytes).unwrap();
         let source_exact = SkillSource::local_dir(src_exact.to_str().unwrap());
         let rec = reg.install_skill(&source_exact, true).unwrap();
@@ -4148,7 +4190,7 @@ mod tests {
             &reg2,
             &instance_dir,
             SkillMode::LinkSelected,
-            &[id.clone()],
+            std::slice::from_ref(&id),
             &adapter,
         )
         .unwrap();
@@ -4201,7 +4243,7 @@ mod tests {
             &reg,
             &instance_dir,
             SkillMode::CopySelected,
-            &[id.clone()],
+            std::slice::from_ref(&id),
             &adapter,
         )
         .unwrap();
@@ -4273,7 +4315,7 @@ mod tests {
             &reg,
             &instance_dir,
             SkillMode::LinkSelected,
-            &[id.clone()],
+            std::slice::from_ref(&id),
             &single_adapter,
         )
         .unwrap_err();
@@ -4289,10 +4331,14 @@ mod tests {
         .unwrap();
         assert!(instance_dir.join("win-skill").exists());
 
-        // Windows privilege cannot be triggered on Linux; pin the hint
-        // text the privilege error must carry.
-        let fake_priv_msg = "symlink creation failed due to privilege (Windows): operation not permitted. Use CopySelected as explicit alternate";
-        assert!(fake_priv_msg.contains("CopySelected"));
+        // Windows privilege cannot be triggered on Linux; pin the
+        // classifier that routes such failures to the CopySelected hint.
+        assert!(is_link_privilege_error(
+            "operation requires elevation (os error 1314)"
+        ));
+        assert!(is_link_privilege_error("Privilege not held"));
+        assert!(!is_link_privilege_error("os error 2: no such file"));
+        assert!(COPY_SELECTED_HINT.contains("CopySelected"));
 
         drop(std::fs::remove_dir_all(&root));
         drop(std::fs::remove_dir_all(&src_parent));
@@ -4472,7 +4518,6 @@ mod tests {
             has_local_edits: false,
             diff: Vec::new(),
             conflicts: Vec::new(),
-            drift: None,
             can_auto_apply: true,
         };
         let err = reg
@@ -4603,7 +4648,10 @@ mod tests {
             let full = crate::process::ExecuteOpts { env, ..opts };
             let out = crate::process::run_command(
                 "git",
-                &args.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+                &args
+                    .iter()
+                    .map(std::string::ToString::to_string)
+                    .collect::<Vec<_>>(),
                 &full,
             )
             .unwrap();
@@ -4757,8 +4805,7 @@ mod tests {
         assert!(
             doc2["amp"]["skills"]
                 .get("path")
-                .map_or(true, |p| p.as_str()
-                    != Some(root.to_string_lossy().as_ref())),
+                .is_none_or(|p| p.as_str() != Some(root.to_string_lossy().as_ref())),
             "{doc2}"
         );
 
@@ -4810,7 +4857,7 @@ mod tests {
             &reg,
             &instance_dir,
             SkillMode::CopySelected,
-            &[id.clone()],
+            std::slice::from_ref(&id),
             &adapter,
         )
         .unwrap();
@@ -4818,7 +4865,8 @@ mod tests {
 
         let modified = "---\nname: recopy-skill\ndescription: edited locally\n---\nlocal edit\n";
         std::fs::write(dest.join(SKILL_MD_NAME), modified).unwrap();
-        let previews = preview_reapply_copies(&reg, &instance_dir, &[id.clone()]).unwrap();
+        let previews =
+            preview_reapply_copies(&reg, &instance_dir, std::slice::from_ref(&id)).unwrap();
         assert_eq!(previews.len(), 1);
         assert_eq!(previews[0].drift, DriftStatus::LocallyModified);
         assert!(!previews[0].can_apply);
@@ -4834,7 +4882,7 @@ mod tests {
             &reg,
             &instance_dir,
             SkillMode::CopySelected,
-            &[id.clone()],
+            std::slice::from_ref(&id),
             &adapter,
         )
         .unwrap_err();
@@ -4852,20 +4900,22 @@ mod tests {
         // (rewrite the canonical content so drift is clean again)
         let canonical = std::fs::read_to_string(src.join(SKILL_MD_NAME)).unwrap();
         std::fs::write(dest.join(SKILL_MD_NAME), canonical).unwrap();
-        let previews2 = preview_reapply_copies(&reg, &instance_dir, &[id.clone()]).unwrap();
+        let previews2 =
+            preview_reapply_copies(&reg, &instance_dir, std::slice::from_ref(&id)).unwrap();
         assert_eq!(previews2[0].drift, DriftStatus::Clean);
         assert!(previews2[0].can_apply);
         apply_skill_mode(
             &reg,
             &instance_dir,
             SkillMode::CopySelected,
-            &[id.clone()],
+            std::slice::from_ref(&id),
             &adapter,
         )
         .unwrap();
 
         drop(std::fs::remove_dir_all(&dest));
-        let previews3 = preview_reapply_copies(&reg, &instance_dir, &[id.clone()]).unwrap();
+        let previews3 =
+            preview_reapply_copies(&reg, &instance_dir, std::slice::from_ref(&id)).unwrap();
         assert_eq!(previews3[0].drift, DriftStatus::Missing);
         assert!(previews3[0].can_apply);
         apply_skill_mode(

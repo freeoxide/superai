@@ -1,5 +1,5 @@
-//! Nanocoder adapter: relocated root via `NANOCODER_CONFIG_DIR`, explicit
-//! file overrides via `NANOCODER_PROVIDERS_FILE`/`NANOCODER_MCPSERVERS_FILE`.
+//! Nanocoder adapter: relocated root via `NANOCODER_CONFIG_DIR`; the
+//! `*_FILE` env vars surface in detection evidence and wrapper text only.
 
 use std::path::{Path, PathBuf};
 
@@ -13,34 +13,34 @@ use crate::ids::HarnessId;
 use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence, Isolation};
 
-/// Harness identifier for Nanocoder.
+/// Harness id this adapter registers under.
 pub const HARNESS_ID_STR: &str = "nanocoder";
 
-/// Human display name.
+/// Name the adapter's `display_name()` reports.
 pub const DISPLAY_NAME: &str = "Nanocoder";
 
-/// Primary executable name.
+/// Primary executable probed during detection.
 pub const EXECUTABLE: &str = "nanocoder";
 
-/// Environment variable that relocates the config root.
+/// Env var relocating the config root for detection and wrapper plans.
 pub const CONFIG_ENV_VAR: &str = "NANOCODER_CONFIG_DIR";
 
-/// Explicit providers file override.
+/// Env var whose presence detection reports; no code resolves a file
+/// through it.
 pub const PROVIDERS_ENV_VAR: &str = "NANOCODER_PROVIDERS_FILE";
 
-/// Explicit MCP servers file override.
+/// Env var whose presence detection reports; no code resolves a file
+/// through it.
 pub const MCPSERVERS_ENV_VAR: &str = "NANOCODER_MCPSERVERS_FILE";
 
-/// Default config root when `NANOCODER_CONFIG_DIR` is unset.
-pub const DEFAULT_CONFIG_ROOT_FALLBACK: &str = "~/.config/nanocoder";
-
-/// Research document link.
+/// Research source for the declarations in this file; returned by
+/// `research_doc_link()`.
 pub const RESEARCH_DOC: &str = "docs/harness-configs/nanocoder.md";
 
-/// Last verified date.
+/// Date `last_verified_date()` reports.
 pub const LAST_VERIFIED: &str = "2026-08-25";
 
-/// Schema version for current config shape.
+/// Config shape version `version_resolution()` maps detected versions to.
 pub const SCHEMA_VERSION_STR: &str = "1";
 
 /// Owned selectors for provider/model/mcp mutation.
@@ -53,8 +53,8 @@ pub const OWNED_SELECTORS: &[&str] = &[
     "preferences",
 ];
 
-/// Concrete adapter for Nanocoder: `relocated-root` via `NANOCODER_CONFIG_DIR`
-/// plus explicit file overrides `NANOCODER_PROVIDERS_FILE`/`NANOCODER_MCPSERVERS_FILE`.
+/// Concrete adapter for Nanocoder: detection scans the relocated root's
+/// JSON files; wrapper plans pin the root through `NANOCODER_CONFIG_DIR`.
 #[derive(Debug, Clone)]
 pub struct NanocoderAdapter {
     id: HarnessId,
@@ -67,17 +67,17 @@ impl NanocoderAdapter {
         Ok(Self { id })
     }
 
-    /// Borrow the harness id.
+    /// The harness id this adapter validates instances against.
     pub fn harness_id(&self) -> &HarnessId {
         &self.id
     }
 
-    /// Executable name for this harness.
+    /// Executable probed during detection.
     pub fn executable_name(&self) -> &str {
         EXECUTABLE
     }
 
-    /// Config relocation env var.
+    /// Env var callers may set to relocate the config root.
     pub fn config_env_var(&self) -> &str {
         CONFIG_ENV_VAR
     }
@@ -188,8 +188,7 @@ impl NanocoderAdapter {
 
 impl Default for NanocoderAdapter {
     fn default() -> Self {
-        #[expect(clippy::unwrap_used, reason = "nanocoder is static valid HarnessId")]
-        let id = HarnessId::new(HARNESS_ID_STR).unwrap();
+        let id = HarnessId::from_validated_const(HARNESS_ID_STR);
         Self { id }
     }
 }
@@ -519,7 +518,7 @@ impl Adapter for NanocoderAdapter {
         ]
     }
 
-    /// Home-dir `.mcp.json`, overridable via the `NANOCODER_MCPSERVERS` env vars.
+    /// Home-dir `.mcp.json` under the resolved root; no file override exists.
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(crate::adapter::McpAdapterDecl::new(
             ".mcp.json",

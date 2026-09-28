@@ -155,20 +155,26 @@ pub(crate) fn parse_version_output(output: &str) -> Option<String> {
     None
 }
 
-/// Run `<binary> --version` under a 2s budget and parse the version from the
-/// combined output. A hung child outlives the budget; its thread dies with it.
-pub(crate) fn probe_version(binary: &Path) -> Option<String> {
+/// Run `<binary> args...` under `budget` and return the combined stdout and
+/// stderr. A hung child outlives the budget; its thread dies with it.
+pub(crate) fn run_capturing(binary: &Path, args: &[&str], budget: Duration) -> Option<String> {
     let owned = binary.to_path_buf();
+    let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
     let (tx, rx) = mpsc::channel();
+    // The send Result is the closure's value: a timed-out caller has dropped
+    // the receiver, and that failure is expected, not an error to log.
     thread::spawn(move || {
-        let output = Command::new(&owned)
-            .arg("--version")
+        let mut command = Command::new(&owned);
+        for arg in &args {
+            command.arg(arg);
+        }
+        let output = command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output();
-        drop(tx.send(output));
+        tx.send(output)
     });
-    let Ok(Ok(output)) = rx.recv_timeout(Duration::from_secs(2)) else {
+    let Ok(Ok(output)) = rx.recv_timeout(budget) else {
         return None;
     };
     if !output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
@@ -176,14 +182,23 @@ pub(crate) fn probe_version(binary: &Path) -> Option<String> {
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let combined = if stdout.trim().is_empty() {
+    Some(if stdout.trim().is_empty() {
         stderr.into_owned()
     } else if stderr.trim().is_empty() {
         stdout.into_owned()
     } else {
         format!("{stdout} {stderr}")
-    };
-    parse_version_output(&combined)
+    })
+}
+
+/// Run `<binary> --version` under a 2s budget and parse the version from the
+/// combined output.
+pub(crate) fn probe_version(binary: &Path) -> Option<String> {
+    parse_version_output(&run_capturing(
+        binary,
+        &["--version"],
+        Duration::from_secs(2),
+    )?)
 }
 
 #[cfg(test)]
