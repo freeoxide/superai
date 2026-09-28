@@ -658,9 +658,23 @@ mod tests {
 
     #[test]
     fn mutant_template_selector_traversal_is_rejected() {
+        // Selector::parse accepts names verbatim by design (the executor's
+        // ownership checks enforce traversal safety), so the selector-layer
+        // property is: no panic, and no reinterpretation on round-trip. The
+        // path boundary must refuse traversal outright.
         let traversals = ["../", "a/../b", "..\\", "key:../escape", "table:../"];
         for t in traversals {
-            drop(Selector::parse(t));
+            let selector = match Selector::parse(t) {
+                Ok(selector) => selector,
+                Err(err) => panic!("selector parse rejected {t:?}: {err}"),
+            };
+            let serialized = selector.to_typed_string();
+            let reparsed = Selector::parse(&serialized).expect("typed string must re-parse");
+            assert_eq!(
+                reparsed.to_typed_string(),
+                serialized,
+                "traversal selector must round-trip unchanged: {t:?}"
+            );
         }
         assert!(validate_quarantine_target(&std::env::temp_dir().join("../etc")).is_err());
         assert!(validate_quarantine_target(std::path::Path::new("relative")).is_err());

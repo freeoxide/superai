@@ -144,7 +144,8 @@ pub struct Diagnostic {
     pub col: usize,
     /// Severity (DOC-09); syntax diagnostics default to `Error`.
     pub severity: DiagnosticSeverity,
-    /// Plain text; the location lives in `line`/`col`, never in the message.
+    /// What went wrong, as display text (it may repeat the location in
+    /// words); `line`/`col` carry the span in machine-readable form.
     pub message: String,
 }
 

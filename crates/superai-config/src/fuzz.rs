@@ -15,7 +15,7 @@
 )]
 #![expect(
     clippy::case_sensitive_file_extension_comparisons,
-    reason = "extension casing is one of the fuzzed dimensions, so the comparisons must stay case-sensitive"
+    reason = "the firing site lowercases the file name before matching extensions, so it is already case-insensitive; the lint fires on the literal-ends-with shape alone"
 )]
 #![expect(
     clippy::cast_possible_truncation,
