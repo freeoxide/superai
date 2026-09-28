@@ -372,6 +372,14 @@ mod tests {
         let snap = snapshot(&path);
         assert!(snap.exists);
         assert!(snap.digest.is_some());
+        let mtime = snap.mtime.expect("an existing file must carry its mtime");
+        let age = SystemTime::now()
+            .duration_since(mtime)
+            .expect("snapshot mtime must not be in the future");
+        assert!(
+            age.as_secs() < 60,
+            "the snapshot mtime must be the file's own, got {mtime:?}"
+        );
         drop(std::fs::remove_file(&path));
     }
 

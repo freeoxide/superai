@@ -189,19 +189,18 @@ pub fn load_value(path: &Path) -> Result<Value> {
     parse_strict(&text, path)
 }
 
-/// Write normalized YAML; every changing write to an existing file is
-/// refused with `LossyWrite` before any disk mutation (DOC-06).
-pub fn store(path: &Path, config: &Map<String, Value>) -> Result<()> {
-    ensure_lossless_write(path)?;
-
-    let mut text = yaml_serde::to_string(config).map_err(|source| ConfigError::Yaml {
+fn yaml_text(path: &Path, value: impl serde::Serialize) -> Result<String> {
+    let mut text = yaml_serde::to_string(&value).map_err(|source| ConfigError::Yaml {
         path: path.to_path_buf(),
         source,
     })?;
     if !text.ends_with('\n') {
         text.push('\n');
     }
+    Ok(text)
+}
 
+fn commit_yaml(path: &Path, text: &str) -> Result<()> {
     crate::transaction::commit_file(
         "yaml-store",
         path,
@@ -211,25 +210,19 @@ pub fn store(path: &Path, config: &Map<String, Value>) -> Result<()> {
     Ok(())
 }
 
+/// Write normalized YAML; every changing write to an existing file is
+/// refused with `LossyWrite` before any disk mutation (DOC-06).
+pub fn store(path: &Path, config: &Map<String, Value>) -> Result<()> {
+    ensure_lossless_write(path)?;
+    let text = yaml_text(path, config)?;
+    commit_yaml(path, &text)
+}
+
 /// [`store`] for any root; same gate and boundary.
 pub fn store_value(path: &Path, value: &Value) -> Result<()> {
     ensure_lossless_write(path)?;
-
-    let mut text = yaml_serde::to_string(value).map_err(|source| ConfigError::Yaml {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    if !text.ends_with('\n') {
-        text.push('\n');
-    }
-
-    crate::transaction::commit_file(
-        "yaml-store",
-        path,
-        text.as_bytes(),
-        crate::document::DocumentKind::Yaml,
-    )?;
-    Ok(())
+    let text = yaml_text(path, value)?;
+    commit_yaml(path, &text)
 }
 
 /// Read fresh, apply `edit`, write back only if changed; changing edits on

@@ -11,14 +11,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::atomic::{
-    apply_mode, compute_digest, generate_random_suffix, resolve_final_mode, sync_parent,
-    timestamp_millis_now,
+    apply_mode, compute_digest, generate_temp_path, remove_temp, resolve_final_mode, sync_parent,
 };
 use crate::backup::{BackupEntry, backup_with_injector, verify_backup};
 use crate::document::{DocumentKind, validate_bytes_for_kind};
 use crate::error::{ConfigError, Result};
 use crate::injector::{Injector, Point};
 use crate::journal::{CrashJournal, JournalBackup, JournalPhase};
+use crate::safe_paths::home_dir;
 use crate::snapshot::{Snapshot, is_modified, snapshot};
 
 /// Stable operation identifier for quarantine and backup linkage.
@@ -153,7 +153,7 @@ pub fn validate_remove_target(path: &Path, kind: RemoveKind) -> Result<()> {
             ));
         }
     }
-    if s.contains('*') || s.contains('?') || s.contains('[') {
+    if crate::safe_paths::has_glob(path) {
         return Err(ConfigError::io(
             path,
             std::io::Error::new(
@@ -162,7 +162,7 @@ pub fn validate_remove_target(path: &Path, kind: RemoveKind) -> Result<()> {
             ),
         ));
     }
-    if s.contains('$') || s.contains('%') {
+    if crate::safe_paths::has_unresolved_variable(path) {
         return Err(ConfigError::io(
             path,
             std::io::Error::new(
@@ -171,29 +171,24 @@ pub fn validate_remove_target(path: &Path, kind: RemoveKind) -> Result<()> {
             ),
         ));
     }
-    reject_broad_or_home_roots(path, s)?;
+    reject_broad_or_home_roots(path)?;
     reject_kind_specific_target(path, kind, s)?;
     Ok(())
 }
 
 /// Refuse broad and home roots with platform case rules.
-fn reject_broad_or_home_roots(path: &Path, s: &str) -> Result<()> {
-    if s == "/" || s == "/home" || s == "/tmp" || s == "/usr" || s == "/etc" {
+fn reject_broad_or_home_roots(path: &Path) -> Result<()> {
+    let broad_message = if windows_shaped_broad_root(path) {
+        "refusing to remove broad windows root"
+    } else if crate::safe_paths::is_broad_root(path) {
+        "refusing to remove broad root"
+    } else {
+        ""
+    };
+    if !broad_message.is_empty() {
         return Err(ConfigError::io(
             path,
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "refusing to remove broad root",
-            ),
-        ));
-    }
-    if windows_shaped_broad_root(path) {
-        return Err(ConfigError::io(
-            path,
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "refusing to remove broad windows root",
-            ),
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, broad_message),
         ));
     }
     if let Some(home) = home_dir()
@@ -231,22 +226,6 @@ fn reject_kind_specific_target(path: &Path, kind: RemoveKind, s: &str) -> Result
         }
     }
     Ok(())
-}
-
-fn home_dir() -> Option<PathBuf> {
-    if let Some(home) = std::env::var_os("HOME") {
-        let p = PathBuf::from(home);
-        if p.is_absolute() {
-            return Some(p);
-        }
-    }
-    if let Some(userprofile) = std::env::var_os("USERPROFILE") {
-        let p = PathBuf::from(userprofile);
-        if p.is_absolute() {
-            return Some(p);
-        }
-    }
-    None
 }
 
 /// Whether `s` looks like a Windows path (drive or UNC), regardless of host.
@@ -413,22 +392,6 @@ impl FileAction {
     }
 }
 
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "kept Result for fallible future use"
-)]
-fn generate_temp_path(target: &Path) -> Result<PathBuf> {
-    let parent = target.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = target
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("file");
-    let millis = timestamp_millis_now();
-    let suffix = generate_random_suffix(millis);
-    let tmp_name = format!(".tmp.{file_name}.{suffix}.{millis}");
-    Ok(parent.join(tmp_name))
-}
-
 /// Unix (device, inode) identity following links first, so paths converging
 /// through links count as one target (MUT-02).
 #[cfg(unix)]
@@ -478,7 +441,7 @@ pub fn stage_temp_file(
     let mut final_temp = PathBuf::new();
     let mut file: Option<std::fs::File> = None;
     for _ in 0..5 {
-        let candidate = generate_temp_path(target)?;
+        let candidate = generate_temp_path(target);
         match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -505,7 +468,7 @@ pub fn stage_temp_file(
     // Permissions land while empty (umask cannot widen them) through the held
     // fd, so a swapped name cannot misdirect the chmod.
     if let Err(e) = apply_mode(&f, &final_temp, resolve_final_mode(target, None)) {
-        drop(std::fs::remove_file(&final_temp));
+        remove_temp(&final_temp);
         return Err(e);
     }
     {
@@ -524,7 +487,7 @@ pub fn stage_temp_file(
         })();
         if let Err(e) = write_result {
             // A staging failure must never leak its half-written temp.
-            drop(std::fs::remove_file(&final_temp));
+            remove_temp(&final_temp);
             return Err(e);
         }
     }
@@ -592,7 +555,7 @@ pub fn commit_staged_file(
             if e.kind() == std::io::ErrorKind::CrossesDevices || e.raw_os_error() == Some(18) =>
         {
             std::fs::copy(staged, target).map_err(|copy_e| ConfigError::io(target, copy_e))?;
-            drop(std::fs::remove_file(staged));
+            remove_temp(staged);
         }
         Err(e) => return Err(ConfigError::io(target, e)),
     }
@@ -769,9 +732,15 @@ pub fn commit_file_expecting_with_roots(
     let verification = transaction.verify()?;
     if let Some(failed) = verification.iter().find(|v| !v.digest_ok || !v.parse_ok) {
         let message = failed.message.clone();
-        drop(transaction.rollback());
+        let rollback = transaction.rollback();
         cleanup_staged_temps(&transaction.staged_temps);
-        return Err(ConfigError::verification(target, message));
+        return match rollback {
+            Ok(_) => Err(ConfigError::verification(target, message)),
+            Err(e) => Err(ConfigError::verification(
+                target,
+                format!("{message}; rollback also failed: {e}"),
+            )),
+        };
     }
     let backup = commit_outcome.backups.into_iter().next();
     Ok(FileCommitReport {
@@ -784,7 +753,7 @@ pub fn commit_file_expecting_with_roots(
 fn cleanup_staged_temps(temps: &[PathBuf]) {
     for temp in temps {
         if temp.exists() {
-            drop(std::fs::remove_file(temp));
+            remove_temp(temp);
         }
     }
 }
@@ -1078,7 +1047,7 @@ fn validate_path_safety(path: &Path) -> Result<()> {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL"),
         ));
     }
-    if raw.contains('*') || raw.contains('?') || raw.contains('[') {
+    if crate::safe_paths::has_glob(path) {
         return Err(ConfigError::io(
             path,
             std::io::Error::new(
@@ -1087,7 +1056,7 @@ fn validate_path_safety(path: &Path) -> Result<()> {
             ),
         ));
     }
-    if raw.contains('$') || raw.contains('%') {
+    if crate::safe_paths::has_unresolved_variable(path) {
         return Err(ConfigError::io(
             path,
             std::io::Error::new(
@@ -1648,7 +1617,7 @@ impl Transaction {
                 // Non-journaled callers have no recovery sweep; failed
                 // staging must clean up after itself.
                 for temp in &staged {
-                    drop(std::fs::remove_file(temp));
+                    remove_temp(temp);
                 }
                 Err(e)
             }
@@ -1738,7 +1707,7 @@ impl Transaction {
 
         for temp in &self.staged_temps {
             if temp.exists() {
-                drop(std::fs::remove_file(temp));
+                remove_temp(temp);
             }
         }
 
@@ -1828,7 +1797,9 @@ impl Transaction {
         {
             use std::os::unix::fs::PermissionsExt;
             let perm = std::fs::Permissions::from_mode(0o755);
-            drop(std::fs::set_permissions(path, perm));
+            if let Err(e) = std::fs::set_permissions(path, perm) {
+                crate::atomic::warn_io("staging dir mode", path, &e);
+            }
         }
         self.inject(Point::ParentSync)?;
         sync_parent(path)?;
@@ -2125,7 +2096,7 @@ impl Transaction {
 
         for temp in &self.staged_temps {
             if temp.exists() {
-                drop(std::fs::remove_file(temp));
+                remove_temp(temp);
             }
         }
 
@@ -2258,6 +2229,8 @@ impl Transaction {
 )]
 mod tests {
     use super::*;
+    use crate::atomic::generate_random_suffix;
+
     use crate::document::strip_jsonc_comments;
     use crate::journal::{journal_path, recover_pending};
     use std::sync::Mutex;
@@ -4339,7 +4312,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn remove_target_rejects_every_broad_unix_root() {
-        for root in ["/", "/home", "/tmp", "/usr", "/etc"] {
+        // The shared safe_paths matrix owns the spellings; this asserts the
+        // remove-target path wires it in for every one of them.
+        for root in [
+            "/", "/home", "/home/", "/tmp", "/tmp/", "/usr", "/usr/", "/etc", "/etc/", "/var",
+            "/var/",
+        ] {
             assert!(
                 validate_remove_target(Path::new(root), RemoveKind::WrapperFile).is_err(),
                 "broad root {root} must be refused"

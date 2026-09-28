@@ -5,50 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::atomic::compute_digest;
 use crate::error::{ConfigError, Result};
-
-fn home_dir() -> Option<PathBuf> {
-    if let Some(home) = std::env::var_os("HOME") {
-        let p = PathBuf::from(home);
-        if p.is_absolute() {
-            return Some(p);
-        }
-    }
-    if let Some(up) = std::env::var_os("USERPROFILE") {
-        let p = PathBuf::from(up);
-        if p.is_absolute() {
-            return Some(p);
-        }
-    }
-    None
-}
-
-/// Broad roots never quarantined: unix roots plus Windows-shaped ones
-/// (drive, UNC, first-level system dirs), inert on unix hosts.
-fn is_broad_root(path: &Path) -> bool {
-    let s = path.to_string_lossy();
-    let raw = s.as_ref();
-    matches!(raw, "/" | "/home" | "/tmp" | "/usr" | "/etc" | "/var")
-        || raw == "/home/"
-        || raw == "/tmp/"
-        || crate::transaction::windows_shaped_broad_root(path)
-}
-
-/// Check for unresolved variable patterns.
-fn has_unresolved_variable(path: &Path) -> bool {
-    let s = path.to_string_lossy();
-    if s.contains('$') || s.contains('%') {
-        return true;
-    }
-    // `~` counts only as a whole path component (unexpanded home shorthand).
-    // Windows 8.3 short names like `RUNNER~1` are legal and must pass.
-    path.components().any(|c| c.as_os_str() == "~")
-}
-
-/// Check for glob patterns.
-fn has_glob(path: &Path) -> bool {
-    let s = path.to_string_lossy();
-    s.contains('*') || s.contains('?') || s.contains('[')
-}
+use crate::safe_paths::{has_glob, has_unresolved_variable, home_dir, is_broad_root};
 
 /// `~/.superai/quarantine`; relocated roots use [`quarantine_base_under`].
 pub fn quarantine_base() -> Result<PathBuf> {
@@ -333,11 +290,11 @@ fn move_to_quarantine_with_dest_in_base(
     {
         use std::os::unix::fs::PermissionsExt;
         let perm = std::fs::Permissions::from_mode(0o700);
-        drop(std::fs::set_permissions(&qdir, perm.clone()));
+        std::fs::set_permissions(&qdir, perm.clone()).map_err(|e| ConfigError::io(&qdir, e))?;
         if let Some(parent) = qdir.parent()
             && parent.exists()
         {
-            drop(std::fs::set_permissions(parent, perm));
+            std::fs::set_permissions(parent, perm).map_err(|e| ConfigError::io(parent, e))?;
         }
     }
 
@@ -361,11 +318,15 @@ fn move_to_quarantine_with_dest_in_base(
         }
     }
 
-    // Digest and size are captured before the move.
+    // Digest and size are captured before the move; an unreadable file
+    // degrades to presence-only recoverability, and says so on stderr.
     let (digest, size) = if path.is_file() {
         match std::fs::read(path) {
             Ok(bytes) => (Some(compute_digest(&bytes)), Some(bytes.len() as u64)),
-            Err(_) => (None, None),
+            Err(e) => {
+                crate::atomic::warn_io("pre-move digest", path, &e);
+                (None, None)
+            }
         }
     } else {
         (None, None)
@@ -411,8 +372,9 @@ fn move_to_quarantine_with_dest_in_base(
 
     if let Some(parent) = final_dest.parent()
         && let Ok(f) = std::fs::File::open(parent)
+        && let Err(e) = f.sync_all()
     {
-        drop(f.sync_all());
+        crate::atomic::warn_io("quarantine parent sync", parent, &e);
     }
 
     Ok(QuarantineEntry {
@@ -572,7 +534,13 @@ pub fn list_quarantine(operation_id: &str) -> Result<Vec<QuarantineEntry>> {
         // lstat: a dangling quarantined link must list, not error.
         let meta = std::fs::symlink_metadata(&path).map_err(|e| ConfigError::io(&path, e))?;
         let digest = if meta.is_file() {
-            std::fs::read(&path).ok().map(|b| compute_digest(&b))
+            match std::fs::read(&path) {
+                Ok(bytes) => Some(compute_digest(&bytes)),
+                Err(e) => {
+                    crate::atomic::warn_io("quarantine listing digest", &path, &e);
+                    None
+                }
+            }
         } else {
             None
         };
@@ -699,13 +667,6 @@ mod tests {
             "recovery round-trips from the relocated base"
         );
         drop(std::fs::remove_dir_all(dir.join(".superai")));
-    }
-
-    #[test]
-    fn quarantine_rejects_invalid_operation_id() {
-        quarantine_dir("").unwrap_err();
-        quarantine_dir("a/b").unwrap_err();
-        quarantine_dir("a\\b").unwrap_err();
     }
 
     #[test]

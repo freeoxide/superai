@@ -6,59 +6,60 @@ pub enum ConfigError {
     /// The file could not be read, written, or copied.
     #[error("io error on {path}: {source}")]
     Io {
-        /// Path the operation was attempted on.
+        /// Path as passed to the failing call, never canonicalized.
         path: PathBuf,
-        /// Underlying OS error.
+        /// OS error; match on its `kind()`, the message is not stable.
         source: std::io::Error,
     },
 
     /// The file exists but is not valid JSON.
     #[error("invalid json in {path}: {source}")]
     Json {
-        /// Path of the offending file.
+        /// File whose text failed to parse.
         path: PathBuf,
-        /// Parser error.
+        /// Parser error, positioned by line and column.
         source: serde_json::Error,
     },
 
     /// The file exists but is not valid TOML.
     #[error("invalid toml in {path}: {source}")]
     Toml {
-        /// Path of the offending file.
+        /// File whose text failed to parse.
         path: PathBuf,
-        /// Parser error.
+        /// Parser error; its Display embeds a snippet of the input, so do
+        /// not render it where secrets must not appear.
         source: toml_edit::TomlError,
     },
 
     /// The file exists but is not valid YAML.
     #[error("invalid yaml in {path}: {source}")]
     Yaml {
-        /// Path of the offending file.
+        /// File whose text failed to parse.
         path: PathBuf,
-        /// Parser error.
+        /// Parser error from the YAML codec.
         source: yaml_serde::Error,
     },
 
     /// The file exists but is not a valid env file.
     #[error("invalid env file in {path}: {message}")]
     Env {
-        /// Path of the offending file.
+        /// File whose lines failed the env shape check.
         path: PathBuf,
-        /// Human-readable message.
+        /// Line number and the missing piece; never the line contents.
         message: String,
     },
 
     /// A JSON config was expected to hold an object at its root.
     #[error("expected a json object at the root of {path}")]
     NotAnObject {
-        /// Path of the offending file.
+        /// File whose JSON root is not an object.
         path: PathBuf,
     },
 
     /// The file changed between preview and commit.
     #[error("concurrent modification of {path}: expected {expected}, actual {actual}")]
     ConcurrentModification {
-        /// Path that was concurrently modified.
+        /// File that changed between the preview and commit reads.
         path: PathBuf,
         /// Digest or metadata expected at preview time.
         expected: String,
@@ -69,18 +70,18 @@ pub enum ConfigError {
     /// Post-commit verification failed.
     #[error("verification failed for {path}: {reason}")]
     Verification {
-        /// Path that verification was attempted for.
+        /// File whose post-commit read-back failed.
         path: PathBuf,
-        /// Human-readable reason.
+        /// What mismatched; digests and sizes, never file contents.
         reason: String,
     },
 
     /// Backup verification failed.
     #[error("backup verification failed for {path}: {reason}")]
     BackupVerification {
-        /// Path that backup verification was attempted for.
+        /// Backup file or restore target involved in the failure.
         path: PathBuf,
-        /// Human-readable reason.
+        /// Digest or size mismatch details.
         reason: String,
     },
 
@@ -99,7 +100,7 @@ pub enum ConfigError {
     /// Selector outside the operation's `owned_keys` (DOC-02); nothing written.
     #[error("selector {selector} is not within the owned keys declared for {path}")]
     NotOwned {
-        /// Path of the document being edited.
+        /// Document the unowned selector was aimed at.
         path: PathBuf,
         /// The rejected selector (redacted when the operation's policy says so).
         selector: String,
@@ -108,7 +109,7 @@ pub enum ConfigError {
     /// `expected_old` mismatch (DOC-02); typed conflict, nothing written.
     #[error("operation conflict at {selector} in {path}: expected {expected}, found {actual}")]
     OperationConflict {
-        /// Path of the document being edited.
+        /// Document holding the conflicted selector.
         path: PathBuf,
         /// Selector the conflict occurred at (redacted when policy says so).
         selector: String,
@@ -121,7 +122,7 @@ pub enum ConfigError {
     /// Selector parent missing and `create_parent` disabled; nothing written.
     #[error("missing parent for {selector} in {path} and create_parent is disabled")]
     ParentMissing {
-        /// Path of the document being edited.
+        /// Document missing the selector's parent.
         path: PathBuf,
         /// Selector whose parent is missing (redacted when policy says so).
         selector: String,
@@ -130,22 +131,23 @@ pub enum ConfigError {
     /// Duplicate-handling mode rejects this edit; nothing written.
     #[error("duplicate rejected at {selector} in {path}: {reason}")]
     DuplicateRejected {
-        /// Path of the document being edited.
+        /// Document where the duplicate was found.
         path: PathBuf,
         /// Selector the duplicate was detected at.
         selector: String,
-        /// Which duplicate situation was rejected.
+        /// The mode that rejected it and the state that triggered it.
         reason: String,
     },
 
     /// Operation cannot apply to this kind/shape; callers fail closed.
     #[error("unsupported operation at {selector} on {path}: {reason}")]
     UnsupportedOperation {
-        /// Path of the document being edited.
+        /// Document the operation could not apply to.
         path: PathBuf,
         /// Selector the operation addressed.
         selector: String,
-        /// Why the operation is unsupported here.
+        /// The shape problem found at the selector, quoted segment by
+        /// segment; never the values along the way.
         reason: String,
     },
 

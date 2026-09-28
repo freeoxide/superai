@@ -1,14 +1,13 @@
 //! Raw editor backend (RAW-01..07): fresh reads, disk-free validation,
 //! redacted diffs, and commits that back up, replace atomically, and verify.
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet};
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 use toml_edit::DocumentMut;
 
+use crate::atomic::compute_digest;
 use crate::backup::{BackupEntry, backup_with_reason};
 use crate::document::{Diagnostic, DocumentKind, Encoding, NewlineStyle};
 use crate::error::{ConfigError, Result};
@@ -20,7 +19,7 @@ use crate::snapshot::{Snapshot, is_modified, snapshot};
 pub struct SensitiveContent(Vec<u8>);
 
 impl SensitiveContent {
-    /// Create from owned bytes.
+    /// Takes ownership without copying; nothing else holds the bytes.
     pub fn new(bytes: Vec<u8>) -> Self {
         Self(bytes)
     }
@@ -40,12 +39,12 @@ impl SensitiveContent {
         std::str::from_utf8(&self.0).ok()
     }
 
-    /// Length in bytes.
+    /// Length of the raw bytes, regardless of UTF-8 validity.
     pub fn len(&self) -> usize {
         self.0.len()
     }
 
-    /// Whether the content is empty.
+    /// Whether there are zero raw bytes.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
@@ -66,12 +65,6 @@ impl std::fmt::Display for SensitiveContent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("[REDACTED]")
     }
-}
-
-fn compute_digest(bytes: &[u8]) -> String {
-    let mut hasher = DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
 }
 
 fn detect_newline(bytes: &[u8]) -> NewlineStyle {
@@ -241,19 +234,20 @@ pub fn validate(content: &[u8], kind: DocumentKind) -> Vec<Diagnostic> {
 
     // Invalid UTF-8 is always a diagnostic, even for opaque fragments.
     let without_bom = bytes_without_bom(content);
-    if let Err(err) = std::str::from_utf8(without_bom) {
-        let valid_up_to = err.valid_up_to();
-        let (line, col) = offset_to_line_col(without_bom, valid_up_to);
-        let len = err.error_len().unwrap_or(1);
-        diagnostics.push(Diagnostic::new(
-            line,
-            col,
-            format!("invalid utf-8 at {line}:{col} ({len} byte(s))"),
-        ));
-        return diagnostics;
-    }
-
-    let text = std::str::from_utf8(without_bom).unwrap_or_default();
+    let text = match std::str::from_utf8(without_bom) {
+        Ok(text) => text,
+        Err(err) => {
+            let valid_up_to = err.valid_up_to();
+            let (line, col) = offset_to_line_col(without_bom, valid_up_to);
+            let len = err.error_len().unwrap_or(1);
+            diagnostics.push(Diagnostic::new(
+                line,
+                col,
+                format!("invalid utf-8 at {line}:{col} ({len} byte(s))"),
+            ));
+            return diagnostics;
+        }
+    };
     if text.trim().is_empty() {
         // RAW-05: the format decides whether empty is valid: TOML/YAML/env
         // have empty documents, JSON kinds require the explicit `{}`.
@@ -386,9 +380,8 @@ fn validate_env(text: &str) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
     // RAW-06: duplicate keys surface as last-wins warnings; they stay
     // non-blocking because env edits preserve duplicates on disk.
-    let lines: Vec<&str> = text.lines().collect();
     let mut seen: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-    for (idx, line) in lines.iter().enumerate() {
+    for (idx, line) in text.lines().enumerate() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
@@ -783,16 +776,12 @@ fn toml_semantic_diff(old: &[u8], new: &[u8]) -> Vec<SemanticOp> {
         return Vec::new();
     }
     let mut ops = Vec::new();
-    let mut keys: BTreeSet<String> = BTreeSet::new();
-    for (k, _) in old_doc.iter() {
-        keys.insert(k.to_owned());
-    }
-    for (k, _) in new_doc.iter() {
-        keys.insert(k.to_owned());
-    }
+    let mut keys: BTreeSet<&str> = BTreeSet::new();
+    keys.extend(old_doc.iter().map(|(k, _)| k));
+    keys.extend(new_doc.iter().map(|(k, _)| k));
     for key in keys {
-        let old_item = old_doc.get(&key);
-        let new_item = new_doc.get(&key);
+        let old_item = old_doc.get(key);
+        let new_item = new_doc.get(key);
         let old_s = old_item.map(ToString::to_string);
         let new_s = new_item.map(ToString::to_string);
         if old_s != new_s {
@@ -916,16 +905,12 @@ fn diff_env_maps(
     new: &BTreeMap<String, String>,
 ) -> Vec<SemanticOp> {
     let mut ops = Vec::new();
-    let mut keys: BTreeSet<String> = BTreeSet::new();
-    for k in old.keys() {
-        keys.insert(k.clone());
-    }
-    for k in new.keys() {
-        keys.insert(k.clone());
-    }
+    let mut keys: BTreeSet<&str> = BTreeSet::new();
+    keys.extend(old.keys().map(String::as_str));
+    keys.extend(new.keys().map(String::as_str));
     for key in keys {
-        let old_v = old.get(&key);
-        let new_v = new.get(&key);
+        let old_v = old.get(key);
+        let new_v = new.get(key);
         if old_v != new_v {
             ops.push(SemanticOp {
                 selector: format!("key:{key}"),
@@ -945,16 +930,12 @@ fn diff_json_values(old: &Value, new: &Value, prefix: String) -> Vec<SemanticOp>
     match (old, new) {
         (Value::Object(old_map), Value::Object(new_map)) => {
             let mut ops = Vec::new();
-            let mut keys: BTreeSet<String> = BTreeSet::new();
-            for k in old_map.keys() {
-                keys.insert(k.clone());
-            }
-            for k in new_map.keys() {
-                keys.insert(k.clone());
-            }
+            let mut keys: BTreeSet<&str> = BTreeSet::new();
+            keys.extend(old_map.keys().map(String::as_str));
+            keys.extend(new_map.keys().map(String::as_str));
             for key in keys {
-                let old_v = old_map.get(&key);
-                let new_v = new_map.get(&key);
+                let old_v = old_map.get(key);
+                let new_v = new_map.get(key);
                 let sel = if prefix.is_empty() {
                     format!("key:{key}")
                 } else {
@@ -1190,13 +1171,15 @@ pub fn create_file_with_injector(
     if !outcome.success {
         // Remove only paths this operation created, only while empty, deepest
         // first; the target did not exist at entry, so anything there is ours.
-        if path.exists() {
-            drop(std::fs::remove_file(path));
+        if path.exists()
+            && let Err(e) = std::fs::remove_file(path)
+        {
+            crate::atomic::warn_io("creation rollback", path, &e);
         }
         for dir in owned_ancestors.iter().rev() {
             let empty = std::fs::read_dir(dir).is_ok_and(|mut d| d.next().is_none());
-            if empty {
-                drop(std::fs::remove_dir(dir));
+            if empty && let Err(e) = std::fs::remove_dir(dir) {
+                crate::atomic::warn_io("creation rollback", dir, &e);
             }
         }
         return Err(ConfigError::io(
@@ -1466,7 +1449,9 @@ fn commit_inner(
     let token = expected_snapshot.unwrap_or(&current_snapshot);
     let staged = crate::transaction::stage_temp_file(path, new_content, None)?;
     if let Err(e) = crate::transaction::commit_staged_file(path, &staged, Some(token), None) {
-        drop(std::fs::remove_file(&staged));
+        if let Err(cleanup) = std::fs::remove_file(&staged) {
+            crate::atomic::warn_io("staged cleanup", &staged, &cleanup);
+        }
         return Err(e);
     }
 
@@ -1531,8 +1516,10 @@ mod tests {
         std::fs::write(&path, br#"{"api_key":"super-secret"}"#).unwrap();
         let doc = read(&path).unwrap();
         let dbg = format!("{doc:?}");
-        assert!(!dbg.contains("super-secret"));
-        assert!(dbg.contains("[REDACTED]") || !dbg.contains("super-secret"));
+        assert!(
+            !dbg.contains("super-secret") && dbg.contains("[REDACTED]"),
+            "the Debug output must be redacted: {dbg}"
+        );
         drop(std::fs::remove_file(&path));
     }
 
@@ -1809,12 +1796,17 @@ mod tests {
         let old = b"a: 1\nb: 2\n";
         let new = b"a: 1\nb: 2\n\n";
         let res = diff(old, new, DocumentKind::Yaml);
-        assert!(!res.lexical_unified_diff.is_empty() || res.is_noop || res.semantic_ops.is_empty());
-        let old_val = yaml_serde::from_str::<Value>(std::str::from_utf8(old).unwrap()).unwrap();
-        let new_val = yaml_serde::from_str::<Value>(std::str::from_utf8(new).unwrap()).unwrap();
-        if old_val == new_val {
-            assert!(res.semantic_ops.is_empty());
-        }
+        // The bytes differ only by a trailing newline, so the lexical diff
+        // must see them while the semantic layer reports no value change.
+        assert!(
+            !res.lexical_unified_diff.is_empty(),
+            "whitespace-only change must show lexically: {res:?}"
+        );
+        assert!(
+            res.semantic_ops.is_empty(),
+            "whitespace-only change must produce no semantic ops: {:?}",
+            res.semantic_ops
+        );
     }
 
     #[test]

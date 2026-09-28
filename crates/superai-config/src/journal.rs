@@ -63,7 +63,8 @@ pub struct JournalBackup {
 /// Minimal journal record written to disk; no secrets, no contents.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CrashJournal {
-    /// Operation id.
+    /// Transaction this journal belongs to; also names the file via
+    /// [`journal_path`].
     pub operation_id: String,
     /// Phase reached before the crash.
     pub phase: JournalPhase,
@@ -72,7 +73,8 @@ pub struct CrashJournal {
     /// Backups created during prepare, per resource.
     #[serde(default)]
     pub backups: Vec<JournalBackup>,
-    /// Staged temp paths (if any).
+    /// Temp files staging created; recovery removes survivors and reports
+    /// removal failures as residuals.
     pub staged_temps: Vec<String>,
     /// Primary paths of steps that were committed.
     #[serde(default)]
@@ -137,7 +139,8 @@ impl CrashJournal {
 /// Outcome of recovering one abandoned journal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JournalRecovery {
-    /// Journal file that was processed.
+    /// Journal processed; removed on a clean recovery, retained when
+    /// residuals remain.
     pub journal_path: PathBuf,
     /// Operation id of the recovered journal.
     pub operation_id: String,
@@ -355,8 +358,9 @@ fn remove_stale_temps(journal: &CrashJournal) -> (Vec<PathBuf>, Vec<PathBuf>) {
                 continue;
             }
             let p = ent.path();
-            if std::fs::remove_file(&p).is_ok() {
-                removed.push(p);
+            match std::fs::remove_file(&p) {
+                Ok(()) => removed.push(p),
+                Err(_) => residuals.push(p),
             }
         }
     }
@@ -680,14 +684,21 @@ mod tests {
     }
 
     #[test]
-    fn journal_phase_display_matches_the_recorded_names() {
-        assert_eq!(JournalPhase::Plan.to_string(), "plan");
-        assert_eq!(JournalPhase::PrepareBackup.to_string(), "prepare_backup");
-        assert_eq!(JournalPhase::StageTemp.to_string(), "stage_temp");
-        assert_eq!(JournalPhase::Commit.to_string(), "commit");
-        assert_eq!(JournalPhase::Verify.to_string(), "verify");
-        assert_eq!(JournalPhase::Rollback.to_string(), "rollback");
-        assert_eq!(JournalPhase::Done.to_string(), "done");
+    fn journal_phase_display_matches_the_wire_names() {
+        // The serde wire format and Display must name phases identically:
+        // recovery logs phase names humans match against persisted journals.
+        for phase in [
+            JournalPhase::Plan,
+            JournalPhase::PrepareBackup,
+            JournalPhase::StageTemp,
+            JournalPhase::Commit,
+            JournalPhase::Verify,
+            JournalPhase::Rollback,
+            JournalPhase::Done,
+        ] {
+            let wire = serde_json::to_string(&phase).unwrap();
+            assert_eq!(wire, format!("\"{phase}\""), "wire vs Display for {phase}");
+        }
     }
 
     #[test]

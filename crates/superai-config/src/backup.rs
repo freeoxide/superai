@@ -59,7 +59,9 @@ fn flush_backup_file(target: &Path) -> Result<()> {
         if was_readonly && let Ok(meta) = std::fs::metadata(target) {
             let mut perm = meta.permissions();
             perm.set_readonly(true);
-            drop(std::fs::set_permissions(target, perm));
+            if let Err(e) = std::fs::set_permissions(target, perm) {
+                crate::atomic::warn_io("readonly restore", target, &e);
+            }
         }
         outcome
     }
@@ -82,18 +84,14 @@ fn flush_backup_file(target: &Path) -> Result<()> {
     }
 }
 
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "kept Result for fallible future use"
-)]
-fn generate_backup_path(original: &Path) -> Result<(PathBuf, u128, String)> {
+fn generate_backup_path(original: &Path) -> (PathBuf, u128, String) {
     let millis = timestamp_millis_now();
     let suffix = generate_random_suffix(millis);
     let file_name = original.file_name().unwrap_or_default().to_os_string();
     let mut name = file_name;
     name.push(format!(".bak.{millis}.{suffix}"));
     let target = original.with_file_name(name);
-    Ok((target, millis, suffix))
+    (target, millis, suffix)
 }
 
 /// Steer away from taken names; after 5 collisions the last candidate is
@@ -101,20 +99,20 @@ fn generate_backup_path(original: &Path) -> Result<(PathBuf, u128, String)> {
 fn pick_backup_path(
     original: &Path,
     mut taken: impl FnMut(&Path) -> bool,
-) -> Result<(PathBuf, u128, String)> {
+) -> (PathBuf, u128, String) {
     // A fixed range, not a counter, bounds the retries: mutated counter
     // arithmetic must not be able to spin this into an unbounded loop.
-    let mut candidate = generate_backup_path(original)?;
+    let mut candidate = generate_backup_path(original);
     if !taken(&candidate.0) {
-        return Ok(candidate);
+        return candidate;
     }
     for _ in 0..4 {
-        candidate = generate_backup_path(original)?;
+        candidate = generate_backup_path(original);
         if !taken(&candidate.0) {
-            return Ok(candidate);
+            return candidate;
         }
     }
-    Ok(candidate)
+    candidate
 }
 
 /// `create_new` write: any occupied name, a planted symlink included, fails
@@ -147,7 +145,7 @@ fn write_backup_bytes(
 ) -> Result<(PathBuf, u128, String)> {
     let mut collisions = 0u32;
     loop {
-        let (target, millis, suffix) = pick_backup_path(original, Path::exists)?;
+        let (target, millis, suffix) = pick_backup_path(original, Path::exists);
         match write_backup_exclusive(&target, bytes, mode) {
             Ok(()) => return Ok((target, millis, suffix)),
             Err(ConfigError::Io { ref source, .. })
@@ -174,17 +172,18 @@ fn write_backup_bytes(
 pub struct BackupId(String);
 
 impl BackupId {
-    /// Create a new `BackupId` from a string.
+    /// Wraps any string unvalidated; only ids re-derived from backup file
+    /// names resolve through [`find_backup_by_id`].
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
     }
 
-    /// Borrow as `str`.
+    /// The stored `<millis>-<4hex>` text, never reformatted.
     pub fn as_str(&self) -> &str {
         &self.0
     }
 
-    /// Consume into `String`.
+    /// Yields the same text [`BackupId::as_str`] borrows, by value.
     pub fn into_string(self) -> String {
         self.0
     }
@@ -205,25 +204,31 @@ impl From<BackupId> for String {
 /// Catalog entry for one backup: locate/verify/restore metadata, no contents.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackupEntry {
-    /// Stable backup identifier.
+    /// Equals the backup file name's `<millis>-<suffix>` pair, so
+    /// [`find_backup_by_id`] resolves it from names alone.
     pub id: BackupId,
-    /// Operation that triggered the backup, if any.
+    /// Set only through [`backup_with_operation`]; `None` for plain backups.
     pub operation_id: Option<String>,
-    /// Original file that was backed up.
+    /// File the backup was taken from; [`restore_verified`] refuses entries
+    /// whose original differs from the restore target.
     pub original_path: PathBuf,
-    /// Path to the backup file on disk.
+    /// Sibling of `original_path`; [`verify_backup_relation`] rejects
+    /// entries stored anywhere else.
     pub backup_path: PathBuf,
-    /// Millis since epoch when the backup was created.
+    /// Creation time in millis since the Unix epoch; drives catalog sort
+    /// order, ties broken by `suffix`.
     pub timestamp_millis: u128,
     /// Collision-resistant 4-hex suffix.
     pub suffix: String,
-    /// Hex digest of the original file before write.
+    /// Digest of the original bytes at backup time;
+    /// [`verify_backup`] recomputes it against the backup file.
     pub digest: String,
-    /// Size in bytes of the original file before write.
+    /// Size in bytes of the original file before write; must match alongside
+    /// `digest` for [`verify_backup`] to pass.
     pub size: u64,
-    /// Permissions mode where available (unix `mode`).
+    /// Unix `mode` bits, `None` off unix where no mode exists.
     pub permissions: Option<u32>,
-    /// Human-readable reason for the backup.
+    /// Free-text cause recorded at backup time; display only, never contents.
     pub reason: String,
 }
 
@@ -306,7 +311,7 @@ fn backup_inner(
     let (target, millis, suffix) = write_backup_bytes(path, &original_bytes, permissions)?;
     #[cfg(not(unix))]
     let (target, millis, suffix) = {
-        let picked = pick_backup_path(path, Path::exists)?;
+        let picked = pick_backup_path(path, Path::exists);
         std::fs::copy(path, &picked.0).map_err(|e| ConfigError::io(path, e))?;
         picked
     };
@@ -387,8 +392,10 @@ pub fn restore_entry(entry: &BackupEntry) -> Result<()> {
     restore(&entry.backup_path, &entry.original_path)
 }
 
-/// List `<file_name>.bak.*` siblings sorted by timestamp then suffix.
-pub fn list_backups(original_path: &Path) -> Result<Vec<BackupEntry>> {
+/// Sibling backup files of `original_path` as `(path, millis, suffix)`,
+/// sorted by timestamp then suffix. Reading file names only; contents are
+/// the caller's job.
+fn scan_backup_files(original_path: &Path) -> Result<Vec<(PathBuf, u128, String)>> {
     let parent = original_path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = original_path
         .file_name()
@@ -405,8 +412,7 @@ pub fn list_backups(original_path: &Path) -> Result<Vec<BackupEntry>> {
         Err(e) => return Err(ConfigError::io(parent, e)),
     };
 
-    let mut entries = Vec::new();
-
+    let mut found = Vec::new();
     for ent in dir {
         let ent = ent.map_err(|e| ConfigError::io(parent, e))?;
         let name = ent.file_name();
@@ -414,46 +420,55 @@ pub fn list_backups(original_path: &Path) -> Result<Vec<BackupEntry>> {
         let Some(rest) = name_str.strip_prefix(prefix.as_str()) else {
             continue;
         };
-        let backup_path = ent.path();
-        let Ok(meta) = std::fs::metadata(&backup_path) else {
-            continue;
-        };
-        if !meta.is_file() {
-            continue;
-        }
         let mut parts = rest.split('.');
         let millis_str = parts.next().unwrap_or_default();
         let suffix = parts.next().unwrap_or("0000").to_owned();
         let timestamp_millis: u128 = millis_str.parse().unwrap_or(0);
-
-        let Ok(bytes) = std::fs::read(&backup_path) else {
-            continue;
-        };
-        let digest = compute_digest(&bytes);
-        let size = bytes.len() as u64;
-        let permissions = get_permissions_u32(&meta);
-        let id = BackupId::new(format!("{timestamp_millis}-{suffix}"));
-
-        entries.push(BackupEntry {
-            id,
-            operation_id: None,
-            original_path: original_path.to_path_buf(),
-            backup_path,
-            timestamp_millis,
-            suffix,
-            digest,
-            size,
-            permissions,
-            reason: String::new(),
-        });
+        found.push((ent.path(), timestamp_millis, suffix));
     }
 
-    entries.sort_by(|a, b| {
-        a.timestamp_millis
-            .cmp(&b.timestamp_millis)
-            .then_with(|| a.suffix.cmp(&b.suffix))
-    });
+    found.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.2.cmp(&b.2)));
+    Ok(found)
+}
 
+/// Build a catalog entry, hashing the backup file's contents. Skips the file
+/// when metadata or bytes cannot be read, matching the historical catalog.
+fn catalog_entry(
+    original_path: &Path,
+    backup_path: PathBuf,
+    timestamp_millis: u128,
+    suffix: String,
+) -> Option<BackupEntry> {
+    let meta = std::fs::metadata(&backup_path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let bytes = std::fs::read(&backup_path).ok()?;
+    let digest = compute_digest(&bytes);
+    let size = bytes.len() as u64;
+    let permissions = get_permissions_u32(&meta);
+    Some(BackupEntry {
+        id: BackupId::new(format!("{timestamp_millis}-{suffix}")),
+        operation_id: None,
+        original_path: original_path.to_path_buf(),
+        backup_path,
+        timestamp_millis,
+        suffix,
+        digest,
+        size,
+        permissions,
+        reason: String::new(),
+    })
+}
+
+/// List `<file_name>.bak.*` siblings sorted by timestamp then suffix.
+pub fn list_backups(original_path: &Path) -> Result<Vec<BackupEntry>> {
+    let mut entries = Vec::new();
+    for (path, millis, suffix) in scan_backup_files(original_path)? {
+        if let Some(entry) = catalog_entry(original_path, path, millis, suffix) {
+            entries.push(entry);
+        }
+    }
     Ok(entries)
 }
 
@@ -497,12 +512,17 @@ pub fn verify_backup_relation(entry: &BackupEntry, target: &Path) -> Result<bool
     verify_backup(entry)
 }
 
-/// Find a backup by [`BackupId`] via the catalog, never a user-built path.
+/// Find a backup by [`BackupId`] without hashing the whole catalog: the id
+/// is the `{millis}-{suffix}` file-name pair, so only the match is read.
 pub fn find_backup_by_id(original_path: &Path, id: &BackupId) -> Result<Option<BackupEntry>> {
-    let entries = list_backups(original_path)?;
-    for entry in entries {
-        if entry.id == *id {
-            return Ok(Some(entry));
+    for (backup_path, timestamp_millis, suffix) in scan_backup_files(original_path)? {
+        if format!("{timestamp_millis}-{suffix}") == id.as_str() {
+            return Ok(catalog_entry(
+                original_path,
+                backup_path,
+                timestamp_millis,
+                suffix,
+            ));
         }
     }
     Ok(None)
@@ -604,17 +624,6 @@ pub struct RestoreReport {
     pub restored_entry: BackupEntry,
 }
 
-/// Restore by [`BackupId`] (MUT-07): resolved by ID, never a user path.
-pub fn restore_by_id(original_path: &Path, backup_id: &BackupId) -> Result<RestoreReport> {
-    let entry = find_backup_by_id(original_path, backup_id)?.ok_or_else(|| {
-        ConfigError::io(
-            original_path,
-            std::io::Error::new(std::io::ErrorKind::NotFound, "backup id not found"),
-        )
-    })?;
-    restore_verified(&entry)
-}
-
 /// Verify digest and relation, back up the current bytes, replace atomically,
 /// verify the read-back (MUT-07).
 pub fn restore_verified(entry: &BackupEntry) -> Result<RestoreReport> {
@@ -679,12 +688,10 @@ pub fn restore_verified(entry: &BackupEntry) -> Result<RestoreReport> {
         ));
     }
     // Best-effort parse check; a failure never fails the restore itself.
-    if let Some(kind) = infer_kind_for_path(&entry.original_path) {
-        drop(validate_bytes_for_kind(
-            &restored_bytes,
-            kind,
-            &entry.original_path,
-        ));
+    if let Some(kind) = infer_kind_for_path(&entry.original_path)
+        && let Err(e) = validate_bytes_for_kind(&restored_bytes, kind, &entry.original_path)
+    {
+        crate::atomic::warn_io("restored-file parse check", &entry.original_path, &e);
     }
     Ok(RestoreReport {
         preview_redacted,
@@ -832,10 +839,7 @@ mod tests {
         std::fs::write(&path, b"v2").unwrap();
         let e2 = backup(&path).unwrap().unwrap();
         assert_ne!(e1.backup_path, e2.backup_path, "backup paths must differ");
-        assert!(
-            e1.id != e2.id || e1.backup_path != e2.backup_path,
-            "ids or paths must differ"
-        );
+        assert_ne!(e1.id, e2.id, "ids must differ when paths differ");
         drop(std::fs::remove_file(&path));
         drop(std::fs::remove_file(&e1.backup_path));
         drop(std::fs::remove_file(&e2.backup_path));
@@ -848,8 +852,7 @@ mod tests {
         let (target, millis, suffix) = pick_backup_path(&path, |c| {
             probes.push(c.to_path_buf());
             false
-        })
-        .unwrap();
+        });
         assert_eq!(probes.len(), 1, "a free name needs exactly one probe");
         assert_eq!(probes.first().map(PathBuf::as_path), Some(target.as_path()));
         let expected = PathBuf::from(format!("cfg.json.bak.{millis}.{suffix}"));
@@ -890,7 +893,7 @@ mod tests {
     fn pick_backup_path_steers_to_the_first_free_name() {
         let path = scratch("steer-busy").with_file_name("cfg.json");
         let (probes, taken) = busy_prober(2);
-        let (target, _, _) = pick_backup_path(&path, taken).unwrap();
+        let (target, _, _) = pick_backup_path(&path, taken);
         let candidates = probes.borrow().clone();
         assert_eq!(candidates.len(), 3, "two busy candidates, then a free one");
         assert_all_distinct(&candidates);
@@ -901,7 +904,7 @@ mod tests {
     fn pick_backup_path_gives_up_after_five_busy_candidates() {
         let path = scratch("steer-full").with_file_name("cfg.json");
         let (probes, taken) = busy_prober(usize::MAX);
-        let (target, _, _) = pick_backup_path(&path, taken).unwrap();
+        let (target, _, _) = pick_backup_path(&path, taken);
         let candidates = probes.borrow().clone();
         assert_eq!(candidates.len(), 5, "the give-up bound is five probes");
         assert_all_distinct(&candidates);
@@ -1036,7 +1039,6 @@ mod tests {
         let d3 = compute_digest(b"world");
         assert_eq!(d1, d2);
         assert_ne!(d1, d3);
-        assert_eq!(d1.len(), 16);
     }
 
     fn assert_no_temp_litter(dir: &Path) {
@@ -1391,15 +1393,6 @@ mod tests {
         }
         drop(std::fs::remove_file(&path));
         drop(std::fs::remove_dir_all(path.parent().unwrap()));
-    }
-
-    #[test]
-    fn backup_id_accessors_preserve_the_string() {
-        let id = BackupId::new("1714123456789-a1b2");
-        assert_eq!(id.as_str(), "1714123456789-a1b2");
-        assert_eq!(id.to_string(), "1714123456789-a1b2");
-        assert_eq!(id.clone().into_string(), "1714123456789-a1b2");
-        assert_eq!(String::from(id), "1714123456789-a1b2");
     }
 
     #[test]

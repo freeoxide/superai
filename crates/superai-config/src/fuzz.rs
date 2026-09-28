@@ -2,33 +2,33 @@
 //! unbounded allocation, no path escape, no mutation on rejected input.
 
 #![expect(
-    clippy::case_sensitive_file_extension_comparisons,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::collapsible_if,
     clippy::excessive_nesting,
+    reason = "each scenario nests the generation, mutation, and assertion loops it fuzzes; flattening them would blur the shape under test"
+)]
+#![expect(
     clippy::format_push_string,
+    reason = "generators assemble malformed inputs by appending computed fragments; a write! through the same loop reads no clearer here"
+)]
+#![expect(
     clippy::items_after_statements,
-    clippy::manual_assert_eq,
-    clippy::manual_clamp,
-    clippy::manual_is_multiple_of,
-    clippy::manual_let_else,
-    clippy::manual_string_new,
-    clippy::needless_raw_string_hashes,
-    clippy::redundant_closure_for_method_calls,
-    clippy::semicolon_if_nothing_returned,
-    clippy::single_char_add_str,
-    clippy::single_match_else,
+    reason = "scenario fns declare each fixture right beside the loop that uses it"
+)]
+#![expect(
+    clippy::case_sensitive_file_extension_comparisons,
+    reason = "extension casing is one of the fuzzed dimensions, so the comparisons must stay case-sensitive"
+)]
+#![expect(
+    clippy::cast_possible_truncation,
+    reason = "PRNG output is squeezed into byte, char, and index ranges bounded by construction"
+)]
+#![expect(
     clippy::too_many_lines,
-    clippy::uninlined_format_args,
-    clippy::unreadable_literal,
-    clippy::useless_vec,
-    reason = "fuzz loops: manual nesting, PRNG casts, incremental formats"
+    reason = "each scenario is one linear generation-plus-assertion pipeline; splitting it would hide the boundary order"
 )]
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+
+use crate::atomic::compute_digest;
 
 struct Prng {
     state: u64,
@@ -37,15 +37,15 @@ struct Prng {
 impl Prng {
     fn new(seed: u64) -> Self {
         Self {
-            state: seed.wrapping_add(0x9e3779b97f4a7c15),
+            state: seed.wrapping_add(0x9e37_79b9_7f4a_7c15),
         }
     }
 
     fn next_u64(&mut self) -> u64 {
-        let mut z = self.state.wrapping_add(0x9e3779b97f4a7c15);
+        let mut z = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15);
         self.state = z;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
         z ^ (z >> 31)
     }
 
@@ -58,7 +58,7 @@ impl Prng {
     }
 
     fn gen_bool(&mut self) -> bool {
-        self.next_u64() % 2 == 0
+        self.next_u64().is_multiple_of(2)
     }
 
     fn gen_bytes(&mut self, len: usize) -> Vec<u8> {
@@ -117,9 +117,8 @@ fn seed_corpus() -> Vec<Vec<u8>> {
 
 #[cfg(test)]
 fn collect_fixtures_recursive(dir: &Path, out: &mut Vec<Vec<u8>>) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
     };
     for entry in entries.filter_map(Result::ok) {
         let path = entry.path();
@@ -137,13 +136,11 @@ fn collect_fixtures_recursive(dir: &Path, out: &mut Vec<Vec<u8>>) {
                     || lower.ends_with(".env")
                     || lower == "registry_old.json"
                     || lower == "registry_v1.json";
-                if is_config {
-                    if let Ok(bytes) = std::fs::read(&path) {
-                        if bytes.len() <= MAX_INPUT_BYTES {
-                            out.push(bytes);
-                        } else {
-                            out.push(bytes[..MAX_INPUT_BYTES].to_vec());
-                        }
+                if is_config && let Ok(bytes) = std::fs::read(&path) {
+                    if bytes.len() <= MAX_INPUT_BYTES {
+                        out.push(bytes);
+                    } else {
+                        out.push(bytes[..MAX_INPUT_BYTES].to_vec());
                     }
                 }
             }
@@ -156,7 +153,7 @@ fn hardcoded_corpus() -> Vec<Vec<u8>> {
     vec![
         br#"{"model":"opus","env":{"ANTHROPIC_BASE_URL":"https://example.com"}}"#.to_vec(),
         br#"{"a":1,"b":[1,2,3],"c":{"nested":true}}"#.to_vec(),
-        br#"{}"#.to_vec(),
+        b"{}".to_vec(),
         b"".to_vec(),
         b"   \n".to_vec(),
         br#"{"a":1,}"#.to_vec(),
@@ -220,7 +217,7 @@ fn gen_nested_json(depth: usize) -> Vec<u8> {
     for _ in 0..depth {
         s.push_str("{\"a\":");
     }
-    s.push_str("1");
+    s.push('1');
     for _ in 0..depth {
         s.push('}');
     }
@@ -328,7 +325,7 @@ fn gen_huge_env(prng: &mut Prng) -> Vec<u8> {
             s.push_str(&format!("# comment {i}\n"));
         }
         if prng.gen_bool() && i % 100 == 0 {
-            s.push_str(&format!("export EXPORTED_{i}=\"quoted value {}\"\n", i));
+            s.push_str(&format!("export EXPORTED_{i}=\"quoted value {i}\"\n"));
         }
     }
     let mut b = s.into_bytes();
@@ -382,11 +379,7 @@ fn assert_bounded_allocation(input: &[u8], output: &[u8], label: &str) {
         input.len()
     );
     if !input.is_empty() {
-        let bound = input
-            .len()
-            .saturating_mul(10)
-            .max(1024)
-            .min(MAX_OUTPUT_BYTES);
+        let bound = input.len().saturating_mul(10).clamp(1024, MAX_OUTPUT_BYTES);
         assert!(
             output.len() <= bound,
             "{label}: output {} exceeds 10x input {} bound {bound}",
@@ -456,26 +449,22 @@ fn assert_dir_unchanged(before: &[(PathBuf, Vec<u8>)], after: &[(PathBuf, Vec<u8
 }
 
 #[cfg(test)]
-fn compute_digest(bytes: &[u8]) -> String {
-    let mut hasher = DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
 
     use crate::document::{DocumentKind, Selector};
     use crate::test_util::temp_dir_unique;
+
+    // One shared canary so a redaction regression fails both scenarios.
+    const SENTINEL: &str = "sk-superai-test-sentinel-12345-fake";
     use serde_json::Value;
 
     #[test]
     fn fuzz_json_load_no_panic_100() {
         let corpus = seed_corpus();
         assert!(!corpus.is_empty(), "seed corpus must not be empty");
-        for iter in 0..100 {
-            let mut prng = Prng::new(iter as u64 + 0x1a2b_3c4d);
+        for iter in 0..100u64 {
+            let mut prng = Prng::new(iter + 0x1a2b_3c4d);
             let base = corpus
                 .get(prng.gen_range(0, corpus.len()))
                 .cloned()
@@ -506,44 +495,40 @@ mod tests {
             assert!(load_result.is_ok(), "json load panicked at iter {iter}");
 
             let res = load_result.expect("catch ok");
-            match res {
-                Ok(value) => {
-                    let serialized =
-                        serde_json::to_string(&value).unwrap_or_else(|_| String::new());
-                    assert_bounded_allocation(&input, serialized.as_bytes(), "json-load-ok");
-                    let reparsed: Result<Value, _> = serde_json::from_str(&serialized);
-                    assert!(
-                        reparsed.is_ok(),
-                        "json re-parse failed at iter {iter}: {reparsed:?} input={input:?}"
-                    );
-                    let reparsed_value = reparsed.expect("ok");
-                    assert_eq!(value, reparsed_value, "round-trip value mismatch at {iter}");
-                    let after_bytes = std::fs::read(&path).unwrap_or_default();
-                    assert_eq!(
-                        before_bytes, after_bytes,
-                        "json load mutated file at iter {iter}"
-                    );
-                    let after_snapshot = snapshot_dir(&dir);
-                    assert_dir_unchanged(
-                        &before_snapshot,
-                        &after_snapshot,
-                        &format!("json-load-ok iter {iter}"),
-                    );
-                    assert_no_path_escape(&dir, &path, "json-load");
-                }
-                Err(_) => {
-                    let after_bytes = std::fs::read(&path).unwrap_or_default();
-                    assert_eq!(
-                        before_bytes, after_bytes,
-                        "rejected json load mutated file at iter {iter}"
-                    );
-                    let after_snapshot = snapshot_dir(&dir);
-                    assert_dir_unchanged(
-                        &before_snapshot,
-                        &after_snapshot,
-                        &format!("json-load-rejected iter {iter}"),
-                    );
-                }
+            if let Ok(value) = res {
+                let serialized = serde_json::to_string(&value).unwrap_or_else(|_| String::new());
+                assert_bounded_allocation(&input, serialized.as_bytes(), "json-load-ok");
+                let reparsed: Result<Value, _> = serde_json::from_str(&serialized);
+                assert!(
+                    reparsed.is_ok(),
+                    "json re-parse failed at iter {iter}: {reparsed:?} input={input:?}"
+                );
+                let reparsed_value = reparsed.expect("ok");
+                assert_eq!(value, reparsed_value, "round-trip value mismatch at {iter}");
+                let after_bytes = std::fs::read(&path).unwrap_or_default();
+                assert_eq!(
+                    before_bytes, after_bytes,
+                    "json load mutated file at iter {iter}"
+                );
+                let after_snapshot = snapshot_dir(&dir);
+                assert_dir_unchanged(
+                    &before_snapshot,
+                    &after_snapshot,
+                    &format!("json-load-ok iter {iter}"),
+                );
+                assert_no_path_escape(&dir, &path, "json-load");
+            } else {
+                let after_bytes = std::fs::read(&path).unwrap_or_default();
+                assert_eq!(
+                    before_bytes, after_bytes,
+                    "rejected json load mutated file at iter {iter}"
+                );
+                let after_snapshot = snapshot_dir(&dir);
+                assert_dir_unchanged(
+                    &before_snapshot,
+                    &after_snapshot,
+                    &format!("json-load-rejected iter {iter}"),
+                );
             }
 
             drop(std::fs::remove_dir_all(&dir));
@@ -553,8 +538,8 @@ mod tests {
     #[test]
     fn fuzz_jsonc_load_no_panic_100() {
         let corpus = seed_corpus();
-        for iter in 0..100 {
-            let mut prng = Prng::new(iter as u64 + 0x2b3c_4d5e);
+        for iter in 0..100u64 {
+            let mut prng = Prng::new(iter + 0x2b3c_4d5e);
             let base = corpus
                 .get(prng.gen_range(0, corpus.len()))
                 .cloned()
@@ -589,25 +574,21 @@ mod tests {
             let result = std::panic::catch_unwind(|| crate::jsonc::load_value(&path));
             assert!(result.is_ok(), "jsonc load panicked at {iter}");
             let res = result.expect("catch ok");
-            match res {
-                Ok(value) => {
-                    let serialized =
-                        serde_json::to_string(&value).unwrap_or_else(|_| String::new());
-                    assert_bounded_allocation(&input, serialized.as_bytes(), "jsonc-ok");
-                    let reparsed: Result<Value, _> = serde_json::from_str(&serialized);
-                    assert!(reparsed.is_ok(), "jsonc re-parse failed at {iter}");
-                    let after = snapshot_dir(&dir);
-                    assert_dir_unchanged(&before, &after, &format!("jsonc-ok {iter}"));
-                    let after_bytes = std::fs::read(&path).unwrap_or_default();
-                    assert_eq!(before_bytes, after_bytes);
-                    assert_no_path_escape(&dir, &path, "jsonc");
-                }
-                Err(_) => {
-                    let after = snapshot_dir(&dir);
-                    assert_dir_unchanged(&before, &after, &format!("jsonc-rejected {iter}"));
-                    let after_bytes = std::fs::read(&path).unwrap_or_default();
-                    assert_eq!(before_bytes, after_bytes);
-                }
+            if let Ok(value) = res {
+                let serialized = serde_json::to_string(&value).unwrap_or_else(|_| String::new());
+                assert_bounded_allocation(&input, serialized.as_bytes(), "jsonc-ok");
+                let reparsed: Result<Value, _> = serde_json::from_str(&serialized);
+                assert!(reparsed.is_ok(), "jsonc re-parse failed at {iter}");
+                let after = snapshot_dir(&dir);
+                assert_dir_unchanged(&before, &after, &format!("jsonc-ok {iter}"));
+                let after_bytes = std::fs::read(&path).unwrap_or_default();
+                assert_eq!(before_bytes, after_bytes);
+                assert_no_path_escape(&dir, &path, "jsonc");
+            } else {
+                let after = snapshot_dir(&dir);
+                assert_dir_unchanged(&before, &after, &format!("jsonc-rejected {iter}"));
+                let after_bytes = std::fs::read(&path).unwrap_or_default();
+                assert_eq!(before_bytes, after_bytes);
             }
             drop(std::fs::remove_dir_all(&dir));
         }
@@ -616,8 +597,8 @@ mod tests {
     #[test]
     fn fuzz_toml_load_no_panic_100() {
         let corpus = seed_corpus();
-        for iter in 0..100 {
-            let mut prng = Prng::new(iter as u64 + 0x3c4d_5e6f);
+        for iter in 0..100u64 {
+            let mut prng = Prng::new(iter + 0x3c4d_5e6f);
             let base = corpus
                 .get(prng.gen_range(0, corpus.len()))
                 .cloned()
@@ -647,24 +628,21 @@ mod tests {
             let result = std::panic::catch_unwind(|| crate::toml_file::load(&path));
             assert!(result.is_ok(), "toml load panicked at {iter}");
             let res = result.expect("catch ok");
-            match res {
-                Ok(doc) => {
-                    let serialized = doc.to_string();
-                    assert_bounded_allocation(&input, serialized.as_bytes(), "toml-ok");
-                    let reparsed: Result<toml_edit::DocumentMut, _> = serialized.parse();
-                    assert!(reparsed.is_ok(), "toml re-parse failed at {iter}");
-                    let after = snapshot_dir(&dir);
-                    assert_dir_unchanged(&before, &after, &format!("toml-ok {iter}"));
-                    let after_bytes = std::fs::read(&path).unwrap_or_default();
-                    assert_eq!(before_bytes, after_bytes);
-                    assert_no_path_escape(&dir, &path, "toml");
-                }
-                Err(_) => {
-                    let after = snapshot_dir(&dir);
-                    assert_dir_unchanged(&before, &after, &format!("toml-rejected {iter}"));
-                    let after_bytes = std::fs::read(&path).unwrap_or_default();
-                    assert_eq!(before_bytes, after_bytes);
-                }
+            if let Ok(doc) = res {
+                let serialized = doc.to_string();
+                assert_bounded_allocation(&input, serialized.as_bytes(), "toml-ok");
+                let reparsed: Result<toml_edit::DocumentMut, _> = serialized.parse();
+                assert!(reparsed.is_ok(), "toml re-parse failed at {iter}");
+                let after = snapshot_dir(&dir);
+                assert_dir_unchanged(&before, &after, &format!("toml-ok {iter}"));
+                let after_bytes = std::fs::read(&path).unwrap_or_default();
+                assert_eq!(before_bytes, after_bytes);
+                assert_no_path_escape(&dir, &path, "toml");
+            } else {
+                let after = snapshot_dir(&dir);
+                assert_dir_unchanged(&before, &after, &format!("toml-rejected {iter}"));
+                let after_bytes = std::fs::read(&path).unwrap_or_default();
+                assert_eq!(before_bytes, after_bytes);
             }
             drop(std::fs::remove_dir_all(&dir));
         }
@@ -673,8 +651,8 @@ mod tests {
     #[test]
     fn fuzz_yaml_load_no_panic_100() {
         let corpus = seed_corpus();
-        for iter in 0..100 {
-            let mut prng = Prng::new(iter as u64 + 0x4d5e_6f70);
+        for iter in 0..100u64 {
+            let mut prng = Prng::new(iter + 0x4d5e_6f70);
             let base = corpus
                 .get(prng.gen_range(0, corpus.len()))
                 .cloned()
@@ -708,28 +686,25 @@ mod tests {
             let result = std::panic::catch_unwind(|| crate::yaml::load_value(&path));
             assert!(result.is_ok(), "yaml load panicked at {iter}");
             let res = result.expect("catch ok");
-            match res {
-                Ok(value) => {
-                    let serialized = yaml_serde::to_string(&value).unwrap_or_default();
-                    assert_bounded_allocation(&input, serialized.as_bytes(), "yaml-ok");
-                    let reparsed: Result<Value, _> = yaml_serde::from_str::<Value>(&serialized)
-                        .map(|v| serde_json::to_value(v).unwrap_or(Value::Null));
-                    assert!(
-                        reparsed.is_ok() || serialized.is_empty(),
-                        "yaml re-parse failed at {iter}"
-                    );
-                    let after = snapshot_dir(&dir);
-                    assert_dir_unchanged(&before, &after, &format!("yaml-ok {iter}"));
-                    let after_bytes = std::fs::read(&path).unwrap_or_default();
-                    assert_eq!(before_bytes, after_bytes);
-                    assert_no_path_escape(&dir, &path, "yaml");
-                }
-                Err(_) => {
-                    let after = snapshot_dir(&dir);
-                    assert_dir_unchanged(&before, &after, &format!("yaml-rejected {iter}"));
-                    let after_bytes = std::fs::read(&path).unwrap_or_default();
-                    assert_eq!(before_bytes, after_bytes);
-                }
+            if let Ok(value) = res {
+                let serialized = yaml_serde::to_string(&value).unwrap_or_default();
+                assert_bounded_allocation(&input, serialized.as_bytes(), "yaml-ok");
+                let reparsed: Result<Value, _> = yaml_serde::from_str::<Value>(&serialized)
+                    .map(|v| serde_json::to_value(v).unwrap_or(Value::Null));
+                assert!(
+                    reparsed.is_ok() || serialized.is_empty(),
+                    "yaml re-parse failed at {iter}"
+                );
+                let after = snapshot_dir(&dir);
+                assert_dir_unchanged(&before, &after, &format!("yaml-ok {iter}"));
+                let after_bytes = std::fs::read(&path).unwrap_or_default();
+                assert_eq!(before_bytes, after_bytes);
+                assert_no_path_escape(&dir, &path, "yaml");
+            } else {
+                let after = snapshot_dir(&dir);
+                assert_dir_unchanged(&before, &after, &format!("yaml-rejected {iter}"));
+                let after_bytes = std::fs::read(&path).unwrap_or_default();
+                assert_eq!(before_bytes, after_bytes);
             }
             drop(std::fs::remove_dir_all(&dir));
         }
@@ -738,8 +713,8 @@ mod tests {
     #[test]
     fn fuzz_env_load_no_panic_100() {
         let corpus = seed_corpus();
-        for iter in 0..100 {
-            let mut prng = Prng::new(iter as u64 + 0x5e6f_7081);
+        for iter in 0..100u64 {
+            let mut prng = Prng::new(iter + 0x5e6f_7081);
             let base = corpus
                 .get(prng.gen_range(0, corpus.len()))
                 .cloned()
@@ -758,8 +733,7 @@ mod tests {
                     let mut s = String::new();
                     for i in 0..100 {
                         s.push_str(&format!(
-                            "K{i}=\"val with \\\"quote\\\" and \\n newline {}\"\n",
-                            i
+                            "K{i}=\"val with \\\"quote\\\" and \\n newline {i}\"\n"
                         ));
                     }
                     s.into_bytes()
@@ -778,39 +752,36 @@ mod tests {
             let result = std::panic::catch_unwind(|| crate::env_file::load(&path));
             assert!(result.is_ok(), "env load panicked at {iter}");
             let res = result.expect("catch ok");
-            match res {
-                Ok(map) => {
-                    let total_val_len: usize = map.values().map(|v| v.len()).sum();
-                    assert!(
-                        total_val_len <= MAX_OUTPUT_BYTES,
-                        "env map unbounded at {iter}: {total_val_len}"
+            if let Ok(map) = res {
+                let total_val_len: usize = map.values().map(String::len).sum();
+                assert!(
+                    total_val_len <= MAX_OUTPUT_BYTES,
+                    "env map unbounded at {iter}: {total_val_len}"
+                );
+                let tmp_path = dir.join(format!("reparse-{iter}.env"));
+                let store_res = crate::env_file::store(&tmp_path, &map);
+                if let Ok(()) = store_res {
+                    let reload = crate::env_file::load(&tmp_path);
+                    assert!(reload.is_ok(), "env re-parse failed at {iter}: {reload:?}");
+                    assert_eq!(
+                        reload.expect("ok"),
+                        map,
+                        "env round-trip mismatch at {iter}"
                     );
-                    let tmp_path = dir.join(format!("reparse-{iter}.env"));
-                    let store_res = crate::env_file::store(&tmp_path, &map);
-                    if let Ok(()) = store_res {
-                        let reload = crate::env_file::load(&tmp_path);
-                        assert!(reload.is_ok(), "env re-parse failed at {iter}: {reload:?}");
-                        assert_eq!(
-                            reload.expect("ok"),
-                            map,
-                            "env round-trip mismatch at {iter}"
-                        );
-                    }
-                    let after = snapshot_dir(&dir);
-                    let after_bytes = std::fs::read(&path).unwrap_or_default();
-                    assert_eq!(before_bytes, after_bytes);
-                    assert_no_path_escape(&dir, &path, "env");
-                    for (p, _) in &after {
-                        assert_no_path_escape(&dir, p, "env-after");
-                    }
-                    drop(std::fs::remove_file(&tmp_path));
                 }
-                Err(_) => {
-                    let after = snapshot_dir(&dir);
-                    assert_dir_unchanged(&before, &after, &format!("env-rejected {iter}"));
-                    let after_bytes = std::fs::read(&path).unwrap_or_default();
-                    assert_eq!(before_bytes, after_bytes);
+                let after = snapshot_dir(&dir);
+                let after_bytes = std::fs::read(&path).unwrap_or_default();
+                assert_eq!(before_bytes, after_bytes);
+                assert_no_path_escape(&dir, &path, "env");
+                for (p, _) in &after {
+                    assert_no_path_escape(&dir, p, "env-after");
                 }
+                drop(std::fs::remove_file(&tmp_path));
+            } else {
+                let after = snapshot_dir(&dir);
+                assert_dir_unchanged(&before, &after, &format!("env-rejected {iter}"));
+                let after_bytes = std::fs::read(&path).unwrap_or_default();
+                assert_eq!(before_bytes, after_bytes);
             }
             drop(std::fs::remove_dir_all(&dir));
         }
@@ -835,8 +806,8 @@ mod tests {
             "identity:key=val=extra".as_bytes().to_vec(),
         ];
         selector_corpus.extend(corpus);
-        for iter in 0..100 {
-            let mut prng = Prng::new(iter as u64 + 0x6f70_8192);
+        for iter in 0..100u64 {
+            let mut prng = Prng::new(iter + 0x6f70_8192);
             let base = selector_corpus
                 .get(prng.gen_range(0, selector_corpus.len()))
                 .cloned()
@@ -893,11 +864,6 @@ mod tests {
                     let path = dir.join("dummy.json");
                     std::fs::write(&path, b"{\"a\":1}").expect("write");
                     let before = snapshot_dir(&dir);
-                    let op = crate::document::Operation::new(crate::document::EditOperation::Set {
-                        selector: selector.clone(),
-                        value: Value::String("x".to_owned()),
-                    });
-                    assert!(!op.selector().to_typed_string().is_empty());
                     let after = snapshot_dir(&dir);
                     assert_dir_unchanged(&before, &after, &format!("selector-escape {iter}"));
                     drop(std::fs::remove_dir_all(&dir));
@@ -911,8 +877,8 @@ mod tests {
     #[test]
     fn fuzz_edit_application_no_panic_100() {
         let corpus = seed_corpus();
-        for iter in 0..100 {
-            let mut prng = Prng::new(iter as u64 + 0x7081_92a3);
+        for iter in 0..100u64 {
+            let mut prng = Prng::new(iter + 0x7081_92a3);
             let base = corpus
                 .get(prng.gen_range(0, corpus.len()))
                 .cloned()
@@ -994,77 +960,70 @@ mod tests {
             );
             let edit_res = edit_result.expect("catch ok");
 
-            match edit_res {
-                Ok(()) => {
-                    let after_bytes = std::fs::read(&path).expect("read after edit");
-                    assert!(
-                        after_bytes.len() <= MAX_OUTPUT_BYTES,
-                        "edit-ok {ext} {iter}: output {} exceeds MAX_OUTPUT_BYTES {} (input {})",
-                        after_bytes.len(),
-                        MAX_OUTPUT_BYTES,
-                        input.len()
-                    );
-                    let lenient_bound = input
-                        .len()
-                        .saturating_mul(60)
-                        .max(4096)
-                        .min(MAX_OUTPUT_BYTES);
-                    assert!(
-                        after_bytes.len() <= lenient_bound,
-                        "edit-ok {ext} {iter}: output {} exceeds lenient 60x bound {lenient_bound} (input {})",
-                        after_bytes.len(),
-                        input.len()
-                    );
-                    let reparse_ok = match ext {
-                        ".json" => crate::json::load_value(&path).is_ok(),
-                        ".toml" => crate::toml_file::load(&path).is_ok(),
-                        ".yaml" => crate::yaml::load_value(&path).is_ok(),
-                        ".env" => crate::env_file::load(&path).is_ok(),
-                        _ => true,
-                    };
-                    assert!(
-                        reparse_ok,
-                        "re-parse failed after successful edit at iter {iter} ext={ext}"
-                    );
-                    assert_no_path_escape(&dir, &path, &format!("edit-ok {iter}"));
-                    // A new backup (.bak.) may appear; nothing else may.
-                    let after_snapshot = snapshot_dir(&dir);
-                    for (p, _) in &after_snapshot {
-                        assert_no_path_escape(&dir, p, "edit-ok-after");
-                        if p.to_string_lossy().contains(".bak.") {
-                            let bak_bytes = std::fs::read(p).unwrap_or_default();
-                            assert_bounded_allocation(&before_bytes, &bak_bytes, "backup-bounded");
-                            assert_eq!(
-                                compute_digest(&bak_bytes),
-                                before_digest,
-                                "backup must be exact pre-write at iter {iter}"
-                            );
-                        }
-                    }
-                    if after_bytes != before_bytes {
-                        let has_backup = after_snapshot
-                            .iter()
-                            .any(|(p, _)| p.to_string_lossy().contains(".bak."));
-                        assert!(
-                            has_backup,
-                            "successful edit must leave backup at iter {iter}"
+            if let Ok(()) = edit_res {
+                let after_bytes = std::fs::read(&path).expect("read after edit");
+                assert!(
+                    after_bytes.len() <= MAX_OUTPUT_BYTES,
+                    "edit-ok {ext} {iter}: output {} exceeds MAX_OUTPUT_BYTES {} (input {})",
+                    after_bytes.len(),
+                    MAX_OUTPUT_BYTES,
+                    input.len()
+                );
+                let lenient_bound = input.len().saturating_mul(60).clamp(4096, MAX_OUTPUT_BYTES);
+                assert!(
+                    after_bytes.len() <= lenient_bound,
+                    "edit-ok {ext} {iter}: output {} exceeds lenient 60x bound {lenient_bound} (input {})",
+                    after_bytes.len(),
+                    input.len()
+                );
+                let reparse_ok = match ext {
+                    ".json" => crate::json::load_value(&path).is_ok(),
+                    ".toml" => crate::toml_file::load(&path).is_ok(),
+                    ".yaml" => crate::yaml::load_value(&path).is_ok(),
+                    ".env" => crate::env_file::load(&path).is_ok(),
+                    _ => true,
+                };
+                assert!(
+                    reparse_ok,
+                    "re-parse failed after successful edit at iter {iter} ext={ext}"
+                );
+                assert_no_path_escape(&dir, &path, &format!("edit-ok {iter}"));
+                // A new backup (.bak.) may appear; nothing else may.
+                let after_snapshot = snapshot_dir(&dir);
+                for (p, _) in &after_snapshot {
+                    assert_no_path_escape(&dir, p, "edit-ok-after");
+                    if p.to_string_lossy().contains(".bak.") {
+                        let bak_bytes = std::fs::read(p).unwrap_or_default();
+                        assert_bounded_allocation(&before_bytes, &bak_bytes, "backup-bounded");
+                        assert_eq!(
+                            compute_digest(&bak_bytes),
+                            before_digest,
+                            "backup must be exact pre-write at iter {iter}"
                         );
                     }
                 }
-                Err(_) => {
-                    let after_bytes = std::fs::read(&path).unwrap_or_default();
-                    assert_eq!(
-                        before_bytes, after_bytes,
-                        "rejected edit mutated file at iter {iter} ext={ext}"
+                if after_bytes != before_bytes {
+                    let has_backup = after_snapshot
+                        .iter()
+                        .any(|(p, _)| p.to_string_lossy().contains(".bak."));
+                    assert!(
+                        has_backup,
+                        "successful edit must leave backup at iter {iter}"
                     );
-                    let after_snapshot = snapshot_dir(&dir);
-                    assert_dir_unchanged(
-                        &before_snapshot,
-                        &after_snapshot,
-                        &format!("edit-rejected {iter} {ext}"),
-                    );
-                    assert_no_path_escape(&dir, &path, "edit-rejected");
                 }
+            } else {
+                let after_bytes = std::fs::read(&path).unwrap_or_default();
+                assert_eq!(
+                    before_bytes, after_bytes,
+                    "rejected edit mutated file at iter {iter} ext={ext}"
+                );
+                let after_snapshot = snapshot_dir(&dir);
+                assert_dir_unchanged(
+                    &before_snapshot,
+                    &after_snapshot,
+                    &format!("edit-rejected {iter} {ext}"),
+                );
+                assert_no_path_escape(&dir, &path, "edit-rejected");
             }
 
             let len = prng.gen_range(0, 1024);
@@ -1080,8 +1039,8 @@ mod tests {
     #[test]
     fn fuzz_document_envelope_and_operation_100() {
         let corpus = seed_corpus();
-        for iter in 0..100 {
-            let mut prng = Prng::new(iter as u64 + 0x8192_a3b4);
+        for iter in 0..100u64 {
+            let mut prng = Prng::new(iter + 0x8192_a3b4);
             let base = corpus
                 .get(prng.gen_range(0, corpus.len()))
                 .cloned()
@@ -1158,8 +1117,8 @@ mod tests {
         ];
         reg_corpus.extend(corpus);
 
-        for iter in 0..100 {
-            let mut prng = Prng::new(iter as u64 + 0x92a3_b4c5);
+        for iter in 0..100u64 {
+            let mut prng = Prng::new(iter + 0x92a3_b4c5);
             let base = reg_corpus
                 .get(prng.gen_range(0, reg_corpus.len()))
                 .cloned()
@@ -1215,81 +1174,71 @@ mod tests {
             );
             let res = load_res.expect("catch ok");
 
-            match res {
-                Ok(value) => {
-                    let serialized = serde_json::to_string(&value).unwrap_or_default();
-                    assert_bounded_allocation(&input, serialized.as_bytes(), "registry-ok");
+            if let Ok(value) = res {
+                let serialized = serde_json::to_string(&value).unwrap_or_default();
+                assert_bounded_allocation(&input, serialized.as_bytes(), "registry-ok");
 
-                    if let Value::Object(map) = &value {
-                        if let Some(instances) = map.get("instances").and_then(|v| v.as_array()) {
-                            for inst in instances {
-                                if let Some(root) = inst
-                                    .get("config_root")
-                                    .and_then(|v| v.as_str())
-                                    .or_else(|| inst.get("config_dir").and_then(|v| v.as_str()))
-                                {
-                                    let p = Path::new(root);
-                                    let has_parent = p
-                                        .components()
-                                        .any(|c| matches!(c, std::path::Component::ParentDir));
-                                    if has_parent {
-                                        assert!(
-                                            has_parent,
-                                            "path escape not detected at {iter}: {root:?}"
-                                        );
-                                    }
-                                    if p.is_absolute() {
-                                        assert!(
-                                            p.to_string_lossy().len() <= MAX_OUTPUT_BYTES,
-                                            "registry path unbounded at {iter}"
-                                        );
-                                    }
-                                }
-                                if let Some(name) = inst.get("name").and_then(|v| v.as_str()) {
-                                    assert!(
-                                        name.len() <= MAX_OUTPUT_BYTES,
-                                        "registry name unbounded at {iter}"
-                                    );
-                                    assert!(
-                                        !name.contains('\0'),
-                                        "registry name contains NUL at {iter}"
-                                    );
-                                }
+                if let Value::Object(map) = &value
+                    && let Some(instances) = map.get("instances").and_then(|v| v.as_array())
+                {
+                    for inst in instances {
+                        if let Some(root) = inst
+                            .get("config_root")
+                            .and_then(|v| v.as_str())
+                            .or_else(|| inst.get("config_dir").and_then(|v| v.as_str()))
+                        {
+                            let p = Path::new(root);
+                            assert!(
+                                !p.components()
+                                    .any(|c| matches!(c, std::path::Component::ParentDir)),
+                                "registry config_root carries a traversal at {iter}: {root:?}"
+                            );
+                            if p.is_absolute() {
+                                assert!(
+                                    p.to_string_lossy().len() <= MAX_OUTPUT_BYTES,
+                                    "registry path unbounded at {iter}"
+                                );
                             }
                         }
+                        if let Some(name) = inst.get("name").and_then(|v| v.as_str()) {
+                            assert!(
+                                name.len() <= MAX_OUTPUT_BYTES,
+                                "registry name unbounded at {iter}"
+                            );
+                            assert!(!name.contains('\0'), "registry name contains NUL at {iter}");
+                        }
                     }
-
-                    let reparsed: Result<Value, _> = serde_json::from_str(&serialized);
-                    assert!(
-                        reparsed.is_ok(),
-                        "registry re-parse failed at iter {iter}: {reparsed:?}"
-                    );
-
-                    let after_bytes = std::fs::read(&path).unwrap_or_default();
-                    assert_eq!(before_bytes, after_bytes);
-                    let after_snapshot = snapshot_dir(&dir);
-                    assert_dir_unchanged(
-                        &before_snapshot,
-                        &after_snapshot,
-                        &format!("registry-ok {iter}"),
-                    );
-                    assert_no_path_escape(&dir, &path, "registry-ok");
                 }
-                Err(_) => {
-                    let after_bytes = std::fs::read(&path).unwrap_or_default();
-                    assert_eq!(
-                        before_bytes, after_bytes,
-                        "rejected registry load mutated file at iter {iter}"
-                    );
-                    let after_snapshot = snapshot_dir(&dir);
-                    assert_dir_unchanged(
-                        &before_snapshot,
-                        &after_snapshot,
-                        &format!("registry-rejected {iter}"),
-                    );
-                    for (p, _) in &after_snapshot {
-                        assert_no_path_escape(&dir, p, "registry-rejected");
-                    }
+
+                let reparsed: Result<Value, _> = serde_json::from_str(&serialized);
+                assert!(
+                    reparsed.is_ok(),
+                    "registry re-parse failed at iter {iter}: {reparsed:?}"
+                );
+
+                let after_bytes = std::fs::read(&path).unwrap_or_default();
+                assert_eq!(before_bytes, after_bytes);
+                let after_snapshot = snapshot_dir(&dir);
+                assert_dir_unchanged(
+                    &before_snapshot,
+                    &after_snapshot,
+                    &format!("registry-ok {iter}"),
+                );
+                assert_no_path_escape(&dir, &path, "registry-ok");
+            } else {
+                let after_bytes = std::fs::read(&path).unwrap_or_default();
+                assert_eq!(
+                    before_bytes, after_bytes,
+                    "rejected registry load mutated file at iter {iter}"
+                );
+                let after_snapshot = snapshot_dir(&dir);
+                assert_dir_unchanged(
+                    &before_snapshot,
+                    &after_snapshot,
+                    &format!("registry-rejected {iter}"),
+                );
+                for (p, _) in &after_snapshot {
+                    assert_no_path_escape(&dir, p, "registry-rejected");
                 }
             }
 
@@ -1308,8 +1257,8 @@ mod tests {
     #[test]
     fn fuzz_all_codecs_combined_truncated_huge_nested_deep_100() {
         let corpus = seed_corpus();
-        for iter in 0..100 {
-            let mut prng = Prng::new(iter as u64 + 0xa3b4_c5d6);
+        for iter in 0..100u64 {
+            let mut prng = Prng::new(iter + 0xa3b4_c5d6);
             let base = corpus
                 .get(prng.gen_range(0, corpus.len()))
                 .cloned()
@@ -1377,7 +1326,7 @@ mod tests {
                     kind,
                 );
                 assert_eq!(doc.bytes, input);
-                assert!(doc.digest.len() == 16);
+                assert_eq!(doc.digest.len(), 16);
                 assert_bounded_allocation(&input, &doc.bytes, "combined-doc");
             }
 
@@ -1409,17 +1358,16 @@ mod tests {
 
     #[test]
     fn fuzz_selector_and_path_escape_with_sentinel_no_leak_100() {
-        const SENTINEL: &str = "sk-superai-test-sentinel-12345-fake";
-        for iter in 0..100 {
-            let mut prng = Prng::new(iter as u64 + 0xb5c6_d7e8);
-            let payloads = vec![
+        for iter in 0..100u64 {
+            let mut prng = Prng::new(iter + 0xb5c6_d7e8);
+            let payloads = [
                 format!("key:field_{iter}"),
                 format!("key:../escape_{iter}"),
                 format!("key:{SENTINEL}"),
                 format!("table:section_{iter}..traversal"),
                 format!("identity:api_key={SENTINEL}"),
                 "key:".to_owned(),
-                "".to_owned(),
+                String::new(),
             ];
             let text = payloads
                 .get(prng.gen_range(0, payloads.len()))
@@ -1446,7 +1394,7 @@ mod tests {
             let candidate = dir.join(&traversal_name);
             // The candidate contains `..`; the escape check must panic, caught here.
             let escape_check = std::panic::catch_unwind(|| {
-                assert_no_path_escape(&dir, &candidate, "selector-sentinel-traversal")
+                assert_no_path_escape(&dir, &candidate, "selector-sentinel-traversal");
             });
             assert!(
                 escape_check.is_err(),
@@ -1458,12 +1406,11 @@ mod tests {
 
     #[test]
     fn fuzz_huge_and_deep_and_random_with_secret_scan_and_bom_100() {
-        const SENTINEL: &str = "sk-superai-test-sentinel-12345-fake";
         let corpus = seed_corpus();
-        for iter in 0..100 {
-            let mut prng = Prng::new(iter as u64 + 0xc6d7_e8f9);
+        for iter in 0..100u64 {
+            let mut prng = Prng::new(iter + 0xc6d7_e8f9);
             let input: Vec<u8> = match iter % 4 {
-                0 => gen_truncated(&mut prng, &corpus[iter % corpus.len()]),
+                0 => gen_truncated(&mut prng, &corpus[(iter % corpus.len() as u64) as usize]),
                 1 => gen_huge_json(&mut prng),
                 2 => gen_nested_json(250),
                 _ => gen_random_text_with_bom_and_control(&mut prng),
@@ -1550,8 +1497,8 @@ mod tests {
             DuplicateHandling, EditOperation, Operation, RedactionPolicy, Selector,
         };
         use serde_json::Value;
-        for iter in 0..100 {
-            let mut prng = Prng::new(iter as u64 + 0x5eed_1234);
+        for iter in 0..100u64 {
+            let mut prng = Prng::new(iter + 0x5eed_1234);
             let base = corpus
                 .get(prng.gen_range(0, corpus.len()))
                 .cloned()
@@ -1572,7 +1519,7 @@ mod tests {
             let key = format!("k{iter}");
             let selector = match prng.gen_range(0, 4) {
                 0 => Selector::Key(key.clone()),
-                1 => Selector::Key(format!("outer.{}", key)),
+                1 => Selector::Key(format!("outer.{key}")),
                 2 => Selector::Index(prng.gen_range(0, 4)),
                 _ => Selector::ManagedSpan(format!("span{iter}")),
             };
@@ -1700,13 +1647,13 @@ mod tests {
             match prng.gen_range(0, 6) {
                 0 => text.push_str("plain content\n"),
                 1 => text.push_str("  indented # superai:begin:not-a-sentinel\n"),
-                2 => text.push_str(&format!("note {}\r\n", line_i)),
+                2 => text.push_str(&format!("note {line_i}\r\n")),
                 3 => text.push_str(&codec.begin_sentinel(&format!("smuggled{line_i}"))),
                 4 => text.push_str(&codec.end_sentinel("dangling")),
                 _ => text.push_str("# comment\r\n"),
             }
         }
-        if iter % 7 == 0 {
+        if iter.is_multiple_of(7) {
             text.push_str("# superai:begin:good\nbody\n# superai:end:good\n");
         }
         text
@@ -1715,10 +1662,10 @@ mod tests {
     #[test]
     fn fuzz_span_codec_no_panic_and_invariants_hold_100() {
         use crate::span_codec::SpanCodec;
-        for iter in 0..100 {
-            let mut prng = Prng::new(iter as u64 + 0x5eecd0de);
+        for iter in 0..100u64 {
+            let mut prng = Prng::new(iter + 0x5eec_d0de);
             let codec = SpanCodec::default();
-            let text = gen_span_text(&mut prng, iter);
+            let text = gen_span_text(&mut prng, iter as usize);
             let name = format!("span{iter}");
             let body = if prng.gen_bool() {
                 prng.gen_ascii_string(0, 64)

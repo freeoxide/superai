@@ -38,13 +38,13 @@ enum LineKind {
 
 #[derive(Debug, Clone)]
 struct EntryMeta {
-    /// Key name.
+    /// Key as written, `export` prefix excluded.
     key: String,
-    /// Decoded value.
+    /// Decoded: quotes stripped and escapes resolved.
     value: String,
-    /// Quoting style.
+    /// Style detected at parse time; reused when rewriting the line.
     quoting: Quoting,
-    /// Whether line had `export` prefix.
+    /// Whether the line had an `export` prefix; preserved on rewrite.
     export: bool,
     /// Byte start of value token (including opening quote if any) in `raw`.
     value_start: usize,
@@ -52,12 +52,13 @@ struct EntryMeta {
     value_end: usize,
 }
 
-/// Detect newline style from raw bytes: CRLF if any `\r\n` occurs, else LF.
+/// Newline for writes, from the shared byte scan: CRLF if any `\r\n` occurs,
+/// else LF.
 fn detect_newline(bytes: &[u8]) -> &'static str {
-    let has_crlf = bytes
-        .windows(2)
-        .any(|w| w.first().copied() == Some(b'\r') && w.get(1).copied() == Some(b'\n'));
-    if has_crlf { "\r\n" } else { "\n" }
+    match crate::document::detect_newline(bytes) {
+        crate::document::NewlineStyle::Crlf => "\r\n",
+        crate::document::NewlineStyle::Lf => "\n",
+    }
 }
 
 /// Strip a leading UTF-8 BOM if present.

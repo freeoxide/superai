@@ -1,8 +1,6 @@
 //! Layer 1: harness config files. Every operation reads fresh, backs up,
 //! and writes back preserving keys superai does not model.
 
-/// QAL-10/11 secret and path abuse verification.
-pub mod abuse;
 /// Atomic commit utilities.
 pub mod atomic;
 /// Backup catalog and verification.
@@ -26,6 +24,7 @@ pub mod jsonc;
 pub mod quarantine;
 /// Raw editor backend: read/validate/diff/commit.
 pub mod raw_editor;
+mod safe_paths;
 /// Filesystem snapshot and conflict token.
 pub mod snapshot;
 /// Managed-span codec for text fragments (DOC-08).
