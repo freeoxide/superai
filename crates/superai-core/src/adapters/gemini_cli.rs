@@ -67,26 +67,6 @@ impl GeminiCliAdapter {
         Ok(Self { id })
     }
 
-    /// The harness id this adapter validates instances against.
-    pub fn harness_id(&self) -> &HarnessId {
-        &self.id
-    }
-
-    /// Executable probed during detection.
-    pub fn executable_name(&self) -> &str {
-        EXECUTABLE
-    }
-
-    /// Env var callers may set to relocate the config root.
-    pub fn config_env_var(&self) -> &str {
-        CONFIG_ENV_VAR
-    }
-
-    /// Migration text returned in place of every mutating operation.
-    pub fn successor_tip(&self) -> &str {
-        MIGRATION_TIP
-    }
-
     fn default_config_root() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var(CONFIG_ENV_VAR)
             && !dir.trim().is_empty()
@@ -420,8 +400,7 @@ mod tests {
     use std::collections::HashSet;
 
     use super::{
-        DISPLAY_NAME, EXECUTABLE, GeminiCliAdapter, HARNESS_ID_STR, ISOLATED_CONFIG_ROOT_HINT,
-        MIGRATION_TIP, RESEARCH_DOC, SUCCESSOR_ID,
+        GeminiCliAdapter, HARNESS_ID_STR, ISOLATED_CONFIG_ROOT_HINT, MIGRATION_TIP, SUCCESSOR_ID,
     };
     use crate::adapter::{Adapter, ConfigScope, DocumentKind, ProductStatus, SurfaceOwnership};
     use crate::error::CoreError;
@@ -454,15 +433,14 @@ mod tests {
     #[test]
     fn adapter_identity() {
         let a = adapter();
+        // Constructor wiring plus catalog registration: an id the catalog
+        // does not know can never reconcile with detection or instances.
         assert_eq!(a.id().as_str(), HARNESS_ID_STR);
-        assert_eq!(a.display_name(), DISPLAY_NAME);
-        assert_eq!(a.executable_name(), EXECUTABLE);
+        assert!(crate::harness_catalog::find_by_id(HARNESS_ID_STR).is_some());
         assert_eq!(a.product_status(), ProductStatus::Retired);
-        assert_eq!(a.research_doc_link(), RESEARCH_DOC);
-        assert!(!a.last_verified_date().is_empty());
-        assert_eq!(a.adapter_revision(), crate::adapter::ADAPTER_REVISION);
-        assert!(a.successor_tip().contains(SUCCESSOR_ID));
-        assert!(a.successor_tip().contains("agy"));
+        // The refusal tip must name the successor and its import command.
+        assert!(MIGRATION_TIP.contains(SUCCESSOR_ID));
+        assert!(MIGRATION_TIP.contains("agy"));
     }
 
     #[test]

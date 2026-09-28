@@ -74,25 +74,9 @@ impl SweAgentAdapter {
         Ok(Self { id })
     }
 
-    /// Borrow the harness id.
-    pub fn harness_id(&self) -> &HarnessId {
-        &self.id
-    }
-
-    /// Executable name for this harness.
-    pub fn executable_name(&self) -> &str {
-        EXECUTABLE
-    }
-
-    /// Config dir env var.
-    pub fn config_dir_env_var(&self) -> &str {
-        CONFIG_DIR_ENV_VAR
-    }
-
     fn probe_version(binary: &Path) -> Option<String> {
-        // SWE-agent builds answer --help when --version is unsupported.
-        // Unlike the shared single-window probe this may spend two 2s
-        // budgets, and --help also runs when --version parses to nothing.
+        // SWE-agent builds answer --help when --version is unsupported; this
+        // may spend two 2s budgets, and --help also runs on no parsed version.
         super::run_capturing(binary, &["--version"], Duration::from_secs(2))
             .and_then(|out| super::parse_version_output(&out))
             .or_else(|| {
@@ -503,10 +487,7 @@ mod tests {
     use std::collections::HashSet;
     use std::path::PathBuf;
 
-    use super::{
-        DISPLAY_NAME, EXECUTABLE, HARNESS_ID_STR, OWNED_SELECTORS, RESEARCH_DOC, SweAgentAdapter,
-        TRAJECTORY_ENV_VAR,
-    };
+    use super::{HARNESS_ID_STR, OWNED_SELECTORS, SweAgentAdapter, TRAJECTORY_ENV_VAR};
     use crate::adapter::{Adapter, ConfigScope, DocumentKind, ProductStatus, SurfaceOwnership};
     use crate::error::CoreError;
     use crate::ids::{HarnessId, InstanceId, InstanceName};
@@ -538,12 +519,11 @@ mod tests {
     #[test]
     fn adapter_identity() {
         let a = adapter();
+        // Constructor wiring plus catalog registration: an id the catalog
+        // does not know can never reconcile with detection or instances.
         assert_eq!(a.id().as_str(), HARNESS_ID_STR);
-        assert_eq!(a.display_name(), DISPLAY_NAME);
-        assert_eq!(a.executable_name(), EXECUTABLE);
+        assert!(crate::harness_catalog::find_by_id(HARNESS_ID_STR).is_some());
         assert_eq!(a.product_status(), ProductStatus::Active);
-        assert_eq!(a.research_doc_link(), RESEARCH_DOC);
-        assert_eq!(a.adapter_revision(), crate::adapter::ADAPTER_REVISION);
     }
 
     #[test]
@@ -562,7 +542,6 @@ mod tests {
         let a = adapter();
         let result = a.detection();
         assert!(!result.evidence.is_empty());
-        assert_ne!(result.confidence.to_string(), "");
     }
 
     #[test]

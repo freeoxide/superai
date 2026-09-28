@@ -380,7 +380,8 @@ pub fn injected_stage_temp(
     };
     let diags = superai_config::raw_editor::validate(&bytes, kind);
     if !diags.is_empty() {
-        // A failed validation consumes the staged file with it.
+        // Only the PathBuf moves into the error; the staged temp file stays
+        // on disk until its cleanup runs.
         return Err(CoreError::Verification {
             path: temp,
             kind: "parse_staged".to_owned(),

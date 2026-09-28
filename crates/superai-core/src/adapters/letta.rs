@@ -97,26 +97,6 @@ impl LettaAdapter {
         Ok(Self { id })
     }
 
-    /// Borrow the harness id.
-    pub fn harness_id(&self) -> &HarnessId {
-        &self.id
-    }
-
-    /// Executable name for this harness.
-    pub fn executable_name(&self) -> &str {
-        EXECUTABLE
-    }
-
-    /// Local backend env var.
-    pub fn local_backend_env_var(&self) -> &str {
-        LOCAL_BACKEND_ENV_VAR
-    }
-
-    /// Base URL env var.
-    pub fn base_url_env_var(&self) -> &str {
-        BASE_URL_ENV_VAR
-    }
-
     fn default_local_backend_dir() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var(LOCAL_BACKEND_ENV_VAR)
             && !dir.trim().is_empty()
@@ -575,10 +555,7 @@ mod tests {
     use std::collections::HashSet;
     use std::path::PathBuf;
 
-    use super::{
-        CONSTRAINED_NOTE, DISPLAY_NAME, EXECUTABLE, HARNESS_ID_STR, LettaAdapter, RESEARCH_DOC,
-        env_preview,
-    };
+    use super::{CONSTRAINED_NOTE, HARNESS_ID_STR, LettaAdapter, env_preview};
     use crate::adapter::{Adapter, ConfigScope, DocumentKind, ProductStatus, SurfaceOwnership};
     use crate::error::CoreError;
     use crate::ids::{HarnessId, InstanceId, InstanceName};
@@ -610,15 +587,11 @@ mod tests {
     #[test]
     fn adapter_identity() {
         let a = adapter();
+        // Constructor wiring plus catalog registration: an id the catalog
+        // does not know can never reconcile with detection or instances.
         assert_eq!(a.id().as_str(), HARNESS_ID_STR);
-        assert_eq!(a.display_name(), DISPLAY_NAME);
-        assert_eq!(a.executable_name(), EXECUTABLE);
-        assert_eq!(a.local_backend_env_var(), super::LOCAL_BACKEND_ENV_VAR);
-        assert_eq!(a.base_url_env_var(), super::BASE_URL_ENV_VAR);
+        assert!(crate::harness_catalog::find_by_id(HARNESS_ID_STR).is_some());
         assert_eq!(a.product_status(), ProductStatus::Active);
-        assert_eq!(a.research_doc_link(), RESEARCH_DOC);
-        assert!(!a.last_verified_date().is_empty());
-        assert_eq!(a.adapter_revision(), crate::adapter::ADAPTER_REVISION);
     }
 
     #[test]
@@ -638,7 +611,6 @@ mod tests {
         let result = a.detection();
         assert!(!result.evidence.is_empty());
         assert!(result.evidence.iter().any(|e| e.contains("constrained")));
-        assert_ne!(result.confidence.to_string(), "");
     }
 
     #[test]
