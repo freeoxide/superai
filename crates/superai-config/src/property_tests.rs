@@ -658,10 +658,8 @@ mod tests {
 
     #[test]
     fn mutant_template_selector_traversal_is_rejected() {
-        // Selector::parse accepts names verbatim by design (the executor's
-        // ownership checks enforce traversal safety), so the selector-layer
-        // property is: no panic, and no reinterpretation on round-trip. The
-        // path boundary must refuse traversal outright.
+        // Selector::parse accepts names verbatim (executor ownership checks
+        // enforce traversal safety), so any Err is a behaviour change naming its input.
         let traversals = ["../", "a/../b", "..\\", "key:../escape", "table:../"];
         for t in traversals {
             let selector = match Selector::parse(t) {
