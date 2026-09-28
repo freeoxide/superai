@@ -577,6 +577,7 @@ mod tests {
 
     use super::{
         CONSTRAINED_NOTE, DISPLAY_NAME, EXECUTABLE, HARNESS_ID_STR, LettaAdapter, RESEARCH_DOC,
+        env_preview,
     };
     use crate::adapter::{Adapter, ConfigScope, DocumentKind, ProductStatus, SurfaceOwnership};
     use crate::error::CoreError;
@@ -654,22 +655,6 @@ mod tests {
             assert!(!res.compatible);
         }
         assert!(!res.notes.is_empty());
-    }
-
-    #[test]
-    fn parse_version_output_cases() {
-        let cases = vec![
-            ("letta 0.2.1", Some("0.2.1")),
-            ("letta 0.2.1-beta", Some("0.2.1-beta")),
-            ("0.2.1", Some("0.2.1")),
-            ("v0.2.1", Some("0.2.1")),
-            ("", None),
-            ("not a version", None),
-        ];
-        for (input, expected) in cases {
-            let got = crate::adapters::parse_version_output(input);
-            assert_eq!(got.as_deref(), expected, "input: {input:?}");
-        }
     }
 
     #[test]
@@ -983,6 +968,23 @@ mod tests {
         assert_eq!(boxed.id().as_str(), HARNESS_ID_STR);
         assert!(!boxed.config_surfaces().is_empty());
         assert_eq!(boxed.adapter_revision(), crate::adapter::ADAPTER_REVISION);
+    }
+
+    #[test]
+    fn long_secrets_redact_instead_of_truncate() {
+        // A long KEY/TOKEN-shaped value must never ride the 80-char
+        // truncation rule into detection evidence.
+        let long_secret = format!("sk-{}", "x".repeat(120));
+        assert_eq!(env_preview("LETTA_API_KEY", &long_secret), "[REDACTED]");
+        assert_eq!(
+            env_preview("LETTA_APP_SERVER_TOKEN", &long_secret),
+            "[REDACTED]"
+        );
+        // Non-secret values still truncate past 80 chars.
+        let long_url = format!("http://localhost/{}", "p".repeat(120));
+        let preview = env_preview("LETTA_BASE_URL", &long_url);
+        assert!(preview.chars().count() <= 81, "{preview}");
+        assert_eq!(env_preview("LETTA_BASE_URL", "short"), "short");
     }
 
     #[test]

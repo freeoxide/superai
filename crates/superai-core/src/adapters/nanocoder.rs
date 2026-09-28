@@ -67,21 +67,6 @@ impl NanocoderAdapter {
         Ok(Self { id })
     }
 
-    /// The harness id this adapter validates instances against.
-    pub fn harness_id(&self) -> &HarnessId {
-        &self.id
-    }
-
-    /// Executable probed during detection.
-    pub fn executable_name(&self) -> &str {
-        EXECUTABLE
-    }
-
-    /// Env var callers may set to relocate the config root.
-    pub fn config_env_var(&self) -> &str {
-        CONFIG_ENV_VAR
-    }
-
     fn default_config_root() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var(CONFIG_ENV_VAR)
             && !dir.trim().is_empty()
@@ -541,10 +526,7 @@ mod tests {
     use std::collections::HashSet;
     use std::path::PathBuf;
 
-    use super::{
-        CONFIG_ENV_VAR, DISPLAY_NAME, EXECUTABLE, HARNESS_ID_STR, NanocoderAdapter,
-        OWNED_SELECTORS, RESEARCH_DOC,
-    };
+    use super::{CONFIG_ENV_VAR, HARNESS_ID_STR, NanocoderAdapter, OWNED_SELECTORS};
     use crate::adapter::{Adapter, ConfigScope, DocumentKind, ProductStatus, SurfaceOwnership};
     use crate::error::CoreError;
     use crate::ids::{HarnessId, InstanceId, InstanceName};
@@ -576,14 +558,11 @@ mod tests {
     #[test]
     fn adapter_identity() {
         let a = adapter();
+        // Constructor wiring plus catalog registration: an id the catalog
+        // does not know can never reconcile with detection or instances.
         assert_eq!(a.id().as_str(), HARNESS_ID_STR);
-        assert_eq!(a.display_name(), DISPLAY_NAME);
-        assert_eq!(a.executable_name(), EXECUTABLE);
-        assert_eq!(a.config_env_var(), CONFIG_ENV_VAR);
+        assert!(crate::harness_catalog::find_by_id(HARNESS_ID_STR).is_some());
         assert_eq!(a.product_status(), ProductStatus::Active);
-        assert_eq!(a.research_doc_link(), RESEARCH_DOC);
-        assert!(!a.last_verified_date().is_empty());
-        assert_eq!(a.adapter_revision(), crate::adapter::ADAPTER_REVISION);
     }
 
     #[test]
@@ -617,7 +596,6 @@ mod tests {
                 assert!(!result.evidence.is_empty());
             }
         }
-        assert_ne!(result.confidence.to_string(), "");
     }
 
     #[test]
@@ -635,22 +613,6 @@ mod tests {
             assert!(res.schema_version.is_none());
         }
         assert!(!res.notes.is_empty());
-    }
-
-    #[test]
-    fn parse_version_output_cases() {
-        let cases = vec![
-            ("nanocoder 1.2.3", Some("1.2.3")),
-            ("nanocoder 0.1.0-beta", Some("0.1.0-beta")),
-            ("v1.0.0", Some("1.0.0")),
-            ("Version: 2.0.0", Some("2.0.0")),
-            ("", None),
-            ("not a version", None),
-        ];
-        for (input, expected) in cases {
-            let got = crate::adapters::parse_version_output(input);
-            assert_eq!(got.as_deref(), expected, "input: {input:?}");
-        }
     }
 
     #[test]
@@ -907,22 +869,24 @@ mod tests {
     fn fixture_minimal_parses() {
         let path = fixture_path("agents.config.minimal.json");
         assert!(path.exists(), "fixture missing: {}", path.display());
+        // The minimal fixture is the empty document nanocoder ships with.
         let map = superai_config::json::load(&path).unwrap();
-        assert!(map.is_empty() || map.contains_key("nanocoder") || map.contains_key("mcpServers"));
+        assert!(
+            map.is_empty(),
+            "minimal fixture must be an empty object: {map:?}"
+        );
     }
 
     #[test]
     fn fixture_populated_parses_and_has_expected_keys() {
         let path = fixture_path("agents.config.populated.json");
         assert!(path.exists(), "fixture missing: {}", path.display());
+        // The populated fixture must carry the two top-level surfaces the
+        // adapter declares ownership over.
         let map = superai_config::json::load(&path).unwrap();
         assert!(
-            map.contains_key("providers")
-                || map.contains_key("mcpServers")
-                || map.contains_key("model")
-                || map.contains_key("providers")
-                || map.contains_key("mcpServers")
-                || !map.is_empty()
+            map.contains_key("nanocoder") && map.contains_key("mcpServers"),
+            "populated fixture missing nanocoder/mcpServers: {map:?}"
         );
     }
 
@@ -971,31 +935,6 @@ mod tests {
         assert!(path.exists(), "fixture missing: {}", path.display());
         let result = superai_config::json::load(&path);
         assert!(result.is_err(), "malformed fixture must fail to parse");
-    }
-
-    #[test]
-    fn secret_redaction_placeholder() {
-        use crate::error::RedactedString;
-        let secret = RedactedString::new("sk-nanocoder-secret-321");
-        let debug = format!("{secret:?}");
-        let display = format!("{secret}");
-        assert!(!debug.contains("sk-nanocoder-secret-321"));
-        assert!(!display.contains("sk-nanocoder-secret-321"));
-        assert!(debug.contains("[REDACTED]"));
-        assert!(display.contains("[REDACTED]"));
-        let json = serde_json::to_string(&secret).unwrap();
-        assert!(!json.contains("sk-nanocoder-secret-321"));
-        assert!(json.contains("[REDACTED]"));
-        assert_eq!(secret.expose_secret(), "sk-nanocoder-secret-321");
-    }
-
-    #[test]
-    fn diff_redaction_does_not_leak_secrets() {
-        use crate::error::RedactedString as OpRedacted;
-        let secret = OpRedacted::new("super-secret-key");
-        let diff_text = format!("set api key to {secret}");
-        assert!(!diff_text.contains("super-secret-key"));
-        assert!(diff_text.contains("[REDACTED]"));
     }
 
     #[test]

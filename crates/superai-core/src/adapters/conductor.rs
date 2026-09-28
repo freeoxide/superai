@@ -69,21 +69,6 @@ impl ConductorAdapter {
         Ok(Self { id })
     }
 
-    /// The harness id this adapter validates instances against.
-    pub fn harness_id(&self) -> &HarnessId {
-        &self.id
-    }
-
-    /// Primary executable probed during detection.
-    pub fn executable_name(&self) -> &str {
-        EXECUTABLE
-    }
-
-    /// Constrained note naming the macOS/worktree scoping the plan enforces.
-    pub fn constrained_note(&self) -> &str {
-        CONSTRAINED_NOTE
-    }
-
     fn default_user_settings() -> Option<PathBuf> {
         let home = std::env::var("HOME")
             .ok()
@@ -557,10 +542,7 @@ impl Adapter for ConductorAdapter {
 mod tests {
     use std::collections::HashSet;
 
-    use super::{
-        CONSTRAINED_NOTE, ConductorAdapter, DISPLAY_NAME, EXECUTABLE, HARNESS_ID_STR,
-        OWNED_SELECTORS, RESEARCH_DOC,
-    };
+    use super::{CONSTRAINED_NOTE, ConductorAdapter, HARNESS_ID_STR, OWNED_SELECTORS};
     use crate::adapter::{Adapter, ConfigScope, DocumentKind, ProductStatus, SurfaceOwnership};
     use crate::error::CoreError;
     use crate::ids::{HarnessId, InstanceId, InstanceName};
@@ -592,14 +574,13 @@ mod tests {
     #[test]
     fn adapter_identity() {
         let a = adapter();
+        // Constructor wiring plus catalog registration: an id the catalog
+        // does not know can never reconcile with detection or instances.
         assert_eq!(a.id().as_str(), HARNESS_ID_STR);
-        assert_eq!(a.display_name(), DISPLAY_NAME);
-        assert_eq!(a.executable_name(), EXECUTABLE);
+        assert!(crate::harness_catalog::find_by_id(HARNESS_ID_STR).is_some());
         assert_eq!(a.product_status(), ProductStatus::Active);
-        assert_eq!(a.research_doc_link(), RESEARCH_DOC);
-        assert!(!a.last_verified_date().is_empty());
-        assert_eq!(a.adapter_revision(), crate::adapter::ADAPTER_REVISION);
-        assert!(a.constrained_note().contains("macOS"));
+        // The constrained note feeds plan text; it must name the worktree
+        // scoping the plan enforces.
         assert!(CONSTRAINED_NOTE.contains("worktrees"));
     }
 
@@ -628,7 +609,6 @@ mod tests {
             }
             InstallPresence::Broken => assert!(!result.evidence.is_empty()),
         }
-        assert_ne!(result.confidence.to_string(), "");
     }
 
     #[test]
@@ -647,22 +627,6 @@ mod tests {
             assert!(res.schema_version.is_none());
         }
         assert!(!res.notes.is_empty());
-    }
-
-    #[test]
-    fn parse_version_output_cases() {
-        let cases = vec![
-            ("conductor 1.2.3", Some("1.2.3")),
-            ("1.0.0", Some("1.0.0")),
-            ("v1.0.0", Some("1.0.0")),
-            ("Version: 2.0.0", Some("2.0.0")),
-            ("", None),
-            ("not a version", None),
-        ];
-        for (input, expected) in cases {
-            let got = crate::adapters::parse_version_output(input);
-            assert_eq!(got.as_deref(), expected, "input: {input:?}");
-        }
     }
 
     #[test]

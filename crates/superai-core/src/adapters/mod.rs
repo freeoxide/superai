@@ -209,6 +209,28 @@ mod decl_tests {
     use crate::adapter::DocumentKind;
     use crate::harness_catalog;
 
+    /// The shared version parser's contract, tested once here instead of
+    /// once per adapter file.
+    #[test]
+    fn parse_version_output_cases() {
+        let cases = vec![
+            ("conductor 1.2.3", Some("1.2.3")),
+            ("1.0.0", Some("1.0.0")),
+            ("v1.0.0", Some("1.0.0")),
+            ("Version: 2.0.0", Some("2.0.0")),
+            ("tool 0.1.0-beta", Some("0.1.0-beta")),
+            ("", None),
+            ("not a version", None),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                crate::adapters::parse_version_output(input).as_deref(),
+                expected,
+                "input: {input:?}"
+            );
+        }
+    }
+
     /// (harness id, expected dest file, expected dest key) for every adapter
     /// that declares an MCP destination, per docs/harness-configs/<doc>.md.
     const MCP_DESTS: &[(&str, &str, &str)] = &[

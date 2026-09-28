@@ -1,16 +1,6 @@
 //! Failure injection per QAL-06 plus fake process/network harness per QAL-07.
 //! Deterministic fail-at-Nth counters thread the REAL transaction boundaries; no live network, no real daemons.
 
-#![expect(
-    clippy::collapsible_if,
-    clippy::excessive_nesting,
-    clippy::manual_string_new,
-    clippy::match_same_arms,
-    clippy::redundant_clone,
-    clippy::vec_init_then_push,
-    reason = "failure harness keeps deliberate deep branching"
-)]
-
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -213,10 +203,10 @@ impl FailureInjector for TestInjector {
             let seen = *counter;
             guard.fail_at.get(&point).copied().map(|nth| (seen, nth))
         };
-        if let Some((seen, nth)) = nth_opt {
-            if seen == nth {
-                return Err(injected_error(point, seen));
-            }
+        if let Some((seen, nth)) = nth_opt
+            && seen == nth
+        {
+            return Err(injected_error(point, seen));
         }
         Ok(())
     }
@@ -255,17 +245,16 @@ fn injected_error(point: FailurePoint, nth: usize) -> CoreError {
                 actual: reason,
             })
         }
-        FailurePoint::AtomicReplace | FailurePoint::ParentSync => CoreError::Commit {
+        FailurePoint::AtomicReplace
+        | FailurePoint::ParentSync
+        | FailurePoint::SecondFile
+        | FailurePoint::ThirdFile => CoreError::Commit {
             path: PathBuf::from(format!("injected:{point}")),
             reason,
         },
         FailurePoint::ReadBackVerify => CoreError::Verification {
             path: PathBuf::from(format!("injected:{point}")),
             kind: "injected_readback".to_owned(),
-            reason,
-        },
-        FailurePoint::SecondFile | FailurePoint::ThirdFile => CoreError::Commit {
-            path: PathBuf::from(format!("injected:{point}")),
             reason,
         },
         FailurePoint::RollbackVerify => CoreError::Rollback {
@@ -292,38 +281,30 @@ struct ConfigInjector<'a>(&'a dyn FailureInjector);
 
 fn map_config_point(point: superai_config::injector::Point) -> FailurePoint {
     use superai_config::injector::Point as P;
+    // Journal-phase points double as the crash-at-phase simulation, sharing
+    // the boundary that historically simulated each phase.
     match point {
         P::BackupOpen => FailurePoint::BackupOpen,
-        P::BackupWrite => FailurePoint::BackupWrite,
+        P::BackupWrite | P::JournalPrepareBackup => FailurePoint::BackupWrite,
         P::BackupFlush => FailurePoint::BackupFlush,
         P::BackupVerify => FailurePoint::BackupVerify,
         P::TempCreate => FailurePoint::TempCreate,
-        P::TempWrite => FailurePoint::TempWrite,
+        P::TempWrite | P::JournalStageTemp => FailurePoint::TempWrite,
         P::TempFlush => FailurePoint::TempFlush,
-        P::ParseStaged => FailurePoint::ParseStaged,
+        P::ParseStaged | P::JournalPlan => FailurePoint::ParseStaged,
         P::ConflictRecheck => FailurePoint::ConflictRecheck,
         P::AtomicReplace => FailurePoint::AtomicReplace,
         P::ParentSync => FailurePoint::ParentSync,
-        P::ReadBackVerify => FailurePoint::ReadBackVerify,
-        P::RollbackVerify => FailurePoint::RollbackVerify,
-        P::SecondFile => FailurePoint::SecondFile,
+        P::ReadBackVerify | P::JournalVerify => FailurePoint::ReadBackVerify,
+        P::RollbackVerify | P::JournalRollback => FailurePoint::RollbackVerify,
+        P::SecondFile | P::JournalCommit => FailurePoint::SecondFile,
         P::ThirdFile => FailurePoint::ThirdFile,
-        // Journal-phase points double as the crash-at-phase simulation; they
-        // map onto the boundary that historically simulated each phase.
-        P::JournalPlan => FailurePoint::ParseStaged,
-        P::JournalPrepareBackup => FailurePoint::BackupWrite,
-        P::JournalStageTemp => FailurePoint::TempWrite,
-        P::JournalCommit => FailurePoint::SecondFile,
-        P::JournalVerify => FailurePoint::ReadBackVerify,
-        P::JournalRollback => FailurePoint::RollbackVerify,
     }
 }
 
 impl superai_config::injector::Injector for ConfigInjector<'_> {
     fn inject(&self, point: superai_config::injector::Point) -> superai_config::Result<()> {
-        self.0
-            .inject(map_config_point(point))
-            .map_err(core_error_to_config)
+        inject_config_point(self.0, point)
     }
 }
 
@@ -332,17 +313,21 @@ impl superai_config::injector::Injector for ConfigInjector<'_> {
 #[derive(Debug, Clone)]
 pub struct OwnedConfigInjector(std::sync::Arc<dyn FailureInjector>);
 
-/// Build an [`OwnedConfigInjector`] from a shared injector.
-pub fn owned_config_injector(injector: std::sync::Arc<dyn FailureInjector>) -> OwnedConfigInjector {
-    OwnedConfigInjector(injector)
-}
-
 impl superai_config::injector::Injector for OwnedConfigInjector {
     fn inject(&self, point: superai_config::injector::Point) -> superai_config::Result<()> {
-        self.0
-            .inject(map_config_point(point))
-            .map_err(core_error_to_config)
+        inject_config_point(self.0.as_ref(), point)
     }
+}
+
+/// The one injection path both config adapters share: remap the config-phase
+/// point onto the core boundary and map the error back.
+fn inject_config_point(
+    injector: &dyn FailureInjector,
+    point: superai_config::injector::Point,
+) -> superai_config::Result<()> {
+    injector
+        .inject(map_config_point(point))
+        .map_err(core_error_to_config)
 }
 
 fn core_error_to_config(err: CoreError) -> superai_config::ConfigError {
@@ -383,16 +368,21 @@ pub fn injected_stage_temp(
     let temp = superai_config::transaction::stage_temp_file(target, content, Some(&adapter))
         .map_err(CoreError::Config)?;
     injector.inject(FailurePoint::ParseStaged)?;
-    let bytes = std::fs::read(&temp).map_err(|e| {
-        CoreError::Config(superai_config::ConfigError::Io {
-            path: temp.clone(),
-            source: e,
-        })
-    })?;
+    // Read errors can move `temp` into the error: both paths end this fn.
+    let bytes = match std::fs::read(&temp) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return Err(CoreError::Config(superai_config::ConfigError::Io {
+                path: temp,
+                source: e,
+            }));
+        }
+    };
     let diags = superai_config::raw_editor::validate(&bytes, kind);
     if !diags.is_empty() {
+        // A failed validation consumes the staged file with it.
         return Err(CoreError::Verification {
-            path: temp.clone(),
+            path: temp,
             kind: "parse_staged".to_owned(),
             reason: format!("staged validation failed: {diags:?}"),
         });
@@ -454,107 +444,105 @@ pub struct VersionFixture {
 
 /// Generate the full version-output variant matrix (deterministic, no live process).
 pub fn version_output_fixtures() -> Vec<VersionFixture> {
-    let mut fixtures = Vec::new();
-
-    fixtures.push(VersionFixture {
-        name: "normal semver".to_owned(),
-        raw_output: "claude-code 1.2.3 (build abc)".to_owned(),
-        exit_code: Some(0),
-        is_timeout: false,
-        is_huge: false,
-        expected_version: Some("1.2.3".to_owned()),
-        should_parse: true,
-    });
-    fixtures.push(VersionFixture {
-        name: "spaces around".to_owned(),
-        raw_output: "  v2.0.0-beta.1  ".to_owned(),
-        exit_code: Some(0),
-        is_timeout: false,
-        is_huge: false,
-        expected_version: Some("2.0.0-beta.1".to_owned()),
-        should_parse: true,
-    });
-    fixtures.push(VersionFixture {
-        name: "missing (empty)".to_owned(),
-        raw_output: "".to_owned(),
-        exit_code: Some(0),
-        is_timeout: false,
-        is_huge: false,
-        expected_version: None,
-        should_parse: false,
-    });
-    fixtures.push(VersionFixture {
-        name: "non-zero exit".to_owned(),
-        raw_output: "error: command not found".to_owned(),
-        exit_code: Some(1),
-        is_timeout: false,
-        is_huge: false,
-        expected_version: Some("error:".to_owned()),
-        should_parse: false,
-    });
-    fixtures.push(VersionFixture {
-        name: "timeout".to_owned(),
-        raw_output: "".to_owned(),
-        exit_code: None,
-        is_timeout: true,
-        is_huge: false,
-        expected_version: None,
-        should_parse: false,
-    });
-    let huge_body = "x".repeat(10 * 1024 * 1024);
-    fixtures.push(VersionFixture {
-        name: "huge 10MB".to_owned(),
-        raw_output: huge_body,
-        exit_code: Some(0),
-        is_timeout: false,
-        is_huge: true,
-        expected_version: Some("x".repeat(64)),
-        should_parse: false,
-    });
-    fixtures.push(VersionFixture {
-        name: "multiline with version on second line".to_owned(),
-        raw_output: "some banner\nv0.1.0\nmore info".to_owned(),
-        exit_code: Some(0),
-        is_timeout: false,
-        is_huge: false,
-        expected_version: Some("0.1.0".to_owned()),
-        should_parse: true,
-    });
-    fixtures.push(VersionFixture {
-        name: "version with prefix spaces and tab".to_owned(),
-        raw_output: "\t  version: 3.4.5  ".to_owned(),
-        exit_code: Some(0),
-        is_timeout: false,
-        is_huge: false,
-        expected_version: Some("3.4.5".to_owned()),
-        should_parse: true,
-    });
-    fixtures.push(VersionFixture {
-        name: "non-semver fallback (long line)".to_owned(),
-        raw_output: "a".repeat(100),
-        exit_code: Some(0),
-        is_timeout: false,
-        is_huge: false,
-        expected_version: Some("a".repeat(64)),
-        should_parse: true,
-    });
-    fixtures.push(VersionFixture {
-        name: "utf8 boundary truncation".to_owned(),
-        raw_output: "café-".repeat(30),
-        exit_code: Some(0),
-        is_timeout: false,
-        is_huge: false,
-        expected_version: {
-            let s = "café-".repeat(30);
-            let mut end = 64usize;
-            while end > 0 && !s.is_char_boundary(end) {
-                end -= 1;
-            }
-            Some(s.get(0..end).unwrap_or(&s).to_owned())
+    let fixtures = vec![
+        VersionFixture {
+            name: "normal semver".to_owned(),
+            raw_output: "claude-code 1.2.3 (build abc)".to_owned(),
+            exit_code: Some(0),
+            is_timeout: false,
+            is_huge: false,
+            expected_version: Some("1.2.3".to_owned()),
+            should_parse: true,
         },
-        should_parse: true,
-    });
-
+        VersionFixture {
+            name: "spaces around".to_owned(),
+            raw_output: "  v2.0.0-beta.1  ".to_owned(),
+            exit_code: Some(0),
+            is_timeout: false,
+            is_huge: false,
+            expected_version: Some("2.0.0-beta.1".to_owned()),
+            should_parse: true,
+        },
+        VersionFixture {
+            name: "missing (empty)".to_owned(),
+            raw_output: String::new(),
+            exit_code: Some(0),
+            is_timeout: false,
+            is_huge: false,
+            expected_version: None,
+            should_parse: false,
+        },
+        VersionFixture {
+            name: "non-zero exit".to_owned(),
+            raw_output: "error: command not found".to_owned(),
+            exit_code: Some(1),
+            is_timeout: false,
+            is_huge: false,
+            expected_version: Some("error:".to_owned()),
+            should_parse: false,
+        },
+        VersionFixture {
+            name: "timeout".to_owned(),
+            raw_output: String::new(),
+            exit_code: None,
+            is_timeout: true,
+            is_huge: false,
+            expected_version: None,
+            should_parse: false,
+        },
+        VersionFixture {
+            name: "huge 10MB".to_owned(),
+            raw_output: "x".repeat(10 * 1024 * 1024),
+            exit_code: Some(0),
+            is_timeout: false,
+            is_huge: true,
+            expected_version: Some("x".repeat(64)),
+            should_parse: false,
+        },
+        VersionFixture {
+            name: "multiline with version on second line".to_owned(),
+            raw_output: "some banner\nv0.1.0\nmore info".to_owned(),
+            exit_code: Some(0),
+            is_timeout: false,
+            is_huge: false,
+            expected_version: Some("0.1.0".to_owned()),
+            should_parse: true,
+        },
+        VersionFixture {
+            name: "version with prefix spaces and tab".to_owned(),
+            raw_output: "\t  version: 3.4.5  ".to_owned(),
+            exit_code: Some(0),
+            is_timeout: false,
+            is_huge: false,
+            expected_version: Some("3.4.5".to_owned()),
+            should_parse: true,
+        },
+        VersionFixture {
+            name: "non-semver fallback (long line)".to_owned(),
+            raw_output: "a".repeat(100),
+            exit_code: Some(0),
+            is_timeout: false,
+            is_huge: false,
+            expected_version: Some("a".repeat(64)),
+            should_parse: true,
+        },
+        VersionFixture {
+            name: "utf8 boundary truncation".to_owned(),
+            raw_output: "café-".repeat(30),
+            exit_code: Some(0),
+            is_timeout: false,
+            is_huge: false,
+            expected_version: {
+                let s = "café-".repeat(30);
+                let mut end = 64usize;
+                while end > 0 && !s.is_char_boundary(end) {
+                    end -= 1;
+                }
+                Some(s.get(0..end).unwrap_or(&s).to_owned())
+            },
+            should_parse: true,
+        },
+    ];
     fixtures
 }
 
@@ -656,11 +644,11 @@ impl FakeProcessHarness {
             return None;
         }
         let text = if outcome.output.stdout.trim().is_empty() {
-            outcome.output.stderr.clone()
+            &outcome.output.stderr
         } else {
-            outcome.output.stdout.clone()
+            &outcome.output.stdout
         };
-        extract_version(&text)
+        extract_version(text)
     }
 
     /// Whether harness contains a fixture.
@@ -928,6 +916,10 @@ impl FakeNetworkHarness {
     }
 
     /// Fetch a URL key; returns `TemplateFetchError` mapped from fixture.
+    #[expect(
+        clippy::excessive_nesting,
+        reason = "the fake response table mirrors the real fetcher's branch-for-branch; splitting it would hide which fixture serves which arm"
+    )]
     pub fn fetch(&self, key: &str) -> Result<Vec<u8>, TemplateFetchError> {
         let entry = self
             .responses
@@ -1378,8 +1370,8 @@ mod tests {
         config.base_url = Some(format!("file://{}", fake.display()));
         let mismatch = TemplateFetchError::DigestMismatch {
             template: "claude-glm".to_owned(),
-            expected: wrong.clone(),
-            actual: actual.clone(),
+            expected: wrong,
+            actual,
         };
         let classified = classify_health(200, &format!("{mismatch}"));
         assert_eq!(classified, HealthStatus::DigestMismatch);
@@ -1867,7 +1859,7 @@ mod tests {
         let mut txn = superai_config::transaction::Transaction::new(
             id,
             vec![superai_config::transaction::FileAction::Write {
-                path: target.clone(),
+                path: target,
                 content: br#"{"a":2}"#.to_vec(),
                 kind: DocumentKind::StrictJson,
             }],
@@ -2176,6 +2168,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::excessive_nesting,
+        reason = "the secret-free check must walk every journal phase and residual inside the recovery loop"
+    )]
     fn all_points_journal_recovery_is_secret_free() {
         // QAL-06: every journal phase must recover without leaking sentinel
         // via diagnostics, exercised on the production journal + recovery.
@@ -2223,6 +2219,10 @@ mod tests {
         }
     }
     #[test]
+    #[expect(
+        clippy::excessive_nesting,
+        reason = "the crash matrix asserts cleanup per (phase, nth) inside the commit-path walk"
+    )]
     fn single_file_matrix_hits_real_transaction_commit_path() {
         // Every temp/rename boundary here is the production stage_temp_file
         // + commit_staged_file body, not a parallel wrapper.

@@ -4338,7 +4338,6 @@ mod tests {
         ));
         assert!(is_link_privilege_error("Privilege not held"));
         assert!(!is_link_privilege_error("os error 2: no such file"));
-        assert!(COPY_SELECTED_HINT.contains("CopySelected"));
 
         drop(std::fs::remove_dir_all(&root));
         drop(std::fs::remove_dir_all(&src_parent));

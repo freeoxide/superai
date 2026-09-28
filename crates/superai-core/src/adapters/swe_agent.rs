@@ -90,8 +90,9 @@ impl SweAgentAdapter {
     }
 
     fn probe_version(binary: &Path) -> Option<String> {
-        // SWE-agent builds answer --help when --version is unsupported, so
-        // the fallback reruns the shared capture on the second flag.
+        // SWE-agent builds answer --help when --version is unsupported.
+        // Unlike the shared single-window probe this may spend two 2s
+        // budgets, and --help also runs when --version parses to nothing.
         super::run_capturing(binary, &["--version"], Duration::from_secs(2))
             .and_then(|out| super::parse_version_output(&out))
             .or_else(|| {
@@ -578,21 +579,6 @@ mod tests {
             assert!(!res.compatible);
         }
         assert!(!res.notes.is_empty());
-    }
-
-    #[test]
-    fn parse_version_output_cases() {
-        let cases = vec![
-            ("sweagent 1.0.0", Some("1.0.0")),
-            ("swe-agent 0.5.1", Some("0.5.1")),
-            ("v1.2.3", Some("1.2.3")),
-            ("", None),
-            ("not a version", None),
-        ];
-        for (input, expected) in cases {
-            let got = crate::adapters::parse_version_output(input);
-            assert_eq!(got.as_deref(), expected, "input: {input:?}");
-        }
     }
 
     #[test]

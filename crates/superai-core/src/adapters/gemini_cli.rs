@@ -512,21 +512,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_version_output_cases() {
-        let cases = vec![
-            ("gemini 2.1.0", Some("2.1.0")),
-            ("0.9.0", Some("0.9.0")),
-            ("v1.2.3", Some("1.2.3")),
-            ("", None),
-            ("not a version", None),
-        ];
-        for (input, expected) in cases {
-            let got = crate::adapters::parse_version_output(input);
-            assert_eq!(got.as_deref(), expected, "input: {input:?}");
-        }
-    }
-
-    #[test]
     fn config_surfaces_include_settings() {
         let a = adapter();
         let surfaces = a.config_surfaces();

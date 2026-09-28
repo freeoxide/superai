@@ -2016,7 +2016,7 @@ mod tests {
         );
     }
 
-    /// Run-5 desktop harnesses have no relocation mechanism, so creation is
+    /// Desktop harnesses have no relocation mechanism, so creation is
     /// refused up front, before any root, marker, or manifest write.
     #[test]
     fn desktop_harnesses_refuse_alias_creation_at_the_relocation_guard() {
@@ -2104,8 +2104,6 @@ mod tests {
             other => panic!("expected MCP-absence refusal, got {other:?}"),
         }
     }
-
-    // Run-5: third-party provider profiles + HOME-virtualized instances
 
     fn provider_anthropic() -> ProviderProfile {
         ProviderProfile::new(
