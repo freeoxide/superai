@@ -1063,15 +1063,6 @@ pub fn load_bundled_providers() -> Result<Vec<ProviderDefinition>> {
     Ok(providers)
 }
 
-/// Load bundled providers plus definitions from `extra_path` (file or
-/// directory); duplicates across the two sets are rejected.
-pub fn load_bundled_plus_extra(extra_path: &Path) -> Result<Vec<ProviderDefinition>> {
-    let mut bundled = load_bundled_providers()?;
-    bundled.extend(load_provider_defs(extra_path)?);
-    validate_no_duplicates(&bundled)?;
-    Ok(bundled)
-}
-
 /// Result of a health probe; `base_url` and `reason` are redacted and
 /// never carry raw secrets.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1104,20 +1095,6 @@ pub fn health_probe(provider: &ProviderDefinition) -> HealthProbeResult {
 pub fn health_probe_url(url: &str) -> HealthProbeResult {
     let cfg = crate::health::HealthConfig::default();
     let res = crate::health::health_probe_url(url, &cfg);
-    HealthProbeResult {
-        provider: res.provider,
-        base_url: res.base_url_redacted,
-        valid: res.valid,
-        reason: res.reason,
-    }
-}
-
-/// Health probe with explicit config (timeout, private policy, size caps).
-pub fn health_probe_with_config(
-    provider: &ProviderDefinition,
-    config: &crate::health::HealthConfig,
-) -> HealthProbeResult {
-    let res = crate::health::health_probe(provider, config);
     HealthProbeResult {
         provider: res.provider,
         base_url: res.base_url_redacted,
@@ -1221,35 +1198,6 @@ pub fn validate_api_key_value(provider: &ProviderDefinition, key: &str) -> Resul
     // Allow ${ENV_VAR} references only for WrapperEnvRef sink path, not for literal writes.
     // We don't reject here; sink selection will enforce the right handling.
     Ok(())
-}
-
-/// OAuth/keychain login requirement (PRV-04): when a harness's only
-/// credential surfaces are external stores, the user must run its login.
-pub fn external_auth_requirement(adapter: &dyn Adapter) -> Option<CoreError> {
-    let surfaces = adapter.config_surfaces();
-    let has_external_store = surfaces.iter().any(|surface| {
-        surface.ownership == SurfaceOwnership::ExternalSecretStore
-            || matches!(surface.kind, DocumentKind::Keychain)
-    });
-    let has_writable = surfaces.iter().any(|surface| {
-        matches!(
-            surface.ownership,
-            SurfaceOwnership::UserEditable | SurfaceOwnership::SuperaiCreated
-        ) && !matches!(
-            surface.kind,
-            DocumentKind::Sqlite | DocumentKind::Keychain | DocumentKind::Opaque
-        )
-    });
-    if has_external_store && !has_writable {
-        return Some(CoreError::ExternalAuthRequired {
-            harness: adapter.id().to_string(),
-            instructions: format!(
-                "run the harness's own login command (e.g. `{binary} login`) in the instance environment; credentials live in the harness keychain, which superai does not touch",
-                binary = adapter.id().as_str()
-            ),
-        });
-    }
-    None
 }
 
 /// Resolve the harness-supported api-key sink: a writable surface with an
@@ -1707,14 +1655,9 @@ fn validate_no_duplicates(providers: &[ProviderDefinition]) -> Result<()> {
 mod tests {
     #![expect(clippy::assertions_on_result_states, reason = "explicit Ok/Err checks")]
     use super::*;
-    use crate::adapter::{
-        ConfigScope, ConfigSurface, DetectionResult, PathResolver, Platform, ProductStatus,
-        VersionResolution, WrapperPlan,
-    };
     use crate::ids::{HarnessId, InstanceId, InstanceName};
     use crate::instance::TemplateRef;
     use crate::paths::AbsolutePath;
-    use crate::state::AdapterSupport;
     use crate::state::{InstanceOrigin, Isolation, Ownership};
     use std::time::Duration;
 
@@ -2097,28 +2040,6 @@ status: active
             .find(|p| p.id.as_str() == "anthropic")
             .expect("anthropic bundled");
         assert_eq!(anthropic.auth.key_prefix.as_deref(), Some("sk-ant-"));
-    }
-
-    #[test]
-    fn bundled_plus_dummy_via_file_no_code_change() {
-        let bundled = load_bundled_providers().unwrap();
-        let base_len = bundled.len();
-        let dir = tmp_dir("bundled-plus-dummy");
-        let dummy_json = single_provider_json("dummy-provider-999", "https://dummy.example.com");
-        std::fs::write(dir.join("dummy.json"), &dummy_json).unwrap();
-        let merged = load_bundled_plus_extra(&dir).unwrap();
-        assert_eq!(merged.len(), base_len + 1);
-        assert!(merged.iter().any(|p| p.id.as_str() == "dummy-provider-999"));
-        let dup_path = dir.join("dup-dummy.json");
-        let dup_json = single_provider_json("anthropic", "https://dup.example.com");
-        std::fs::write(&dup_path, dup_json).unwrap();
-        let err = load_bundled_plus_extra(&dir).unwrap_err();
-        let msg = format!("{err:?}");
-        assert!(
-            msg.to_ascii_lowercase().contains("duplicate"),
-            "expected duplicate error, got {msg}"
-        );
-        drop(std::fs::remove_dir_all(&dir));
     }
 
     #[test]
@@ -2867,78 +2788,5 @@ status: active
         assert!(sonnet.supports_tools);
         assert!(sonnet.input_modalities.contains(&Modality::Image));
         assert!(!anthropic.capabilities.is_empty());
-    }
-
-    #[test]
-    fn external_auth_required_for_keychain_only_harness() {
-        #[derive(Debug)]
-        struct KeychainOnlyAdapter;
-
-        impl Adapter for KeychainOnlyAdapter {
-            fn id(&self) -> HarnessId {
-                HarnessId::new("keychain-harness").unwrap()
-            }
-            fn display_name(&self) -> &'static str {
-                "Keychain Harness"
-            }
-            fn product_status(&self) -> ProductStatus {
-                ProductStatus::Active
-            }
-            fn supported_platforms(&self) -> Vec<Platform> {
-                Vec::new()
-            }
-            fn adapter_revision(&self) -> &'static str {
-                "0.1.0"
-            }
-            fn research_doc_link(&self) -> &'static str {
-                "docs/harness-configs/keychain-harness.md"
-            }
-            fn last_verified_date(&self) -> &'static str {
-                "2026-08-25"
-            }
-            fn detection(&self) -> DetectionResult {
-                DetectionResult::absent(vec!["test".to_owned()])
-            }
-            fn version_resolution(&self) -> VersionResolution {
-                VersionResolution::unknown()
-            }
-            fn config_surfaces(&self) -> Vec<ConfigSurface> {
-                vec![ConfigSurface::new(
-                    "keychain",
-                    PathResolver::fallback_only("keychain"),
-                    DocumentKind::Keychain,
-                    ConfigScope::User,
-                    SurfaceOwnership::ExternalSecretStore,
-                )]
-            }
-            fn supported_operations(&self) -> Vec<(String, AdapterSupport)> {
-                Vec::new()
-            }
-            fn plan_mirror_exclusions(&self) -> Vec<String> {
-                Vec::new()
-            }
-            fn plan_wrapper(&self, _instance: &Instance) -> Result<WrapperPlan> {
-                Ok(WrapperPlan::new("test"))
-            }
-            fn scan_candidates(&self) -> Vec<String> {
-                Vec::new()
-            }
-            fn validate_instance(&self, _instance: &Instance) -> Result<()> {
-                Ok(())
-            }
-        }
-
-        let err = external_auth_requirement(&KeychainOnlyAdapter)
-            .expect("keychain-only harness must require external auth");
-        match err {
-            CoreError::ExternalAuthRequired {
-                harness,
-                instructions,
-            } => {
-                assert_eq!(harness, "keychain-harness");
-                assert!(instructions.contains("login"), "got: {instructions}");
-            }
-            other => panic!("expected ExternalAuthRequired, got {other:?}"),
-        }
     }
 }

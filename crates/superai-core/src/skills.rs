@@ -10,7 +10,6 @@
 
 use std::collections::{BTreeSet, HashSet};
 use std::hash::{Hash, Hasher};
-use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2539,10 +2538,20 @@ fn fetch_https_to_staging(url: &str, staging_dir: &Path) -> Result<()> {
             reason: "fetch_https_to_staging called with file url".to_owned(),
         });
     }
-    let bytes = fetch_bytes_ureq(url).map_err(|e| CoreError::SourceFetch {
+    // Skill sources fetch through the shared bounded engine with skill
+    // limits: 50 MiB body cap and the historical 10s budget.
+    let bytes = crate::template_fetch::fetch_bounded(
+        url,
+        "skill_source",
+        &crate::template_fetch::BoundedFetch {
+            max_bytes: len_as_usize(MAX_TOTAL_BYTES),
+            timeout: std::time::Duration::from_secs(10),
+        },
+    )
+    .map_err(|e| CoreError::SourceFetch {
         kind: "skill_source".to_owned(),
         locator: url.to_owned(),
-        reason: e,
+        reason: e.to_string(),
     })?;
     if bytes.len() > len_as_usize(MAX_SINGLE_FILE_BYTES) {
         return Err(CoreError::Validation {
@@ -2798,78 +2807,6 @@ fn stage_git_revision(url: &str, rev: &str, staging_dir: &Path) -> Result<()> {
         std::fs::remove_dir_all(&git_dir),
     );
     Ok(())
-}
-
-/// Resolve a redirect `Location` against the base: absolute https or
-/// same-origin absolute-path; relative paths refuse fail-closed.
-fn resolve_redirect(base: &str, location: &str) -> std::result::Result<String, String> {
-    if location.starts_with("https://") {
-        return Ok(location.to_owned());
-    }
-    if !location.starts_with('/') {
-        return Err(format!(
-            "redirect location must be absolute, got `{location}`"
-        ));
-    }
-    let rest = base
-        .strip_prefix("https://")
-        .ok_or_else(|| format!("redirect base is not https: `{base}`"))?;
-    let origin = rest.split('/').next().unwrap_or_default();
-    Ok(format!("https://{origin}{location}"))
-}
-
-fn fetch_bytes_ureq(url: &str) -> std::result::Result<Vec<u8>, String> {
-    // Redirects are followed manually so EVERY hop re-passes validation;
-    // https_only alone stops downgrades, not bounces onto private hosts.
-    let config = ureq::Agent::config_builder()
-        .timeout_global(Some(std::time::Duration::from_secs(10)))
-        .https_only(true)
-        .max_redirects(0)
-        .max_redirects_will_error(false)
-        .build();
-    let agent = ureq::Agent::new_with_config(config);
-    let mut current = url.to_owned();
-    for _ in 0..=crate::template_fetch::MAX_REDIRECTS {
-        let mut resp = agent
-            .get(&current)
-            .header("User-Agent", concat!("superai/", env!("CARGO_PKG_VERSION")))
-            .call()
-            .map_err(|e| e.to_string())?;
-        if (300..400).contains(&resp.status().as_u16()) {
-            let location = resp
-                .headers()
-                .get("Location")
-                .and_then(|v| v.to_str().ok())
-                .ok_or_else(|| "redirect without a valid Location header".to_owned())?
-                .to_owned();
-            current = resolve_redirect(&current, &location)?;
-            validate_fetch_url(&current).map_err(|e| e.to_string())?;
-            continue;
-        }
-        if resp.status() == 404 {
-            return Err(format!("404 not found for `{url}`"));
-        }
-        if resp.status() == 429 {
-            return Err(format!("rate limited for `{url}`"));
-        }
-        if resp.status().as_u16() >= 400 {
-            return Err(format!("http {} for `{url}`", resp.status()));
-        }
-        // Cap the read itself so a hostile body cannot balloon memory before
-        // the limit check runs.
-        let mut bytes = Vec::new();
-        let mut reader = resp.body_mut().as_reader();
-        let mut limited = (&mut reader).take(MAX_TOTAL_BYTES.saturating_add(1));
-        limited.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
-        if bytes.len() > len_as_usize(MAX_TOTAL_BYTES) {
-            return Err(format!("size limit exceeded for `{url}`"));
-        }
-        return Ok(bytes);
-    }
-    Err(format!(
-        "more than {} redirects for `{url}`",
-        crate::template_fetch::MAX_REDIRECTS
-    ))
 }
 
 /// Enable a skill for an instance: ensure the destination link/copy exists

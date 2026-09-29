@@ -6,11 +6,6 @@
     reason = "three-way and transaction branches are explicit"
 )]
 #![expect(clippy::too_many_lines, reason = "combined preview and apply logic")]
-#![expect(
-    clippy::redundant_clone,
-    reason = "preview clones values for ownership clarity"
-)]
-#![expect(clippy::uninlined_format_args, reason = "test format explicit")]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
@@ -104,10 +99,14 @@ fn edit_to_engine_operation(edit: &Edit, owned_keys: &[String]) -> Result<Engine
 }
 
 fn quarantine_target(path: &Path, op_id: &str) {
-    // Best-effort: ignore errors, as quarantine is recovery aid
-    let res: std::result::Result<superai_config::quarantine::QuarantineEntry, _> =
-        superai_config::quarantine::move_to_quarantine(path, op_id);
-    drop(res);
+    // Best-effort recovery aid on an already-failing path: errors go to
+    // stderr instead of vanishing or masking the real failure.
+    if let Err(e) = superai_config::quarantine::move_to_quarantine(path, op_id) {
+        eprintln!(
+            "superai-core: quarantine failed for {}: {e}",
+            path.display()
+        );
+    }
 }
 
 fn resolve_config_path(instance: &Instance, adapter: &dyn Adapter) -> PathBuf {
@@ -158,18 +157,6 @@ pub struct Edit {
     pub from: Option<Value>,
     /// Value after the edit, if any (`None` means removal).
     pub to: Option<Value>,
-}
-
-impl Edit {
-    /// Human description.
-    pub fn description(&self) -> String {
-        match (&self.from, &self.to) {
-            (Some(f), Some(t)) => format!("{}: {} -> {}", self.selector, f, t),
-            (None, Some(t)) => format!("{}: (absent) -> {}", self.selector, t),
-            (Some(f), None) => format!("{}: {} -> (removed)", self.selector, f),
-            (None, None) => format!("{}: (absent) -> (removed)", self.selector),
-        }
-    }
 }
 
 /// Kind of conflict that blocks automatic apply.
@@ -344,32 +331,6 @@ fn compute_capability_changes(base: &Template, new: &Template) -> CapabilityChan
     }
 }
 
-/// Resolver-computed capability delta for a preview (CAP-06): support
-/// and source BEFORE vs AFTER, from real resolution sources.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CapabilitySupportChange {
-    /// Capability whose resolution changed.
-    pub capability: crate::capability::Capability,
-    /// Support before the update.
-    pub before: crate::capability::Support,
-    /// Source before the update.
-    pub before_source: capability_resolver::CapabilitySource,
-    /// Support after the update.
-    pub after: crate::capability::Support,
-    /// Source after the update.
-    pub after_source: capability_resolver::CapabilitySource,
-}
-
-impl CapabilitySupportChange {
-    /// Human description of the delta.
-    pub fn describe(&self) -> String {
-        format!(
-            "{}: {} ({}) -> {} ({})",
-            self.capability, self.before, self.before_source, self.after, self.after_source
-        )
-    }
-}
-
 /// Preview of a three-way template update (TPL-06).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdatePreview {
@@ -387,9 +348,6 @@ pub struct UpdatePreview {
     pub wrapper_changes: WrapperChanges,
     /// Capability map changes.
     pub capability_changes: CapabilityChanges,
-    /// Resolver-computed capability deltas (CAP-06): native/substituted/
-    /// absent BEFORE vs AFTER the update, from real resolution sources.
-    pub resolved_capability_changes: Vec<CapabilitySupportChange>,
     /// Warnings such as migration notes and status changes.
     pub warnings: Vec<String>,
 }
@@ -408,7 +366,6 @@ impl UpdatePreview {
             && self.capability_changes.added.is_empty()
             && self.capability_changes.removed.is_empty()
             && self.capability_changes.changed.is_empty()
-            && self.resolved_capability_changes.is_empty()
     }
 }
 
@@ -461,12 +418,9 @@ pub fn preview_three_way(
     };
     for note in &new.migration_notes {
         if !base.migration_notes.contains(note) {
-            // Redact secret-like notes similarly to template diff
-            let redacted = if note.to_ascii_lowercase().contains("api_key")
-                || note.to_ascii_lowercase().contains("secret")
-                || note.to_ascii_lowercase().contains("token")
-                || note.to_ascii_lowercase().contains("sk-")
-            {
+            // Redact secret-like notes with the same pattern set the
+            // template diff uses, so the two views cannot drift.
+            let redacted = if crate::template::is_secret_like(note) {
                 "[REDACTED]".to_owned()
             } else {
                 note.clone()
@@ -586,8 +540,7 @@ pub fn preview_three_way(
                 new: new_val.clone(),
                 kind: ConflictKind::BothModified,
                 message: format!(
-                    "selector `{selector}` both local and new differ from base: local={:?} new={:?} base={:?}",
-                    local_val, new_val, base_val
+                    "selector `{selector}` both local and new differ from base: local={local_val:?} new={new_val:?} base={base_val:?}"
                 ),
             });
         }
@@ -614,67 +567,8 @@ pub fn preview_three_way(
         conflicts,
         wrapper_changes,
         capability_changes,
-        resolved_capability_changes: Vec::new(),
         warnings,
     }
-}
-
-/// Resolver-backed capability delta between two templates (CAP-06),
-/// reporting support/source changes from real resolution sources.
-pub fn compute_resolved_capability_delta(
-    base: &Template,
-    new: &Template,
-    adapter: &dyn Adapter,
-    provider: Option<&crate::provider::ProviderDefinition>,
-) -> Vec<CapabilitySupportChange> {
-    let before_sources = capability_resolver::CapabilitySources::for_adapter(
-        adapter,
-        provider,
-        Some(&base.capability_map),
-    );
-    let after_sources = capability_resolver::CapabilitySources::for_adapter(
-        adapter,
-        provider,
-        Some(&new.capability_map),
-    );
-    let mut deltas = Vec::new();
-    let before_all =
-        capability_resolver::resolve_all_with_sources(&new.harness, &new.provider, &before_sources);
-    let after_all =
-        capability_resolver::resolve_all_with_sources(&new.harness, &new.provider, &after_sources);
-    for (cap, before) in before_all {
-        let after = after_all
-            .iter()
-            .find(|(c, _)| *c == cap)
-            .map(|(_, resolved)| resolved);
-        if let Some(after) = after
-            && (before.support != after.support || before.source != after.source)
-        {
-            deltas.push(CapabilitySupportChange {
-                capability: cap,
-                before: before.support,
-                before_source: before.source,
-                after: after.support,
-                after_source: after.source,
-            });
-        }
-    }
-    deltas
-}
-
-/// [`preview_three_way`] plus the resolver-computed capability delta
-/// (CAP-06): capability changes visible BEFORE any commit.
-pub fn preview_update_with_capability_resolution(
-    base: &Template,
-    new: &Template,
-    local: &Map<String, Value>,
-    adapter: &dyn Adapter,
-    provider: Option<&crate::provider::ProviderDefinition>,
-) -> UpdatePreview {
-    let mut preview = preview_three_way(base, new, local);
-    preview.resolved_capability_changes =
-        compute_resolved_capability_delta(base, new, adapter, provider);
-    preview
 }
 
 /// Outcome of `apply_update`.
@@ -690,8 +584,6 @@ pub struct ApplyOutcome {
     pub quarantined: Vec<PathBuf>,
     /// Warnings emitted during apply.
     pub warnings: Vec<String>,
-    /// Snapshot digest before the apply (conflict token).
-    pub conflict_token: Option<String>,
 }
 
 /// Verify in-memory template bytes: size cap, id/version agreement,
@@ -833,7 +725,6 @@ pub fn apply_update_with_catalog_digests(
 
     let config_path = resolve_config_path(fresh_instance, adapter);
     let snap_before = snapshot(&config_path);
-    let conflict_token = snap_before.digest.clone();
     let local_map = load_local_map(&config_path)?;
 
     let preview = preview_three_way(base, new, &local_map);
@@ -852,13 +743,13 @@ pub fn apply_update_with_catalog_digests(
         });
     }
 
-    // Check for external edit between snapshot and recompute (should be none since we just snapshotted)
+    // An external edit between snapshot and recheck must abort the apply.
     let snap_recheck = snapshot(&config_path);
     if is_modified(&snap_before, &snap_recheck) {
         return Err(CoreError::ConcurrentModification {
-            path: config_path.clone(),
-            expected: snap_before.digest.clone().unwrap_or_default(),
-            actual: snap_recheck.digest.clone().unwrap_or_default(),
+            path: config_path,
+            expected: snap_before.digest.unwrap_or_default(),
+            actual: snap_recheck.digest.unwrap_or_default(),
         });
     }
 
@@ -870,7 +761,7 @@ pub fn apply_update_with_catalog_digests(
         .chain(new.patches.iter())
         .map(|p| p.selector.clone())
         .collect();
-    let mut new_value = Value::Object(local_map.clone());
+    let mut new_value = Value::Object(local_map);
     for edit in &preview.auto_applicable {
         let op = edit_to_engine_operation(edit, &owned_keys)?;
         executor::apply_to_value(&config_path, &mut new_value, &op).map_err(CoreError::Config)?;
@@ -882,13 +773,10 @@ pub fn apply_update_with_catalog_digests(
         });
     };
 
-    let serialized_value = Value::Object(new_local_map.clone());
-    let mut new_bytes_serialized =
-        serde_json::to_string_pretty(&serialized_value).map_err(|e| {
-            CoreError::SchemaValidation {
-                path: config_path.clone(),
-                details: format!("serialize new config failed: {e}"),
-            }
+    let mut new_bytes_serialized = serde_json::to_string_pretty(&Value::Object(new_local_map))
+        .map_err(|e| CoreError::SchemaValidation {
+            path: config_path.clone(),
+            details: format!("serialize new config failed: {e}"),
         })?;
     new_bytes_serialized.push('\n');
     let new_content = new_bytes_serialized.into_bytes();
@@ -989,11 +877,10 @@ pub fn apply_update_with_catalog_digests(
         }
         return Ok(ApplyOutcome {
             applied: Vec::new(),
-            verification: outcome.diagnostics_redacted.clone(),
+            verification: outcome.diagnostics_redacted,
             registry_updated: false,
             quarantined,
-            warnings: preview.warnings.clone(),
-            conflict_token,
+            warnings: preview.warnings,
         });
     }
     // Concurrent-modification check: the post-commit snapshot must equal the
@@ -1057,7 +944,7 @@ pub fn apply_update_with_catalog_digests(
     let mut all_warnings = preview.warnings.clone();
     all_warnings.extend(capability_warnings);
 
-    // 7. write new template version to registry last (only after verification)
+    // The registry record is written last, only after verification.
     let fresh_registry = Registry::load(registry_path)?;
     let idx_opt = fresh_registry
         .instances()
@@ -1105,7 +992,6 @@ pub fn apply_update_with_catalog_digests(
         registry_updated: true,
         quarantined: Vec::new(),
         warnings: all_warnings,
-        conflict_token,
     })
 }
 
@@ -1312,40 +1198,6 @@ mod tests {
                 .iter()
                 .any(|w| w.contains("deprecated") && w.contains("claude-glm-next"))
         );
-    }
-
-    #[test]
-    fn resolved_capability_delta_uses_sources_not_string_diff() {
-        // Template override flips vision absent->native; the string diff
-        // alone cannot express the source-attributed before/after.
-        let base = minimal_template("1.0.0", vec![patch("key:model", json!("glm-4"))]);
-        let mut new = minimal_template("1.2.0", vec![patch("key:model", json!("glm-4.5"))]);
-        new.capability_map.insert(
-            crate::capability::Capability::Vision,
-            crate::capability::Support::Native,
-        );
-        let adapter = crate::adapters::claude_code::ClaudeCodeAdapter::new().unwrap();
-        let providers = crate::provider::load_bundled_providers().unwrap();
-        let glm = providers.iter().find(|p| p.id.as_str() == "glm").unwrap();
-        let mut local = Map::new();
-        local.insert("model".to_owned(), json!("glm-4"));
-        let preview =
-            preview_update_with_capability_resolution(&base, &new, &local, &adapter, Some(glm));
-        let vision = preview
-            .resolved_capability_changes
-            .iter()
-            .find(|c| c.capability == crate::capability::Capability::Vision)
-            .expect("vision delta present");
-        assert_eq!(vision.before, crate::capability::Support::Absent);
-        assert_eq!(vision.after, crate::capability::Support::Native);
-        assert_eq!(
-            vision.after_source,
-            capability_resolver::CapabilitySource::Template
-        );
-        assert!(vision.describe().contains("vision"));
-        // The plain preview keeps the empty resolved section.
-        let plain = preview_three_way(&base, &new, &local);
-        assert!(plain.resolved_capability_changes.is_empty());
     }
 
     #[test]
@@ -1824,8 +1676,7 @@ mod tests {
         );
         assert!(
             apply_res.is_err(),
-            "expected conflict error, got {:?}",
-            apply_res
+            "expected conflict error, got {apply_res:?}"
         );
         let registry_after_fail = Registry::load(&registry_path).unwrap();
         let still = registry_after_fail.get_by_id("test-instance-002").unwrap();
@@ -1925,9 +1776,9 @@ mod tests {
             b
         })
         .unwrap();
-        let mut base_tmp = base.clone();
-        base_tmp.digest = compute_digest(&base_bytes);
-        let base_bytes = serde_json::to_vec(&base_tmp).unwrap();
+        let mut base = base;
+        base.digest = compute_digest(&base_bytes);
+        let base_bytes = serde_json::to_vec(&base).unwrap();
         // new with invalid digest format (should trigger validation error)
         new.digest = "not-a-valid-digest".to_owned();
         let new_bytes = serde_json::to_vec(&new).unwrap();
@@ -1960,7 +1811,7 @@ mod tests {
         let res = apply_update(
             &instance,
             &registry_path,
-            &base_tmp,
+            &base,
             &new,
             &base_bytes,
             &new_bytes,
@@ -1983,23 +1834,15 @@ mod tests {
         let config_path = config_root.join("settings.json");
         let base = minimal_template("1.1.0", vec![patch("key:model", json!("glm-4"))]);
         let new = minimal_template("1.2.0", vec![patch("key:model", json!("glm-4.5"))]);
-        let base_bytes = {
-            let mut b = base.clone();
-            let tmp_bytes = serde_json::to_vec(&b).unwrap();
-            b.digest = compute_digest(&tmp_bytes);
-            serde_json::to_vec(&b).unwrap()
-        };
-        let mut base_fixed = base.clone();
-        base_fixed.digest = compute_digest(&base_bytes);
+        // One working copy per template: the digest field is fixed up to
+        // match the serialized bytes, then the fixed copy feeds apply_update.
+        let mut base_fixed = base;
+        let tmp_bytes = serde_json::to_vec(&base_fixed).unwrap();
+        base_fixed.digest = compute_digest(&tmp_bytes);
         let base_bytes = serde_json::to_vec(&base_fixed).unwrap();
-        let new_bytes = {
-            let mut n = new.clone();
-            let tmp_bytes = serde_json::to_vec(&n).unwrap();
-            n.digest = compute_digest(&tmp_bytes);
-            serde_json::to_vec(&n).unwrap()
-        };
-        let mut new_fixed = new.clone();
-        new_fixed.digest = compute_digest(&new_bytes);
+        let mut new_fixed = new;
+        let tmp_bytes = serde_json::to_vec(&new_fixed).unwrap();
+        new_fixed.digest = compute_digest(&tmp_bytes);
         let new_bytes = serde_json::to_vec(&new_fixed).unwrap();
 
         let instance = Instance {

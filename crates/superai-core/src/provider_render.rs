@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use serde::Serialize;
 use serde_json::Value;
 
+use superai_config::ConfigError;
 use superai_config::document::{
     DocumentKind as EngineKind, EditOperation, Operation as EngineOperation, Selector,
 };
@@ -1343,7 +1344,15 @@ pub fn commit_provider_change(
         });
     }
     let path = instance.config_root.as_path().join(&surface.id);
-    let existing = std::fs::read(&path).ok();
+    // Absent file means a fresh document; a read error must not be
+    // silently rewritten, so it propagates.
+    let existing = match std::fs::read(&path) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            return Err(CoreError::Config(ConfigError::Io { path, source: e }));
+        }
+    };
     let new_bytes = match kind {
         DocumentKind::Toml => {
             let mut doc = match existing.as_deref() {
@@ -1379,12 +1388,10 @@ pub fn commit_provider_change(
                         match serde_json::from_slice::<Value>(bytes) {
                             Ok(value) => value,
                             Err(_) => {
-                                return Err(CoreError::Config(
-                                    superai_config::ConfigError::LossyWrite {
-                                        path: path.clone(),
-                                        format: "jsonc",
-                                    },
-                                ));
+                                return Err(CoreError::Config(ConfigError::LossyWrite {
+                                    path: path.clone(),
+                                    format: "jsonc",
+                                }));
                             }
                         }
                     }

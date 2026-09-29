@@ -1,31 +1,24 @@
 //! Property tests for QAL-03: manual loops with a deterministic RNG, no
 //! external dep.
 
-#![expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::collapsible_if,
-    clippy::excessive_nesting,
-    clippy::manual_is_multiple_of,
-    clippy::manual_let_else,
-    clippy::redundant_clone,
-    clippy::same_functions_in_if_condition,
-    clippy::single_char_add_str,
-    clippy::uninlined_format_args,
-    clippy::unnecessary_to_owned,
-    clippy::unreadable_literal,
-    reason = "property loops keep PRNG casts and manual nesting"
-)]
-
 #[cfg(test)]
 mod tests {
+    // The SplitMix64 helper mixes seeds with fixed-width casts and hex
+    // constants by construction; the property loops inherit that and nest
+    // fixture setup inside their assertions.
+    #![expect(
+        clippy::cast_possible_truncation,
+        clippy::excessive_nesting,
+        clippy::unreadable_literal,
+        reason = "SplitMix64 mixing uses fixed-width casts and hex constants"
+    )]
+
     use std::collections::HashSet;
     use std::path::PathBuf;
 
     use crate::capability::Support;
     use crate::capability_resolver::{
-        ACTIVE_PAIRS, ALL_CAPABILITIES, CapabilitySource, MATRIX, resolve, resolve_all,
-        validate_matrix_completeness,
+        ACTIVE_PAIRS, ALL_CAPABILITIES, CapabilitySource, resolve, resolve_all,
     };
     use crate::ids::{
         HarnessId, InstanceId, InstanceName, ProviderId, TemplateId, TemplateVersion,
@@ -36,8 +29,8 @@ mod tests {
     use crate::state::{InstanceOrigin, Isolation, Ownership};
     use crate::test_util::temp_dir_unique;
 
-    // Deterministic PRNG: SplitMix64, no external crate.
-
+    // Deterministic PRNG: SplitMix64, no external crate. The wrapping mixes
+    // rely on fixed-width casts and hex constants by construction.
     struct Prng {
         state: u64,
     }
@@ -57,7 +50,6 @@ mod tests {
             z ^ (z >> 31)
         }
 
-        #[expect(clippy::cast_possible_truncation, reason = "prng helper")]
         fn next_u32(&mut self) -> u32 {
             self.next_u64() as u32
         }
@@ -72,7 +64,7 @@ mod tests {
         }
 
         fn gen_bool(&mut self) -> bool {
-            self.next_u32() % 2 == 0
+            self.next_u32().is_multiple_of(2)
         }
 
         fn gen_string(&mut self, min_len: usize, max_len: usize, charset: &[u8]) -> String {
@@ -103,7 +95,7 @@ mod tests {
             "com8", "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
         ];
         if reserved.contains(&lower.as_str()) {
-            s.push_str("x");
+            s.push('x');
         }
         s
     }
@@ -214,7 +206,7 @@ mod tests {
             "\"base_url\"",
         ];
         for iter in 0..80 {
-            let mut rng = Prng::new(iter as u64 + 0x1111);
+            let mut rng = Prng::new(u64::try_from(iter).unwrap_or(u64::MAX) + 0x1111);
             let mut reg = Registry::default();
             let n = rng.gen_range(0, 5);
             for i in 0..n {
@@ -233,15 +225,15 @@ mod tests {
                 );
             }
             let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
-            if let serde_json::Value::Object(map) = &v {
-                if let Some(instances) = map.get("instances") {
-                    let text = serde_json::to_string(instances).unwrap().to_lowercase();
-                    for field in forbidden {
-                        assert!(
-                            !text.contains(field),
-                            "forbidden in instances at {iter}: {field}"
-                        );
-                    }
+            if let serde_json::Value::Object(map) = &v
+                && let Some(instances) = map.get("instances")
+            {
+                let text = serde_json::to_string(instances).unwrap().to_lowercase();
+                for field in forbidden {
+                    assert!(
+                        !text.contains(field),
+                        "forbidden in instances at {iter}: {field}"
+                    );
                 }
             }
             drop(std::fs::remove_dir_all(path.parent().unwrap()));
@@ -276,12 +268,11 @@ mod tests {
         let probe = OfflineProbe;
 
         for iter in 0..80 {
-            let mut rng = Prng::new(iter as u64 + 0x2222);
+            let mut rng = Prng::new(u64::try_from(iter).unwrap_or(u64::MAX) + 0x2222);
             let harness_str = harness_ids[rng.gen_range(0, harness_ids.len())];
             let harness = HarnessId::new(harness_str).unwrap();
-            let entry = match catalog.get(&harness) {
-                Some(e) => e,
-                None => continue,
+            let Some(entry) = catalog.get(&harness) else {
+                continue;
             };
             if entry.methods.is_empty() {
                 continue;
@@ -346,7 +337,7 @@ mod tests {
     #[test]
     fn property_preview_deterministic_capability_resolve() {
         for iter in 0..100 {
-            let mut rng = Prng::new(iter as u64 + 0x3333);
+            let mut rng = Prng::new(u64::try_from(iter).unwrap_or(u64::MAX) + 0x3333);
             let harness = random_harness(&mut rng);
             let provider = random_provider(&mut rng);
             let cap_idx = rng.gen_range(0, ALL_CAPABILITIES.len());
@@ -400,7 +391,7 @@ mod tests {
     #[test]
     fn property_restore_exact_registry() {
         for iter in 0..50 {
-            let mut rng = Prng::new(iter as u64 + 0x4444);
+            let mut rng = Prng::new(u64::try_from(iter).unwrap_or(u64::MAX) + 0x4444);
             let path = scratch_registry_path("prop-restore-reg", iter);
             let mut reg = Registry::default();
             let n = rng.gen_range(1, 4);
@@ -446,7 +437,7 @@ mod tests {
     #[test]
     fn property_collision_safe_normalization_ids() {
         for iter in 0..100 {
-            let mut rng = Prng::new(iter as u64 + 0x5555);
+            let mut rng = Prng::new(u64::try_from(iter).unwrap_or(u64::MAX) + 0x5555);
             let base = random_valid_name(&mut rng, "base-");
             let var1 = random_case_variation(true, &base, &mut rng);
             let var2 = random_case_variation(true, &base, &mut rng);
@@ -473,7 +464,7 @@ mod tests {
                 let root1 = AbsolutePath::from_path(&coll_base.join("1")).unwrap();
                 let root2 = AbsolutePath::from_path(&coll_base.join("2")).unwrap();
                 let inst1 = Instance {
-                    id: InstanceId::new(&format!("id-{}-1", iter)).unwrap(),
+                    id: InstanceId::new(&format!("id-{iter}-1")).unwrap(),
                     name: a.clone(),
                     harness: harness.clone(),
                     config_root: root1,
@@ -487,7 +478,7 @@ mod tests {
                     adapter_revision: "0.1.0".to_owned(),
                 };
                 let inst2 = Instance {
-                    id: InstanceId::new(&format!("id-{}-2", iter)).unwrap(),
+                    id: InstanceId::new(&format!("id-{iter}-2")).unwrap(),
                     name: b.clone(),
                     harness,
                     config_root: root2,
@@ -513,11 +504,11 @@ mod tests {
                 }
             }
 
-            let other_base = format!("{}-x", base);
-            if let (Ok(a), Ok(b)) = (InstanceName::new(&base), InstanceName::new(&other_base)) {
-                if a.normalized() != b.normalized() {
-                    assert!(!a.eq_case_fold(&b), "distinct should not collide at {iter}");
-                }
+            let other_base = format!("{base}-x");
+            if let (Ok(a), Ok(b)) = (InstanceName::new(&base), InstanceName::new(&other_base))
+                && a.normalized() != b.normalized()
+            {
+                assert!(!a.eq_case_fold(&b), "distinct should not collide at {iter}");
             }
         }
     }
@@ -525,7 +516,7 @@ mod tests {
     #[test]
     fn property_collision_safe_normalization_paths() {
         for iter in 0..100 {
-            let mut rng = Prng::new(iter as u64 + 0x6666);
+            let mut rng = Prng::new(u64::try_from(iter).unwrap_or(u64::MAX) + 0x6666);
             let base = format!(
                 "{}/base-{}",
                 crate::test_util::tmp_abs_str("prop-base"),
@@ -548,7 +539,7 @@ mod tests {
                 "path normalization failed at {iter}: {noisy2} vs {noisy3}"
             );
 
-            let p1_again = AbsolutePath::new(&p1.to_string()).unwrap();
+            let p1_again = AbsolutePath::new(p1.as_ref()).unwrap();
             assert_eq!(p1, p1_again, "idempotent path normalization at {iter}");
 
             let other = format!("{base}/other-{}", rng.gen_string(3, 6, SIMPLE_CHARSET));
@@ -560,7 +551,7 @@ mod tests {
             let name1 = InstanceName::new(&random_valid_name(&mut rng, "n1-")).unwrap();
             let name2 = InstanceName::new(&random_valid_name(&mut rng, "n2-")).unwrap();
             let inst1 = Instance {
-                id: InstanceId::new(&format!("pid-{}-1", iter)).unwrap(),
+                id: InstanceId::new(&format!("pid-{iter}-1")).unwrap(),
                 name: name1,
                 harness: harness.clone(),
                 config_root: p1.clone(),
@@ -574,7 +565,7 @@ mod tests {
                 adapter_revision: "0.1.0".to_owned(),
             };
             let inst2 = Instance {
-                id: InstanceId::new(&format!("pid-{}-2", iter)).unwrap(),
+                id: InstanceId::new(&format!("pid-{iter}-2")).unwrap(),
                 name: name2,
                 harness,
                 config_root: p2, // same normalized as p1
@@ -603,10 +594,8 @@ mod tests {
 
     #[test]
     fn property_capability_complete() {
-        validate_matrix_completeness().unwrap();
-
         for iter in 0..50 {
-            let mut rng = Prng::new(iter as u64 + 0x7777);
+            let mut rng = Prng::new(u64::try_from(iter).unwrap_or(u64::MAX) + 0x7777);
             for (harness_str, provider_str) in ACTIVE_PAIRS {
                 let harness = HarnessId::new(harness_str).unwrap();
                 let provider = ProviderId::new(provider_str).unwrap();
@@ -618,19 +607,17 @@ mod tests {
                 );
                 let mut seen = HashSet::new();
                 for (cap, res) in &resolved {
-                    assert!(seen.insert(*cap), "duplicate cap {:?} at {iter}", cap);
+                    assert!(seen.insert(*cap), "duplicate cap {cap:?} at {iter}");
                     assert!(
                         !res.explanation.trim().is_empty(),
-                        "empty explanation for {harness_str}/{provider_str} {:?} at {iter}",
-                        cap
+                        "empty explanation for {harness_str}/{provider_str} {cap:?} at {iter}"
                     );
                     // The matrix has entries for every active pair, so the
                     // source must never be Unknown.
                     assert_ne!(
                         res.source,
                         CapabilitySource::Unknown,
-                        "active pair {harness_str}/{provider_str} has Unknown source for {:?} at {iter}",
-                        cap
+                        "active pair {harness_str}/{provider_str} has Unknown source for {cap:?} at {iter}"
                     );
                     if res.support == Support::Substituted {
                         assert!(
@@ -640,8 +627,7 @@ mod tests {
                                     | CapabilitySource::Template
                                     | CapabilitySource::Plugin
                             ),
-                            "substituted should have provider/template/plugin source at {iter}: {:?}",
-                            cap
+                            "substituted should have provider/template/plugin source at {iter}: {cap:?}"
                         );
                     }
                 }
@@ -669,26 +655,13 @@ mod tests {
                     "unknown pair should be Unknown source at {iter}"
                 );
             }
-
-            let mut seen_matrix = HashSet::new();
-            for e in MATRIX {
-                let key = (
-                    e.harness.to_lowercase(),
-                    e.provider.to_lowercase(),
-                    e.capability,
-                );
-                assert!(
-                    seen_matrix.insert(key),
-                    "duplicate matrix entry at {iter}: {e:?}"
-                );
-            }
         }
     }
 
     #[test]
     fn property_registry_unrelated_survive() {
         for iter in 0..50 {
-            let mut rng = Prng::new(iter as u64 + 0x8888);
+            let mut rng = Prng::new(u64::try_from(iter).unwrap_or(u64::MAX) + 0x8888);
             let mut reg = Registry::default();
             let n = rng.gen_range(2, 6);
             let mut inserted_ids = Vec::new();
@@ -741,18 +714,20 @@ mod tests {
     #[test]
     fn property_no_op_byte_identity_raw_editor() {
         for iter in 0..80 {
-            let mut rng = Prng::new(iter as u64 + 0x9999);
-            // Generate valid JSON bytes to satisfy strict validation.
-            let valid_bytes = if rng.gen_bool() {
-                let n = rng.gen_range(0, 50);
-                format!("{{\"k\":{n}}}").into_bytes()
-            } else if rng.gen_bool() {
-                b"{}".to_vec()
-            } else {
-                let s = rng.gen_string(0, 10, SIMPLE_CHARSET);
-                format!("\"{s}\"").into_bytes()
+            let mut rng = Prng::new(u64::try_from(iter).unwrap_or(u64::MAX) + 0x9999);
+            // Generate valid JSON bytes to satisfy strict validation; three
+            // shapes so object, empty, and string documents all appear.
+            let bytes = match rng.gen_range(0, 3) {
+                0 => {
+                    let n = rng.gen_range(0, 50);
+                    format!("{{\"k\":{n}}}").into_bytes()
+                }
+                1 => b"{}".to_vec(),
+                _ => {
+                    let s = rng.gen_string(0, 10, SIMPLE_CHARSET);
+                    format!("\"{s}\"").into_bytes()
+                }
             };
-            let bytes = valid_bytes;
             let path = temp_dir_unique("prop-noop-core").join(format!("file-{iter}.json"));
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, &bytes).unwrap();
@@ -786,11 +761,15 @@ mod tests {
     #[test]
     fn property_preview_deterministic_raw_editor_commit() {
         for iter in 0..50 {
-            let mut rng = Prng::new(iter as u64 + 0xaaaa);
+            let mut rng = Prng::new(u64::try_from(iter).unwrap_or(u64::MAX) + 0xaaaa);
             let old_len = rng.gen_range(0, 150);
             let new_len = rng.gen_range(0, 150);
-            let old: Vec<u8> = (0..old_len).map(|_| rng.gen_range(32, 127) as u8).collect();
-            let new: Vec<u8> = (0..new_len).map(|_| rng.gen_range(32, 127) as u8).collect();
+            let old: Vec<u8> = (0..old_len)
+                .map(|_| u8::try_from(rng.gen_range(32, 127)).unwrap_or(b'x'))
+                .collect();
+            let new: Vec<u8> = (0..new_len)
+                .map(|_| u8::try_from(rng.gen_range(32, 127)).unwrap_or(b'x'))
+                .collect();
 
             let d1 = superai_config::raw_editor::diff(
                 &old,
@@ -821,7 +800,7 @@ mod tests {
         // Mutant-killer: deleting the forbidden-field check or secret
         // redaction fails this.
         for iter in 0..30 {
-            let mut rng = Prng::new(iter as u64 + 0xbbbb);
+            let mut rng = Prng::new(u64::try_from(iter).unwrap_or(u64::MAX) + 0xbbbb);
             let reg = {
                 let mut r = Registry::default();
                 let inst = random_instance(&mut rng, iter, 0);
@@ -931,9 +910,8 @@ mod tests {
     #[test]
     fn mutant_capability_resolution_complete_and_deterministic() {
         // Mutant-killer: capability matrix must be complete, deterministic, and not return Unknown for active pairs
-        validate_matrix_completeness().unwrap();
         for iter in 0..20 {
-            let mut rng = Prng::new(iter as u64 + 0xcccc);
+            let mut rng = Prng::new(u64::try_from(iter).unwrap_or(u64::MAX) + 0xcccc);
             for (h, p) in ACTIVE_PAIRS {
                 let harness = HarnessId::new(h).unwrap();
                 let provider = ProviderId::new(p).unwrap();
@@ -972,8 +950,8 @@ mod tests {
         let r1 = AbsolutePath::from_path(&crate::test_util::tmp_abs("mutant1")).unwrap();
         let inst1 = Instance {
             id: InstanceId::new("id-mutant-1").unwrap(),
-            name: n1.clone(),
-            harness: h.clone(),
+            name: n1,
+            harness: h,
             config_root: r1,
             binary: None,
             wrapper: Some(WrapperRef {

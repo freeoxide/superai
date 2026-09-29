@@ -5,6 +5,19 @@
     clippy::excessive_nesting,
     reason = "intentional deep branching for redaction and version parsing"
 )]
+
+/// Shell metachars rejected in any superai-executed argument, command, or
+/// locator; one list so a newly spelled bypass is fixed once.
+pub(crate) const SHELL_METACHARS: &[&str] = &[
+    "`", "$(", "${", "&&", "||", ";", "|", ">", "<", "&", "!", "\"", "'", "\n", "\r",
+];
+
+/// True when `value` contains any shell metachar. Windows treats a backslash
+/// as a path separator, so native-locator callers check it themselves.
+pub(crate) fn contains_shell_metachars(value: &str) -> bool {
+    SHELL_METACHARS.iter().any(|pat| value.contains(pat))
+}
+
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
@@ -114,16 +127,18 @@ pub fn redact_args(args: &[String], flags: &[&str]) -> Vec<String> {
         }
         let mut handled = false;
         for flag in flags {
-            if let Some(value) = arg.strip_prefix(&format!("{flag}=")) {
-                if value.is_empty() {
-                    redact_next = true;
-                    result.push(arg.clone());
-                } else {
-                    result.push(format!("{flag}=***"));
-                }
-                handled = true;
-                break;
+            // Borrow-compare instead of formatting `{flag}=` per pair.
+            let Some(rest) = arg.strip_prefix(*flag).and_then(|r| r.strip_prefix('=')) else {
+                continue;
+            };
+            if rest.is_empty() {
+                redact_next = true;
+                result.push(arg.clone());
+            } else {
+                result.push(format!("{flag}=***"));
             }
+            handled = true;
+            break;
         }
         if handled {
             continue;

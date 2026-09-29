@@ -236,6 +236,25 @@ impl fmt::Display for DocumentKind {
     }
 }
 
+impl From<DocumentKind> for superai_config::document::DocumentKind {
+    fn from(kind: DocumentKind) -> Self {
+        match kind {
+            DocumentKind::Json => Self::StrictJson,
+            DocumentKind::Jsonc => Self::JsonC,
+            DocumentKind::Toml => Self::Toml,
+            DocumentKind::Yaml => Self::Yaml,
+            DocumentKind::Env => Self::Env,
+            DocumentKind::TextFragment => Self::TextFragment,
+            // Executable, SQLite, and keychain content validates as opaque
+            // (read-only) config; superai never rewrites those in place.
+            DocumentKind::Executable
+            | DocumentKind::Sqlite
+            | DocumentKind::Keychain
+            | DocumentKind::Opaque => Self::Opaque,
+        }
+    }
+}
+
 /// Scope where a surface is read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -431,11 +450,6 @@ impl RootShape {
             Self::EnvEntries => "env entries",
         }
     }
-
-    /// Whether the parsed semantic `value` satisfies this root shape.
-    pub fn matches_value(&self, value: &Value) -> bool {
-        matches!(value, Value::Object(_))
-    }
 }
 
 impl fmt::Display for RootShape {
@@ -565,13 +579,15 @@ fn validate_value_against(
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     if let Some(shape) = root_shape
-        && !shape.matches_value(value)
+        // Every declared shape parses to a JSON object, so one predicate
+        // covers all four variants; the variant only picks diagnostic wording.
+        && !matches!(value, Value::Object(_))
     {
         diagnostics.push(Diagnostic::new(
             1,
             1,
             format!(
-                "root must be a {} ({})",
+                "root must be of kind {} ({})",
                 shape,
                 ValueType::of(value).as_str()
             ),
@@ -639,7 +655,7 @@ pub fn validate_instance_surfaces(adapter: &dyn Adapter, root: &Path) -> Result<
         let Ok(content) = std::fs::read(&path) else {
             continue;
         };
-        let kind = superai_config::document::DocumentKind::from_path(&path);
+        let kind = superai_config::document::DocumentKind::from(surface.kind);
         let errors: Vec<String> = validate_surface_content(adapter, &surface.id, &content, kind)
             .into_iter()
             .filter(|d| d.severity == superai_config::document::DiagnosticSeverity::Error)
@@ -840,10 +856,11 @@ impl fmt::Display for SkillMode {
 }
 
 /// Transport for an MCP server (EXT-08).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum McpTransport {
-    /// Standard I/O (command + args).
+    /// Standard I/O (command + args); the serde default transport.
+    #[default]
     Stdio,
     /// Server-sent events (URL).
     Sse,
@@ -1370,21 +1387,6 @@ impl GenericAdapter {
             source: source.to_owned(),
         }
     }
-
-    /// Overall ledger support for this adapter.
-    pub fn ledger_support(&self) -> AdapterSupport {
-        self.support
-    }
-
-    /// Ledger reason.
-    pub fn ledger_reason(&self) -> &str {
-        &self.reason
-    }
-
-    /// Ledger source document.
-    pub fn ledger_source(&self) -> &str {
-        &self.source
-    }
 }
 
 impl Adapter for GenericAdapter {
@@ -1418,11 +1420,15 @@ impl Adapter for GenericAdapter {
 
     fn detection(&self) -> DetectionResult {
         // Generic adapters do not probe the filesystem; they report unknown
-        // version so callers know to treat the install as absent.
+        // version so callers know to treat the install as absent. The ledger
+        // reason travels in the evidence so the support ceiling is explained.
         DetectionResult {
             present: InstallPresence::Absent,
             version: None,
-            evidence: vec![format!("generic adapter for {}", self.display_name)],
+            evidence: vec![format!(
+                "generic adapter for {}: {}",
+                self.display_name, self.reason
+            )],
             confidence: DetectionConfidence::Low,
         }
     }
@@ -1617,13 +1623,19 @@ mod tests {
             "developer preview, schema incomplete",
             "docs/harness-configs/deepseek-harness.md",
         );
-        assert_eq!(adapter.ledger_support(), AdapterSupport::ResearchBlocked);
         assert_eq!(adapter.product_status(), ProductStatus::Preview);
         let boxed: Box<dyn Adapter> = Box::new(adapter);
         let ops = boxed.supported_operations();
         for (_, support) in ops {
             assert_eq!(support, AdapterSupport::ResearchBlocked);
         }
+        assert!(
+            boxed
+                .detection()
+                .evidence
+                .iter()
+                .any(|e| e.contains("developer preview, schema incomplete"))
+        );
     }
 
     #[test]
@@ -1724,9 +1736,7 @@ mod tests {
         assert!(found, "wrapper env must reference instance root");
     }
 
-    use super::{
-        DeprecatedKeyDecl, OwnedKeyRule, RootShape, SurfaceSchema, ValueType, VersionResolution,
-    };
+    use super::{RootShape, SurfaceSchema, ValueType, VersionResolution};
 
     fn table_schema() -> SurfaceSchema {
         SurfaceSchema::new()
@@ -1750,7 +1760,7 @@ mod tests {
         assert!(
             diagnostics
                 .iter()
-                .any(|d| d.message.contains("root must be a table")),
+                .any(|d| d.message.contains("root must be of kind table")),
             "diagnostics: {diagnostics:?}"
         );
     }
@@ -1937,25 +1947,28 @@ mod tests {
         assert_eq!(RootShape::Table.to_string(), "table");
         assert_eq!(RootShape::Mapping.to_string(), "mapping");
         assert_eq!(RootShape::EnvEntries.to_string(), "env entries");
+        // Every declared shape accepts an object root and rejects any other
+        // root, since all four parse to a JSON object.
         for shape in [
             RootShape::Object,
             RootShape::Table,
             RootShape::Mapping,
             RootShape::EnvEntries,
         ] {
-            assert!(shape.matches_value(&serde_json::json!({"a": 1})));
-            assert!(!shape.matches_value(&serde_json::json!([1])));
+            assert!(
+                super::validate_value_against(Some(shape), &[], &serde_json::json!({"a": 1}))
+                    .is_empty()
+            );
+            let diags = super::validate_value_against(Some(shape), &[], &serde_json::json!([1]));
+            assert!(
+                diags.iter().any(|d| d.message.contains(shape.as_str())),
+                "{shape}: {diags:?}"
+            );
         }
     }
 
     #[test]
-    fn owned_key_rule_and_deprecated_decl_shapes() {
-        let rule = OwnedKeyRule::new("model", ValueType::String);
-        assert_eq!(rule.path, "model");
-        assert_eq!(rule.expected, ValueType::String);
-        let decl = DeprecatedKeyDecl::new("old-key", None);
-        assert_eq!(decl.key, "old-key");
-        assert!(decl.replacement.is_none());
+    fn surface_schema_starts_empty() {
         let schema = SurfaceSchema::new();
         assert!(schema.root_shape.is_none());
         assert!(schema.owned_key_rules.is_empty());

@@ -1,18 +1,11 @@
 //! MCP canonical definition and lifecycle (EXT-08..10): per-entry merges
 //! keep foreign servers and unmodelled keys; JSONC/YAML refuse writes.
 
+// The per-format (JSON/TOML/YAML) walkers branch per node kind, so deep
+// nesting is intrinsic to the serialization dispatch.
 #![expect(
-    clippy::collapsible_if,
-    clippy::derivable_impls,
     clippy::excessive_nesting,
-    clippy::for_kv_map,
-    clippy::manual_let_else,
-    clippy::map_unwrap_or,
-    clippy::needless_pass_by_value,
-    clippy::too_many_lines,
-    clippy::uninlined_format_args,
-    clippy::unnecessary_wraps,
-    reason = "per-format walks keep manual nesting and literal-bounded generics"
+    reason = "per-format walkers branch per node kind"
 )]
 
 use std::collections::BTreeMap;
@@ -25,12 +18,10 @@ use crate::adapter::{DocumentKind, McpAdapterDecl, McpTransport};
 use crate::error::{CoreError, Result};
 use crate::ids::McpServerId;
 
-const SHELL_PATTERNS: &[&str] = &[
-    "`", "$(", "${", "&&", "||", ";", "|", ">", "<", "&", "!", "\\", "\"", "'", "\n", "\r",
-];
-
 fn contains_shell_metachars(value: &str) -> bool {
-    SHELL_PATTERNS.iter().any(|pat| value.contains(pat))
+    // MCP commands never carry native paths, so the Windows separator is
+    // rejected like any other quoting metachar.
+    crate::process::contains_shell_metachars(value) || value.contains('\\')
 }
 
 // NUL is itself a control char, so one pass over the chars covers both.
@@ -221,12 +212,6 @@ pub struct McpServerDef {
     /// Tool exclude list where harness supports it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exclude_tools: Option<Vec<String>>,
-}
-
-impl Default for McpTransport {
-    fn default() -> Self {
-        Self::Stdio
-    }
 }
 
 impl McpServerDef {
@@ -429,19 +414,20 @@ pub fn to_native_value(server: &McpServerDef) -> Value {
 }
 
 /// Parse a native value plus server id into a canonical definition.
+#[expect(
+    clippy::too_many_lines,
+    reason = "per-shape canonicalization branches read linearly"
+)]
 pub fn from_native_value(id: &str, value: &Value) -> Result<McpServerDef> {
     let server_id = McpServerId::new(id).map_err(|e| CoreError::Validation {
         field: "mcp.id".to_owned(),
         reason: format!("invalid McpServerId `{id}`: {e}"),
     })?;
-    let obj = match value {
-        Value::Object(m) => m,
-        _ => {
-            return Err(CoreError::SchemaValidation {
-                path: PathBuf::from(id),
-                details: format!("mcp server `{id}` must be an object, got {value}"),
-            });
-        }
+    let Value::Object(obj) = value else {
+        return Err(CoreError::SchemaValidation {
+            path: PathBuf::from(id),
+            details: format!("mcp server `{id}` must be an object, got {value}"),
+        });
     };
     let command = obj
         .get("command")
@@ -560,31 +546,33 @@ pub fn from_native_value(id: &str, value: &Value) -> Result<McpServerDef> {
         .get("transport")
         .or_else(|| obj.get("type"))
         .and_then(|v| v.as_str())
-        .map(|s| match s.to_lowercase().as_str() {
-            "stdio" => McpTransport::Stdio,
-            "sse" => McpTransport::Sse,
-            "http" => McpTransport::Http,
-            "websocket" | "ws" => McpTransport::WebSocket,
-            "streamable_http" | "streamable-http" | "streamablehttp" => {
-                McpTransport::StreamableHttp
-            }
-            _ => {
+        .map_or_else(
+            || {
                 if command.is_some() {
                     McpTransport::Stdio
-                } else {
+                } else if url.is_some() {
                     McpTransport::Sse
+                } else {
+                    McpTransport::Stdio
                 }
-            }
-        })
-        .unwrap_or_else(|| {
-            if command.is_some() {
-                McpTransport::Stdio
-            } else if url.is_some() {
-                McpTransport::Sse
-            } else {
-                McpTransport::Stdio
-            }
-        });
+            },
+            |s| match s.to_lowercase().as_str() {
+                "stdio" => McpTransport::Stdio,
+                "sse" => McpTransport::Sse,
+                "http" => McpTransport::Http,
+                "websocket" | "ws" => McpTransport::WebSocket,
+                "streamable_http" | "streamable-http" | "streamablehttp" => {
+                    McpTransport::StreamableHttp
+                }
+                _ => {
+                    if command.is_some() {
+                        McpTransport::Stdio
+                    } else {
+                        McpTransport::Sse
+                    }
+                }
+            },
+        );
 
     let def = McpServerDef {
         id: server_id,
@@ -721,7 +709,7 @@ fn read_outer_and_inner(
     decl: &McpAdapterDecl,
 ) -> Result<(Value, BTreeMap<String, Value>)> {
     let outer = read_outer_value(path, decl.kind)?;
-    let inner = inner_entries(&outer, decl)?;
+    let inner = inner_entries(&outer, decl);
     Ok((outer, inner))
 }
 
@@ -738,10 +726,10 @@ fn navigate_dotted<'a>(value: &'a Value, dotted: &str) -> Option<&'a Value> {
     }
 }
 
-fn inner_entries(outer: &Value, decl: &McpAdapterDecl) -> Result<BTreeMap<String, Value>> {
+fn inner_entries(outer: &Value, decl: &McpAdapterDecl) -> BTreeMap<String, Value> {
     let mut out = BTreeMap::new();
     let Some(container) = navigate_dotted(outer, &decl.dest_key) else {
-        return Ok(out);
+        return out;
     };
     match &decl.shape {
         crate::adapter::McpDestShape::NameMap => {
@@ -761,7 +749,7 @@ fn inner_entries(outer: &Value, decl: &McpAdapterDecl) -> Result<BTreeMap<String
             }
         }
     }
-    Ok(out)
+    out
 }
 
 /// A single owned-server mutation to stage (EXT-09 per-entry writes keep
@@ -858,7 +846,7 @@ fn write_server_entry(
     path: &Path,
     decl: &McpAdapterDecl,
     id: &str,
-    write: ServerWrite,
+    write: &ServerWrite,
 ) -> Result<()> {
     if let Some(reason) = &decl.read_only {
         return Err(CoreError::UnsupportedOperation {
@@ -881,8 +869,8 @@ fn write_server_entry(
         }));
     }
     match (decl.kind, &decl.shape) {
-        (DocumentKind::Json, shape) => write_json_server(path, decl, id, &write, shape),
-        (DocumentKind::Toml, shape) => write_toml_server(path, decl, id, &write, shape),
+        (DocumentKind::Json, shape) => write_json_server(path, decl, id, write, shape),
+        (DocumentKind::Toml, shape) => write_toml_server(path, decl, id, write, shape),
         (other, _) => Err(CoreError::UnsupportedOperation {
             harness: "mcp".to_owned(),
             operation: format!("write `{}` entry `{id}`", decl.dest_key),
@@ -1025,9 +1013,8 @@ fn json_to_toml_item(value: &Value) -> std::result::Result<toml_edit::Item, Stri
         Value::Array(arr) => {
             let mut toml_arr = toml_edit::Array::new();
             for item in arr {
-                let converted = match json_to_toml_item(item)? {
-                    toml_edit::Item::Value(v) => v,
-                    _ => return Err("nested tables inside mcp arrays are not supported".to_owned()),
+                let toml_edit::Item::Value(converted) = json_to_toml_item(item)? else {
+                    return Err("nested tables inside mcp arrays are not supported".to_owned());
                 };
                 toml_arr.push(converted);
             }
@@ -1138,14 +1125,12 @@ fn write_toml_server(
                     toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new()),
                 );
             }
-            let arr = match root.get_mut(decl.dest_key.as_str()) {
-                Some(toml_edit::Item::ArrayOfTables(a)) => a,
-                _ => {
-                    return Err(schema_err(format!(
-                        "mcp container `{}` must be an array of tables",
-                        decl.dest_key
-                    )));
-                }
+            let Some(toml_edit::Item::ArrayOfTables(arr)) = root.get_mut(decl.dest_key.as_str())
+            else {
+                return Err(schema_err(format!(
+                    "mcp container `{}` must be an array of tables",
+                    decl.dest_key
+                )));
             };
             let position = arr
                 .iter()
@@ -1277,11 +1262,11 @@ pub fn preview_install(
     );
     // Diff text never carries env or header values, only key names.
     let mut redacted_parts: Vec<String> = Vec::new();
-    for (k, _) in &server.env {
-        redacted_parts.push(format!("env:{}=[REDACTED]", k));
+    for k in server.env.keys() {
+        redacted_parts.push(format!("env:{k}=[REDACTED]"));
     }
-    for (k, _) in &server.headers {
-        redacted_parts.push(format!("header:{}=[REDACTED]", k));
+    for k in server.headers.keys() {
+        redacted_parts.push(format!("header:{k}=[REDACTED]"));
     }
     let diff_redacted = if redacted_parts.is_empty() {
         diff
@@ -1315,16 +1300,16 @@ pub fn install_mcp_server(
             reason: preview.conflicts.join("; "),
         });
     }
-    if let Some(ref ex) = preview.existing {
-        if *ex == *server {
-            return Ok(server.clone());
-        }
+    if let Some(ref ex) = preview.existing
+        && *ex == *server
+    {
+        return Ok(server.clone());
     }
     // Read fresh for the merge; disk is truth.
     let (_outer, inner) = read_outer_and_inner(path, decl)?;
     let existing_native = inner.get(server.id.as_str());
     let merged = merge_server_native(existing_native, &to_native_value(server));
-    write_server_entry(path, decl, server.id.as_str(), ServerWrite::Upsert(merged))?;
+    write_server_entry(path, decl, server.id.as_str(), &ServerWrite::Upsert(merged))?;
     Ok(server.clone())
 }
 
@@ -1341,13 +1326,13 @@ pub fn set_mcp_enabled(
         .cloned()
         .ok_or_else(|| CoreError::Validation {
             field: "mcp.id".to_owned(),
-            reason: format!("mcp server `{}` not found", id),
+            reason: format!("mcp server `{id}` not found"),
         })?;
     let mut def = from_native_value(id.as_str(), &val)?;
     def.disabled = !enabled;
     def.validate()?;
     let merged = merge_server_native(inner.get(id.as_str()), &to_native_value(&def));
-    write_server_entry(path, decl, id.as_str(), ServerWrite::Upsert(merged))?;
+    write_server_entry(path, decl, id.as_str(), &ServerWrite::Upsert(merged))?;
     Ok(def)
 }
 
@@ -1364,7 +1349,7 @@ pub fn remove_mcp_server(
         None => return Ok(None),
     };
     let def = from_native_value(id.as_str(), &existing_val)?;
-    write_server_entry(path, decl, id.as_str(), ServerWrite::Remove)?;
+    write_server_entry(path, decl, id.as_str(), &ServerWrite::Remove)?;
     Ok(Some(def))
 }
 
@@ -1373,17 +1358,17 @@ pub fn redacted_diff(server: &McpServerDef) -> String {
     let mut parts: Vec<String> = Vec::new();
     parts.push(format!("id={}", server.id));
     if let Some(cmd) = &server.command {
-        parts.push(format!("command={}", cmd));
+        parts.push(format!("command={cmd}"));
     }
     if let Some(url) = &server.url {
-        parts.push(format!("url={}", url));
+        parts.push(format!("url={url}"));
     }
     parts.push(format!("disabled={}", server.disabled));
     parts.push(format!("transport={}", server.transport));
-    for (k, _) in &server.env {
+    for k in server.env.keys() {
         parts.push(format!("env:{}=[REDACTED]", redacted_value(k, "")));
     }
-    for (k, _) in &server.headers {
+    for k in server.headers.keys() {
         parts.push(format!("header:{}=[REDACTED]", redacted_value(k, "")));
     }
     parts.join(" ")
@@ -1510,7 +1495,7 @@ pub fn transfer_between_scopes(
         && *dest == preview.source_existing
     {
         if action == ScopeTransfer::Move {
-            write_server_entry(source_path, source_decl, id.as_str(), ServerWrite::Remove)?;
+            write_server_entry(source_path, source_decl, id.as_str(), &ServerWrite::Remove)?;
         }
         return Ok(Some(preview.source_existing));
     }
@@ -1520,10 +1505,10 @@ pub fn transfer_between_scopes(
         dest_path,
         dest_decl,
         id.as_str(),
-        ServerWrite::Upsert(merged),
+        &ServerWrite::Upsert(merged),
     )?;
     if action == ScopeTransfer::Move {
-        write_server_entry(source_path, source_decl, id.as_str(), ServerWrite::Remove)?;
+        write_server_entry(source_path, source_decl, id.as_str(), &ServerWrite::Remove)?;
     }
     Ok(Some(preview.source_existing))
 }
@@ -1626,6 +1611,7 @@ impl BulkPlan {
 
 /// Build every per-instance plan fresh (EXT-11); unsupported targets and
 /// conflicts surface before commit, snapshots guard the plan→apply window.
+#[expect(clippy::too_many_lines, reason = "per-target planning reads linearly")]
 pub fn bulk_plan(targets: &[BulkTarget], action: &BulkAction) -> BulkPlan {
     let mut plans = Vec::new();
     for target in targets {
@@ -1950,7 +1936,7 @@ mod tests {
         let json = serde_json::to_string(&server).unwrap();
         let de: McpServerDef = serde_json::from_str(&json).unwrap();
         assert_eq!(server, de);
-        assert!(!json.contains("secret-123") || json.contains("secret-123")); // raw value present in storage, but diff must redact
+        assert!(json.contains("secret-123"), "raw value stays in storage");
         let diff = redacted_diff(&server);
         assert!(!diff.contains("secret-123"), "diff must not leak secret");
         assert!(diff.contains("[REDACTED]"));
@@ -2874,7 +2860,7 @@ mod tests {
         };
         let plan = bulk_plan(&targets, &action);
         let refusing = plan.refusing_targets();
-        assert_eq!(refusing.len(), 1, "{:?}", refusing);
+        assert_eq!(refusing.len(), 1, "{refusing:?}");
         assert_eq!(refusing[0].instance, "pi-box");
         assert!(
             refusing[0]

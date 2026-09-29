@@ -725,19 +725,27 @@ impl Registry {
 
     /// Rename an instance, preserving id/root/template; the wrapper's
     /// `command_name` follows when it equalled the old name (case-folded).
-    #[expect(
-        clippy::indexing_slicing,
-        reason = "idx validated via position search, bounds checked"
-    )]
     pub fn rename(&mut self, old_name: &str, new_name: InstanceName) -> Result<()> {
-        let idx = self
+        let not_found = || CoreError::Validation {
+            field: "name".to_owned(),
+            reason: format!("instance `{old_name}` not found for rename"),
+        };
+        let Some(idx) = self
             .instances
             .iter()
             .position(|i| i.name.as_str() == old_name)
-            .ok_or_else(|| CoreError::Validation {
-                field: "name".to_owned(),
-                reason: format!("instance `{old_name}` not found for rename"),
-            })?;
+        else {
+            return Err(not_found());
+        };
+        let (old_name_owned, old_command) = {
+            let Some(inst) = self.instances.get_mut(idx) else {
+                return Err(not_found());
+            };
+            (
+                inst.name.to_string(),
+                inst.wrapper.as_ref().map(|w| w.command_name.clone()),
+            )
+        };
 
         let new_norm = new_name.normalized();
         for (j, other) in self.instances.iter().enumerate() {
@@ -767,19 +775,26 @@ impl Registry {
                 });
             }
         }
-        let inst = &mut self.instances[idx];
-        let old_name_owned = inst.name.to_string();
-        let old_command = inst.wrapper.as_ref().map(|w| w.command_name.clone());
-        inst.name = new_name.clone();
-        if let Some(wrapper) = &mut inst.wrapper
-            && wrapper.command_name.normalized() == old_name_owned.to_lowercase()
         {
-            wrapper.command_name = new_name.clone();
+            let Some(inst) = self.instances.get_mut(idx) else {
+                return Err(not_found());
+            };
+            inst.name = new_name.clone();
+            if let Some(wrapper) = &mut inst.wrapper
+                && wrapper.command_name.normalized() == old_name_owned.to_lowercase()
+            {
+                wrapper.command_name = new_name.clone();
+            }
         }
 
         if let Err(e) = self.validate() {
             // Roll back the name and any wrapper command the rename touched.
-            let inst = &mut self.instances[idx];
+            let Some(inst) = self.instances.get_mut(idx) else {
+                return Err(CoreError::Validation {
+                    field: "name".to_owned(),
+                    reason: format!("instance `{old_name_owned}` vanished during rename"),
+                });
+            };
             inst.name = InstanceName::new(&old_name_owned).unwrap_or(new_name);
             if let (Some(wrapper), Some(command)) = (&mut inst.wrapper, old_command) {
                 wrapper.command_name = command;

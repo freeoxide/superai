@@ -879,7 +879,7 @@ mod tests {
         use crate::install_catalog::InstallCatalog;
 
         let catalog = InstallCatalog::embedded().expect("embedded catalog");
-        let entries = catalog.entries;
+        let entries = &catalog.entries;
         assert!(!entries.is_empty(), "embedded catalog must be populated");
 
         for iter in 0u64..100u64 {

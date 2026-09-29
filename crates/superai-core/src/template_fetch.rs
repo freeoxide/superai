@@ -20,9 +20,6 @@ pub const FETCH_TIMEOUT_SECS: u64 = 30;
 /// User-Agent string `superai/<version>`.
 pub const USER_AGENT: &str = concat!("superai/", env!("CARGO_PKG_VERSION"));
 
-/// Maximum response size (1 MiB).
-pub const MAX_BYTES: usize = MAX_TEMPLATE_BYTES;
-
 /// Errors from fetching templates or catalogs.
 #[derive(Debug, thiserror::Error)]
 pub enum TemplateFetchError {
@@ -31,7 +28,7 @@ pub enum TemplateFetchError {
     Network {
         /// Template or URL context.
         template: String,
-        /// Human reason.
+        /// Display-safe detail; never echoes fetched content or secrets.
         reason: String,
     },
     /// Remote file not found (404).
@@ -39,7 +36,7 @@ pub enum TemplateFetchError {
     NotFound {
         /// Template or URL context.
         template: String,
-        /// Human reason.
+        /// Display-safe detail; never echoes fetched content or secrets.
         reason: String,
     },
     /// Rate limited (429).
@@ -47,7 +44,7 @@ pub enum TemplateFetchError {
     RateLimited {
         /// Template or URL context.
         template: String,
-        /// Human reason.
+        /// Display-safe detail; never echoes fetched content or secrets.
         reason: String,
     },
     /// Digest mismatch between catalog and fetched bytes.
@@ -65,7 +62,7 @@ pub enum TemplateFetchError {
     SchemaInvalid {
         /// Template or URL context.
         template: String,
-        /// Human reason.
+        /// Display-safe detail; never echoes fetched content or secrets.
         reason: String,
     },
     /// Invalid URL (not https, or traversal).
@@ -73,7 +70,7 @@ pub enum TemplateFetchError {
     InvalidUrl {
         /// Template or URL context.
         template: String,
-        /// Human reason.
+        /// Display-safe detail; never echoes fetched content or secrets.
         reason: String,
     },
     /// Response exceeds size limit.
@@ -81,7 +78,7 @@ pub enum TemplateFetchError {
     SizeLimit {
         /// Template or URL context.
         template: String,
-        /// Human reason.
+        /// Display-safe detail; never echoes fetched content or secrets.
         reason: String,
     },
     /// Too many redirects.
@@ -89,7 +86,7 @@ pub enum TemplateFetchError {
     RedirectLimit {
         /// Template or URL context.
         template: String,
-        /// Human reason.
+        /// Display-safe detail; never echoes fetched content or secrets.
         reason: String,
     },
 }
@@ -244,16 +241,26 @@ pub fn fetch_bytes(url: &str, context: &str) -> Result<Vec<u8>, TemplateFetchErr
                 }
             }
         })?;
-        if bytes.len() > MAX_BYTES {
+        if bytes.len() > MAX_TEMPLATE_BYTES {
             return Err(TemplateFetchError::SizeLimit {
                 template: context.to_owned(),
-                reason: format!("file size {} exceeds limit {MAX_BYTES}", bytes.len()),
+                reason: format!(
+                    "file size {} exceeds limit {MAX_TEMPLATE_BYTES}",
+                    bytes.len()
+                ),
             });
         }
         return Ok(bytes);
     }
 
-    fetch_bytes_ureq(url, context)
+    fetch_bounded(
+        url,
+        context,
+        &BoundedFetch {
+            max_bytes: MAX_TEMPLATE_BYTES,
+            timeout: Duration::from_secs(FETCH_TIMEOUT_SECS),
+        },
+    )
 }
 
 /// Resolve a redirect `Location`: absolute https or same-origin
@@ -282,8 +289,24 @@ fn resolve_redirect(
     Ok(format!("https://{origin}{location}"))
 }
 
-fn fetch_bytes_ureq(url: &str, context: &str) -> Result<Vec<u8>, TemplateFetchError> {
-    let agent = build_agent(Duration::from_secs(FETCH_TIMEOUT_SECS));
+/// Tuning for the shared bounded HTTPS fetch. Skill sources take a larger
+/// limit and a shorter timeout than template files.
+pub(crate) struct BoundedFetch {
+    /// Maximum response size in bytes.
+    pub max_bytes: usize,
+    /// Whole-request timeout.
+    pub timeout: Duration,
+}
+
+/// One bounded HTTPS GET whose redirects are followed manually so every hop
+/// re-passes URL validation; the engine behind template and skill fetches.
+pub(crate) fn fetch_bounded(
+    url: &str,
+    context: &str,
+    limits: &BoundedFetch,
+) -> Result<Vec<u8>, TemplateFetchError> {
+    let agent = build_agent(limits.timeout);
+    let max_bytes = limits.max_bytes;
     let mut current = url.to_owned();
     // Redirects are followed manually so EVERY hop re-passes URL validation;
     // ureq itself never re-checks a Location target (QAL-11).
@@ -330,27 +353,27 @@ fn fetch_bytes_ureq(url: &str, context: &str) -> Result<Vec<u8>, TemplateFetchEr
         if let Some(len_str) = response.headers().get("Content-Length")
             && let Ok(s) = len_str.to_str()
             && let Ok(len) = s.parse::<usize>()
-            && len > MAX_BYTES
+            && len > max_bytes
         {
             return Err(TemplateFetchError::SizeLimit {
                 template: context.to_owned(),
-                reason: format!("content-length {len} exceeds limit {MAX_BYTES}"),
+                reason: format!("content-length {len} exceeds limit {max_bytes}"),
             });
         }
 
         let mut body = response.body_mut().as_reader();
         let mut buf: Vec<u8> = Vec::new();
-        let mut limited = (&mut body).take((MAX_BYTES + 1) as u64);
+        let mut limited = (&mut body).take((max_bytes + 1) as u64);
         limited
             .read_to_end(&mut buf)
             .map_err(|e| TemplateFetchError::Network {
                 template: context.to_owned(),
                 reason: format!("read failed for `{current}`: {e}"),
             })?;
-        if buf.len() > MAX_BYTES {
+        if buf.len() > max_bytes {
             return Err(TemplateFetchError::SizeLimit {
                 template: context.to_owned(),
-                reason: format!("response size exceeds limit {MAX_BYTES}"),
+                reason: format!("response size exceeds limit {max_bytes}"),
             });
         }
         return Ok(buf);
@@ -365,7 +388,7 @@ fn build_agent(timeout: Duration) -> ureq::Agent {
     let config = ureq::Agent::config_builder()
         .timeout_global(Some(timeout))
         .https_only(true)
-        // The redirect loop in fetch_bytes_ureq follows manually so each hop
+        // The redirect loop follows manually so each hop
         // is re-validated; ureq must not silently follow anything itself.
         .max_redirects(0)
         .max_redirects_will_error(false)
@@ -452,10 +475,13 @@ pub fn fetch_catalog_from_path(path: &Path) -> Result<Catalog, TemplateFetchErro
             }
         }
     })?;
-    if bytes.len() > MAX_BYTES {
+    if bytes.len() > MAX_TEMPLATE_BYTES {
         return Err(TemplateFetchError::SizeLimit {
             template: "catalog".to_owned(),
-            reason: format!("catalog size {} exceeds limit {MAX_BYTES}", bytes.len()),
+            reason: format!(
+                "catalog size {} exceeds limit {MAX_TEMPLATE_BYTES}",
+                bytes.len()
+            ),
         });
     }
     let catalog =
@@ -527,28 +553,6 @@ pub fn fetch_template(
             reason: format!("{e}"),
         })?;
     Ok(tmpl)
-}
-
-/// Verify that template bytes match `expected_digest` and parse as a valid
-/// template, without network I/O.
-pub fn verify_template_bytes(
-    bytes: &[u8],
-    expected_digest: &str,
-    context: &str,
-) -> Result<(), TemplateFetchError> {
-    let actual = compute_digest(bytes);
-    if actual != expected_digest.to_ascii_lowercase() {
-        return Err(TemplateFetchError::DigestMismatch {
-            template: context.to_owned(),
-            expected: expected_digest.to_owned(),
-            actual,
-        });
-    }
-    Template::from_json_bytes(bytes).map_err(|e| TemplateFetchError::SchemaInvalid {
-        template: context.to_owned(),
-        reason: format!("{e}"),
-    })?;
-    Ok(())
 }
 
 /// Ensure a relative path never escapes `base` when joined; lexical
@@ -875,7 +879,7 @@ mod tests {
         let dir = crate::test_util::temp_dir_unique("tpl-fetch");
         drop(std::fs::remove_dir_all(&dir));
         std::fs::create_dir_all(&dir).unwrap();
-        let huge = vec![b'a'; MAX_BYTES + 1];
+        let huge = vec![b'a'; MAX_TEMPLATE_BYTES + 1];
         let path = dir.join("catalog.json");
         std::fs::write(&path, &huge).unwrap();
         let err = fetch_catalog_from_path(&path).unwrap_err();
@@ -884,18 +888,6 @@ mod tests {
             other => panic!("expected SizeLimit, got {other:?}"),
         }
         drop(std::fs::remove_dir_all(&dir));
-    }
-
-    #[test]
-    fn verify_template_bytes_success_and_mismatch() {
-        let patch = OwnedPatch {
-            selector: "key:model".to_owned(),
-            value: json!("sonnet"),
-        };
-        let current = sample_template_bytes("Label", vec![patch], Some("c".repeat(64)));
-        let digest = compute_digest(&current);
-        verify_template_bytes(&current, &digest, "claude-glm").unwrap();
-        verify_template_bytes(&current, &"0".repeat(64), "claude-glm").unwrap_err();
     }
 
     #[test]

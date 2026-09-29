@@ -135,17 +135,12 @@ impl AbsolutePath {
         Ok(Self(normalized))
     }
 
-    /// Borrow as [`Path`].
+    /// Read-only borrow of the wrapped path; reading never re-normalizes.
     pub fn as_path(&self) -> &Path {
         &self.0
     }
 
-    /// Borrow as string lossy (for display).
-    pub fn as_str_lossy(&self) -> String {
-        self.0.to_string_lossy().into_owned()
-    }
-
-    /// Consume into inner [`PathBuf`].
+    /// Consume the wrapper; the buffer is returned unchanged.
     pub fn into_inner(self) -> PathBuf {
         self.0
     }
@@ -282,24 +277,19 @@ impl ConfigRoot {
         Ok(Self(inner))
     }
 
-    /// Borrow as [`Path`].
+    /// Read-only borrow of the wrapped path; reading never re-normalizes.
     pub fn as_path(&self) -> &Path {
         self.0.as_path()
     }
 
-    /// Borrow inner [`AbsolutePath`].
+    /// Borrow the wrapped absolute path; the guarantee stays absolute.
     pub fn as_absolute(&self) -> &AbsolutePath {
         &self.0
     }
 
-    /// Consume into inner.
+    /// Consume the wrapper; the path is returned unchanged.
     pub fn into_inner(self) -> AbsolutePath {
         self.0
-    }
-
-    /// Consume into [`PathBuf`].
-    pub fn into_path_buf(self) -> PathBuf {
-        self.0.into_inner()
     }
 }
 
@@ -386,17 +376,17 @@ impl ConfigSurfacePath {
         Ok(Self(inner))
     }
 
-    /// Borrow as [`Path`].
+    /// Read-only borrow of the wrapped path; reading never re-normalizes.
     pub fn as_path(&self) -> &Path {
         self.0.as_path()
     }
 
-    /// Borrow inner.
+    /// Borrow the wrapped absolute path; the guarantee stays absolute.
     pub fn as_absolute(&self) -> &AbsolutePath {
         &self.0
     }
 
-    /// Consume.
+    /// Consume the wrapper; the path is returned unchanged.
     pub fn into_inner(self) -> AbsolutePath {
         self.0
     }
@@ -486,24 +476,20 @@ impl WrapperPath {
         Ok(Self(inner))
     }
 
-    /// Borrow as [`Path`].
+    /// Read-only borrow of the wrapped path; reading never re-normalizes.
     pub fn as_path(&self) -> &Path {
         self.0.as_path()
     }
 
-    /// Borrow inner.
+    /// Borrow the wrapped absolute path; the guarantee stays absolute.
     pub fn as_absolute(&self) -> &AbsolutePath {
         &self.0
     }
 
     /// Consume.
+    /// Consume the wrapper; the path is returned unchanged.
     pub fn into_inner(self) -> AbsolutePath {
         self.0
-    }
-
-    /// Consume into [`PathBuf`].
-    pub fn into_path_buf(self) -> PathBuf {
-        self.0.into_inner()
     }
 }
 
@@ -644,11 +630,6 @@ impl ExecutableRef {
     /// Returns true if this is an absolute path.
     pub fn is_absolute(&self) -> bool {
         matches!(self, Self::Absolute(_))
-    }
-
-    /// Returns true if this is a bare name.
-    pub fn is_named(&self) -> bool {
-        matches!(self, Self::Named(_))
     }
 
     /// Borrow as [`Path`] if absolute, else `None`.
@@ -933,7 +914,6 @@ mod tests {
     #[test]
     fn executable_ref_named() {
         let e = ExecutableRef::new("claude").unwrap();
-        assert!(e.is_named());
         assert_eq!(e.as_name(), Some("claude"));
         assert!(!e.is_absolute());
         let e2 = ExecutableRef::new("code").unwrap();
@@ -989,7 +969,6 @@ mod tests {
             home.join("bin").join("claude")
         );
         let e2 = ExecutableRef::expand_home("claude", &home).unwrap();
-        assert!(e2.is_named());
         assert_eq!(e2.as_name(), Some("claude"));
         ExecutableRef::expand_home("~/../etc", &home).unwrap_err();
         ExecutableRef::expand_home("", &home).unwrap_err();

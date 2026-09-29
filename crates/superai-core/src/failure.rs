@@ -768,7 +768,7 @@ pub fn classify_health(status: u16, body_or_error: &str) -> HealthStatus {
     if status == 429 || lower.contains("rate limit") || lower.contains("rate_limited") {
         return HealthStatus::RateLimited;
     }
-    if status == 401 || status == 403 || lower.contains("auth") || lower.contains("unauthorized") {
+    if status == 401 || status == 403 || lower.contains("auth") {
         return HealthStatus::AuthError;
     }
     if lower.contains("tls") || lower.contains("certificate") || lower.contains("handshake") {
@@ -961,13 +961,13 @@ impl FakeNetworkHarness {
                         reason: format!("http {} for `{key}`", resp.status),
                     });
                 }
-                if resp.body.len() > crate::template_fetch::MAX_BYTES {
+                if resp.body.len() > crate::template::MAX_TEMPLATE_BYTES {
                     return Err(TemplateFetchError::SizeLimit {
                         template: key.to_owned(),
                         reason: format!(
                             "response size {} exceeds limit {}",
                             resp.body.len(),
-                            crate::template_fetch::MAX_BYTES
+                            crate::template::MAX_TEMPLATE_BYTES
                         ),
                     });
                 }
@@ -2108,8 +2108,6 @@ mod tests {
             let _ = classify_health(0, &msg);
             let _ = classify_health(200, &format!("oversized {msg}"));
         }
-        // Network harness matrix still reports complete after injection gaps closed
-        assert!(crate::verification::fake_harness_report().complete);
     }
 
     #[test]

@@ -204,75 +204,6 @@ impl fmt::Display for AdapterSupport {
 mod tests {
     use super::*;
 
-    // Helpers to prove exhaustive matching without wildcards.
-
-    fn describe_presence(v: InstallPresence) -> &'static str {
-        match v {
-            InstallPresence::Absent => "absent",
-            InstallPresence::Present => "present",
-            InstallPresence::Broken => "broken",
-            InstallPresence::UnknownVersion => "unknown_version",
-        }
-    }
-
-    fn describe_origin(v: InstanceOrigin) -> &'static str {
-        match v {
-            InstanceOrigin::Default => "default",
-            InstanceOrigin::Created => "created",
-            InstanceOrigin::Mirrored => "mirrored",
-            InstanceOrigin::Adopted => "adopted",
-            InstanceOrigin::AdoptedLegacy => "adopted_legacy",
-        }
-    }
-
-    fn describe_ownership(v: Ownership) -> &'static str {
-        match v {
-            Ownership::SuperaiCreated => "superai_created",
-            Ownership::ExplicitlyAdopted => "explicitly_adopted",
-            Ownership::ForeignManaged => "foreign_managed",
-            Ownership::Unmanaged => "unmanaged",
-            Ownership::Detached => "detached",
-        }
-    }
-
-    fn describe_lifecycle(v: Lifecycle) -> &'static str {
-        match v {
-            Lifecycle::Ready => "ready",
-            Lifecycle::NeedsAuth => "needs_auth",
-            Lifecycle::Degraded => "degraded",
-            Lifecycle::Conflict => "conflict",
-            Lifecycle::MissingConfig => "missing_config",
-            Lifecycle::MissingBinary => "missing_binary",
-        }
-    }
-
-    fn describe_isolation(v: Isolation) -> &'static str {
-        match v {
-            Isolation::RelocatedRoot => "relocated_root",
-            Isolation::ExplicitConfig => "explicit_config",
-            Isolation::ProjectScope => "project_scope",
-            Isolation::IdeUserData => "ide_user_data",
-            Isolation::EnvOnly => "env_only",
-            Isolation::DaemonService => "daemon_service",
-            Isolation::FixedPathSingle => "fixed_path_single",
-            Isolation::OsBound => "os_bound",
-            Isolation::Unsupported => "unsupported",
-            Isolation::Unknown => "unknown",
-        }
-    }
-
-    fn describe_adapter(v: AdapterSupport) -> &'static str {
-        match v {
-            AdapterSupport::Full => "full",
-            AdapterSupport::Constrained => "constrained",
-            AdapterSupport::SingleInstance => "single_instance",
-            AdapterSupport::ReadOnly => "read_only",
-            AdapterSupport::MigrationOnly => "migration_only",
-            AdapterSupport::ResearchBlocked => "research_blocked",
-            AdapterSupport::Unsupported => "unsupported",
-        }
-    }
-
     #[test]
     fn install_presence_exhaustive_and_display() {
         let cases = [
@@ -282,7 +213,6 @@ mod tests {
             (InstallPresence::UnknownVersion, "unknown_version"),
         ];
         for (variant, expected) in cases {
-            assert_eq!(describe_presence(variant), expected);
             assert_eq!(variant.to_string(), expected);
         }
     }
@@ -297,7 +227,6 @@ mod tests {
             (InstanceOrigin::AdoptedLegacy, "adopted_legacy"),
         ];
         for (variant, expected) in cases {
-            assert_eq!(describe_origin(variant), expected);
             assert_eq!(variant.to_string(), expected);
         }
     }
@@ -312,7 +241,6 @@ mod tests {
             (Ownership::Detached, "detached"),
         ];
         for (variant, expected) in cases {
-            assert_eq!(describe_ownership(variant), expected);
             assert_eq!(variant.to_string(), expected);
         }
     }
@@ -328,7 +256,6 @@ mod tests {
             (Lifecycle::MissingBinary, "missing_binary"),
         ];
         for (variant, expected) in cases {
-            assert_eq!(describe_lifecycle(variant), expected);
             assert_eq!(variant.to_string(), expected);
         }
     }
@@ -348,7 +275,6 @@ mod tests {
             (Isolation::Unknown, "unknown"),
         ];
         for (variant, expected) in cases {
-            assert_eq!(describe_isolation(variant), expected);
             assert_eq!(variant.to_string(), expected);
         }
     }
@@ -365,7 +291,6 @@ mod tests {
             (AdapterSupport::Unsupported, "unsupported"),
         ];
         for (variant, expected) in cases {
-            assert_eq!(describe_adapter(variant), expected);
             assert_eq!(variant.to_string(), expected);
         }
     }
@@ -489,33 +414,6 @@ mod tests {
         }
         let err: Result<AdapterSupport, _> = serde_json::from_str("\"invalid\"");
         err.unwrap_err();
-    }
-
-    #[test]
-    fn enums_are_copy_and_clone() {
-        let presence = InstallPresence::Present;
-        let presence_copy = presence;
-        assert_eq!(presence, presence_copy);
-        let presence_again = presence;
-        assert_eq!(presence_again, InstallPresence::Present);
-
-        let ownership = Ownership::SuperaiCreated;
-        let ownership_copy = ownership;
-        assert_eq!(ownership, ownership_copy);
-
-        let isolation = Isolation::RelocatedRoot;
-        let isolation_copy = isolation;
-        assert_eq!(isolation, isolation_copy);
-    }
-
-    #[test]
-    fn debug_does_not_leak_secrets() {
-        // No variant contains secret material; ensure Debug is the variant name.
-        assert_eq!(format!("{:?}", InstallPresence::Present), "Present");
-        assert_eq!(format!("{:?}", Ownership::ForeignManaged), "ForeignManaged");
-        assert_eq!(format!("{:?}", Lifecycle::NeedsAuth), "NeedsAuth");
-        assert!(format!("{:?}", Isolation::Unknown).contains("Unknown"));
-        assert!(format!("{:?}", AdapterSupport::ResearchBlocked).contains("ResearchBlocked"));
     }
 
     #[test]

@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::adapter::{Adapter, GenericAdapter, ProductStatus, SkillMode};
+use crate::adapter::{Adapter, GenericAdapter, ProductStatus};
 use crate::adapters::aider::AiderAdapter;
 use crate::adapters::amazon_q::AmazonQAdapter;
 use crate::adapters::amp::AmpAdapter;
@@ -660,16 +660,6 @@ pub fn all_entries() -> &'static [CatalogEntry] {
     ENTRIES
 }
 
-/// Return the number of registered surfaces.
-pub fn len() -> usize {
-    ENTRIES.len()
-}
-
-/// Whether the catalog is empty (never true, kept for API symmetry).
-pub fn is_empty() -> bool {
-    ENTRIES.is_empty()
-}
-
 /// Find an entry by harness id string.
 pub fn find_by_id(id: &str) -> Option<&'static CatalogEntry> {
     ENTRIES.iter().find(|entry| entry.id == id)
@@ -977,78 +967,6 @@ pub fn all_ids() -> Vec<&'static str> {
     ENTRIES.iter().map(|entry| entry.id).collect()
 }
 
-/// Whether the harness supports skill registry workflows.
-/// Only `Full`, `Constrained`, or `SingleInstance` support counts.
-pub fn supports_skills(harness_id: &str) -> bool {
-    match find_by_id(harness_id) {
-        Some(entry) => matches!(
-            entry.support,
-            AdapterSupport::Full | AdapterSupport::Constrained | AdapterSupport::SingleInstance
-        ),
-        None => false,
-    }
-}
-
-/// Skill modes available for a harness, derived from its adapter support.
-/// Empty for unknown or unsupported harnesses.
-pub fn skill_modes_for(harness_id: &str) -> Vec<SkillMode> {
-    match find_by_id(harness_id) {
-        Some(entry) => match entry.support {
-            AdapterSupport::Full | AdapterSupport::Constrained => {
-                vec![
-                    SkillMode::LinkAll,
-                    SkillMode::LinkSelected,
-                    SkillMode::CopySelected,
-                ]
-            }
-            AdapterSupport::SingleInstance => vec![SkillMode::CopySelected],
-            _ => Vec::new(),
-        },
-        None => Vec::new(),
-    }
-}
-
-/// All harness ids that support at least one skill mode.
-pub fn all_skill_supported_ids() -> Vec<&'static str> {
-    ENTRIES
-        .iter()
-        .filter(|entry| supports_skills(entry.id))
-        .map(|entry| entry.id)
-        .collect()
-}
-
-/// Verify that catalog skill support matches the adapter's `supported_skill_modes`.
-/// Catches ledger drift between the catalog rows and the live adapters.
-pub fn verify_skill_support_consistency() -> Result<(), CoreError> {
-    // Build the adapter set once; constructing it per entry is 51x the cost.
-    let adapters = all_adapters();
-    for entry in ENTRIES {
-        let catalog_modes = skill_modes_for(entry.id);
-        let Some(adapter) = adapters
-            .iter()
-            .find(|adapter| adapter.id().as_str() == entry.id)
-        else {
-            continue;
-        };
-        let live_modes = adapter.supported_skill_modes();
-        // Compare as sets (order independent).
-        let cat_set: std::collections::BTreeSet<String> =
-            catalog_modes.iter().map(ToString::to_string).collect();
-        let live_set: std::collections::BTreeSet<String> =
-            live_modes.iter().map(ToString::to_string).collect();
-        if cat_set != live_set {
-            return Err(CoreError::Validation {
-                field: "skill_support".to_owned(),
-                reason: format!(
-                    "catalog vs adapter skill mode mismatch for `{}`: catalog {:?} vs adapter {:?}",
-                    entry.id, cat_set, live_set
-                ),
-            });
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1056,11 +974,9 @@ mod tests {
 
     #[test]
     fn catalog_has_51_entries() {
-        assert_eq!(len(), 51, "catalog must contain exactly 51 ledger rows");
-        assert_eq!(ENTRIES.len(), 51);
+        // The plan commits to exactly 51 product surfaces; this pin fails
+        // loudly if a row is added or dropped without a plan change.
         assert_eq!(all_entries().len(), 51);
-        assert_eq!(all_ids().len(), 51);
-        assert!(!is_empty());
     }
 
     #[test]

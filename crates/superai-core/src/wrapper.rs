@@ -1612,10 +1612,10 @@ mod tests {
         );
         assert!(cmd.contains("set \"ANTHROPIC_API_KEY=\""), "unset: {cmd}");
         assert!(cmd.contains("%*"), "forwards %*");
-        assert!(
-            cmd.contains("%%") || !cmd.contains('%') || cmd.contains("%*"),
-            "cmd quoting"
-        );
+        // Every remaining % must be an escaped %% or the %* forward; a lone
+        // % would be read as a variable reference by cmd.exe.
+        let percent_free = cmd.replace("%%", "").replace("%*", "");
+        assert!(!percent_free.contains('%'), "lone % in cmd: {cmd}");
         assert!(!cmd.contains("sk-"));
 
         // An apostrophe is doubled in PowerShell single quotes.

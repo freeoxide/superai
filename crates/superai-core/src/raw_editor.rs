@@ -997,7 +997,7 @@ mod tests {
         let err = commit_for_adapter(&path, b"[1, 2]", None, &adapter).unwrap_err();
         match err {
             CoreError::SchemaValidation { details, .. } => {
-                assert!(details.contains("root must be a object"), "{details}");
+                assert!(details.contains("root must be of kind object"), "{details}");
             }
             other => panic!("expected SchemaValidation, got {other:?}"),
         }

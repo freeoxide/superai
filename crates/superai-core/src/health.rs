@@ -233,8 +233,6 @@ pub fn validate_base_url_for_probe(url: &str, allow_private: bool) -> Result<()>
     Ok(())
 }
 
-// Redaction, never emit raw secrets
-
 const SECRET_QUERY_KEYS: &[&str] = &[
     "api_key", "apikey", "api-key", "key", "token", "secret", "password", "auth", "bearer", "sk-",
 ];
@@ -268,9 +266,8 @@ pub fn redact_url(url: &str) -> String {
             None => (pair, None),
         };
         let klower = k.to_ascii_lowercase();
-        let is_secret = SECRET_QUERY_KEYS
-            .iter()
-            .any(|pat| klower.contains(&pat.to_ascii_lowercase()));
+        // Keys in SECRET_QUERY_KEYS are already lowercase constants.
+        let is_secret = SECRET_QUERY_KEYS.iter().any(|pat| klower.contains(*pat));
         if is_secret {
             out_parts.push(format!("{k}={}", RedactedString::placeholder()));
         } else if let Some(v) = v_opt {
@@ -379,44 +376,46 @@ pub fn health_probe_with_mock(
     if !base_validation.valid {
         return base_validation;
     }
-    if mock_body.len() > config.max_bytes {
-        return HealthCheckResult {
-            provider: provider.id.to_string(),
-            base_url_redacted: redact_url(&provider.base_url),
-            valid: false,
-            status: HealthStatus::Oversized,
-            reason: format!(
-                "response {} bytes exceeds limit {}",
-                mock_body.len(),
-                config.max_bytes
-            ),
-            elapsed_ms: (start.elapsed().as_millis() as u64),
-            timestamp: now_iso8601(),
-            kind: config.kind,
-            timeout_ms: (config.timeout.as_millis() as u64),
-            allow_private_network: config.allow_private_network,
-            auth_style: provider.auth_style.clone(),
-            stripped_auth_on_redirect: false,
-        };
-    }
-    let mut stripped = false;
-    if let Some(target) = redirect_target {
-        stripped = should_strip_auth_for_redirect(&provider.base_url, target);
-        if stripped && config.max_redirects == 0 {
-            return HealthCheckResult {
+    let redacted = redact_url(&provider.base_url);
+    let build =
+        |valid: bool, status: HealthStatus, reason: String, stripped_auth_on_redirect: bool| {
+            HealthCheckResult {
                 provider: provider.id.to_string(),
-                base_url_redacted: redact_url(&provider.base_url),
-                valid: false,
-                status: HealthStatus::RedirectLoop,
-                reason: format!("redirect limit exceeded for {}", redact_url(target)),
+                base_url_redacted: redacted.clone(),
+                valid,
+                status,
+                reason,
                 elapsed_ms: (start.elapsed().as_millis() as u64),
                 timestamp: now_iso8601(),
                 kind: config.kind,
                 timeout_ms: (config.timeout.as_millis() as u64),
                 allow_private_network: config.allow_private_network,
                 auth_style: provider.auth_style.clone(),
-                stripped_auth_on_redirect: true,
-            };
+                stripped_auth_on_redirect,
+            }
+        };
+    if mock_body.len() > config.max_bytes {
+        return build(
+            false,
+            HealthStatus::Oversized,
+            format!(
+                "response {} bytes exceeds limit {}",
+                mock_body.len(),
+                config.max_bytes
+            ),
+            false,
+        );
+    }
+    let mut stripped = false;
+    if let Some(target) = redirect_target {
+        stripped = should_strip_auth_for_redirect(&provider.base_url, target);
+        if stripped && config.max_redirects == 0 {
+            return build(
+                false,
+                HealthStatus::RedirectLoop,
+                format!("redirect limit exceeded for {}", redact_url(target)),
+                true,
+            );
         }
     }
     let status = classify_health(mock_status, mock_body);
@@ -435,20 +434,7 @@ pub fn health_probe_with_mock(
     } else {
         reason_source
     };
-    HealthCheckResult {
-        provider: provider.id.to_string(),
-        base_url_redacted: redact_url(&provider.base_url),
-        valid,
-        status,
-        reason,
-        elapsed_ms: (start.elapsed().as_millis() as u64),
-        timestamp: now_iso8601(),
-        kind: config.kind,
-        timeout_ms: (config.timeout.as_millis() as u64),
-        allow_private_network: config.allow_private_network,
-        auth_style: provider.auth_style.clone(),
-        stripped_auth_on_redirect: stripped,
-    }
+    build(valid, status, reason, stripped)
 }
 
 /// Validate a raw URL string via health config (bounded, redacted).
@@ -607,8 +593,6 @@ pub enum HealthFailureClass {
     Server,
     /// Timed out.
     Timeout,
-    /// Response body did not satisfy the probe's accepted-body predicate.
-    Schema,
     /// Model referenced by the probe was not found (404 on model endpoints).
     ModelNotFound,
     /// Redirect limit exceeded or redirect loop.
@@ -626,7 +610,6 @@ impl std::fmt::Display for HealthFailureClass {
             Self::RateLimit => "rate_limit",
             Self::Server => "server",
             Self::Timeout => "timeout",
-            Self::Schema => "schema",
             Self::ModelNotFound => "model_not_found",
             Self::Redirect => "redirect",
             Self::Network => "network",
@@ -947,7 +930,7 @@ fn class_status(class: HealthFailureClass) -> HealthStatus {
         HealthFailureClass::Auth => HealthStatus::AuthError,
         HealthFailureClass::RateLimit => HealthStatus::RateLimited,
         HealthFailureClass::Tls => HealthStatus::TlsError,
-        HealthFailureClass::Server | HealthFailureClass::Schema => HealthStatus::ServerError,
+        HealthFailureClass::Server => HealthStatus::ServerError,
         HealthFailureClass::ModelNotFound
         | HealthFailureClass::Dns
         | HealthFailureClass::Network => HealthStatus::NotFound,
@@ -1651,7 +1634,6 @@ mod tests {
             HealthFailureClass::ModelNotFound.to_string(),
             "model_not_found"
         );
-        assert_eq!(HealthFailureClass::Schema.to_string(), "schema");
     }
 
     #[test]
