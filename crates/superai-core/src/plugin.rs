@@ -1329,8 +1329,11 @@ pub fn remove_config_entry(
 #[cfg(test)]
 #[expect(
     clippy::items_after_statements,
-    clippy::map_unwrap_or,
     reason = "fixtures build records step by step"
+)]
+#[expect(
+    clippy::map_unwrap_or,
+    reason = "the backup probe treats a directory it cannot read as backup-free"
 )]
 mod tests {
     use super::*;

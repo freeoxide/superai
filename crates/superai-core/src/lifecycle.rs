@@ -2656,29 +2656,33 @@ fn cleanup_logged<E: std::fmt::Display>(
     }
 }
 
-/// Digest of every regular file under `root`, sorted by path (INS-04
-/// source-unchanged proof; also used by reconciliation tests).
-fn source_tree_digests(root: &Path) -> Vec<(PathBuf, String)> {
+/// Digest of every file under `root`, sorted by path (INS-04 source-unchanged
+/// proof); an unreadable entry is an error, never a silent omission.
+fn source_tree_digests(root: &Path) -> Result<Vec<(PathBuf, String)>> {
+    let io_err = |path: &Path, source: std::io::Error| {
+        CoreError::Config(ConfigError::Io {
+            path: path.to_path_buf(),
+            source,
+        })
+    };
     let mut out: Vec<(PathBuf, String)> = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
+        let entries = std::fs::read_dir(&dir).map_err(|e| io_err(&dir, e))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| io_err(&dir, e))?;
             let path = entry.path();
-            let Ok(meta) = std::fs::symlink_metadata(&path) else {
-                continue;
-            };
+            let meta = std::fs::symlink_metadata(&path).map_err(|e| io_err(&path, e))?;
             if meta.is_dir() && !meta.file_type().is_symlink() {
                 stack.push(path);
-            } else if let Ok(bytes) = std::fs::read(&path) {
+            } else {
+                let bytes = std::fs::read(&path).map_err(|e| io_err(&path, e))?;
                 out.push((path, compute_digest_bytes(&bytes)));
             }
         }
     }
     out.sort_by(|a, b| a.0.cmp(&b.0));
-    out
+    Ok(out)
 }
 
 /// Deterministic instance id for a create: name + digest of the target root
@@ -2803,7 +2807,7 @@ pub fn create_mirrored(
 
     // INS-04: capture the source tree before any staging; the copy's
     // source-unchanged proof compares fresh digests after the transaction.
-    let source_before = source_tree_digests(&source_root);
+    let source_before = source_tree_digests(&source_root)?;
 
     let steps = isolate_and_configure(
         request,
@@ -2942,9 +2946,15 @@ pub fn create_mirrored(
         });
     }
 
-    // INS-04: the source cannot have changed during the mirror; a mismatch
-    // quarantines the residuals and aborts before any registry write.
-    let source_after = source_tree_digests(&source_root);
+    // INS-04: the source cannot have changed during the mirror; a mismatch or
+    // an unavailable proof quarantines the mirror and aborts before the registry write.
+    let source_after = match source_tree_digests(&source_root) {
+        Ok(digests) => digests,
+        Err(e) => {
+            quarantine_root_and_wrapper(&target_root, request.wrapper.as_ref(), &op_id_str);
+            return Err(e);
+        }
+    };
     if source_after != source_before {
         quarantine_root_and_wrapper(&target_root, request.wrapper.as_ref(), &op_id_str);
         return Err(CoreError::ConcurrentModification {
@@ -5266,23 +5276,41 @@ pub fn detect_repairs_with_home(
         && let (Ok(id), Ok(name)) = (InstanceId::new("journal"), InstanceName::new("journal"))
     {
         let journal_root = superai_config::journal::journal_dir(home);
-        if let Ok(entries) = std::fs::read_dir(&journal_root) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().is_some_and(|e| e == "json") {
-                    items.push(RepairItem {
-                        instance: id,
-                        name,
-                        kind: RepairKind::IncompleteJournal,
-                        description: format!(
-                            "incomplete transaction journal pending recovery at {}",
-                            path.display()
-                        ),
-                        requires_adoption: false,
-                    });
-                    break;
+        match std::fs::read_dir(&journal_root) {
+            Ok(entries) => {
+                for entry in entries {
+                    let path = match entry {
+                        Ok(entry) => entry.path(),
+                        Err(e) => {
+                            eprintln!(
+                                "superai-core: journal repair scan skipped an unreadable entry in {}: {e}",
+                                journal_root.display()
+                            );
+                            continue;
+                        }
+                    };
+                    if path.extension().is_some_and(|e| e == "json") {
+                        items.push(RepairItem {
+                            instance: id,
+                            name,
+                            kind: RepairKind::IncompleteJournal,
+                            description: format!(
+                                "incomplete transaction journal pending recovery at {}",
+                                path.display()
+                            ),
+                            requires_adoption: false,
+                        });
+                        break;
+                    }
                 }
             }
+            // No journal dir means nothing is pending; any other scan failure
+            // must not read as "no pending journals".
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => eprintln!(
+                "superai-core: cannot scan journal dir {}: {e}",
+                journal_root.display()
+            ),
         }
     }
     items
@@ -8753,14 +8781,14 @@ mod tests {
         let source = tmp.join("source");
         std::fs::create_dir_all(&source).unwrap();
         std::fs::write(source.join("settings.json"), r#"{"model":"a"}"#).unwrap();
-        let before = source_tree_digests(&source);
+        let before = source_tree_digests(&source).unwrap();
         // No change: the digests match.
-        let after_unchanged = source_tree_digests(&source);
+        let after_unchanged = source_tree_digests(&source).unwrap();
         assert_eq!(before, after_unchanged);
         // A change (any file) makes the digests differ; the create flow
         // turns exactly this comparison into ConcurrentModification.
         std::fs::write(source.join("history.jsonl"), "sneaky edit\n").unwrap();
-        let after_changed = source_tree_digests(&source);
+        let after_changed = source_tree_digests(&source).unwrap();
         assert_ne!(
             before, after_changed,
             "the digest proof must observe mid-mirror changes"

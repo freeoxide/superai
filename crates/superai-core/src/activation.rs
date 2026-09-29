@@ -503,11 +503,27 @@ impl FixedPathProfileStore {
             if !file_name.ends_with(PROFILE_META_SUFFIX) {
                 continue;
             }
-            if let Ok(bytes) = std::fs::read(&path)
-                && let Ok(summary) = serde_json::from_slice::<ProfileSummary>(&bytes)
-            {
-                out.push(summary);
-            }
+            let bytes = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    eprintln!(
+                        "superai-core: skipping unreadable profile metadata {}: {e}",
+                        path.display()
+                    );
+                    continue;
+                }
+            };
+            let summary = match serde_json::from_slice::<ProfileSummary>(&bytes) {
+                Ok(summary) => summary,
+                Err(e) => {
+                    eprintln!(
+                        "superai-core: skipping malformed profile metadata {}: {e}",
+                        path.display()
+                    );
+                    continue;
+                }
+            };
+            out.push(summary);
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(out)

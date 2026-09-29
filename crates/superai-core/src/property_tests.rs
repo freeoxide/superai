@@ -3,12 +3,12 @@
 
 #[cfg(test)]
 mod tests {
-    // The SplitMix64 helper mixes seeds with fixed-width casts and hex
-    // constants by construction; the property loops inherit that and nest
-    // fixture setup inside their assertions.
+    #![expect(
+        clippy::excessive_nesting,
+        reason = "each property loop nests fixture setup inside its assertion pass"
+    )]
     #![expect(
         clippy::cast_possible_truncation,
-        clippy::excessive_nesting,
         clippy::unreadable_literal,
         reason = "SplitMix64 mixing uses fixed-width casts and hex constants"
     )]

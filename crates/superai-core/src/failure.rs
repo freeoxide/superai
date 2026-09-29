@@ -1033,12 +1033,7 @@ impl FakeNetworkHarness {
 #[cfg(test)]
 #[expect(
     clippy::assertions_on_result_states,
-    clippy::doc_markdown,
-    clippy::let_underscore_must_use,
-    clippy::option_map_unit_fn,
-    clippy::uninlined_format_args,
-    clippy::unreachable,
-    reason = "crash-recovery asserts check Result states directly"
+    reason = "crash-recovery tests assert the Result state itself: an injected failure must abort and a cleared point must succeed, with no payload to inspect"
 )]
 mod tests {
     use super::*;
@@ -1704,9 +1699,8 @@ mod tests {
 
     #[test]
     fn cross_host_redirect_header_stripping_is_enforced() {
-        // The production fetchers (health.rs, verification.rs) drop the
-        // Authorization header exactly when this returns true; pin the
-        // decision for both hosts, port and case variations.
+        // Production fetchers (health.rs, verification.rs) drop the
+        // Authorization header exactly when this returns true.
         let original = "https://github.com/freeoxide/superai/catalog.json";
         assert!(should_strip_auth_for_redirect(
             original,
@@ -1733,7 +1727,7 @@ mod tests {
     }
 
     /// Runs a real two-file journaled transaction crashing at `point`/`nth`
-    /// via the TestInjector; returns the journal path.
+    /// via the `TestInjector`; returns the journal path.
     fn run_journaled_transaction_crashing_at(
         home: &Path,
         op_id: &str,
@@ -1783,7 +1777,7 @@ mod tests {
             (JournalPhase::Commit, FailurePoint::SecondFile, 3),
             (JournalPhase::Verify, FailurePoint::ReadBackVerify, 3),
         ] {
-            let dir = test_dir(&format!("journal-prod-{}", phase));
+            let dir = test_dir(&format!("journal-prod-{phase}"));
             let journal_path =
                 run_journaled_transaction_crashing_at(&dir, "op-journal-prod", point, nth);
             assert!(journal_path.exists(), "journal at {phase} must be on disk");
@@ -1947,7 +1941,7 @@ mod tests {
             );
             inj.fail_at(point, 2);
             // After clearing, next inject should succeed count correctly
-            let _ = inj.inject(point);
+            drop(inj.inject(point));
             assert_eq!(inj.calls_for(point), 2);
             inj.clear_rules();
             assert!(
@@ -2008,11 +2002,11 @@ mod tests {
             ],
         );
         // Use TextFragment for second to allow prepare, then break staged temp to simulate injected failure
-        txn.steps.get_mut(1).map(|step| {
-            if let superai_config::transaction::FileAction::Write { kind, .. } = step {
-                *kind = DocumentKind::TextFragment;
-            }
-        });
+        if let Some(superai_config::transaction::FileAction::Write { kind, .. }) =
+            txn.steps.get_mut(1)
+        {
+            *kind = DocumentKind::TextFragment;
+        }
         txn.prepare().unwrap();
         let second = txn.staged_temps.get(1).cloned().unwrap();
         drop(std::fs::remove_file(&second));
@@ -2072,7 +2066,7 @@ mod tests {
                     drop(std::fs::remove_file(&staged));
                     r
                 }
-                _ => unreachable!(),
+                _ => panic!("unexpected failure point {point} in the flush/sync matrix"),
             };
             assert!(res.is_err(), "point {point} must fail");
             let msg = format!("{:?}", res.unwrap_err());

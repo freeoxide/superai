@@ -1,12 +1,10 @@
 //! Shared TOML/JSON conversion: one walker set for the MCP destination
-//! files (EXT-08..10) and the provider renderer (PRV), so a conversion
-//! fix lands once.
+//! files (EXT-08..10) and the provider renderer (PRV).
 
 use serde_json::{Map, Value};
 
-/// Parse a TOML document into its JSON-equivalent value. `Item::None`
-/// entries (phantom keys left by removals) are skipped; non-finite
-/// floats become `Value::Null`, the same rendering `serde_json` uses.
+/// Parse a TOML document into its JSON-equivalent value: phantom `Item::None`
+/// keys are skipped and non-finite floats become `Value::Null`.
 pub(crate) fn document_to_value(doc: &toml_edit::DocumentMut) -> Value {
     table_to_value(doc.as_table())
 }
@@ -14,6 +12,8 @@ pub(crate) fn document_to_value(doc: &toml_edit::DocumentMut) -> Value {
 fn table_to_value(table: &toml_edit::Table) -> Value {
     let mut map = Map::new();
     for (key, item) in table {
+        // Removals leave phantom `Item::None` keys behind; every caller of
+        // this walker only reads documents, so dropping them is unobservable.
         if item.is_none() {
             continue;
         }
@@ -58,9 +58,8 @@ fn number_to_toml_value(n: &serde_json::Number) -> toml_edit::Value {
     }
 }
 
-/// Server-entry flavor: null is refused, objects become inline tables,
-/// and array members must themselves be values (error text is part of
-/// the MCP diagnostics contract).
+/// Server-entry flavor: null is refused, objects become inline tables, and
+/// array members must themselves be values (error text feeds MCP diagnostics).
 pub(crate) fn json_value_to_toml_strict(value: &Value) -> Result<toml_edit::Item, String> {
     match value {
         Value::Null => Err("toml cannot represent null in mcp server entries".to_owned()),
@@ -141,8 +140,16 @@ mod tests {
 
     #[test]
     fn strict_flavor_refuses_null_and_inlines_objects() {
-        let null_err = json_value_to_toml_strict(&Value::Null).unwrap_err();
-        assert!(null_err.contains("null"), "{null_err}");
+        // The error text is part of the MCP diagnostics contract; the lenient
+        // flavor has no error path and renders the same null as `Item::None`.
+        assert_eq!(
+            json_value_to_toml_strict(&Value::Null).unwrap_err(),
+            "toml cannot represent null in mcp server entries"
+        );
+        assert!(matches!(
+            json_value_to_toml_lenient(&Value::Null),
+            toml_edit::Item::None
+        ));
         // Objects become inline tables so an array of servers stays flat.
         let item = json_value_to_toml_strict(&json!({"a": 1})).unwrap();
         assert!(matches!(

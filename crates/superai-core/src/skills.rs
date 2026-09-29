@@ -277,18 +277,13 @@ pub struct Consumer {
 
 use crate::registry::now_iso8601;
 
-/// Shell metachars that must not appear in GitHub URLs.
-const SHELL_PATTERNS: &[&str] = &[
-    "`", "$(", "${", "&&", "||", ";", "|", ">", "<", "&", "!", "\\", "\"", "'", "\n", "\r",
-];
-
+/// Shell metachars that must not appear in GitHub URLs: [`crate::process::SHELL_METACHARS`]
+/// plus a backslash, legitimate as a path separator only in native locators.
 fn contains_shell_metachars(value: &str) -> bool {
-    for pat in SHELL_PATTERNS {
-        if value.contains(pat) {
-            return true;
-        }
-    }
-    false
+    crate::process::SHELL_METACHARS
+        .iter()
+        .any(|pat| value.contains(pat))
+        || value.contains('\\')
 }
 
 /// Unique staging root under the system temp dir, distinct across threads and
@@ -3255,11 +3250,21 @@ pub fn find_consumers(
             continue;
         }
         let candidate = dir.join(skill_id.as_str());
-        if let Ok(meta) = std::fs::symlink_metadata(&candidate) {
-            if meta.file_type().is_symlink() {
-                if let Ok(target) = std::fs::read_link(&candidate)
-                    && target == src
-                {
+        let meta = match std::fs::symlink_metadata(&candidate) {
+            Ok(meta) => meta,
+            // Not installed in this instance: absence, never an error.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                eprintln!(
+                    "superai-core: cannot inspect skill consumer {}: {e}",
+                    candidate.display()
+                );
+                continue;
+            }
+        };
+        if meta.file_type().is_symlink() {
+            match std::fs::read_link(&candidate) {
+                Ok(target) if target == src => {
                     consumers.push(Consumer {
                         display: candidate.display().to_string(),
                         path: candidate,
@@ -3267,29 +3272,34 @@ pub fn find_consumers(
                     });
                 }
                 // A symlink elsewhere is foreign, not a consumer.
-            } else if meta.is_dir() {
-                let prov_dir = registry
-                    .root
-                    .join(PROVENANCE_DIR_NAME)
-                    .join(skill_id.as_str());
-                // Any provenance file, or a same-named dir carrying a
-                // SKILL.md, counts as a (possibly divergent) copy.
-                let is_copy = if prov_dir.exists() {
-                    match std::fs::read_dir(&prov_dir) {
-                        Ok(entries) => entries.flatten().next().is_some(),
-                        Err(_) => false,
-                    }
-                } else {
-                    false
-                };
-                let has_skill_md = candidate.join(SKILL_MD_NAME).exists();
-                if is_copy || has_skill_md {
-                    consumers.push(Consumer {
-                        display: candidate.display().to_string(),
-                        path: candidate,
-                        mode: "CopySelected".to_owned(),
-                    });
+                Ok(_) => {}
+                Err(e) => eprintln!(
+                    "superai-core: cannot read skill consumer link {}: {e}",
+                    candidate.display()
+                ),
+            }
+        } else if meta.is_dir() {
+            let prov_dir = registry
+                .root
+                .join(PROVENANCE_DIR_NAME)
+                .join(skill_id.as_str());
+            // Any provenance file, or a same-named dir carrying a
+            // SKILL.md, counts as a (possibly divergent) copy.
+            let is_copy = if prov_dir.exists() {
+                match std::fs::read_dir(&prov_dir) {
+                    Ok(entries) => entries.flatten().next().is_some(),
+                    Err(_) => false,
                 }
+            } else {
+                false
+            };
+            let has_skill_md = candidate.join(SKILL_MD_NAME).exists();
+            if is_copy || has_skill_md {
+                consumers.push(Consumer {
+                    display: candidate.display().to_string(),
+                    path: candidate,
+                    mode: "CopySelected".to_owned(),
+                });
             }
         }
     }

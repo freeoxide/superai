@@ -1,15 +1,6 @@
 //! Wrapper generation for isolated instances: deterministic, safely
 //! quoted launchers with identity/digest markers; secrets never embedded.
 
-#![expect(
-    clippy::manual_pattern_char_comparison,
-    reason = "wrapper digest parsing"
-)]
-#![expect(
-    clippy::string_slice,
-    reason = "digest extraction uses char-boundary find"
-)]
-
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -356,12 +347,8 @@ pub fn write_wrapper(path: &WrapperPath, content: &str) -> Result<String> {
 }
 
 fn extract_digest(content: &str) -> Option<String> {
-    let start = content.find("digest=")?;
-    let after = &content[start + "digest=".len()..];
-    let end = after
-        .find(|c: char| c == '\n' || c == ' ' || c == '"' || c == '\'')
-        .unwrap_or(after.len());
-    let digest = &after[..end];
+    let (_, after) = content.split_once("digest=")?;
+    let digest = after.split(['\n', ' ', '"', '\'']).next()?;
     if digest.is_empty() || digest == "PLACEHOLDER" {
         None
     } else {
@@ -609,12 +596,8 @@ fn is_opaque_shell(content: &str) -> bool {
 }
 
 fn extract_marker_field(content: &str, key: &str) -> Option<String> {
-    let start = content.find(key)?;
-    let after = &content[start + key.len()..];
-    let end = after
-        .find(|c: char| c == ' ' || c == '\n' || c == '"' || c == '\'')
-        .unwrap_or(after.len());
-    let raw = &after[..end];
+    let (_, after) = content.split_once(key)?;
+    let raw = after.split([' ', '\n', '"', '\'']).next()?;
     if raw.is_empty() {
         None
     } else {
@@ -668,10 +651,12 @@ pub fn parse_wrapper_content(content: &str) -> Option<ParsedWrapper> {
             continue;
         }
         if let Some(rest) = trimmed.strip_prefix("export ") {
-            if let Some(eq) = rest.find('=') {
-                let key = rest[..eq].trim().to_owned();
-                let quoted = rest[eq + 1..].trim();
-                let value = unquote_shell(quoted)?;
+            if let Some(eq) = rest.find('=')
+                && let Some(key_part) = rest.get(..eq)
+                && let Some(quoted) = rest.get(eq + 1..)
+            {
+                let key = key_part.trim().to_owned();
+                let value = unquote_shell(quoted.trim())?;
                 env_vars.push((key, value));
             }
             continue;
@@ -727,11 +712,9 @@ fn unquote_shell(s: &str) -> Option<String> {
     }
     if let Some(inner) = t.strip_prefix('\'') {
         // Our generator escapes ' as '\''; undo that.
-        if let Some(end) = inner.rfind('\'') {
-            let body = &inner[..end];
-            return Some(body.replace("'\\''", "'"));
-        }
-        return None;
+        let end = inner.rfind('\'')?;
+        let body = inner.get(..end)?;
+        return Some(body.replace("'\\''", "'"));
     }
     if (t.starts_with('"') && t.ends_with('"') && t.len() >= 2)
         || (t.starts_with('"') && t.contains("\"$@\""))
@@ -1092,21 +1075,14 @@ fn redact_probe_output(text: &str) -> String {
     for prefix in ["sk-", "ghp_", "xoxb-"] {
         let mut redacted = String::with_capacity(out.len());
         let mut rest = out.as_str();
-        while let Some(idx) = rest.find(prefix) {
-            let secret_start = idx + prefix.len();
-            redacted.push_str(&rest[..secret_start]);
-            let tail = &rest[secret_start..];
-            let end = tail
+        while let Some((head, tail)) = rest.split_once(prefix) {
+            redacted.push_str(head);
+            redacted.push_str(prefix);
+            redacted.push_str("[REDACTED]");
+            let body_end = tail
                 .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
                 .unwrap_or(tail.len());
-            if end == 0 {
-                // bare prefix with no body; keep scanning after it
-                redacted.push_str("[REDACTED]");
-                rest = &rest[secret_start..];
-            } else {
-                redacted.push_str("[REDACTED]");
-                rest = &rest[secret_start + end..];
-            }
+            rest = tail.get(body_end..).unwrap_or("");
         }
         redacted.push_str(rest);
         out = redacted;
@@ -1456,7 +1432,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         // Path with spaces, quotes, Unicode, dollar and percent
         let tricky = crate::test_util::tmp_abs_str("my work with 'quote' $dollar %percent üñî");
-        let tricky_prefix = &tricky[..tricky.find('\'').expect("fixture contains a quote")];
+        let Some((tricky_prefix, _)) = tricky.split_once('\'') else {
+            panic!("fixture contains a quote");
+        };
         let inst = sample_instance_with_root(&tricky);
         let mut plan = WrapperPlan::new("test");
         plan.env_vars
@@ -1620,7 +1598,9 @@ mod tests {
 
         // An apostrophe is doubled in PowerShell single quotes.
         let tricky = crate::test_util::tmp_abs_str("it's here");
-        let tricky_prefix = &tricky[..tricky.find('\'').expect("fixture contains a quote")];
+        let Some((tricky_prefix, _)) = tricky.split_once('\'') else {
+            panic!("fixture contains a quote");
+        };
         let inst2 = sample_instance_with_root(&tricky);
         let mut plan2 = WrapperPlan::new("test");
         plan2
