@@ -904,45 +904,40 @@ fn toml_value_to_value(v: &toml_edit::Value) -> Value {
     }
 }
 
-fn json_value_to_toml_item(value: &Value, path: &Path, selector: &str) -> Result<Item> {
+// Mirrors core's pub(crate) toml_convert walkers; config cannot depend on
+// core, and the reverse walk's ConfigError texts are part of this contract.
+fn json_to_toml_value(value: &Value, path: &Path, selector: &str) -> Result<toml_edit::Value> {
     use toml_edit::Value as Tv;
-    let item = match value {
-        Value::Null => {
-            return Err(ConfigError::unsupported_operation(
-                path,
-                selector,
-                "toml cannot represent null".to_owned(),
-            ));
-        }
-        Value::Bool(b) => toml_edit::value(*b),
+    match value {
+        Value::Null => Err(ConfigError::unsupported_operation(
+            path,
+            selector,
+            "toml cannot represent null".to_owned(),
+        )),
+        Value::Bool(b) => Ok(Tv::from(*b)),
         Value::Number(n) => {
             if let Some(i) = n.as_i64() {
-                toml_edit::value(i)
+                Ok(Tv::from(i))
             } else {
-                toml_edit::value(n.as_f64().unwrap_or_default())
+                Ok(Tv::from(n.as_f64().unwrap_or_default()))
             }
         }
-        Value::String(s) => toml_edit::value(s.as_str()),
+        Value::String(s) => Ok(Tv::from(s.as_str())),
         Value::Array(items) => {
             let mut arr = toml_edit::Array::new();
             for item in items {
-                if let Item::Value(v) = json_value_to_toml_item(item, path, selector)? {
-                    arr.push(v);
-                }
+                arr.push(json_to_toml_value(item, path, selector)?);
             }
-            Item::Value(Tv::Array(arr))
+            Ok(Tv::Array(arr))
         }
         Value::Object(map) => {
             let mut inline = toml_edit::InlineTable::new();
             for (key, inner) in map {
-                if let Item::Value(v) = json_value_to_toml_item(inner, path, selector)? {
-                    inline.insert(key.as_str(), v);
-                }
+                inline.insert(key.as_str(), json_to_toml_value(inner, path, selector)?);
             }
-            Item::Value(Tv::InlineTable(inline))
+            Ok(Tv::InlineTable(inline))
         }
-    };
-    Ok(item)
+    }
 }
 
 fn toml_navigate_table<'a>(
@@ -1006,7 +1001,7 @@ fn toml_set_at(
     path: &Path,
     selector: &str,
 ) -> Result<()> {
-    let item = json_value_to_toml_item(value, path, selector)?;
+    let item = json_to_toml_value(value, path, selector)?;
     let (parent, leaf) = split_last(segments);
     if leaf.is_empty() {
         return Err(ConfigError::unsupported_operation(
@@ -1019,9 +1014,9 @@ fn toml_set_at(
     if table.contains_key(leaf) {
         // Index assignment keeps position and decor; `Table::insert`
         // would drop the comments above the key (DOC-04).
-        table[leaf] = item;
+        table[leaf] = Item::Value(item);
     } else {
-        table.insert(leaf, item);
+        table.insert(leaf, Item::Value(item));
     }
     Ok(())
 }
@@ -1915,6 +1910,23 @@ mod tests {
         let after2 = std::fs::read_to_string(&path).unwrap();
         assert!(after2.contains("keep = false"));
         assert!(after2.contains("# keep me"));
+        drop(std::fs::remove_file(&path));
+    }
+
+    #[test]
+    fn file_apply_toml_null_value_is_typed_error_and_leaves_file_intact() {
+        let path = scratch("apply-toml-null", ".toml");
+        std::fs::write(&path, b"a = 1\n").unwrap();
+
+        let op = set_op("key:a", Value::Null).with_owned_keys(vec!["a".into()]);
+        let err = apply(&path, DocumentKind::Toml, &op).unwrap_err();
+        match err {
+            ConfigError::UnsupportedOperation { reason, .. } => {
+                assert_eq!(reason, "toml cannot represent null");
+            }
+            other => panic!("expected UnsupportedOperation, got {other:?}"),
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), b"a = 1\n");
         drop(std::fs::remove_file(&path));
     }
 

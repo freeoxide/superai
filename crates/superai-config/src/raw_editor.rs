@@ -9,7 +9,7 @@ use toml_edit::DocumentMut;
 
 use crate::atomic::compute_digest;
 use crate::backup::{BackupEntry, backup_with_reason};
-use crate::document::{Diagnostic, DocumentKind, Encoding, NewlineStyle};
+use crate::document::{Diagnostic, DocumentKind, Encoding, NewlineStyle, detect_newline};
 use crate::error::{ConfigError, Result};
 use crate::snapshot::{Snapshot, is_modified, snapshot};
 
@@ -64,17 +64,6 @@ impl std::fmt::Debug for SensitiveContent {
 impl std::fmt::Display for SensitiveContent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("[REDACTED]")
-    }
-}
-
-fn detect_newline(bytes: &[u8]) -> NewlineStyle {
-    let has_crlf = bytes
-        .windows(2)
-        .any(|w| w.first().copied() == Some(b'\r') && w.get(1).copied() == Some(b'\n'));
-    if has_crlf {
-        NewlineStyle::Crlf
-    } else {
-        NewlineStyle::Lf
     }
 }
 
