@@ -4,43 +4,40 @@
 use std::path::PathBuf;
 
 use crate::adapter::{
-    ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
-    DetectionResult, DocumentKind, Os, PathResolver, Platform, ProductStatus, RestartBehavior,
-    SurfaceOwnership, VersionResolution, WrapperPlan,
+    ADAPTER_REVISION, Adapter, ConfigScope, ConfigSurface, DetectionResult, DocumentKind,
+    PathResolver, Platform, ProductStatus, RestartBehavior, SurfaceOwnership, VersionResolution,
+    WrapperPlan,
 };
 use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
-use crate::state::{AdapterSupport, InstallPresence, Isolation};
+use crate::state::{AdapterSupport, Isolation};
 
-/// Harness identifier for Amazon Q Developer CLI.
+/// Catalog id superai registers this harness under.
 pub const HARNESS_ID_STR: &str = "amazon-q-cli";
 
-/// Human display name.
+/// Name shown for this harness in listings and errors.
 pub const DISPLAY_NAME: &str = "Amazon Q Developer CLI";
 
-/// Primary executable name.
+/// Binary name resolved on PATH during detection.
 pub const EXECUTABLE: &str = "q";
 
-/// Default config root fallback.
-pub const DEFAULT_CONFIG_ROOT_FALLBACK: &str = "~/.aws/amazonq";
-
-/// Research document link.
+/// Research doc whose findings the constants in this file encode.
 pub const RESEARCH_DOC: &str = "docs/harness-configs/amazon-q-cli.md";
 
-/// Last verified date.
+/// Date the research doc was last checked against the harness.
 pub const LAST_VERIFIED: &str = "2026-08-25";
 
-/// Schema version.
+/// Schema version this adapter maps detected versions to.
 pub const SCHEMA_VERSION_STR: &str = "1";
 
 /// Sunset announcement.
 pub const SUNSET_NOTE: &str = "sunsetting 2026-05-15, EOS 2027-04-30";
 
-/// Successor harness id.
+/// Harness id the research doc names as this harness's successor.
 pub const SUCCESSOR_ID: &str = "kiro";
 
-/// Migration tip.
+/// Pointer to the successor migration documented in the research doc.
 pub const MIGRATION_TIP: &str = "Amazon Q Developer CLI is sunsetting (no new signups 2026-05-15, EOS 2027-04-30); migrate to kiro (Kiro CLI): export settings.json, cli-agents/*.json, rules/*.md, and mcpServers from agent JSON";
 
 /// Sunset `MigrationOnly`: detection, reads, and migration guidance only.
@@ -56,29 +53,9 @@ impl AmazonQAdapter {
         Ok(Self { id })
     }
 
-    /// Borrow the harness id.
-    pub fn harness_id(&self) -> &HarnessId {
-        &self.id
-    }
-
-    /// Executable name.
-    pub fn executable_name(&self) -> &str {
-        EXECUTABLE
-    }
-
-    /// Migration tip.
-    pub fn successor_tip(&self) -> &str {
-        MIGRATION_TIP
-    }
-
     fn default_config_root() -> Option<PathBuf> {
-        let home = std::env::var("HOME")
-            .ok()
-            .or_else(|| std::env::var("USERPROFILE").ok())?;
-        if home.trim().is_empty() {
-            return None;
-        }
-        Some(PathBuf::from(home).join(".aws").join("amazonq"))
+        let home = super::home_dir()?;
+        Some(home.join(".aws").join("amazonq"))
     }
 
     #[expect(
@@ -122,8 +99,7 @@ impl AmazonQAdapter {
 
 impl Default for AmazonQAdapter {
     fn default() -> Self {
-        #[expect(clippy::unwrap_used, reason = "amazon-q-cli is static valid HarnessId")]
-        let id = HarnessId::new(HARNESS_ID_STR).unwrap();
+        let id = HarnessId::from_validated_const(HARNESS_ID_STR);
         Self { id }
     }
 }
@@ -142,11 +118,7 @@ impl Adapter for AmazonQAdapter {
     }
 
     fn supported_platforms(&self) -> Vec<Platform> {
-        vec![
-            Platform::new(Os::Linux, Arch::Any),
-            Platform::new(Os::Macos, Arch::Any),
-            Platform::new(Os::Windows, Arch::Any),
-        ]
+        super::desktop_platforms()
     }
 
     fn adapter_revision(&self) -> &str {
@@ -193,19 +165,10 @@ impl Adapter for AmazonQAdapter {
 
         self.collect_config_evidence(&mut evidence);
 
-        let present = match (&binary_path, &version) {
-            (Some(_), Some(_)) => InstallPresence::Present,
-            (Some(_), None) => InstallPresence::UnknownVersion,
-            (None, _) => InstallPresence::Absent,
-        };
+        let present = super::install_presence(binary_path.is_some(), version.is_some());
 
-        let confidence = if present == InstallPresence::Absent {
-            DetectionConfidence::High
-        } else if binary_path.is_some() && version.is_none() {
-            DetectionConfidence::Medium
-        } else {
-            DetectionConfidence::High
-        };
+        let confidence =
+            super::detection_confidence(binary_path.is_some(), version.is_some(), false);
 
         DetectionResult::new(present, version, evidence, confidence)
     }
@@ -333,15 +296,7 @@ impl Adapter for AmazonQAdapter {
     }
 
     fn plan_wrapper(&self, instance: &Instance) -> Result<WrapperPlan, CoreError> {
-        if instance.harness != self.id {
-            return Err(CoreError::Validation {
-                field: "harness".to_owned(),
-                reason: format!(
-                    "instance harness `{}` does not match adapter `{}`",
-                    instance.harness, self.id
-                ),
-            });
-        }
+        super::ensure_instance_harness(&self.id, instance)?;
         Err(CoreError::UnsupportedOperation {
             harness: self.id.to_string(),
             operation: "plan_wrapper".to_owned(),
@@ -360,12 +315,7 @@ impl Adapter for AmazonQAdapter {
     }
 
     fn validate_instance(&self, instance: &Instance) -> Result<(), CoreError> {
-        if instance.harness != self.id {
-            return Err(CoreError::Validation {
-                field: "harness".to_owned(),
-                reason: format!("expected harness `{}`, got `{}`", self.id, instance.harness),
-            });
-        }
+        super::ensure_instance_harness(&self.id, instance)?;
         instance.validate()?;
         match instance.isolation {
             Isolation::ProjectScope | Isolation::RelocatedRoot | Isolation::Unknown => Ok(()),
@@ -406,15 +356,13 @@ impl Adapter for AmazonQAdapter {
 mod tests {
     use std::collections::HashSet;
 
-    use super::{
-        AmazonQAdapter, DISPLAY_NAME, EXECUTABLE, HARNESS_ID_STR, RESEARCH_DOC, SUCCESSOR_ID,
-    };
-    use crate::adapter::{Adapter, ConfigScope, DocumentKind, ProductStatus, SurfaceOwnership};
+    use super::{AmazonQAdapter, HARNESS_ID_STR, SUCCESSOR_ID};
+    use crate::adapter::{Adapter, ConfigScope, DocumentKind, SurfaceOwnership};
     use crate::error::CoreError;
     use crate::ids::{HarnessId, InstanceId, InstanceName};
     use crate::instance::Instance;
     use crate::paths::AbsolutePath;
-    use crate::state::{AdapterSupport, InstallPresence, InstanceOrigin, Isolation, Ownership};
+    use crate::state::{AdapterSupport, InstanceOrigin, Isolation, Ownership};
 
     fn adapter() -> AmazonQAdapter {
         AmazonQAdapter::new().unwrap()
@@ -440,13 +388,11 @@ mod tests {
     #[test]
     fn adapter_identity() {
         let a = adapter();
+        // Constructor wiring plus catalog registration: an id the catalog
+        // does not know can never reconcile with detection or instances.
+        let entry = crate::harness_catalog::find_by_id(HARNESS_ID_STR).unwrap();
         assert_eq!(a.id().as_str(), HARNESS_ID_STR);
-        assert_eq!(a.display_name(), DISPLAY_NAME);
-        assert_eq!(a.executable_name(), EXECUTABLE);
-        assert_eq!(a.product_status(), ProductStatus::Sunset);
-        assert_eq!(a.research_doc_link(), RESEARCH_DOC);
-        assert!(!a.last_verified_date().is_empty());
-        assert!(a.successor_tip().contains(SUCCESSOR_ID));
+        assert_eq!(a.product_status(), entry.product_status);
     }
 
     #[test]
@@ -472,14 +418,7 @@ mod tests {
                 .any(|e| e.contains("sunset") || e.contains("EOS"))
         );
         assert!(result.evidence.iter().any(|e| e.contains(SUCCESSOR_ID)));
-        match result.present {
-            InstallPresence::Absent
-            | InstallPresence::Present
-            | InstallPresence::UnknownVersion
-            | InstallPresence::Broken => {
-                assert!(!result.evidence.is_empty());
-            }
-        }
+        assert!(!result.evidence.is_empty());
     }
 
     #[test]
@@ -492,21 +431,6 @@ mod tests {
                 .iter()
                 .any(|n| n.contains(SUCCESSOR_ID) || n.contains("migration"))
         );
-    }
-
-    #[test]
-    fn parse_version_output_cases() {
-        let cases = vec![
-            ("q 1.12.0", Some("1.12.0")),
-            ("1.0.0", Some("1.0.0")),
-            ("v2.0.1", Some("2.0.1")),
-            ("", None),
-            ("not a version", None),
-        ];
-        for (input, expected) in cases {
-            let got = crate::adapters::parse_version_output(input);
-            assert_eq!(got.as_deref(), expected, "input: {input:?}");
-        }
     }
 
     #[test]

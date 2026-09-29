@@ -2,29 +2,24 @@
 //! Research source: `docs/harness-configs/claude-desktop.md` (verified 2026-09-18).
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
 use std::time::Duration;
 
 use superai_config::document::ValueType;
 
-use serde_json::Value;
-
 use crate::adapter::{
-    ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
-    DetectionResult, DocumentKind, Os, PathResolver, Platform, ProductStatus, RestartBehavior,
-    RootShape, SurfaceOwnership, SurfaceSchema, VersionResolution, WrapperPlan,
+    ADAPTER_REVISION, Adapter, ConfigScope, ConfigSurface, DetectionConfidence, DetectionResult,
+    DocumentKind, PathResolver, Platform, ProductStatus, RestartBehavior, RootShape,
+    SurfaceOwnership, SurfaceSchema, VersionResolution, WrapperPlan,
 };
 use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence, Isolation};
 
-/// Harness identifier for Claude Desktop.
+/// Catalog id superai registers this harness under.
 pub const HARNESS_ID_STR: &str = "claude-desktop";
 
-/// Human display name.
+/// Name shown for this harness in listings and errors.
 pub const DISPLAY_NAME: &str = "Claude Desktop";
 
 /// Linux .deb package/binary name; the GUI binary name is otherwise unverified.
@@ -49,236 +44,17 @@ pub const PERSONAL_SKILLS_PATH: &str = "~/.claude/skills";
 pub const NO_RELOCATION_NOTE: &str = "no config-relocation mechanism (verified-absent): \
 no env var, no portable mode, no --config-dir; hardcoded app-support paths";
 
-/// Research document link.
+/// Research doc whose findings the constants in this file encode.
 pub const RESEARCH_DOC: &str = "docs/harness-configs/claude-desktop.md";
 
-/// Last verified date.
+/// Date the research doc was last checked against the harness.
 pub const LAST_VERIFIED: &str = "2026-09-18";
 
-/// Schema version.
+/// Schema version this adapter maps detected versions to.
 pub const SCHEMA_VERSION_STR: &str = "1";
 
 /// Owned selectors inside `claude_desktop_config.json`.
 pub const OWNED_SELECTORS: &[&str] = &["mcpServers"];
-
-/// MCP container selector.
-pub const MCP_OWNED_SELECTORS: &[&str] = &["mcpServers"];
-
-/// Linux local 3P config root; coexists by design with the 1P `~/.config/Claude`.
-pub const THIRD_PARTY_LINUX_ROOT: &str = "~/.config/Claude-3p";
-
-/// macOS local 3P config root.
-pub const THIRD_PARTY_MACOS_ROOT: &str = "~/Library/Application Support/Claude-3p";
-
-/// Windows local 3P config root.
-pub const THIRD_PARTY_WINDOWS_ROOT: &str = "%LOCALAPPDATA%\\Claude-3p";
-
-/// Inference-config directory inside the 3P root (official: `configLibrary/`).
-pub const THIRD_PARTY_LIBRARY_DIR: &str = "configLibrary";
-
-/// Library file name; undocumented, so it stays a parameter of [`commit_third_party_inference`].
-pub const THIRD_PARTY_LIBRARY_FILE: &str = "inference.json";
-
-/// Gateway-group + connection keys superai owns on the 3P surface (official names).
-pub const THIRD_PARTY_OWNED_SELECTORS: &[&str] = &[
-    "inferenceGatewayBaseUrl",
-    "inferenceGatewayApiKey",
-    "inferenceGatewayAuthScheme",
-    "inferenceProvider",
-    "inferenceModels",
-];
-
-/// Auth scheme the 3P gateway expects (official enum: `bearer` default | `x-api-key`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ThirdPartyAuthScheme {
-    /// `Authorization: Bearer <key>` (the documented default).
-    Bearer,
-    /// `x-api-key: <key>`.
-    XApiKey,
-}
-
-impl ThirdPartyAuthScheme {
-    /// The wire value the app config expects.
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Bearer => "bearer",
-            Self::XApiKey => "x-api-key",
-        }
-    }
-}
-
-/// Third-party inference gateway keys; the gateway must speak the Anthropic Messages API.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ThirdPartyInference<'a> {
-    /// Full URL of the inference gateway endpoint (`inferenceGatewayBaseUrl`).
-    pub gateway_base_url: &'a str,
-    /// Gateway key, written into the 3P config (0600, backed up); never reaches a manifest or log.
-    pub api_key: &'a crate::error::RedactedString,
-    /// Auth scheme (`inferenceGatewayAuthScheme`).
-    pub auth_scheme: ThirdPartyAuthScheme,
-    /// `inferenceProvider` value; the gateway flow uses `gateway`.
-    pub provider: &'a str,
-    /// `inferenceModels` names, first = default model.
-    pub models: Vec<String>,
-}
-
-impl<'a> ThirdPartyInference<'a> {
-    /// A gateway-flavored configuration with the documented defaults.
-    #[must_use]
-    pub fn gateway(
-        base_url: &'a str,
-        api_key: &'a crate::error::RedactedString,
-        auth_scheme: ThirdPartyAuthScheme,
-    ) -> Self {
-        Self {
-            gateway_base_url: base_url,
-            api_key,
-            auth_scheme,
-            provider: "gateway",
-            models: Vec::new(),
-        }
-    }
-
-    /// Pin the model list (first entry is the default).
-    #[must_use]
-    pub fn with_models(mut self, models: Vec<String>) -> Self {
-        self.models = models;
-        self
-    }
-}
-
-/// Standalone surface with its own fixed `Claude-3p` root, reached via [`crate::profile`].
-pub fn third_party_inference_surface() -> ConfigSurface {
-    let file = format!("{THIRD_PARTY_LIBRARY_DIR}/{THIRD_PARTY_LIBRARY_FILE}");
-    let resolver = PathResolver::new(
-        Some(&format!("{THIRD_PARTY_LINUX_ROOT}/{file}")),
-        Some(&format!("{THIRD_PARTY_MACOS_ROOT}/{file}")),
-        Some(&format!(
-            "{THIRD_PARTY_WINDOWS_ROOT}\\{THIRD_PARTY_LIBRARY_DIR}\\{THIRD_PARTY_LIBRARY_FILE}"
-        )),
-        &format!("{THIRD_PARTY_MACOS_ROOT}/{file}"),
-    );
-    let mut surface = ConfigSurface::new(
-        &file,
-        resolver,
-        DocumentKind::Json,
-        ConfigScope::User,
-        SurfaceOwnership::UserEditable,
-    );
-    surface.precedence = 10;
-    surface.owned_selectors = THIRD_PARTY_OWNED_SELECTORS
-        .iter()
-        .map(|s| (*s).to_owned())
-        .collect();
-    surface.backup_required = true;
-    surface.restart_behavior = RestartBehavior::Restart;
-    surface
-}
-
-/// Write the 3P inference config under `config_root` (never the real home):
-/// fresh read, backup, atomic write; foreign keys survive; 0600 for the key.
-pub fn commit_third_party_inference(
-    config_root: &Path,
-    library_file: &str,
-    config: &ThirdPartyInference<'_>,
-) -> Result<PathBuf, CoreError> {
-    let path = config_root
-        .join(THIRD_PARTY_LIBRARY_DIR)
-        .join(validated_library_file(library_file)?);
-    let key = config.api_key.expose_secret().to_owned();
-    superai_config::json::edit(&path, |map| {
-        map.insert(
-            "inferenceGatewayBaseUrl".to_owned(),
-            Value::String(config.gateway_base_url.to_owned()),
-        );
-        map.insert("inferenceGatewayApiKey".to_owned(), Value::String(key));
-        map.insert(
-            "inferenceGatewayAuthScheme".to_owned(),
-            Value::String(config.auth_scheme.as_str().to_owned()),
-        );
-        map.insert(
-            "inferenceProvider".to_owned(),
-            Value::String(config.provider.to_owned()),
-        );
-        let models: Vec<Value> = config
-            .models
-            .iter()
-            .map(|name| serde_json::json!({ "name": name }))
-            .collect();
-        map.insert("inferenceModels".to_owned(), Value::Array(models));
-    })
-    .map_err(CoreError::Config)?;
-    harden_file_permissions(&path)?;
-    Ok(path)
-}
-
-/// A plain file name: rejecting separators, drive colons, parent components,
-/// and DOS device basenames keeps the write inside `configLibrary`.
-fn validated_library_file(library_file: &str) -> Result<&str, CoreError> {
-    if is_windows_device_basename(library_file) {
-        return Err(CoreError::InvalidPath {
-            kind: "library_file".to_owned(),
-            value: library_file.to_owned(),
-            reason: "reserved as a Windows device name".to_owned(),
-        });
-    }
-    let is_plain = !library_file.is_empty()
-        && !library_file.contains(['/', '\\', ':'])
-        && library_file != "."
-        && library_file != ".."
-        && Path::new(library_file)
-            .file_name()
-            .is_some_and(|n| n == library_file);
-    if is_plain {
-        Ok(library_file)
-    } else {
-        Err(CoreError::InvalidPath {
-            kind: "library_file".to_owned(),
-            value: library_file.to_owned(),
-            reason: "must be a plain file name inside configLibrary".to_owned(),
-        })
-    }
-}
-
-/// DOS device basenames (`CON`, `COM1`, ...) resolve to devices on Windows
-/// in any case or extension; the key is the stem before the first dot.
-fn is_windows_device_basename(name: &str) -> bool {
-    let stem = name.split_once('.').map_or(name, |(s, _)| s);
-    let key = stem.trim_end_matches(['.', ' ', '\t']).to_ascii_lowercase();
-    let numbered = |prefix: &str| {
-        key.strip_prefix(prefix).is_some_and(|digits| {
-            digits.len() == 1
-                && digits
-                    .as_bytes()
-                    .first()
-                    .is_some_and(|&b| b.is_ascii_digit() && b != b'0')
-        })
-    };
-    matches!(key.as_str(), "aux" | "con" | "nul" | "prn") || numbered("com") || numbered("lpt")
-}
-
-/// Unix: 0600 because the file carries the gateway key; Windows already
-/// creates it user-only. Same treatment as the provider key sink.
-#[cfg(unix)]
-fn harden_file_permissions(path: &Path) -> Result<(), CoreError> {
-    use std::os::unix::fs::PermissionsExt as _;
-    let perm = std::fs::Permissions::from_mode(0o600);
-    std::fs::set_permissions(path, perm).map_err(|e| CoreError::InvalidPath {
-        kind: "permissions".to_owned(),
-        value: path.display().to_string(),
-        reason: format!("cannot set 0o600: {e}"),
-    })
-}
-
-#[cfg(not(unix))]
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "no-op off unix; callers keep the Result contract"
-)]
-fn harden_file_permissions(_path: &Path) -> Result<(), CoreError> {
-    Ok(())
-}
 
 /// Concrete adapter for Claude Desktop.
 #[derive(Debug, Clone)]
@@ -293,55 +69,23 @@ impl ClaudeDesktopAdapter {
         Ok(Self { id })
     }
 
-    /// Borrow harness id.
-    pub fn harness_id(&self) -> &HarnessId {
-        &self.id
-    }
-
-    /// Executable name.
-    pub fn executable_name(&self) -> &str {
-        EXECUTABLE
-    }
-
     fn find_binary_in_path() -> Option<PathBuf> {
         super::find_in_path(&[EXECUTABLE])
     }
 
     fn probe_version(binary: &Path) -> Option<String> {
-        let owned = binary.to_path_buf();
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let output = Command::new(&owned)
-                .arg("--version")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output();
-            drop(tx.send(output));
-        });
-        let Ok(Ok(output)) = rx.recv_timeout(Duration::from_secs(2)) else {
-            return None;
-        };
-        if !output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
-            return None;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let combined = if stdout.trim().is_empty() {
-            stderr.into_owned()
-        } else {
-            stdout.into_owned()
-        };
-        harvest_version_token(&combined)
+        // Claude Desktop prints a date-stamped build string, not semver;
+        // harvest_version_token stays local for that scheme.
+        harvest_version_token(&super::run_capturing(
+            binary,
+            &["--version"],
+            Duration::from_secs(2),
+        )?)
     }
 
     /// Per-OS default root; the app has no relocation env var, so this is the only root.
     fn default_config_root() -> Option<PathBuf> {
-        let home = std::env::var("HOME")
-            .ok()
-            .or_else(|| std::env::var("USERPROFILE").ok())?;
-        if home.trim().is_empty() {
-            return None;
-        }
+        let home = super::home_dir()?;
         if cfg!(target_os = "macos") {
             Some(
                 PathBuf::from(&home)
@@ -367,13 +111,8 @@ impl ClaudeDesktopAdapter {
     }
 
     fn personal_skills_root() -> Option<PathBuf> {
-        let home = std::env::var("HOME")
-            .ok()
-            .or_else(|| std::env::var("USERPROFILE").ok())?;
-        if home.trim().is_empty() {
-            return None;
-        }
-        Some(PathBuf::from(home).join(".claude").join("skills"))
+        let home = super::home_dir()?;
+        Some(home.join(".claude").join("skills"))
     }
 
     #[expect(clippy::excessive_nesting, reason = "evidence branches explicit")]
@@ -433,8 +172,7 @@ fn harvest_version_token(output: &str) -> Option<String> {
 
 impl Default for ClaudeDesktopAdapter {
     fn default() -> Self {
-        #[expect(clippy::unwrap_used, reason = "claude-desktop is static valid")]
-        let id = HarnessId::new(HARNESS_ID_STR).unwrap();
+        let id = HarnessId::from_validated_const(HARNESS_ID_STR);
         Self { id }
     }
 }
@@ -453,11 +191,7 @@ impl Adapter for ClaudeDesktopAdapter {
     }
 
     fn supported_platforms(&self) -> Vec<Platform> {
-        vec![
-            Platform::new(Os::Linux, Arch::Any),
-            Platform::new(Os::Macos, Arch::Any),
-            Platform::new(Os::Windows, Arch::Any),
-        ]
+        super::desktop_platforms()
     }
 
     fn adapter_revision(&self) -> &str {
@@ -647,15 +381,7 @@ impl Adapter for ClaudeDesktopAdapter {
     /// The app reads one hardcoded per-OS path; no env var points elsewhere.
     /// The alias core refuses aliasing on exactly this empty env set.
     fn plan_wrapper(&self, instance: &Instance) -> Result<WrapperPlan, CoreError> {
-        if instance.harness != self.id {
-            return Err(CoreError::Validation {
-                field: "harness".to_owned(),
-                reason: format!(
-                    "instance harness `{}` does not match adapter `{}`",
-                    instance.harness, self.id
-                ),
-            });
-        }
+        super::ensure_instance_harness(&self.id, instance)?;
         instance.validate()?;
         let mut plan =
             WrapperPlan::new("fixed default root: no relocation mechanism (verified-absent)");
@@ -689,12 +415,7 @@ impl Adapter for ClaudeDesktopAdapter {
     }
 
     fn validate_instance(&self, instance: &Instance) -> Result<(), CoreError> {
-        if instance.harness != self.id {
-            return Err(CoreError::Validation {
-                field: "harness".to_owned(),
-                reason: format!("expected harness `{}`, got `{}`", self.id, instance.harness),
-            });
-        }
+        super::ensure_instance_harness(&self.id, instance)?;
         instance.validate()?;
         match instance.isolation {
             Isolation::FixedPathSingle | Isolation::RelocatedRoot | Isolation::Unknown => {
@@ -723,6 +444,7 @@ impl Adapter for ClaudeDesktopAdapter {
         }
     }
 
+    // LinkAll first: relink_skills takes the first supported mode.
     fn supported_skill_modes(&self) -> Vec<crate::adapter::SkillMode> {
         vec![
             crate::adapter::SkillMode::LinkAll,
@@ -753,13 +475,10 @@ impl Adapter for ClaudeDesktopAdapter {
 #[cfg(test)]
 mod tests {
     use super::{
-        CONFIG_FILE, ClaudeDesktopAdapter, DISPLAY_NAME, EXECUTABLE, HARNESS_ID_STR,
-        LINUX_CONFIG_ROOT, MACOS_CONFIG_ROOT, NO_RELOCATION_NOTE, OWNED_SELECTORS, RESEARCH_DOC,
-        WINDOWS_CONFIG_ROOT,
+        CONFIG_FILE, ClaudeDesktopAdapter, HARNESS_ID_STR, LINUX_CONFIG_ROOT, MACOS_CONFIG_ROOT,
+        NO_RELOCATION_NOTE, OWNED_SELECTORS, WINDOWS_CONFIG_ROOT,
     };
-    use crate::adapter::{
-        Adapter, ConfigScope, DocumentKind, ProductStatus, RestartBehavior, SurfaceOwnership,
-    };
+    use crate::adapter::{Adapter, ConfigScope, DocumentKind, RestartBehavior, SurfaceOwnership};
     use crate::error::CoreError;
     use crate::ids::{HarnessId, InstanceId, InstanceName};
     use crate::instance::Instance;
@@ -790,12 +509,11 @@ mod tests {
     #[test]
     fn adapter_identity() {
         let a = adapter();
+        // Constructor wiring plus catalog registration: an id the catalog
+        // does not know can never reconcile with detection or instances.
+        let entry = crate::harness_catalog::find_by_id(HARNESS_ID_STR).unwrap();
         assert_eq!(a.id().as_str(), HARNESS_ID_STR);
-        assert_eq!(a.display_name(), DISPLAY_NAME);
-        assert_eq!(a.executable_name(), EXECUTABLE);
-        assert_eq!(a.product_status(), ProductStatus::Active);
-        assert_eq!(a.research_doc_link(), RESEARCH_DOC);
-        assert_eq!(a.last_verified_date(), "2026-09-18");
+        assert_eq!(a.product_status(), entry.product_status);
     }
 
     #[test]
@@ -1036,272 +754,5 @@ mod tests {
                 .any(|d| d.message.contains("root must be") && d.message.contains("object")),
             "non-object root must be rejected: {diags:?}"
         );
-    }
-
-    #[test]
-    fn third_party_surface_declares_official_keys_and_roots() {
-        let surface = super::third_party_inference_surface();
-        assert_eq!(surface.kind, DocumentKind::Json);
-        assert_eq!(surface.scope, ConfigScope::User);
-        assert_eq!(surface.ownership, SurfaceOwnership::UserEditable);
-        assert_eq!(surface.restart_behavior, RestartBehavior::Restart);
-        assert!(surface.backup_required);
-        for key in super::THIRD_PARTY_OWNED_SELECTORS {
-            assert!(
-                surface.owned_selectors.contains(&(*key).to_owned()),
-                "owned selector {key} missing"
-            );
-        }
-        // The three officially documented local roots (Claude-3p siblings of
-        // the 1P roots) and the configLibrary dir; never the 1P root.
-        let hints = [
-            surface.path_resolver.linux.as_deref(),
-            surface.path_resolver.macos.as_deref(),
-            surface.path_resolver.windows.as_deref(),
-        ];
-        for hint in hints.into_iter().flatten() {
-            assert!(hint.contains("Claude-3p"), "3P root missing: {hint}");
-            assert!(
-                hint.contains(super::THIRD_PARTY_LIBRARY_DIR),
-                "configLibrary missing: {hint}"
-            );
-            assert!(!hint.contains("Claude-3p-3p"), "{hint}");
-        }
-        // The declaration is NOT part of config_surfaces() (pinned 1P
-        // partition): it is reached explicitly with parameterized roots.
-        let a = adapter();
-        assert!(
-            !a.config_surfaces().iter().any(|s| s.id == surface.id),
-            "the 3P surface is a separate fixed root, not under config_root"
-        );
-    }
-
-    #[test]
-    fn third_party_write_preserves_foreign_keys_and_hardens() {
-        let root = crate::test_util::temp_dir_unique("claude-3p-write");
-        let library = root.join(super::THIRD_PARTY_LIBRARY_DIR);
-        std::fs::create_dir_all(&library).unwrap();
-        let file = library.join(super::THIRD_PARTY_LIBRARY_FILE);
-        std::fs::write(
-            &file,
-            serde_json::to_string_pretty(&serde_json::json!({
-                "inferenceStreamIdleTimeoutSec": 600,
-                "coworkEgressAllowedHosts": ["example.com"],
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-
-        let key = crate::error::RedactedString::new("dummy-gateway-token");
-        let config = super::ThirdPartyInference::gateway(
-            "http://127.0.0.1:8787",
-            &key,
-            super::ThirdPartyAuthScheme::Bearer,
-        )
-        .with_models(vec!["gateway-default".to_owned()]);
-        let written =
-            super::commit_third_party_inference(&root, super::THIRD_PARTY_LIBRARY_FILE, &config)
-                .unwrap();
-        assert_eq!(written, file);
-
-        let value = superai_config::json::load(&file).unwrap();
-        assert_eq!(
-            value.get("inferenceGatewayBaseUrl"),
-            Some(&serde_json::json!("http://127.0.0.1:8787"))
-        );
-        assert_eq!(
-            value.get("inferenceGatewayApiKey"),
-            Some(&serde_json::json!("dummy-gateway-token"))
-        );
-        assert_eq!(
-            value.get("inferenceGatewayAuthScheme"),
-            Some(&serde_json::json!("bearer"))
-        );
-        assert_eq!(
-            value.get("inferenceProvider"),
-            Some(&serde_json::json!("gateway"))
-        );
-        assert_eq!(
-            value.get("inferenceModels"),
-            Some(&serde_json::json!([{"name": "gateway-default"}]))
-        );
-        assert_eq!(
-            value.get("inferenceStreamIdleTimeoutSec"),
-            Some(&serde_json::json!(600))
-        );
-        assert_eq!(
-            value.get("coworkEgressAllowedHosts"),
-            Some(&serde_json::json!(["example.com"]))
-        );
-        assert!(superai_config::backup::list_backups(&file).is_ok_and(|b| !b.is_empty()));
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&file).unwrap().permissions().mode();
-            assert_eq!(mode & 0o777, 0o600, "gateway key file must be 0600");
-        }
-
-        let xapikey = super::ThirdPartyInference::gateway(
-            "http://127.0.0.1:8787",
-            &key,
-            super::ThirdPartyAuthScheme::XApiKey,
-        );
-        super::commit_third_party_inference(&root, super::THIRD_PARTY_LIBRARY_FILE, &xapikey)
-            .unwrap();
-        let value = superai_config::json::load(&file).unwrap();
-        assert_eq!(
-            value.get("inferenceGatewayAuthScheme"),
-            Some(&serde_json::json!("x-api-key"))
-        );
-        drop(std::fs::remove_dir_all(&root));
-    }
-
-    #[test]
-    fn third_party_library_file_traversal_is_refused() {
-        let root = crate::test_util::temp_dir_unique("claude-3p-traversal");
-        std::fs::create_dir_all(&root).unwrap();
-        let key = crate::error::RedactedString::new("dummy-gateway-token");
-        let config = super::ThirdPartyInference::gateway(
-            "http://127.0.0.1:8787",
-            &key,
-            super::ThirdPartyAuthScheme::Bearer,
-        );
-        for escape in ["../escape.json", "a/b.json", "..", "", "C:con"] {
-            let err = super::commit_third_party_inference(&root, escape, &config).unwrap_err();
-            assert!(
-                matches!(err, CoreError::InvalidPath { .. }),
-                "{escape}: {err:?}"
-            );
-        }
-        assert!(!root.join("escape.json").exists());
-        assert!(
-            superai_config::json::load(&root.join("configLibrary").join("inference.json"))
-                .is_ok_and(|m| m.is_empty())
-        );
-        drop(std::fs::remove_dir_all(&root));
-    }
-
-    /// DOS device basenames resolve to devices on Windows with any
-    /// extension and any case; nearby ordinary names stay legal.
-    #[test]
-    fn windows_device_basenames_are_matched_case_folded_with_extensions() {
-        for name in [
-            "con",
-            "CON",
-            "Con",
-            "cOn.json",
-            "aux.cfg",
-            "nul",
-            "nul.tar.gz",
-            "prn.",
-            "com3 .txt",
-            "com1",
-            "COM9.data",
-            "lpt1",
-            "LPT9",
-        ] {
-            assert!(super::is_windows_device_basename(name), "{name}");
-        }
-        for name in [
-            "config.json",
-            "console.log",
-            "com",
-            "com0",
-            "com10",
-            "lpt0",
-            "lptx",
-            "nully",
-            "constants.json",
-            "auxiliary",
-        ] {
-            assert!(!super::is_windows_device_basename(name), "{name}");
-        }
-    }
-
-    /// Writing a 3P library file named after a Windows device is refused
-    /// before any file is created.
-    #[test]
-    fn third_party_library_file_windows_device_names_are_refused() {
-        let root = crate::test_util::temp_dir_unique("claude-3p-devices");
-        std::fs::create_dir_all(&root).unwrap();
-        let key = crate::error::RedactedString::new("dummy-gateway-token");
-        let config = super::ThirdPartyInference::gateway(
-            "http://127.0.0.1:8787",
-            &key,
-            super::ThirdPartyAuthScheme::Bearer,
-        );
-        for name in ["con", "CON.json", "aux", "com1.cfg", "lpt9"] {
-            let err = super::commit_third_party_inference(&root, name, &config).unwrap_err();
-            assert!(
-                matches!(err, CoreError::InvalidPath { .. }),
-                "{name}: {err:?}"
-            );
-            assert!(
-                !root.join("configLibrary").join(name).exists(),
-                "{name} must not be written"
-            );
-        }
-        drop(std::fs::remove_dir_all(&root));
-    }
-
-    /// Run-5 area-A reachability: the 3P keys reach the fixed path through a
-    /// symlink-swap profile, all on fake roots.
-    #[test]
-    fn third_party_keys_reach_the_fixed_path_via_a_profile_swap() {
-        use crate::profile;
-        let base = crate::test_util::temp_dir_unique("claude-3p-profile-base");
-        let record = profile::create_profile(
-            &base,
-            &profile::ProfileSpec::new(
-                HarnessId::new(HARNESS_ID_STR).unwrap(),
-                InstanceName::new("gatewayed").unwrap(),
-            ),
-        )
-        .unwrap();
-        let key = crate::error::RedactedString::new("dummy-gateway-token");
-        let config = super::ThirdPartyInference::gateway(
-            "http://127.0.0.1:8787",
-            &key,
-            super::ThirdPartyAuthScheme::Bearer,
-        )
-        .with_models(vec!["gateway-default".to_owned()]);
-        super::commit_third_party_inference(
-            record.root.as_path(),
-            super::THIRD_PARTY_LIBRARY_FILE,
-            &config,
-        )
-        .unwrap();
-
-        // Swap the profile in at a FAKE Claude-3p path (never the real home)
-        // and read the keys back through it.
-        let fake_fixed = crate::test_util::temp_dir_unique("claude-3p-fake-root");
-        let fixed_path = fake_fixed.join(".config").join("Claude-3p");
-        profile::activate_profile(
-            &base,
-            &HarnessId::new(HARNESS_ID_STR).unwrap(),
-            "gatewayed",
-            &fixed_path,
-        )
-        .unwrap();
-        let through_path = fixed_path
-            .join(super::THIRD_PARTY_LIBRARY_DIR)
-            .join(super::THIRD_PARTY_LIBRARY_FILE);
-        let value = superai_config::json::load(&through_path).unwrap();
-        assert_eq!(
-            value.get("inferenceGatewayBaseUrl"),
-            Some(&serde_json::json!("http://127.0.0.1:8787"))
-        );
-        assert_eq!(
-            value.get("inferenceGatewayApiKey"),
-            Some(&serde_json::json!("dummy-gateway-token"))
-        );
-
-        // Deactivate removes the swap; the fixed path is gone again (there
-        // was no pre-existing content to restore).
-        profile::deactivate_profile(&base, &HarnessId::new(HARNESS_ID_STR).unwrap(), &fixed_path)
-            .unwrap();
-        assert!(!fixed_path.exists(), "swap removed");
-        drop(std::fs::remove_dir_all(&base));
-        drop(std::fs::remove_dir_all(&fake_fixed));
     }
 }

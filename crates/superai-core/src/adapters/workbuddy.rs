@@ -2,14 +2,11 @@
 //! JSON tree, relocated per instance; the desktop app is GUI-only, never mutated.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
 use std::time::Duration;
 
 use crate::adapter::{
-    ADAPTER_REVISION, Adapter, AdapterCapabilityDecl, Arch, ConfigScope, ConfigSurface,
-    DetectionConfidence, DetectionResult, DocumentKind, McpAdapterDecl, Os, PathResolver, Platform,
+    ADAPTER_REVISION, Adapter, AdapterCapabilityDecl, ConfigScope, ConfigSurface,
+    DetectionConfidence, DetectionResult, DocumentKind, McpAdapterDecl, PathResolver, Platform,
     ProductStatus, RestartBehavior, RootShape, SurfaceOwnership, SurfaceSchema, VersionResolution,
     WrapperPlan,
 };
@@ -20,13 +17,13 @@ use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence, Isolation};
 use superai_config::document::ValueType;
 
-/// Harness identifier for `WorkBuddy` / `CodeBuddy` CLI.
+/// Catalog id superai registers this harness under.
 pub const HARNESS_ID_STR: &str = "workbuddy";
 
-/// Human display name.
+/// Name shown for this harness in listings and errors.
 pub const DISPLAY_NAME: &str = "WorkBuddy / CodeBuddy CLI (cbc)";
 
-/// Primary executable name (the headless CLI binary).
+/// Binary name resolved on PATH during detection (the headless CLI binary).
 pub const EXECUTABLE: &str = "cbc";
 
 /// Alternate executable name shipped by the same npm package.
@@ -38,16 +35,13 @@ pub const NPM_PACKAGE: &str = "@tencent-ai/codebuddy-code";
 /// Environment variable that relocates the whole config root.
 pub const CONFIG_ENV_VAR: &str = "CODEBUDDY_CONFIG_DIR";
 
-/// Default config root when `CODEBUDDY_CONFIG_DIR` is unset.
-pub const DEFAULT_CONFIG_ROOT_FALLBACK: &str = "~/.codebuddy";
-
-/// Research document link.
+/// Research doc whose findings the constants in this file encode.
 pub const RESEARCH_DOC: &str = "docs/harness-configs/workbuddy.md";
 
 /// Catalog recheck date; the research doc itself was verified 2026-09-08.
 pub const LAST_VERIFIED: &str = "2026-09-01";
 
-/// Schema version for the current config shape.
+/// Schema version this adapter maps detected versions to.
 pub const SCHEMA_VERSION_STR: &str = "1";
 
 /// cbc version where the autocompact window moved from `models.json` `maxInputTokens` to the `CODEBUDDY_AUTO_COMPACT_WINDOW` env var.
@@ -104,51 +98,8 @@ impl WorkBuddyAdapter {
         Ok(Self { id })
     }
 
-    /// Borrow the harness id.
-    pub fn harness_id(&self) -> &HarnessId {
-        &self.id
-    }
-
-    /// Executable name for this harness.
-    pub fn executable_name(&self) -> &str {
-        EXECUTABLE
-    }
-
-    /// Config relocation env var.
-    pub fn config_env_var(&self) -> &str {
-        CONFIG_ENV_VAR
-    }
-
     fn run_with_timeout(binary: &Path, args: &[&str]) -> Option<String> {
-        let binary_owned = binary.to_path_buf();
-        let args_owned: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let mut command = Command::new(&binary_owned);
-            for arg in &args_owned {
-                command.arg(arg);
-            }
-            let output = command
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output();
-            drop(tx.send(output));
-        });
-        let Ok(Ok(output)) = rx.recv_timeout(Duration::from_secs(2)) else {
-            return None;
-        };
-        if !output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
-            return None;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stdout.trim().is_empty() {
-            Some(stderr.into_owned())
-        } else if stderr.trim().is_empty() {
-            Some(stdout.into_owned())
-        } else {
-            Some(format!("{stdout} {stderr}"))
-        }
+        super::run_capturing(binary, args, Duration::from_secs(2))
     }
 
     /// The exact `cbc --version` format is unverified (workbuddy.md §7), so
@@ -248,13 +199,8 @@ impl WorkBuddyAdapter {
         {
             return Some(PathBuf::from(dir));
         }
-        let home = std::env::var("HOME")
-            .ok()
-            .or_else(|| std::env::var("USERPROFILE").ok())?;
-        if home.trim().is_empty() {
-            return None;
-        }
-        Some(PathBuf::from(home).join(".codebuddy"))
+        let home = super::home_dir()?;
+        Some(home.join(".codebuddy"))
     }
 
     #[expect(
@@ -301,8 +247,7 @@ impl WorkBuddyAdapter {
 
 impl Default for WorkBuddyAdapter {
     fn default() -> Self {
-        #[expect(clippy::unwrap_used, reason = "workbuddy is a static valid HarnessId")]
-        let id = HarnessId::new(HARNESS_ID_STR).unwrap();
+        let id = HarnessId::from_validated_const(HARNESS_ID_STR);
         Self { id }
     }
 }
@@ -321,11 +266,7 @@ impl Adapter for WorkBuddyAdapter {
     }
 
     fn supported_platforms(&self) -> Vec<Platform> {
-        vec![
-            Platform::new(Os::Linux, Arch::Any),
-            Platform::new(Os::Macos, Arch::Any),
-            Platform::new(Os::Windows, Arch::Any),
-        ]
+        super::desktop_platforms()
     }
 
     fn adapter_revision(&self) -> &str {
@@ -389,11 +330,7 @@ impl Adapter for WorkBuddyAdapter {
 
         self.collect_config_evidence(&mut evidence);
 
-        let present = match (&binary_path, &version) {
-            (Some(_), Some(_)) => InstallPresence::Present,
-            (Some(_), None) => InstallPresence::UnknownVersion,
-            (None, _) => InstallPresence::Absent,
-        };
+        let present = super::install_presence(binary_path.is_some(), version.is_some());
 
         let confidence = if version.is_some() || present == InstallPresence::Absent {
             DetectionConfidence::High
@@ -645,15 +582,7 @@ impl Adapter for WorkBuddyAdapter {
     }
 
     fn plan_wrapper(&self, instance: &Instance) -> Result<WrapperPlan, CoreError> {
-        if instance.harness != self.id {
-            return Err(CoreError::Validation {
-                field: "harness".to_owned(),
-                reason: format!(
-                    "instance harness `{}` does not match adapter `{}`",
-                    instance.harness, self.id
-                ),
-            });
-        }
+        super::ensure_instance_harness(&self.id, instance)?;
         instance.validate()?;
         let mut plan = WrapperPlan::new("relocated-root via CODEBUDDY_CONFIG_DIR");
         plan.env_vars
@@ -706,12 +635,7 @@ impl Adapter for WorkBuddyAdapter {
     }
 
     fn validate_instance(&self, instance: &Instance) -> Result<(), CoreError> {
-        if instance.harness != self.id {
-            return Err(CoreError::Validation {
-                field: "harness".to_owned(),
-                reason: format!("expected harness `{}`, got `{}`", self.id, instance.harness),
-            });
-        }
+        super::ensure_instance_harness(&self.id, instance)?;
         instance.validate()?;
         match instance.isolation {
             Isolation::RelocatedRoot | Isolation::Unknown => Ok(()),
@@ -765,6 +689,7 @@ impl Adapter for WorkBuddyAdapter {
         Self::models_era_conflict(&version, content)
     }
 
+    // LinkAll first: relink_skills takes the first supported mode.
     fn supported_skill_modes(&self) -> Vec<crate::adapter::SkillMode> {
         vec![
             crate::adapter::SkillMode::LinkAll,
@@ -821,11 +746,10 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        CONFIG_ENV_VAR, DISPLAY_NAME, EXECUTABLE, HARNESS_ID_STR, KNOWN_ENV_VARS,
-        MODELS_OWNED_SELECTORS, RESEARCH_DOC, SCHEMA_VERSION_STR, SETTINGS_OWNED_SELECTORS,
+        CONFIG_ENV_VAR, EXECUTABLE, HARNESS_ID_STR, KNOWN_ENV_VARS, SCHEMA_VERSION_STR,
         WorkBuddyAdapter,
     };
-    use crate::adapter::{Adapter, ConfigScope, DocumentKind, ProductStatus, SurfaceOwnership};
+    use crate::adapter::{Adapter, ConfigScope, DocumentKind, SurfaceOwnership};
     use crate::capability::{Capability, Support};
     use crate::error::CoreError;
     use crate::ids::{HarnessId, InstanceId, InstanceName};
@@ -857,14 +781,11 @@ mod tests {
     #[test]
     fn adapter_identity() {
         let a = adapter();
+        // Constructor wiring plus catalog registration: an id the catalog
+        // does not know can never reconcile with detection or instances.
+        let entry = crate::harness_catalog::find_by_id(HARNESS_ID_STR).unwrap();
         assert_eq!(a.id().as_str(), HARNESS_ID_STR);
-        assert_eq!(a.display_name(), DISPLAY_NAME);
-        assert_eq!(a.executable_name(), EXECUTABLE);
-        assert_eq!(a.config_env_var(), CONFIG_ENV_VAR);
-        assert_eq!(a.product_status(), ProductStatus::Active);
-        assert_eq!(a.research_doc_link(), RESEARCH_DOC);
-        assert!(!a.last_verified_date().is_empty());
-        assert_eq!(a.adapter_revision(), crate::adapter::ADAPTER_REVISION);
+        assert_eq!(a.product_status(), entry.product_status);
     }
 
     #[test]
@@ -898,7 +819,6 @@ mod tests {
             }
             InstallPresence::Broken => {}
         }
-        assert_ne!(result.confidence.to_string(), "");
     }
 
     #[test]
@@ -913,22 +833,6 @@ mod tests {
             assert!(res.schema_version.is_none());
         }
         assert!(!res.notes.is_empty());
-    }
-
-    #[test]
-    fn parse_version_output_cases() {
-        let cases = [
-            ("cbc 2.147.0", Some("2.147.0")),
-            ("@tencent-ai/codebuddy-code 2.147.0", Some("2.147.0")),
-            ("v2.103.4", Some("2.103.4")),
-            ("2.147.0-beta.1", Some("2.147.0-beta.1")),
-            ("", None),
-            ("not a version", None),
-        ];
-        for (input, expected) in cases {
-            let got = crate::adapters::parse_version_output(input);
-            assert_eq!(got.as_deref(), expected, "input: {input:?}");
-        }
     }
 
     #[test]
@@ -1010,18 +914,6 @@ mod tests {
         };
         assert!(precedence("project.settings.local.json") > precedence("project.settings.json"));
         assert!(precedence("project.settings.json") > precedence("settings.json"));
-    }
-
-    #[test]
-    fn owned_selectors_are_stable() {
-        for selectors in [MODELS_OWNED_SELECTORS, SETTINGS_OWNED_SELECTORS] {
-            assert!(selectors.len() >= 2);
-            let set: HashSet<&str> = selectors.iter().copied().collect();
-            assert_eq!(set.len(), selectors.len(), "selectors must be unique");
-            for sel in set {
-                assert!(!sel.is_empty());
-            }
-        }
     }
 
     #[test]

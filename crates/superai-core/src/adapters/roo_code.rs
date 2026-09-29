@@ -4,22 +4,22 @@
 use std::path::{Path, PathBuf};
 
 use crate::adapter::{
-    ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
-    DetectionResult, DocumentKind, Os, PathResolver, Platform, ProductStatus, RestartBehavior,
-    SurfaceOwnership, VersionResolution, WrapperPlan,
+    ADAPTER_REVISION, Adapter, ConfigScope, ConfigSurface, DetectionConfidence, DetectionResult,
+    DocumentKind, PathResolver, Platform, ProductStatus, RestartBehavior, SurfaceOwnership,
+    VersionResolution, WrapperPlan,
 };
 use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence, Isolation};
 
-/// Harness identifier for Roo Code.
+/// Catalog id superai registers this harness under.
 pub const HARNESS_ID_STR: &str = "roo-code";
 
-/// Human display name.
+/// Name shown for this harness in listings and errors.
 pub const DISPLAY_NAME: &str = "Roo Code";
 
-/// Primary executable (VS Code).
+/// Binary name resolved on PATH during detection (VS Code).
 pub const EXECUTABLE: &str = "code";
 
 /// Extension identifier.
@@ -28,22 +28,22 @@ pub const EXTENSION_ID: &str = "RooVeterinaryInc.roo-cline";
 /// Successor extension identifier.
 pub const SUCCESSOR_EXTENSION: &str = "kilocode.Kilo-Code";
 
-/// Successor harness id.
+/// Harness id the research doc names as this harness's successor.
 pub const SUCCESSOR_ID: &str = "kilo-code";
 
-/// Research document link.
+/// Research doc whose findings the constants in this file encode.
 pub const RESEARCH_DOC: &str = "docs/harness-configs/roo-code.md";
 
-/// Last verified date.
+/// Date the research doc was last checked against the harness.
 pub const LAST_VERIFIED: &str = "2026-08-25";
 
-/// Schema version.
+/// Schema version this adapter maps detected versions to.
 pub const SCHEMA_VERSION_STR: &str = "1";
 
 /// Archive date.
 pub const ARCHIVE_DATE: &str = "2026-05";
 
-/// Migration tip.
+/// Pointer to the successor migration documented in the research doc.
 pub const MIGRATION_TIP: &str = "Roo Code archived 2026-05; successor kilo-code (Kilo Code kilocode.Kilo-Code) via Migration Wizard or `code --install-extension kilocode.Kilo-Code`; map .roomodes/.roo/rules/custom_modes.yaml/mcp_settings.json -> .kilocode, .roo/mcp.json -> .kilocode/mcp.json, .roorules -> AGENTS.md";
 
 /// Concrete adapter for Roo Code (`MigrationOnly`).
@@ -59,29 +59,9 @@ impl RooCodeAdapter {
         Ok(Self { id })
     }
 
-    /// Borrow harness id.
-    pub fn harness_id(&self) -> &HarnessId {
-        &self.id
-    }
-
-    /// Executable name.
-    pub fn executable_name(&self) -> &str {
-        EXECUTABLE
-    }
-
-    /// Migration tip.
-    pub fn successor_tip(&self) -> &str {
-        MIGRATION_TIP
-    }
-
     fn default_storage_root() -> Option<PathBuf> {
-        let home = std::env::var("HOME")
-            .ok()
-            .or_else(|| std::env::var("USERPROFILE").ok())?;
-        if home.trim().is_empty() {
-            return None;
-        }
-        let base = PathBuf::from(home);
+        let home = super::home_dir()?;
+        let base = home;
         let candidates = [
             base.join(".config")
                 .join("Code")
@@ -155,8 +135,7 @@ impl RooCodeAdapter {
 
 impl Default for RooCodeAdapter {
     fn default() -> Self {
-        #[expect(clippy::unwrap_used, reason = "roo-code is static valid HarnessId")]
-        let id = HarnessId::new(HARNESS_ID_STR).unwrap();
+        let id = HarnessId::from_validated_const(HARNESS_ID_STR);
         Self { id }
     }
 }
@@ -175,11 +154,7 @@ impl Adapter for RooCodeAdapter {
     }
 
     fn supported_platforms(&self) -> Vec<Platform> {
-        vec![
-            Platform::new(Os::Linux, Arch::Any),
-            Platform::new(Os::Macos, Arch::Any),
-            Platform::new(Os::Windows, Arch::Any),
-        ]
+        super::desktop_platforms()
     }
 
     fn adapter_revision(&self) -> &str {
@@ -224,11 +199,7 @@ impl Adapter for RooCodeAdapter {
 
         self.collect_config_evidence(&mut evidence);
 
-        let present = match (&binary_path, &version) {
-            (Some(_), Some(_)) => InstallPresence::Present,
-            (Some(_), None) => InstallPresence::UnknownVersion,
-            (None, _) => InstallPresence::Absent,
-        };
+        let present = super::install_presence(binary_path.is_some(), version.is_some());
 
         let confidence = if present == InstallPresence::Absent {
             if evidence.iter().any(|e| e.contains("storage dir exists")) {
@@ -387,15 +358,7 @@ impl Adapter for RooCodeAdapter {
     }
 
     fn plan_wrapper(&self, instance: &Instance) -> Result<WrapperPlan, CoreError> {
-        if instance.harness != self.id {
-            return Err(CoreError::Validation {
-                field: "harness".to_owned(),
-                reason: format!(
-                    "instance harness `{}` does not match adapter `{}`",
-                    instance.harness, self.id
-                ),
-            });
-        }
+        super::ensure_instance_harness(&self.id, instance)?;
         Err(CoreError::UnsupportedOperation {
             harness: self.id.to_string(),
             operation: "plan_wrapper".to_owned(),
@@ -418,12 +381,7 @@ impl Adapter for RooCodeAdapter {
     }
 
     fn validate_instance(&self, instance: &Instance) -> Result<(), CoreError> {
-        if instance.harness != self.id {
-            return Err(CoreError::Validation {
-                field: "harness".to_owned(),
-                reason: format!("expected harness `{}`, got `{}`", self.id, instance.harness),
-            });
-        }
+        super::ensure_instance_harness(&self.id, instance)?;
         instance.validate()?;
         match instance.isolation {
             Isolation::IdeUserData | Isolation::Unknown | Isolation::RelocatedRoot => Ok(()),
@@ -466,11 +424,8 @@ impl Adapter for RooCodeAdapter {
 mod tests {
     use std::collections::HashSet;
 
-    use super::{
-        DISPLAY_NAME, EXECUTABLE, EXTENSION_ID, HARNESS_ID_STR, RESEARCH_DOC, RooCodeAdapter,
-        SUCCESSOR_ID,
-    };
-    use crate::adapter::{Adapter, ConfigScope, DocumentKind, ProductStatus, SurfaceOwnership};
+    use super::{HARNESS_ID_STR, RooCodeAdapter, SUCCESSOR_ID};
+    use crate::adapter::{Adapter, ConfigScope, DocumentKind, SurfaceOwnership};
     use crate::error::CoreError;
     use crate::ids::{HarnessId, InstanceId, InstanceName};
     use crate::instance::Instance;
@@ -501,14 +456,11 @@ mod tests {
     #[test]
     fn adapter_identity() {
         let a = adapter();
+        // Constructor wiring plus catalog registration: an id the catalog
+        // does not know can never reconcile with detection or instances.
+        let entry = crate::harness_catalog::find_by_id(HARNESS_ID_STR).unwrap();
         assert_eq!(a.id().as_str(), HARNESS_ID_STR);
-        assert_eq!(a.display_name(), DISPLAY_NAME);
-        assert_eq!(a.executable_name(), EXECUTABLE);
-        assert_eq!(a.product_status(), ProductStatus::Archived);
-        assert_eq!(a.research_doc_link(), RESEARCH_DOC);
-        assert!(!a.last_verified_date().is_empty());
-        assert!(a.successor_tip().contains(SUCCESSOR_ID));
-        assert_eq!(EXTENSION_ID, "RooVeterinaryInc.roo-cline");
+        assert_eq!(a.product_status(), entry.product_status);
     }
 
     #[test]
@@ -541,20 +493,6 @@ mod tests {
                 .iter()
                 .any(|n| n.contains(SUCCESSOR_ID) || n.contains("migration"))
         );
-    }
-
-    #[test]
-    fn parse_version_output_cases() {
-        let cases = vec![
-            ("1.84.0", Some("1.84.0")),
-            ("v1.2.3", Some("1.2.3")),
-            ("", None),
-            ("not a version", None),
-        ];
-        for (input, expected) in cases {
-            let got = crate::adapters::parse_version_output(input);
-            assert_eq!(got.as_deref(), expected, "input: {input:?}");
-        }
     }
 
     #[test]

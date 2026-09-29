@@ -4,23 +4,23 @@
 use std::path::PathBuf;
 
 use crate::adapter::{
-    ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
-    DetectionResult, DocumentKind, Os, PathResolver, Platform, ProductStatus, RestartBehavior,
-    RootShape, SurfaceOwnership, SurfaceSchema, VersionResolution, WrapperPlan,
+    ADAPTER_REVISION, Adapter, ConfigScope, ConfigSurface, DetectionResult, DocumentKind,
+    PathResolver, Platform, ProductStatus, RestartBehavior, RootShape, SurfaceOwnership,
+    SurfaceSchema, VersionResolution, WrapperPlan,
 };
 use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
-use crate::state::{AdapterSupport, InstallPresence};
+use crate::state::AdapterSupport;
 use superai_config::document::ValueType;
 
-/// Harness identifier for `OpenClaw`.
+/// Catalog id superai registers this harness under.
 pub const HARNESS_ID_STR: &str = "openclaw";
 
-/// Human display name.
+/// Name shown for this harness in listings and errors.
 pub const DISPLAY_NAME: &str = "OpenClaw";
 
-/// Primary executable name.
+/// Binary name resolved on PATH during detection.
 pub const EXECUTABLE: &str = "openclaw";
 
 /// Env var that overrides home.
@@ -32,22 +32,16 @@ pub const STATE_DIR_ENV_VAR: &str = "OPENCLAW_STATE_DIR";
 /// Env var that overrides config path.
 pub const CONFIG_PATH_ENV_VAR: &str = "OPENCLAW_CONFIG_PATH";
 
-/// Default config path fallback.
-pub const DEFAULT_CONFIG_PATH_FALLBACK: &str = "~/.openclaw/openclaw.json";
-
-/// Default state dir fallback.
-pub const DEFAULT_STATE_DIR_FALLBACK: &str = "~/.openclaw";
-
-/// Research document link.
+/// Research doc whose findings the constants in this file encode.
 pub const RESEARCH_DOC: &str = "docs/harness-configs/openclaw.md";
 
-/// Last verified date.
+/// Date the research doc was last checked against the harness.
 pub const LAST_VERIFIED: &str = "2026-08-25";
 
-/// Schema version.
+/// Schema version this adapter maps detected versions to.
 pub const SCHEMA_VERSION_STR: &str = "1";
 
-/// Research-blocked reason.
+/// Why provider writes stay blocked until the research lands.
 pub const BLOCKED_REASON: &str = "daemon state, gateway/schema incomplete: ports, gateway security, multi-agent, plugin/skill paths unverified; long-running service not per-invocation CLI";
 
 /// Daemon facts the corpus honestly permits: no verified port/bind, so
@@ -86,21 +80,6 @@ impl OpenClawAdapter {
         Ok(Self { id })
     }
 
-    /// Borrow harness id.
-    pub fn harness_id(&self) -> &HarnessId {
-        &self.id
-    }
-
-    /// Executable name.
-    pub fn executable_name(&self) -> &str {
-        EXECUTABLE
-    }
-
-    /// Blocked reason.
-    pub fn blocked_reason(&self) -> &str {
-        BLOCKED_REASON
-    }
-
     fn default_state_dir() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var(STATE_DIR_ENV_VAR)
             && !dir.trim().is_empty()
@@ -112,13 +91,8 @@ impl OpenClawAdapter {
         {
             return Some(PathBuf::from(dir));
         }
-        let home = std::env::var("HOME")
-            .ok()
-            .or_else(|| std::env::var("USERPROFILE").ok())?;
-        if home.trim().is_empty() {
-            return None;
-        }
-        Some(PathBuf::from(home).join(".openclaw"))
+        let home = super::home_dir()?;
+        Some(home.join(".openclaw"))
     }
 
     #[expect(
@@ -163,8 +137,7 @@ impl OpenClawAdapter {
 
 impl Default for OpenClawAdapter {
     fn default() -> Self {
-        #[expect(clippy::unwrap_used, reason = "openclaw is static valid HarnessId")]
-        let id = HarnessId::new(HARNESS_ID_STR).unwrap();
+        let id = HarnessId::from_validated_const(HARNESS_ID_STR);
         Self { id }
     }
 }
@@ -183,11 +156,7 @@ impl Adapter for OpenClawAdapter {
     }
 
     fn supported_platforms(&self) -> Vec<Platform> {
-        vec![
-            Platform::new(Os::Linux, Arch::Any),
-            Platform::new(Os::Macos, Arch::Any),
-            Platform::new(Os::Windows, Arch::Any),
-        ]
+        super::desktop_platforms()
     }
 
     fn adapter_revision(&self) -> &str {
@@ -232,23 +201,13 @@ impl Adapter for OpenClawAdapter {
 
         self.collect_config_evidence(&mut evidence);
 
-        let present = match (&binary_path, &version) {
-            (Some(_), Some(_)) => InstallPresence::Present,
-            (Some(_), None) => InstallPresence::UnknownVersion,
-            (None, _) => InstallPresence::Absent,
-        };
+        let present = super::install_presence(binary_path.is_some(), version.is_some());
 
-        let confidence = if present == InstallPresence::Absent {
-            if evidence.iter().any(|e| e.contains("state dir exists")) {
-                DetectionConfidence::Low
-            } else {
-                DetectionConfidence::High
-            }
-        } else if binary_path.is_some() && version.is_none() {
-            DetectionConfidence::Medium
-        } else {
-            DetectionConfidence::High
-        };
+        let confidence = super::detection_confidence(
+            binary_path.is_some(),
+            version.is_some(),
+            evidence.iter().any(|e| e.contains("state dir exists")),
+        );
 
         DetectionResult::new(present, version, evidence, confidence)
     }
@@ -373,15 +332,7 @@ impl Adapter for OpenClawAdapter {
     }
 
     fn plan_wrapper(&self, instance: &Instance) -> Result<WrapperPlan, CoreError> {
-        if instance.harness != self.id {
-            return Err(CoreError::Validation {
-                field: "harness".to_owned(),
-                reason: format!(
-                    "instance harness `{}` does not match adapter `{}`",
-                    instance.harness, self.id
-                ),
-            });
-        }
+        super::ensure_instance_harness(&self.id, instance)?;
         Err(CoreError::ResearchBlocked {
             harness: self.id.to_string(),
             surface: "wrapper".to_owned(),
@@ -403,12 +354,7 @@ impl Adapter for OpenClawAdapter {
     }
 
     fn validate_instance(&self, instance: &Instance) -> Result<(), CoreError> {
-        if instance.harness != self.id {
-            return Err(CoreError::Validation {
-                field: "harness".to_owned(),
-                reason: format!("expected harness `{}`, got `{}`", self.id, instance.harness),
-            });
-        }
+        super::ensure_instance_harness(&self.id, instance)?;
         instance.validate()?;
         Err(CoreError::ResearchBlocked {
             harness: self.id.to_string(),
@@ -453,10 +399,8 @@ impl Adapter for OpenClawAdapter {
 mod tests {
     use std::collections::HashSet;
 
-    use super::{
-        BLOCKED_REASON, DISPLAY_NAME, EXECUTABLE, HARNESS_ID_STR, OpenClawAdapter, RESEARCH_DOC,
-    };
-    use crate::adapter::{Adapter, ConfigScope, DocumentKind, ProductStatus, SurfaceOwnership};
+    use super::{BLOCKED_REASON, HARNESS_ID_STR, OpenClawAdapter};
+    use crate::adapter::{Adapter, ConfigScope, DocumentKind, SurfaceOwnership};
     use crate::error::CoreError;
     use crate::ids::{HarnessId, InstanceId, InstanceName};
     use crate::instance::Instance;
@@ -487,13 +431,11 @@ mod tests {
     #[test]
     fn adapter_identity() {
         let a = adapter();
+        // Constructor wiring plus catalog registration: an id the catalog
+        // does not know can never reconcile with detection or instances.
+        let entry = crate::harness_catalog::find_by_id(HARNESS_ID_STR).unwrap();
         assert_eq!(a.id().as_str(), HARNESS_ID_STR);
-        assert_eq!(a.display_name(), DISPLAY_NAME);
-        assert_eq!(a.executable_name(), EXECUTABLE);
-        assert_eq!(a.product_status(), ProductStatus::Active);
-        assert_eq!(a.research_doc_link(), RESEARCH_DOC);
-        assert!(!a.last_verified_date().is_empty());
-        assert!(a.blocked_reason().contains("gateway"));
+        assert_eq!(a.product_status(), entry.product_status);
     }
 
     #[test]
@@ -547,21 +489,6 @@ mod tests {
                 .iter()
                 .any(|n| n.contains("research blocked") || n.contains("gateway"))
         );
-    }
-
-    #[test]
-    fn parse_version_output_cases() {
-        let cases = vec![
-            ("openclaw 1.2.3", Some("1.2.3")),
-            ("1.0.0", Some("1.0.0")),
-            ("v2.0.0", Some("2.0.0")),
-            ("", None),
-            ("not a version", None),
-        ];
-        for (input, expected) in cases {
-            let got = crate::adapters::parse_version_output(input);
-            assert_eq!(got.as_deref(), expected, "input: {input:?}");
-        }
     }
 
     #[test]

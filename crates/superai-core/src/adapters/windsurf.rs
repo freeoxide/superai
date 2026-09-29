@@ -4,22 +4,22 @@
 use std::path::{Path, PathBuf};
 
 use crate::adapter::{
-    ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
-    DetectionResult, DocumentKind, Os, PathResolver, Platform, ProductStatus, RestartBehavior,
-    SurfaceOwnership, VersionResolution, WrapperPlan,
+    ADAPTER_REVISION, Adapter, ConfigScope, ConfigSurface, DetectionResult, DocumentKind,
+    PathResolver, Platform, ProductStatus, RestartBehavior, SurfaceOwnership, VersionResolution,
+    WrapperPlan,
 };
 use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
-use crate::state::{AdapterSupport, InstallPresence, Isolation};
+use crate::state::{AdapterSupport, Isolation};
 
-/// Harness identifier for Windsurf.
+/// Catalog id superai registers this harness under.
 pub const HARNESS_ID_STR: &str = "windsurf";
 
-/// Human display name.
+/// Name shown for this harness in listings and errors.
 pub const DISPLAY_NAME: &str = "Windsurf/Devin Desktop";
 
-/// Primary executable.
+/// Binary name resolved on PATH during detection.
 pub const EXECUTABLE: &str = "windsurf";
 
 /// Alternative executable (Devin converged).
@@ -34,16 +34,16 @@ pub const EXTENSIONS_DIR_FLAG: &str = "--extensions-dir";
 /// Default MCP config fallback.
 pub const DEFAULT_MCP_FALLBACK: &str = "~/.codeium/windsurf/mcp_config.json";
 
-/// Research document link.
+/// Research doc whose findings the constants in this file encode.
 pub const RESEARCH_DOC: &str = "docs/harness-configs/windsurf.md";
 
-/// Last verified date.
+/// Date the research doc was last checked against the harness.
 pub const LAST_VERIFIED: &str = "2026-08-25";
 
-/// Schema version.
+/// Schema version this adapter maps detected versions to.
 pub const SCHEMA_VERSION_STR: &str = "1";
 
-/// Owned selectors for MCP.
+/// Selectors superai owns on the MCP surface; other keys round-trip.
 pub const MCP_OWNED_SELECTORS: &[&str] = &["mcpServers"];
 
 /// Concrete adapter for Windsurf.
@@ -59,42 +59,20 @@ impl WindsurfAdapter {
         Ok(Self { id })
     }
 
-    /// Borrow harness id.
-    pub fn harness_id(&self) -> &HarnessId {
-        &self.id
-    }
-
-    /// Executable name.
-    pub fn executable_name(&self) -> &str {
-        EXECUTABLE
-    }
-
     fn default_mcp_path() -> Option<PathBuf> {
-        let home = std::env::var("HOME")
-            .ok()
-            .or_else(|| std::env::var("USERPROFILE").ok())?;
-        if home.trim().is_empty() {
-            return None;
-        }
+        let home = super::home_dir()?;
         Some(
-            PathBuf::from(home)
-                .join(".codeium")
+            home.join(".codeium")
                 .join("windsurf")
                 .join("mcp_config.json"),
         )
     }
 
     fn default_user_data_root() -> Option<PathBuf> {
-        let home = std::env::var("HOME")
-            .ok()
-            .or_else(|| std::env::var("USERPROFILE").ok())?;
-        if home.trim().is_empty() {
-            return None;
-        }
+        let home = super::home_dir()?;
         if cfg!(target_os = "macos") {
             Some(
-                PathBuf::from(home)
-                    .join("Library")
+                home.join("Library")
                     .join("Application Support")
                     .join("Windsurf")
                     .join("User"),
@@ -106,19 +84,13 @@ impl WindsurfAdapter {
                 return Some(PathBuf::from(appdata).join("Windsurf").join("User"));
             }
             Some(
-                PathBuf::from(home)
-                    .join("AppData")
+                home.join("AppData")
                     .join("Roaming")
                     .join("Windsurf")
                     .join("User"),
             )
         } else {
-            Some(
-                PathBuf::from(home)
-                    .join(".config")
-                    .join("Windsurf")
-                    .join("User"),
-            )
+            Some(home.join(".config").join("Windsurf").join("User"))
         }
     }
 
@@ -166,8 +138,7 @@ impl WindsurfAdapter {
 
 impl Default for WindsurfAdapter {
     fn default() -> Self {
-        #[expect(clippy::unwrap_used, reason = "windsurf is static valid")]
-        let id = HarnessId::new(HARNESS_ID_STR).unwrap();
+        let id = HarnessId::from_validated_const(HARNESS_ID_STR);
         Self { id }
     }
 }
@@ -186,11 +157,7 @@ impl Adapter for WindsurfAdapter {
     }
 
     fn supported_platforms(&self) -> Vec<Platform> {
-        vec![
-            Platform::new(Os::Linux, Arch::Any),
-            Platform::new(Os::Macos, Arch::Any),
-            Platform::new(Os::Windows, Arch::Any),
-        ]
+        super::desktop_platforms()
     }
 
     fn adapter_revision(&self) -> &str {
@@ -236,34 +203,14 @@ impl Adapter for WindsurfAdapter {
             }
         }
         self.collect_config_evidence(&mut evidence);
-        let present = match (&binary_path, &version) {
-            (Some(_), Some(_)) => InstallPresence::Present,
-            (Some(_), None) => InstallPresence::UnknownVersion,
-            (None, _) => InstallPresence::Absent,
-        };
-        // Absent forces High, so the Low "mcp_config.json exists" arm can never fire.
-        let confidence = match (&binary_path, &version) {
-            (Some(_), None) => DetectionConfidence::Medium,
-            (Some(_), Some(_)) | (None, _) => DetectionConfidence::High,
-        };
+        let present = super::install_presence(binary_path.is_some(), version.is_some());
+        let confidence =
+            super::detection_confidence(binary_path.is_some(), version.is_some(), false);
         DetectionResult::new(present, version, evidence, confidence)
     }
 
     fn version_resolution(&self) -> VersionResolution {
-        let detection = self.detection();
-        if let Some(v) = detection.version {
-            let mut notes = Vec::new();
-            notes.push(format!("detected windsurf version {v}"));
-            notes.push(format!("mapped to schema version {SCHEMA_VERSION_STR}"));
-            let mut res =
-                VersionResolution::new(Some(v), Some(SCHEMA_VERSION_STR.to_owned()), true);
-            res.notes = notes;
-            res
-        } else {
-            let mut res = VersionResolution::unknown();
-            res.notes = detection.evidence;
-            res
-        }
+        super::resolution_from_detection(self.detection(), "windsurf", SCHEMA_VERSION_STR)
     }
 
     fn config_surfaces(&self) -> Vec<ConfigSurface> {
@@ -404,22 +351,16 @@ impl Adapter for WindsurfAdapter {
     }
 
     fn plan_wrapper(&self, instance: &Instance) -> Result<WrapperPlan, CoreError> {
-        if instance.harness != self.id {
-            return Err(CoreError::Validation {
-                field: "harness".to_owned(),
-                reason: format!(
-                    "instance harness `{}` does not match adapter `{}`",
-                    instance.harness, self.id
-                ),
-            });
-        }
+        super::ensure_instance_harness(&self.id, instance)?;
         instance.validate()?;
         let mut plan = WrapperPlan::new(
             "ide-user-data via --user-data-dir (MCP JSON + rules/skills IDE storage)",
         );
         // No config-dir env var exists; the env var below records the isolated
         // MCP path as evidence only.
-        let mcp_isolated = Path::new(&instance.config_root.to_string())
+        let mcp_isolated = instance
+            .config_root
+            .as_path()
             .join("codeium")
             .join("windsurf")
             .join("mcp_config.json");
@@ -427,8 +368,8 @@ impl Adapter for WindsurfAdapter {
             "WINDSURF_MCP_CONFIG".to_owned(),
             mcp_isolated.display().to_string(),
         ));
-        let user_data = Path::new(&instance.config_root.to_string()).join("vscode-data");
-        let extensions = Path::new(&instance.config_root.to_string()).join("extensions");
+        let user_data = instance.config_root.as_path().join("vscode-data");
+        let extensions = instance.config_root.as_path().join("extensions");
         plan.args.push(USER_DATA_DIR_FLAG.to_owned());
         plan.args.push(user_data.display().to_string());
         plan.args.push(EXTENSIONS_DIR_FLAG.to_owned());
@@ -457,12 +398,7 @@ impl Adapter for WindsurfAdapter {
     }
 
     fn validate_instance(&self, instance: &Instance) -> Result<(), CoreError> {
-        if instance.harness != self.id {
-            return Err(CoreError::Validation {
-                field: "harness".to_owned(),
-                reason: format!("expected harness `{}`, got `{}`", self.id, instance.harness),
-            });
-        }
+        super::ensure_instance_harness(&self.id, instance)?;
         instance.validate()?;
         match instance.isolation {
             Isolation::IdeUserData | Isolation::RelocatedRoot | Isolation::Unknown => Ok(()),
@@ -474,11 +410,7 @@ impl Adapter for WindsurfAdapter {
     }
 
     fn supported_skill_modes(&self) -> Vec<crate::adapter::SkillMode> {
-        vec![
-            crate::adapter::SkillMode::LinkAll,
-            crate::adapter::SkillMode::LinkSelected,
-            crate::adapter::SkillMode::CopySelected,
-        ]
+        super::skill_modes_link_first()
     }
 
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
@@ -500,10 +432,8 @@ impl Adapter for WindsurfAdapter {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        DISPLAY_NAME, EXECUTABLE, HARNESS_ID_STR, RESEARCH_DOC, USER_DATA_DIR_FLAG, WindsurfAdapter,
-    };
-    use crate::adapter::{Adapter, DocumentKind, ProductStatus};
+    use super::{HARNESS_ID_STR, USER_DATA_DIR_FLAG, WindsurfAdapter};
+    use crate::adapter::{Adapter, DocumentKind};
     use crate::error::CoreError;
     use crate::ids::{HarnessId, InstanceId, InstanceName};
     use crate::instance::Instance;
@@ -534,11 +464,11 @@ mod tests {
     #[test]
     fn adapter_identity() {
         let a = adapter();
+        // Constructor wiring plus catalog registration: an id the catalog
+        // does not know can never reconcile with detection or instances.
+        let entry = crate::harness_catalog::find_by_id(HARNESS_ID_STR).unwrap();
         assert_eq!(a.id().as_str(), HARNESS_ID_STR);
-        assert_eq!(a.display_name(), DISPLAY_NAME);
-        assert_eq!(a.executable_name(), EXECUTABLE);
-        assert_eq!(a.product_status(), ProductStatus::Active);
-        assert_eq!(a.research_doc_link(), RESEARCH_DOC);
+        assert_eq!(a.product_status(), entry.product_status);
     }
 
     #[test]

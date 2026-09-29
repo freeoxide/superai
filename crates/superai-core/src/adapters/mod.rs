@@ -6,6 +6,10 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
+use crate::adapter::DetectionConfidence;
+use crate::instance::Instance;
+use crate::state::{AdapterSupport, InstallPresence};
+
 pub mod aider;
 pub mod amazon_q;
 pub mod amp;
@@ -112,7 +116,8 @@ fn probe_path_dir(dir: &str, name: &str) -> Option<PathBuf> {
     None
 }
 
-/// Parse the first version-shaped token (`1.2.3`, `v1.2`, `1.0.0-rc1`).
+/// Parse the first version-shaped token (`1.2.3`, `v1.2`, `1.0.0-rc1`);
+/// `name/1.2.3` slash compounds are split so harness-prefixed output parses.
 #[expect(clippy::excessive_nesting, reason = "token fallback chain is explicit")]
 pub(crate) fn parse_version_output(output: &str) -> Option<String> {
     let trimmed = output.trim();
@@ -120,35 +125,37 @@ pub(crate) fn parse_version_output(output: &str) -> Option<String> {
         return None;
     }
     for token in trimmed.split_whitespace() {
-        let mut candidate = token;
-        if let Some(stripped) = candidate.strip_prefix('v') {
-            candidate = stripped;
-        } else if let Some(stripped) = candidate.strip_prefix('V') {
-            candidate = stripped;
-        }
-        let cleaned = candidate.trim_matches(|c: char| c == ',' || c == ')' || c == '(');
-        if cleaned.is_empty() {
-            continue;
-        }
-        let has_dot = cleaned.contains('.');
-        let starts_digit = cleaned.chars().next().is_some_and(|c| c.is_ascii_digit());
-        if has_dot && starts_digit {
-            let is_version_like = cleaned
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+');
-            if is_version_like {
-                return Some(cleaned.to_owned());
+        for segment in token.split('/') {
+            let mut candidate = segment;
+            if let Some(stripped) = candidate.strip_prefix('v') {
+                candidate = stripped;
+            } else if let Some(stripped) = candidate.strip_prefix('V') {
+                candidate = stripped;
             }
-            let mut version_part = String::new();
-            for ch in cleaned.chars() {
-                if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '+' {
-                    version_part.push(ch);
-                } else {
-                    break;
+            let cleaned = candidate.trim_matches(|c: char| c == ',' || c == ')' || c == '(');
+            if cleaned.is_empty() {
+                continue;
+            }
+            let has_dot = cleaned.contains('.');
+            let starts_digit = cleaned.chars().next().is_some_and(|c| c.is_ascii_digit());
+            if has_dot && starts_digit {
+                let is_version_like = cleaned
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+');
+                if is_version_like {
+                    return Some(cleaned.to_owned());
                 }
-            }
-            if version_part.contains('.') && !version_part.is_empty() {
-                return Some(version_part);
+                let mut version_part = String::new();
+                for ch in cleaned.chars() {
+                    if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '+' {
+                        version_part.push(ch);
+                    } else {
+                        break;
+                    }
+                }
+                if version_part.contains('.') && !version_part.is_empty() {
+                    return Some(version_part);
+                }
             }
         }
     }
@@ -201,6 +208,164 @@ pub(crate) fn probe_version(binary: &Path) -> Option<String> {
     )?)
 }
 
+/// The one mirror-exclusion matcher, shared by the adapters' exclusion tests:
+/// exact, trailing `/*` prefix, leading `*.` suffix, and single-star infix
+/// glob patterns.
+#[cfg(test)]
+pub(crate) fn exclusion_matches(patterns: &[String], file: &str) -> bool {
+    patterns.iter().any(|pat| {
+        if let Some(prefix) = pat.strip_suffix("/*") {
+            file.starts_with(prefix)
+        } else if let Some(suffix) = pat.strip_prefix("*.") {
+            file.ends_with(suffix)
+        } else if pat.contains('*') {
+            match pat.split('*').collect::<Vec<_>>()[..] {
+                [head, tail] => file.starts_with(head) && file.ends_with(tail),
+                _ => file == pat,
+            }
+        } else {
+            file == pat
+        }
+    })
+}
+
+/// HOME, falling back to USERPROFILE on Windows; None when neither is usable.
+pub(crate) fn home_dir() -> Option<PathBuf> {
+    for var in ["HOME", "USERPROFILE"] {
+        if let Ok(home) = std::env::var(var)
+            && !home.trim().is_empty()
+        {
+            return Some(PathBuf::from(home));
+        }
+    }
+    None
+}
+
+/// The desktop triple every catalog harness supports today.
+pub(crate) fn desktop_platforms() -> Vec<crate::adapter::Platform> {
+    use crate::adapter::{Arch, Os, Platform};
+    vec![
+        Platform::new(Os::Linux, Arch::Any),
+        Platform::new(Os::Macos, Arch::Any),
+        Platform::new(Os::Windows, Arch::Any),
+    ]
+}
+
+/// The 11-operation row, every op [`AdapterSupport::Full`], shared by
+/// adapters that support the whole catalog surface.
+pub(crate) fn all_operations_full() -> Vec<(String, AdapterSupport)> {
+    [
+        "detect",
+        "read_config",
+        "write_config",
+        "manage_skills",
+        "manage_mcp",
+        "manage_plugins",
+        "configure_provider",
+        "plan_mirror",
+        "plan_wrapper",
+        "scan_candidates",
+        "validate_instance",
+    ]
+    .into_iter()
+    .map(|op| (op.to_owned(), AdapterSupport::Full))
+    .collect()
+}
+
+/// Skill modes, copy-first preference: `relink_skills` takes the first mode.
+pub(crate) fn skill_modes_copy_first() -> Vec<crate::adapter::SkillMode> {
+    use crate::adapter::SkillMode;
+    vec![
+        SkillMode::CopySelected,
+        SkillMode::LinkAll,
+        SkillMode::LinkSelected,
+    ]
+}
+
+/// Skill modes, link-first preference: harnesses whose skills live in a
+/// registry the copy would detach from.
+pub(crate) fn skill_modes_link_first() -> Vec<crate::adapter::SkillMode> {
+    use crate::adapter::SkillMode;
+    vec![
+        SkillMode::LinkAll,
+        SkillMode::LinkSelected,
+        SkillMode::CopySelected,
+    ]
+}
+
+/// Probe outcome for a found-or-missing binary and a parsed-or-missing version.
+pub(crate) fn install_presence(binary_found: bool, version_found: bool) -> InstallPresence {
+    match (binary_found, version_found) {
+        (true, true) => InstallPresence::Present,
+        (true, false) => InstallPresence::UnknownVersion,
+        (false, _) => InstallPresence::Absent,
+    }
+}
+
+/// Shared detection rule: a missing binary is decisive (High) unless leftover
+/// config evidence marks the harness uninstalled (Low); an unparsable version
+/// probe is the only Medium.
+pub(crate) fn detection_confidence(
+    binary_found: bool,
+    version_found: bool,
+    absent_config_seen: bool,
+) -> DetectionConfidence {
+    if !binary_found {
+        return if absent_config_seen {
+            DetectionConfidence::Low
+        } else {
+            DetectionConfidence::High
+        };
+    }
+    if version_found {
+        DetectionConfidence::High
+    } else {
+        DetectionConfidence::Medium
+    }
+}
+
+/// Map a probe outcome onto the resolution, naming `harness` in the notes.
+pub(crate) fn resolution_from_detection(
+    detection: crate::adapter::DetectionResult,
+    harness: &str,
+    schema_version: &str,
+) -> crate::adapter::VersionResolution {
+    let Some(version) = detection.version else {
+        let mut res = crate::adapter::VersionResolution::unknown();
+        res.notes = detection.evidence;
+        return res;
+    };
+    let notes = vec![
+        format!("detected {harness} version {version}"),
+        format!("mapped to schema version {schema_version}"),
+    ];
+    let mut res = crate::adapter::VersionResolution::new(
+        Some(version),
+        Some(schema_version.to_owned()),
+        true,
+    );
+    res.notes = notes;
+    res
+}
+
+/// Refuse instances whose harness is not `id`; the guard every adapter's
+/// `plan_wrapper` and `validate_instance` opens with.
+pub(crate) fn ensure_instance_harness(
+    id: &crate::ids::HarnessId,
+    instance: &Instance,
+) -> Result<(), crate::error::CoreError> {
+    if instance.harness != *id {
+        return Err(crate::error::CoreError::Validation {
+            field: "harness".to_owned(),
+            reason: format!(
+                "instance harness `{}` does not match adapter `{id}`",
+                instance.harness
+            ),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod decl_tests {
     //! Every catalog adapter declares exactly one of an MCP destination or a
@@ -218,6 +383,8 @@ mod decl_tests {
             ("1.0.0", Some("1.0.0")),
             ("v1.0.0", Some("1.0.0")),
             ("Version: 2.0.0", Some("2.0.0")),
+            ("vibe-kanban/0.1.44 linux-x64 node-v22.23.2", Some("0.1.44")),
+            ("linux-x64 node-v22.23.2", None),
             ("tool 0.1.0-beta", Some("0.1.0-beta")),
             ("", None),
             ("not a version", None),
@@ -228,6 +395,44 @@ mod decl_tests {
                 expected,
                 "input: {input:?}"
             );
+        }
+    }
+
+    /// One canonical check for every adapter's owned selectors, replacing the
+    /// per-file stability copies: unique and non-empty within each surface.
+    #[test]
+    fn owned_selectors_unique_and_non_empty_per_surface() {
+        for adapter in harness_catalog::all_adapters() {
+            let id = adapter.id().as_str().to_owned();
+            for surface in adapter.config_surfaces() {
+                let set: std::collections::HashSet<&str> =
+                    surface.owned_selectors.iter().map(String::as_str).collect();
+                assert_eq!(
+                    set.len(),
+                    surface.owned_selectors.len(),
+                    "{id}/{}: duplicate owned selectors",
+                    surface.id
+                );
+                assert!(
+                    surface.owned_selectors.iter().all(|s| !s.is_empty()),
+                    "{id}/{}: empty owned selector",
+                    surface.id
+                );
+            }
+        }
+    }
+
+    /// Detection is a pure function of machine state: two runs must agree.
+    /// One canonical check instead of per-file determinism copies.
+    #[test]
+    fn detection_is_deterministic_per_adapter() {
+        for adapter in harness_catalog::all_adapters() {
+            let id = adapter.id().as_str().to_owned();
+            let first = adapter.detection();
+            let second = adapter.detection();
+            assert_eq!(first.present, second.present, "{id}");
+            assert_eq!(first.version, second.version, "{id}");
+            assert_eq!(first.confidence, second.confidence, "{id}");
         }
     }
 

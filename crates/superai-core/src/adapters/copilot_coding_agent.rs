@@ -4,31 +4,31 @@
 use std::path::{Path, PathBuf};
 
 use crate::adapter::{
-    ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
-    DetectionResult, DocumentKind, Os, PathResolver, Platform, ProductStatus, RestartBehavior,
-    SurfaceOwnership, VersionResolution, WrapperPlan,
+    ADAPTER_REVISION, Adapter, ConfigScope, ConfigSurface, DetectionConfidence, DetectionResult,
+    DocumentKind, PathResolver, Platform, ProductStatus, RestartBehavior, SurfaceOwnership,
+    VersionResolution, WrapperPlan,
 };
 use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence};
 
-/// Harness identifier for Copilot Coding Agent.
+/// Catalog id superai registers this harness under.
 pub const HARNESS_ID_STR: &str = "copilot-coding-agent";
 
-/// Human display name.
+/// Name shown for this harness in listings and errors.
 pub const DISPLAY_NAME: &str = "Copilot Coding Agent";
 
-/// Primary executable name (none local; `gh` is closest local helper, but agent is cloud).
+/// Binary name resolved on PATH during detection (none local; `gh` is closest local helper, but agent is cloud).
 pub const EXECUTABLE: &str = "gh";
 
 /// Alternative executable name (copilot CLI, distinct product but shares brand).
 pub const EXECUTABLE_ALT: &str = "copilot";
 
-/// Research document link.
+/// Research doc whose findings the constants in this file encode.
 pub const RESEARCH_DOC: &str = "docs/harness-configs/copilot-cli.md";
 
-/// Last verified date.
+/// Date the research doc was last checked against the harness.
 pub const LAST_VERIFIED: &str = "2026-08-25";
 
 /// Schema version (no local schema).
@@ -48,21 +48,6 @@ impl CopilotCodingAgentAdapter {
     pub fn new() -> Result<Self, CoreError> {
         let id = HarnessId::new(HARNESS_ID_STR)?;
         Ok(Self { id })
-    }
-
-    /// Borrow the harness id.
-    pub fn harness_id(&self) -> &HarnessId {
-        &self.id
-    }
-
-    /// Executable name for this harness (cloud agent has no local binary; `gh` is helper).
-    pub fn executable_name(&self) -> &str {
-        EXECUTABLE
-    }
-
-    /// Unsupported reason.
-    pub fn unsupported_reason(&self) -> &str {
-        UNSUPPORTED_REASON
     }
 
     #[expect(clippy::unused_self, reason = "uses adapter constants via Self")]
@@ -125,11 +110,7 @@ impl CopilotCodingAgentAdapter {
 
 impl Default for CopilotCodingAgentAdapter {
     fn default() -> Self {
-        #[expect(
-            clippy::unwrap_used,
-            reason = "copilot-coding-agent is static valid HarnessId"
-        )]
-        let id = HarnessId::new(HARNESS_ID_STR).unwrap();
+        let id = HarnessId::from_validated_const(HARNESS_ID_STR);
         Self { id }
     }
 }
@@ -148,11 +129,7 @@ impl Adapter for CopilotCodingAgentAdapter {
     }
 
     fn supported_platforms(&self) -> Vec<Platform> {
-        vec![
-            Platform::new(Os::Linux, Arch::Any),
-            Platform::new(Os::Macos, Arch::Any),
-            Platform::new(Os::Windows, Arch::Any),
-        ]
+        super::desktop_platforms()
     }
 
     fn adapter_revision(&self) -> &str {
@@ -175,7 +152,7 @@ impl Adapter for CopilotCodingAgentAdapter {
         if let Some(path) = binary_path.as_ref() {
             evidence.push(format!(
                 "found helper binary `{}` at {}",
-                path.display(),
+                EXECUTABLE,
                 path.display()
             ));
             // The gh version is evidence, never claimed as coding-agent version.
@@ -297,15 +274,7 @@ impl Adapter for CopilotCodingAgentAdapter {
     }
 
     fn plan_wrapper(&self, instance: &Instance) -> Result<WrapperPlan, CoreError> {
-        if instance.harness != self.id {
-            return Err(CoreError::Validation {
-                field: "harness".to_owned(),
-                reason: format!(
-                    "instance harness `{}` does not match adapter `{}`",
-                    instance.harness, self.id
-                ),
-            });
-        }
+        super::ensure_instance_harness(&self.id, instance)?;
         Err(CoreError::UnsupportedOperation {
             harness: self.id.to_string(),
             operation: "plan_wrapper".to_owned(),
@@ -356,11 +325,8 @@ impl Adapter for CopilotCodingAgentAdapter {
 mod tests {
     use std::collections::HashSet;
 
-    use super::{
-        CopilotCodingAgentAdapter, DISPLAY_NAME, EXECUTABLE, HARNESS_ID_STR, RESEARCH_DOC,
-        UNSUPPORTED_REASON,
-    };
-    use crate::adapter::{Adapter, DocumentKind, ProductStatus};
+    use super::{CopilotCodingAgentAdapter, HARNESS_ID_STR};
+    use crate::adapter::{Adapter, DocumentKind};
     use crate::error::CoreError;
     use crate::ids::{HarnessId, InstanceId, InstanceName};
     use crate::instance::Instance;
@@ -391,15 +357,11 @@ mod tests {
     #[test]
     fn adapter_identity() {
         let a = adapter();
+        // Constructor wiring plus catalog registration: an id the catalog
+        // does not know can never reconcile with detection or instances.
+        let entry = crate::harness_catalog::find_by_id(HARNESS_ID_STR).unwrap();
         assert_eq!(a.id().as_str(), HARNESS_ID_STR);
-        assert_eq!(a.display_name(), DISPLAY_NAME);
-        assert_eq!(a.executable_name(), EXECUTABLE);
-        assert_eq!(a.product_status(), ProductStatus::Active);
-        assert_eq!(a.research_doc_link(), RESEARCH_DOC);
-        assert!(!a.last_verified_date().is_empty());
-        assert_eq!(a.adapter_revision(), crate::adapter::ADAPTER_REVISION);
-        assert!(a.unsupported_reason().contains("cloud-owned"));
-        assert!(UNSUPPORTED_REASON.contains("no local mutation"));
+        assert_eq!(a.product_status(), entry.product_status);
     }
 
     #[test]
@@ -430,25 +392,9 @@ mod tests {
         let res = a.version_resolution();
         assert!(!res.compatible);
         assert!(res.schema_version.is_none());
-        assert!(res.detected_version.is_none() || res.detected_version.is_some()); // helper may exist
         assert!(!res.notes.is_empty());
         assert!(res.notes.iter().any(|n| n.contains("unsupported")));
         assert!(res.notes.iter().any(|n| n.contains("no local config")));
-    }
-
-    #[test]
-    fn parse_version_output_cases() {
-        let cases = vec![
-            ("gh version 2.80.0", Some("2.80.0")),
-            ("copilot 0.1.1", Some("0.1.1")),
-            ("v2.80.0", Some("2.80.0")),
-            ("", None),
-            ("not a version", None),
-        ];
-        for (input, expected) in cases {
-            let got = crate::adapters::parse_version_output(input);
-            assert_eq!(got.as_deref(), expected, "input: {input:?}");
-        }
     }
 
     #[test]

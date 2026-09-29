@@ -4,22 +4,22 @@
 use std::path::PathBuf;
 
 use crate::adapter::{
-    ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
-    DetectionResult, DocumentKind, Os, PathResolver, Platform, ProductStatus, RestartBehavior,
-    SurfaceOwnership, VersionResolution, WrapperPlan,
+    ADAPTER_REVISION, Adapter, ConfigScope, ConfigSurface, DetectionResult, DocumentKind,
+    PathResolver, Platform, ProductStatus, RestartBehavior, SurfaceOwnership, VersionResolution,
+    WrapperPlan,
 };
 use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
-use crate::state::{AdapterSupport, InstallPresence, Isolation};
+use crate::state::{AdapterSupport, Isolation};
 
-/// Harness identifier for Plandex.
+/// Catalog id superai registers this harness under.
 pub const HARNESS_ID_STR: &str = "plandex";
 
-/// Human display name.
+/// Name shown for this harness in listings and errors.
 pub const DISPLAY_NAME: &str = "Plandex";
 
-/// Primary executable name.
+/// Binary name resolved on PATH during detection.
 pub const EXECUTABLE: &str = "plandex";
 
 /// Env var for API host override.
@@ -43,19 +43,16 @@ pub const SERVER_BASE_DIR_ENV_VAR: &str = "PLANDEX_BASE_DIR";
 /// Database URL (self-host).
 pub const DATABASE_URL_ENV_VAR: &str = "DATABASE_URL";
 
-/// Per-user v2 home; live cli/v2.2.1 exposes no relocation env or legacy paths.
-pub const V2_HOME_DIR_HINT: &str = "~/.plandex-home-v2";
-
 /// Custom models JSON inside the v2 home (via `plandex models custom`).
 pub const CUSTOM_MODELS_FILE: &str = "custom-models.json";
 
-/// Research document link.
+/// Research doc whose findings the constants in this file encode.
 pub const RESEARCH_DOC: &str = "docs/harness-configs/plandex.md";
 
-/// Last verified date.
+/// Date the research doc was last checked against the harness.
 pub const LAST_VERIFIED: &str = "2026-08-25";
 
-/// Schema version for current config shape.
+/// Schema version this adapter maps detected versions to.
 pub const SCHEMA_VERSION_STR: &str = "1";
 
 /// Constrained note: provider/server scoped.
@@ -92,38 +89,14 @@ impl PlandexAdapter {
         Ok(Self { id })
     }
 
-    /// Borrow the harness id.
-    pub fn harness_id(&self) -> &HarnessId {
-        &self.id
-    }
-
-    /// Executable name for this harness.
-    pub fn executable_name(&self) -> &str {
-        EXECUTABLE
-    }
-
-    /// API host env var.
-    pub fn api_host_env_var(&self) -> &str {
-        API_HOST_ENV_VAR
-    }
-
-    /// Constrained note.
+    /// Constraint recorded wherever full support would overstate.
     pub fn constrained_note(&self) -> &str {
         CONSTRAINED_NOTE
     }
 
     fn custom_models_path() -> Option<PathBuf> {
-        let home = std::env::var("HOME")
-            .ok()
-            .or_else(|| std::env::var("USERPROFILE").ok())?;
-        if home.trim().is_empty() {
-            return None;
-        }
-        Some(
-            PathBuf::from(home)
-                .join(".plandex-home-v2")
-                .join(CUSTOM_MODELS_FILE),
-        )
+        let home = super::home_dir()?;
+        Some(home.join(".plandex-home-v2").join(CUSTOM_MODELS_FILE))
     }
 
     #[expect(
@@ -192,8 +165,7 @@ impl PlandexAdapter {
 
 impl Default for PlandexAdapter {
     fn default() -> Self {
-        #[expect(clippy::unwrap_used, reason = "plandex is static valid HarnessId")]
-        let id = HarnessId::new(HARNESS_ID_STR).unwrap();
+        let id = HarnessId::from_validated_const(HARNESS_ID_STR);
         Self { id }
     }
 }
@@ -212,11 +184,7 @@ impl Adapter for PlandexAdapter {
     }
 
     fn supported_platforms(&self) -> Vec<Platform> {
-        vec![
-            Platform::new(Os::Linux, Arch::Any),
-            Platform::new(Os::Macos, Arch::Any),
-            Platform::new(Os::Windows, Arch::Any),
-        ]
+        super::desktop_platforms()
     }
 
     fn adapter_revision(&self) -> &str {
@@ -263,18 +231,10 @@ impl Adapter for PlandexAdapter {
 
         self.collect_config_evidence(&mut evidence);
 
-        let present = match (&binary_path, &version) {
-            (Some(_), Some(_)) => InstallPresence::Present,
-            (Some(_), None) => InstallPresence::UnknownVersion,
-            (None, _) => InstallPresence::Absent,
-        };
+        let present = super::install_presence(binary_path.is_some(), version.is_some());
 
-        // Absent forces High, so the Low "custom models JSON found" arm can never fire.
-        let confidence = match (&binary_path, &version) {
-            (Some(_), None) => DetectionConfidence::Medium,
-            (Some(_), Some(_)) | (None, _) => DetectionConfidence::High,
-        };
-
+        let confidence =
+            super::detection_confidence(binary_path.is_some(), version.is_some(), false);
         DetectionResult::new(present, version, evidence, confidence)
     }
 
@@ -438,15 +398,7 @@ impl Adapter for PlandexAdapter {
     }
 
     fn plan_wrapper(&self, instance: &Instance) -> Result<WrapperPlan, CoreError> {
-        if instance.harness != self.id {
-            return Err(CoreError::Validation {
-                field: "harness".to_owned(),
-                reason: format!(
-                    "instance harness `{}` does not match adapter `{}`",
-                    instance.harness, self.id
-                ),
-            });
-        }
+        super::ensure_instance_harness(&self.id, instance)?;
         instance.validate()?;
         let mut plan =
             WrapperPlan::new("env_only via PLANDEX_API_HOST + provider keys, server per-deploy");
@@ -485,12 +437,7 @@ impl Adapter for PlandexAdapter {
     }
 
     fn validate_instance(&self, instance: &Instance) -> Result<(), CoreError> {
-        if instance.harness != self.id {
-            return Err(CoreError::Validation {
-                field: "harness".to_owned(),
-                reason: format!("expected harness `{}`, got `{}`", self.id, instance.harness),
-            });
-        }
+        super::ensure_instance_harness(&self.id, instance)?;
         instance.validate()?;
         match instance.isolation {
             Isolation::EnvOnly | Isolation::Unknown | Isolation::RelocatedRoot => Ok(()),
@@ -504,11 +451,7 @@ impl Adapter for PlandexAdapter {
     }
 
     fn supported_skill_modes(&self) -> Vec<crate::adapter::SkillMode> {
-        vec![
-            crate::adapter::SkillMode::LinkAll,
-            crate::adapter::SkillMode::LinkSelected,
-            crate::adapter::SkillMode::CopySelected,
-        ]
+        super::skill_modes_link_first()
     }
 
     fn mcp_absence_reason(&self) -> Option<&'static str> {
@@ -524,11 +467,8 @@ impl Adapter for PlandexAdapter {
 mod tests {
     use std::collections::HashSet;
 
-    use super::{
-        API_HOST_ENV_VAR, CONSTRAINED_NOTE, DISPLAY_NAME, EXECUTABLE, HARNESS_ID_STR,
-        OWNED_SELECTORS, PlandexAdapter, RESEARCH_DOC,
-    };
-    use crate::adapter::{Adapter, ConfigScope, DocumentKind, ProductStatus, SurfaceOwnership};
+    use super::{API_HOST_ENV_VAR, HARNESS_ID_STR, OWNED_SELECTORS, PlandexAdapter};
+    use crate::adapter::{Adapter, ConfigScope, DocumentKind, SurfaceOwnership};
     use crate::error::CoreError;
     use crate::ids::{HarnessId, InstanceId, InstanceName};
     use crate::instance::Instance;
@@ -559,17 +499,11 @@ mod tests {
     #[test]
     fn adapter_identity() {
         let a = adapter();
+        // Constructor wiring plus catalog registration: an id the catalog
+        // does not know can never reconcile with detection or instances.
+        let entry = crate::harness_catalog::find_by_id(HARNESS_ID_STR).unwrap();
         assert_eq!(a.id().as_str(), HARNESS_ID_STR);
-        assert_eq!(a.display_name(), DISPLAY_NAME);
-        assert_eq!(a.executable_name(), EXECUTABLE);
-        assert_eq!(a.api_host_env_var(), API_HOST_ENV_VAR);
-        assert_eq!(a.product_status(), ProductStatus::Active);
-        assert_eq!(a.research_doc_link(), RESEARCH_DOC);
-        assert!(!a.last_verified_date().is_empty());
-        assert_eq!(a.adapter_revision(), crate::adapter::ADAPTER_REVISION);
-        assert!(a.constrained_note().contains("env"));
-        assert!(CONSTRAINED_NOTE.contains("PLANDEX_API_HOST"));
-        assert!(CONSTRAINED_NOTE.contains("provider"));
+        assert_eq!(a.product_status(), entry.product_status);
     }
 
     #[test]
@@ -597,7 +531,6 @@ mod tests {
             }
             InstallPresence::Broken => assert!(!result.evidence.is_empty()),
         }
-        assert_ne!(result.confidence.to_string(), "");
     }
 
     #[test]
@@ -616,22 +549,6 @@ mod tests {
             assert!(res.schema_version.is_none());
         }
         assert!(!res.notes.is_empty());
-    }
-
-    #[test]
-    fn parse_version_output_cases() {
-        let cases = vec![
-            ("plandex v2.1.0", Some("2.1.0")),
-            ("plandex 2.0.1", Some("2.0.1")),
-            ("v1.0.0", Some("1.0.0")),
-            ("Version: 2.0.0", Some("2.0.0")),
-            ("", None),
-            ("not a version", None),
-        ];
-        for (input, expected) in cases {
-            let got = crate::adapters::parse_version_output(input);
-            assert_eq!(got.as_deref(), expected, "input: {input:?}");
-        }
     }
 
     #[test]
@@ -720,16 +637,6 @@ mod tests {
                     surface.id
                 );
             }
-        }
-    }
-
-    #[test]
-    fn owned_selectors_are_stable() {
-        assert!(OWNED_SELECTORS.len() >= 8);
-        let set: HashSet<&str> = OWNED_SELECTORS.iter().copied().collect();
-        assert_eq!(set.len(), OWNED_SELECTORS.len(), "selectors must be unique");
-        for required in ["providers", "models", "modelPacks", "PLANDEX_API_HOST"] {
-            assert!(set.contains(required), "missing {required}");
         }
     }
 

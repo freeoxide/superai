@@ -6,19 +6,19 @@ use std::path::PathBuf;
 use superai_config::document::ValueType;
 
 use crate::adapter::{
-    ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
-    DetectionResult, DocumentKind, Os, PathResolver, Platform, ProductStatus, RestartBehavior,
-    RootShape, SurfaceOwnership, SurfaceSchema, VersionResolution, WrapperPlan,
+    ADAPTER_REVISION, Adapter, ConfigScope, ConfigSurface, DetectionConfidence, DetectionResult,
+    DocumentKind, PathResolver, Platform, ProductStatus, RestartBehavior, RootShape,
+    SurfaceOwnership, SurfaceSchema, VersionResolution, WrapperPlan,
 };
 use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence, Isolation};
 
-/// Harness identifier for the `ChatGPT` desktop app.
+/// Catalog id superai registers this harness under.
 pub const HARNESS_ID_STR: &str = "chatgpt-desktop";
 
-/// Human display name.
+/// Name shown for this harness in listings and errors.
 pub const DISPLAY_NAME: &str = "ChatGPT Desktop (Codex)";
 
 /// The shared Codex store this app reads (owned by the codex-cli harness).
@@ -41,13 +41,13 @@ pub const SHARED_STATE_WARNING: &str = "shares ~/.codex with codex-cli";
 pub const NO_RELOCATION_NOTE: &str = "no app-level relocation documented; CODEX_HOME is a CLI-documented knob: \
 whether the GUI honors it is undocumented";
 
-/// Research document link.
+/// Research doc whose findings the constants in this file encode.
 pub const RESEARCH_DOC: &str = "docs/harness-configs/chatgpt-desktop.md";
 
-/// Last verified date.
+/// Date the research doc was last checked against the harness.
 pub const LAST_VERIFIED: &str = "2026-09-18";
 
-/// Schema version.
+/// Schema version this adapter maps detected versions to.
 pub const SCHEMA_VERSION_STR: &str = "1";
 
 /// Concrete adapter for the `ChatGPT` desktop app (`ReadOnly`).
@@ -63,24 +63,14 @@ impl ChatGptDesktopAdapter {
         Ok(Self { id })
     }
 
-    /// Borrow harness id.
-    pub fn harness_id(&self) -> &HarnessId {
-        &self.id
-    }
-
     fn shared_store_root() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var(CODEX_HOME_ENV_VAR)
             && !dir.trim().is_empty()
         {
             return Some(PathBuf::from(dir));
         }
-        let home = std::env::var("HOME")
-            .ok()
-            .or_else(|| std::env::var("USERPROFILE").ok())?;
-        if home.trim().is_empty() {
-            return None;
-        }
-        Some(PathBuf::from(home).join(".codex"))
+        let home = super::home_dir()?;
+        Some(home.join(".codex"))
     }
 
     /// The GUI binary name is unverified, so evidence keys on the shared
@@ -127,8 +117,7 @@ impl ChatGptDesktopAdapter {
 
 impl Default for ChatGptDesktopAdapter {
     fn default() -> Self {
-        #[expect(clippy::unwrap_used, reason = "chatgpt-desktop is static valid")]
-        let id = HarnessId::new(HARNESS_ID_STR).unwrap();
+        let id = HarnessId::from_validated_const(HARNESS_ID_STR);
         Self { id }
     }
 }
@@ -147,11 +136,7 @@ impl Adapter for ChatGptDesktopAdapter {
     }
 
     fn supported_platforms(&self) -> Vec<Platform> {
-        vec![
-            Platform::new(Os::Linux, Arch::Any),
-            Platform::new(Os::Macos, Arch::Any),
-            Platform::new(Os::Windows, Arch::Any),
-        ]
+        super::desktop_platforms()
     }
 
     fn adapter_revision(&self) -> &str {
@@ -304,15 +289,7 @@ impl Adapter for ChatGptDesktopAdapter {
     /// Setting `CODEX_HOME` here would fabricate undocumented GUI relocation;
     /// the empty env set is what the alias core refuses on (alias codex-cli).
     fn plan_wrapper(&self, instance: &Instance) -> Result<WrapperPlan, CoreError> {
-        if instance.harness != self.id {
-            return Err(CoreError::Validation {
-                field: "harness".to_owned(),
-                reason: format!(
-                    "instance harness `{}` does not match adapter `{}`",
-                    instance.harness, self.id
-                ),
-            });
-        }
+        super::ensure_instance_harness(&self.id, instance)?;
         instance.validate()?;
         let mut plan = WrapperPlan::new(
             "read-only on the shared ~/.codex store; alias via codex-cli (CODEX_HOME)",
@@ -347,12 +324,7 @@ impl Adapter for ChatGptDesktopAdapter {
     }
 
     fn validate_instance(&self, instance: &Instance) -> Result<(), CoreError> {
-        if instance.harness != self.id {
-            return Err(CoreError::Validation {
-                field: "harness".to_owned(),
-                reason: format!("expected harness `{}`, got `{}`", self.id, instance.harness),
-            });
-        }
+        super::ensure_instance_harness(&self.id, instance)?;
         instance.validate()?;
         match instance.isolation {
             Isolation::FixedPathSingle | Isolation::RelocatedRoot | Isolation::Unknown => {
@@ -404,10 +376,10 @@ impl Adapter for ChatGptDesktopAdapter {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChatGptDesktopAdapter, DESKTOP_OWNED_SELECTOR, DISPLAY_NAME, HARNESS_ID_STR,
-        REMOTE_MCP_POSITION, RESEARCH_DOC, SHARED_STATE_WARNING,
+        ChatGptDesktopAdapter, DESKTOP_OWNED_SELECTOR, HARNESS_ID_STR, REMOTE_MCP_POSITION,
+        SHARED_STATE_WARNING,
     };
-    use crate::adapter::{Adapter, ConfigScope, DocumentKind, ProductStatus, SurfaceOwnership};
+    use crate::adapter::{Adapter, ConfigScope, DocumentKind, SurfaceOwnership};
     use crate::error::CoreError;
     use crate::ids::{HarnessId, InstanceId, InstanceName};
     use crate::instance::Instance;
@@ -438,11 +410,11 @@ mod tests {
     #[test]
     fn adapter_identity() {
         let a = adapter();
+        // Constructor wiring plus catalog registration: an id the catalog
+        // does not know can never reconcile with detection or instances.
+        let entry = crate::harness_catalog::find_by_id(HARNESS_ID_STR).unwrap();
         assert_eq!(a.id().as_str(), HARNESS_ID_STR);
-        assert_eq!(a.display_name(), DISPLAY_NAME);
-        assert_eq!(a.product_status(), ProductStatus::Active);
-        assert_eq!(a.research_doc_link(), RESEARCH_DOC);
-        assert_eq!(a.last_verified_date(), "2026-09-18");
+        assert_eq!(a.product_status(), entry.product_status);
     }
 
     #[test]

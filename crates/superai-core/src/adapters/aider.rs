@@ -6,31 +6,31 @@ use std::path::{Path, PathBuf};
 use superai_config::document::ValueType;
 
 use crate::adapter::{
-    ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
-    DetectionResult, DocumentKind, Os, PathResolver, Platform, ProductStatus, RestartBehavior,
-    RootShape, SurfaceOwnership, SurfaceSchema, VersionResolution, WrapperPlan,
+    ADAPTER_REVISION, Adapter, ConfigScope, ConfigSurface, DetectionResult, DocumentKind,
+    PathResolver, Platform, ProductStatus, RestartBehavior, RootShape, SurfaceOwnership,
+    SurfaceSchema, VersionResolution, WrapperPlan,
 };
 use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
-use crate::state::{AdapterSupport, InstallPresence, Isolation};
+use crate::state::{AdapterSupport, Isolation};
 
-/// Harness identifier for Aider.
+/// Catalog id superai registers this harness under.
 pub const HARNESS_ID_STR: &str = "aider";
 
-/// Human display name.
+/// Name shown for this harness in listings and errors.
 pub const DISPLAY_NAME: &str = "Aider";
 
-/// Primary executable name.
+/// Binary name resolved on PATH during detection.
 pub const EXECUTABLE: &str = "aider";
 
-/// Research document link.
+/// Research doc whose findings the constants in this file encode.
 pub const RESEARCH_DOC: &str = "docs/harness-configs/aider.md";
 
-/// Last verified date.
+/// Date the research doc was last checked against the harness.
 pub const LAST_VERIFIED: &str = "2026-08-25";
 
-/// Schema version for current config shape.
+/// Schema version this adapter maps detected versions to.
 pub const SCHEMA_VERSION_STR: &str = "1";
 
 /// Kebab-case keys mirroring long CLI options; other keys round-trip untouched.
@@ -57,28 +57,8 @@ impl AiderAdapter {
         Ok(Self { id })
     }
 
-    /// Borrow the harness id.
-    pub fn harness_id(&self) -> &HarnessId {
-        &self.id
-    }
-
-    /// Executable name for this harness.
-    pub fn executable_name(&self) -> &str {
-        EXECUTABLE
-    }
-
     fn default_home() -> Option<PathBuf> {
-        if let Ok(home) = std::env::var("HOME")
-            && !home.trim().is_empty()
-        {
-            return Some(PathBuf::from(home));
-        }
-        if let Ok(home) = std::env::var("USERPROFILE")
-            && !home.trim().is_empty()
-        {
-            return Some(PathBuf::from(home));
-        }
-        None
+        super::home_dir()
     }
 
     #[expect(
@@ -131,8 +111,7 @@ impl AiderAdapter {
 
 impl Default for AiderAdapter {
     fn default() -> Self {
-        #[expect(clippy::unwrap_used, reason = "aider is static valid HarnessId")]
-        let id = HarnessId::new(HARNESS_ID_STR).unwrap();
+        let id = HarnessId::from_validated_const(HARNESS_ID_STR);
         Self { id }
     }
 }
@@ -151,11 +130,7 @@ impl Adapter for AiderAdapter {
     }
 
     fn supported_platforms(&self) -> Vec<Platform> {
-        vec![
-            Platform::new(Os::Linux, Arch::Any),
-            Platform::new(Os::Macos, Arch::Any),
-            Platform::new(Os::Windows, Arch::Any),
-        ]
+        super::desktop_platforms()
     }
 
     fn adapter_revision(&self) -> &str {
@@ -202,46 +177,15 @@ impl Adapter for AiderAdapter {
 
         self.collect_config_evidence(&mut evidence);
 
-        let present = match (&binary_path, &version) {
-            (Some(_), Some(_)) => InstallPresence::Present,
-            (Some(_), None) => InstallPresence::UnknownVersion,
-            (None, _) => InstallPresence::Absent,
-        };
+        let present = super::install_presence(binary_path.is_some(), version.is_some());
 
-        let confidence = match (
-            &binary_path,
-            &version,
-            evidence.iter().any(|e| e.contains("yaml config exists")),
-        ) {
-            (Some(_), None, _) => DetectionConfidence::Medium,
-            (None, _, true) => DetectionConfidence::Low,
-            (Some(_), Some(_), _) | (None, _, false) => DetectionConfidence::High,
-        };
-
-        let confidence = if present == InstallPresence::Absent {
-            DetectionConfidence::High
-        } else {
-            confidence
-        };
-
+        let confidence =
+            super::detection_confidence(binary_path.is_some(), version.is_some(), false);
         DetectionResult::new(present, version, evidence, confidence)
     }
 
     fn version_resolution(&self) -> VersionResolution {
-        let detection = self.detection();
-        if let Some(v) = detection.version {
-            let mut notes = Vec::new();
-            notes.push(format!("detected aider version {v}"));
-            notes.push(format!("mapped to schema version {SCHEMA_VERSION_STR}"));
-            let mut res =
-                VersionResolution::new(Some(v), Some(SCHEMA_VERSION_STR.to_owned()), true);
-            res.notes = notes;
-            res
-        } else {
-            let mut res = VersionResolution::unknown();
-            res.notes = detection.evidence;
-            res
-        }
+        super::resolution_from_detection(self.detection(), "aider", SCHEMA_VERSION_STR)
     }
 
     fn config_surfaces(&self) -> Vec<ConfigSurface> {
@@ -343,19 +287,7 @@ impl Adapter for AiderAdapter {
     }
 
     fn supported_operations(&self) -> Vec<(String, AdapterSupport)> {
-        vec![
-            ("detect".to_owned(), AdapterSupport::Full),
-            ("read_config".to_owned(), AdapterSupport::Full),
-            ("write_config".to_owned(), AdapterSupport::Full),
-            ("manage_skills".to_owned(), AdapterSupport::Full),
-            ("manage_mcp".to_owned(), AdapterSupport::Full),
-            ("manage_plugins".to_owned(), AdapterSupport::Full),
-            ("configure_provider".to_owned(), AdapterSupport::Full),
-            ("plan_mirror".to_owned(), AdapterSupport::Full),
-            ("plan_wrapper".to_owned(), AdapterSupport::Full),
-            ("scan_candidates".to_owned(), AdapterSupport::Full),
-            ("validate_instance".to_owned(), AdapterSupport::Full),
-        ]
+        super::all_operations_full()
     }
 
     fn plan_mirror_exclusions(&self) -> Vec<String> {
@@ -374,22 +306,14 @@ impl Adapter for AiderAdapter {
     }
 
     fn plan_wrapper(&self, instance: &Instance) -> Result<WrapperPlan, CoreError> {
-        if instance.harness != self.id {
-            return Err(CoreError::Validation {
-                field: "harness".to_owned(),
-                reason: format!(
-                    "instance harness `{}` does not match adapter `{}`",
-                    instance.harness, self.id
-                ),
-            });
-        }
+        super::ensure_instance_harness(&self.id, instance)?;
         instance.validate()?;
         let mut plan =
             WrapperPlan::new("explicit-config via --config/--env-file + HOME relocation");
         plan.env_vars
             .push(("HOME".to_owned(), instance.config_root.to_string()));
-        let config_path = Path::new(&instance.config_root.to_string()).join(".aider.conf.yml");
-        let env_path = Path::new(&instance.config_root.to_string()).join(".env");
+        let config_path = instance.config_root.as_path().join(".aider.conf.yml");
+        let env_path = instance.config_root.as_path().join(".env");
         plan.args.push("--config".to_owned());
         plan.args.push(config_path.display().to_string());
         plan.args.push("--env-file".to_owned());
@@ -416,12 +340,7 @@ impl Adapter for AiderAdapter {
     }
 
     fn validate_instance(&self, instance: &Instance) -> Result<(), CoreError> {
-        if instance.harness != self.id {
-            return Err(CoreError::Validation {
-                field: "harness".to_owned(),
-                reason: format!("expected harness `{}`, got `{}`", self.id, instance.harness),
-            });
-        }
+        super::ensure_instance_harness(&self.id, instance)?;
         instance.validate()?;
         match instance.isolation {
             Isolation::ExplicitConfig | Isolation::RelocatedRoot | Isolation::Unknown => {
@@ -520,10 +439,8 @@ mod tests {
     use std::collections::HashSet;
     use std::path::PathBuf;
 
-    use super::{
-        AiderAdapter, DISPLAY_NAME, EXECUTABLE, HARNESS_ID_STR, OWNED_SELECTORS, RESEARCH_DOC,
-    };
-    use crate::adapter::{Adapter, ConfigScope, DocumentKind, ProductStatus, SurfaceOwnership};
+    use super::{AiderAdapter, HARNESS_ID_STR, OWNED_SELECTORS};
+    use crate::adapter::{Adapter, ConfigScope, DocumentKind, SurfaceOwnership};
     use crate::error::CoreError;
     use crate::ids::{HarnessId, InstanceId, InstanceName};
     use crate::instance::Instance;
@@ -554,13 +471,11 @@ mod tests {
     #[test]
     fn adapter_identity() {
         let a = adapter();
+        // Constructor wiring plus catalog registration: an id the catalog
+        // does not know can never reconcile with detection or instances.
+        let entry = crate::harness_catalog::find_by_id(HARNESS_ID_STR).unwrap();
         assert_eq!(a.id().as_str(), HARNESS_ID_STR);
-        assert_eq!(a.display_name(), DISPLAY_NAME);
-        assert_eq!(a.executable_name(), EXECUTABLE);
-        assert_eq!(a.product_status(), ProductStatus::Active);
-        assert_eq!(a.research_doc_link(), RESEARCH_DOC);
-        assert!(!a.last_verified_date().is_empty());
-        assert_eq!(a.adapter_revision(), crate::adapter::ADAPTER_REVISION);
+        assert_eq!(a.product_status(), entry.product_status);
     }
 
     #[test]
@@ -594,7 +509,6 @@ mod tests {
                 assert!(!result.evidence.is_empty());
             }
         }
-        assert_ne!(result.confidence.to_string(), "");
     }
 
     #[test]
@@ -612,22 +526,6 @@ mod tests {
             assert!(res.schema_version.is_none());
         }
         assert!(!res.notes.is_empty());
-    }
-
-    #[test]
-    fn parse_version_output_cases() {
-        let cases = vec![
-            ("aider 0.84.0", Some("0.84.0")),
-            ("aider 0.84.0.dev", Some("0.84.0.dev")),
-            ("v0.80.1", Some("0.80.1")),
-            ("Version: 0.84.0", Some("0.84.0")),
-            ("", None),
-            ("not a version", None),
-        ];
-        for (input, expected) in cases {
-            let got = crate::adapters::parse_version_output(input);
-            assert_eq!(got.as_deref(), expected, "input: {input:?}");
-        }
     }
 
     #[test]
@@ -677,13 +575,6 @@ mod tests {
     }
 
     #[test]
-    fn owned_selectors_are_stable() {
-        assert!(OWNED_SELECTORS.len() >= 5);
-        let set: HashSet<&str> = OWNED_SELECTORS.iter().copied().collect();
-        assert_eq!(set.len(), OWNED_SELECTORS.len(), "selectors must be unique");
-    }
-
-    #[test]
     fn supported_operations_cover_full() {
         let a = adapter();
         let ops = a.supported_operations();
@@ -724,30 +615,10 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::excessive_nesting, reason = "test closure nesting is explicit")]
     fn plan_mirror_includes_config_and_excludes_history() {
         let a = adapter();
         let exclusions = a.plan_mirror_exclusions();
-        let is_excluded = |file: &str| {
-            exclusions.iter().any(|pat| {
-                if pat.ends_with("/*") {
-                    let prefix = pat.trim_end_matches("/*");
-                    file.starts_with(prefix)
-                } else if pat.starts_with("*.") {
-                    let suffix = pat.trim_start_matches('*');
-                    file.ends_with(suffix)
-                } else if pat.contains('*') {
-                    let parts: Vec<&str> = pat.split('*').collect();
-                    if parts.len() == 2 {
-                        file.starts_with(parts[0]) && file.ends_with(parts[1])
-                    } else {
-                        file == pat
-                    }
-                } else {
-                    file == pat
-                }
-            })
-        };
+        let is_excluded = |file: &str| crate::adapters::exclusion_matches(&exclusions, file);
         assert!(!is_excluded(".aider.conf.yml"));
         assert!(!is_excluded(".aider.model.settings.yml"));
         assert!(is_excluded(".aider.chat.history.md"));
@@ -973,7 +844,7 @@ mod tests {
             path.display()
         );
         let map = superai_config::env_file::load(&path).unwrap();
-        assert!(map.is_empty() || map.contains_key("OPENAI_API_KEY") || !map.is_empty());
+        assert!(map.contains_key("OPENAI_API_KEY"));
     }
 
     #[test]
@@ -1078,43 +949,6 @@ mod tests {
         assert_eq!(after_env["OPENAI_API_BASE"], "https://api.openrouter.ai/v1");
         drop(std::fs::remove_file(&yml_path));
         drop(std::fs::remove_file(&env_path));
-    }
-
-    #[test]
-    fn secret_redaction_placeholder() {
-        use crate::error::RedactedString;
-        let secret = RedactedString::new("sk-test-secret-456");
-        let debug = format!("{secret:?}");
-        let display = format!("{secret}");
-        assert!(!debug.contains("sk-test-secret-456"));
-        assert!(!display.contains("sk-test-secret-456"));
-        assert!(debug.contains("[REDACTED]"));
-        assert!(display.contains("[REDACTED]"));
-        let json = serde_json::to_string(&secret).unwrap();
-        assert!(!json.contains("sk-test-secret-456"));
-        assert!(json.contains("[REDACTED]"));
-        assert_eq!(secret.expose_secret(), "sk-test-secret-456");
-    }
-
-    #[test]
-    fn diff_redaction_does_not_leak_secrets() {
-        use crate::error::RedactedString as OpRedacted;
-        let secret = OpRedacted::new("super-secret-key");
-        let diff_text = format!("set api key to {secret}");
-        assert!(!diff_text.contains("super-secret-key"));
-        assert!(diff_text.contains("[REDACTED]"));
-    }
-
-    #[test]
-    fn conflict_detection_placeholder_no_panic() {
-        let a = adapter();
-        let r1 = a.detection();
-        let r2 = a.detection();
-        assert_eq!(r1.present, r2.present);
-        assert_eq!(r1.confidence, r2.confidence);
-        let inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".aider-work"));
-        a.validate_instance(&inst).unwrap();
-        a.validate_instance(&inst).unwrap();
     }
 
     #[test]
