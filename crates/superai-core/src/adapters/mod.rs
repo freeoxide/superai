@@ -258,14 +258,28 @@ fn run_probe(binary: &Path, args: &[String], budget: Duration) -> Option<String>
     })
 }
 
+/// Parse a version from `<binary>` argv runs: `primary` first, then `fallback`
+/// under a second `budget` when that run or its parse fails; empty = single-shot.
+pub(crate) fn probe_version_with_fallback(
+    binary: &Path,
+    primary: &[&str],
+    fallback: &[&str],
+    budget: Duration,
+) -> Option<String> {
+    let probe = |argv: &[&str]| {
+        run_capturing(binary, argv, budget).and_then(|out| parse_version_output(&out))
+    };
+    match probe(primary) {
+        Some(version) => Some(version),
+        None if fallback.is_empty() => None,
+        None => probe(fallback),
+    }
+}
+
 /// Run `<binary> --version` under a 2s budget and parse the version from the
 /// combined output.
 pub(crate) fn probe_version(binary: &Path) -> Option<String> {
-    parse_version_output(&run_capturing(
-        binary,
-        &["--version"],
-        Duration::from_secs(2),
-    )?)
+    probe_version_with_fallback(binary, &["--version"], &[], Duration::from_secs(2))
 }
 
 /// The one mirror-exclusion matcher, shared by the adapters' exclusion tests:
@@ -469,27 +483,40 @@ mod decl_tests {
         }
     }
 
-    /// A probe past its budget returns None and the child is killed, not
-    /// left running: the /proc sweep fails if any `sleep 30` probe survives.
+    /// A probe past its budget returns None and the child is killed, not left
+    /// running: the /proc sweep fails while the bare `sleep` victim survives.
     #[test]
     #[cfg(unix)]
     fn run_capturing_kills_a_hung_child() {
         let out = super::run_capturing(
-            std::path::Path::new("sh"),
-            &["-c", "sleep 30"],
+            std::path::Path::new("sleep"),
+            &["30"],
             std::time::Duration::from_millis(150),
         );
         assert!(out.is_none(), "a hung probe must yield None");
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        for entry in std::fs::read_dir("/proc").unwrap() {
-            let entry = entry.unwrap();
-            let cmd = std::fs::read_to_string(entry.path().join("cmdline")).unwrap_or_default();
-            let argv: Vec<&str> = cmd.split('\0').filter(|a| !a.is_empty()).collect();
+        let victim = ["sleep", "30"];
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while argv_alive(&victim) {
             assert!(
-                argv != ["sh", "-c", "sleep 30"],
-                "timed-out probe child survived: {argv:?}"
+                std::time::Instant::now() < deadline,
+                "timed-out probe child survived: {victim:?}"
             );
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
+    }
+
+    /// Whether any live process's argv is exactly `wanted`; /proc entries
+    /// that vanish mid-scan or have unreadable cmdlines never match.
+    #[cfg(all(test, unix))]
+    fn argv_alive(wanted: &[&str]) -> bool {
+        let cmdline_matches = |entry: std::fs::DirEntry| {
+            std::fs::read_to_string(entry.path().join("cmdline")).is_ok_and(|cmd| {
+                cmd.split('\0')
+                    .filter(|a| !a.is_empty())
+                    .eq(wanted.iter().copied())
+            })
+        };
+        std::fs::read_dir("/proc").is_ok_and(|entries| entries.flatten().any(cmdline_matches))
     }
 
     /// Runtime backstop for `from_validated_const`: every adapter literal,

@@ -836,7 +836,7 @@ mod tests {
         let path = fixture_path("config.minimal.toml");
         assert!(path.exists(), "fixture missing: {}", path.display());
         let doc = superai_config::toml_file::load(&path).unwrap();
-        assert!(doc.is_empty() || doc.to_string().contains("model") || doc.to_string().is_empty());
+        assert!(doc.is_empty() || doc.to_string().contains("model"));
     }
 
     #[test]

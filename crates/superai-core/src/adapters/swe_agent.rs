@@ -75,14 +75,13 @@ impl SweAgentAdapter {
     }
 
     fn probe_version(binary: &Path) -> Option<String> {
-        // SWE-agent builds answer --help when --version is unsupported; this
-        // may spend two 2s budgets, and --help also runs on no parsed version.
-        super::run_capturing(binary, &["--version"], Duration::from_secs(2))
-            .and_then(|out| super::parse_version_output(&out))
-            .or_else(|| {
-                super::run_capturing(binary, &["--help"], Duration::from_secs(2))
-                    .and_then(|out| super::parse_version_output(&out))
-            })
+        // SWE-agent answers --help with its version when --version is unsupported.
+        super::probe_version_with_fallback(
+            binary,
+            &["--version"],
+            &["--help"],
+            Duration::from_secs(2),
+        )
     }
 
     fn default_config_root() -> Option<PathBuf> {

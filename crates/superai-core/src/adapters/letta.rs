@@ -481,11 +481,8 @@ impl Adapter for LettaAdapter {
         ));
         // Length-derived port HINT: same-length names collide, so the real
         // server url stays external to the instance.
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "name len < 100 truncation intentional"
-        )]
-        let derived_port = 8283u16 + (instance.name.as_str().len() as u16 % 100);
+        let name_len = u16::try_from(instance.name.as_str().len()).unwrap_or(u16::MAX);
+        let derived_port = 8283u16 + (name_len % 100);
         let derived_url = format!("http://localhost:{derived_port}");
         plan.env_vars
             .push((BASE_URL_ENV_VAR.to_owned(), derived_url));
