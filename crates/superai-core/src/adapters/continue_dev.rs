@@ -91,10 +91,13 @@ impl ContinueDevAdapter {
                     let cfg_json = root.join("config.json");
                     if cfg.exists() {
                         evidence.push(format!("config.yaml found at {}", cfg.display()));
-                        if let Ok(text) = std::fs::read_to_string(&cfg)
-                            && text.contains("models:")
-                        {
-                            evidence.push("config.yaml contains models".to_owned());
+                        match std::fs::read_to_string(&cfg) {
+                            Ok(text) if text.contains("models:") => {
+                                evidence.push("config.yaml contains models".to_owned());
+                            }
+                            Ok(_) => {}
+                            Err(err) => evidence
+                                .push(format!("config unreadable at {}: {err}", cfg.display())),
                         }
                     } else if cfg_json.exists() {
                         evidence.push(format!(

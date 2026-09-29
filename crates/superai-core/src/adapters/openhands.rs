@@ -88,6 +88,23 @@ impl OpenHandsAdapter {
         Some(home.join(".openhands"))
     }
 
+    /// Evidence line for a readable config carrying any marker, or for the
+    /// read failure itself; a readable file without markers stays silent.
+    fn probe_config_markers(
+        path: &Path,
+        markers: &[&str],
+        label: &str,
+        evidence: &mut Vec<String>,
+    ) {
+        match std::fs::read_to_string(path) {
+            Ok(text) if markers.iter().any(|m| text.contains(m)) => {
+                evidence.push(format!("{label} carries an owned marker"));
+            }
+            Ok(_) => {}
+            Err(err) => evidence.push(format!("config unreadable at {}: {err}", path.display())),
+        }
+    }
+
     #[expect(
         clippy::excessive_nesting,
         reason = "detection branches are explicit for evidence"
@@ -105,11 +122,12 @@ impl OpenHandsAdapter {
                             "V1 agent_settings.json found at {}",
                             v1_settings.display()
                         ));
-                        if let Ok(text) = std::fs::read_to_string(&v1_settings)
-                            && (text.contains("\"llm\"") || text.contains("model"))
-                        {
-                            evidence.push("agent_settings.json contains llm/model".to_owned());
-                        }
+                        Self::probe_config_markers(
+                            &v1_settings,
+                            &["\"llm\"", "model"],
+                            "agent_settings.json",
+                            evidence,
+                        );
                     } else {
                         evidence.push(format!(
                             "V1 agent_settings.json missing at {}",
@@ -119,11 +137,12 @@ impl OpenHandsAdapter {
                     let v0_global = root.join("config.toml");
                     if v0_global.exists() {
                         evidence.push(format!("V0 config.toml found at {}", v0_global.display()));
-                        if let Ok(text) = std::fs::read_to_string(&v0_global)
-                            && (text.contains("[llm]") || text.contains("[core]"))
-                        {
-                            evidence.push("V0 config.toml contains [llm]/[core]".to_owned());
-                        }
+                        Self::probe_config_markers(
+                            &v0_global,
+                            &["[llm]", "[core]"],
+                            "V0 config.toml",
+                            evidence,
+                        );
                     } else {
                         evidence.push(format!("V0 config.toml missing at {}", v0_global.display()));
                     }

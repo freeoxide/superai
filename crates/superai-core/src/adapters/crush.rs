@@ -95,10 +95,16 @@ impl CrushAdapter {
                     let crush_json = root.join("crush.json");
                     if crushrc.exists() {
                         evidence.push(format!("global crushrc found at {}", crushrc.display()));
-                        if let Ok(text) = std::fs::read_to_string(&crushrc)
-                            && (text.contains("provider add") || text.contains("model large"))
-                        {
-                            evidence.push("global crushrc contains provider/model".to_owned());
+                        match std::fs::read_to_string(&crushrc) {
+                            Ok(text)
+                                if (text.contains("provider add")
+                                    || text.contains("model large")) =>
+                            {
+                                evidence.push("global crushrc contains provider/model".to_owned());
+                            }
+                            Ok(_) => {}
+                            Err(err) => evidence
+                                .push(format!("config unreadable at {}: {err}", crushrc.display())),
                         }
                     } else {
                         evidence.push(format!("global crushrc missing at {}", crushrc.display()));

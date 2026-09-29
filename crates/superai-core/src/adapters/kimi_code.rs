@@ -94,11 +94,18 @@ impl KimiCodeAdapter {
                     let cfg = Self::config_path_for_root(&root);
                     if cfg.exists() {
                         evidence.push(format!("config.toml found at {}", cfg.display()));
-                        if let Ok(text) = std::fs::read_to_string(&cfg)
-                            && (text.contains("default_model") || text.contains("[providers"))
-                        {
-                            evidence
-                                .push("config.toml contains default_model/providers".to_owned());
+                        match std::fs::read_to_string(&cfg) {
+                            Ok(text)
+                                if (text.contains("default_model")
+                                    || text.contains("[providers")) =>
+                            {
+                                evidence.push(
+                                    "config.toml contains default_model/providers".to_owned(),
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(err) => evidence
+                                .push(format!("config unreadable at {}: {err}", cfg.display())),
                         }
                     } else {
                         evidence.push(format!("config.toml missing at {}", cfg.display()));
@@ -456,10 +463,8 @@ mod tests {
     #[test]
     fn adapter_identity() {
         let a = adapter();
-        // Constructor wiring plus catalog registration: an id the catalog
-        // does not know can never reconcile with detection or instances.
-        // The catalog entry predates the id shortening and is keyed by the
-        // ledger alias, not the current harness id.
+        // Catalog registration via the ledger alias: the entry predates the
+        // id shortening, and an unknown id can never reconcile instances.
         let entry = crate::harness_catalog::find_by_id(HARNESS_ID_LEDGER_ALIAS).unwrap();
         assert_eq!(a.id().as_str(), HARNESS_ID_STR);
         assert_eq!(entry.id, HARNESS_ID_LEDGER_ALIAS);

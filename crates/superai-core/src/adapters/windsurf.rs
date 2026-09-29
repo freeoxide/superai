@@ -101,10 +101,14 @@ impl WindsurfAdapter {
             Some(p) => {
                 if p.exists() {
                     evidence.push(format!("mcp_config.json exists at {}", p.display()));
-                    if let Ok(text) = std::fs::read_to_string(&p)
-                        && text.contains("mcpServers")
-                    {
-                        evidence.push("mcp_config.json contains mcpServers".to_owned());
+                    match std::fs::read_to_string(&p) {
+                        Ok(text) if text.contains("mcpServers") => {
+                            evidence.push("mcp_config.json contains mcpServers".to_owned());
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            evidence.push(format!("config unreadable at {}: {err}", p.display()));
+                        }
                     }
                 } else {
                     evidence.push(format!("mcp_config.json missing at {}", p.display()));

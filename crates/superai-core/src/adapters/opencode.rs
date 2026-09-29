@@ -106,10 +106,15 @@ impl OpenCodeAdapter {
                     let cfg_jc = root.join("opencode.jsonc");
                     if cfg.exists() {
                         evidence.push(format!("opencode.json found at {}", cfg.display()));
-                        if let Ok(text) = std::fs::read_to_string(&cfg)
-                            && (text.contains("\"$schema\"") || text.contains("$schema"))
-                        {
-                            evidence.push("opencode.json contains $schema marker".to_owned());
+                        match std::fs::read_to_string(&cfg) {
+                            Ok(text)
+                                if (text.contains("\"$schema\"") || text.contains("$schema")) =>
+                            {
+                                evidence.push("opencode.json contains $schema marker".to_owned());
+                            }
+                            Ok(_) => {}
+                            Err(err) => evidence
+                                .push(format!("config unreadable at {}: {err}", cfg.display())),
                         }
                     } else if cfg_jc.exists() {
                         evidence.push(format!("opencode.jsonc found at {}", cfg_jc.display()));

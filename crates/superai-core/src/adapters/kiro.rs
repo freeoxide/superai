@@ -19,9 +19,8 @@ pub const HARNESS_ID_STR: &str = "kiro";
 /// Name shown for this harness in listings and errors.
 pub const DISPLAY_NAME: &str = "Kiro CLI/IDE";
 
-/// Binary name resolved on PATH during detection; the only binary the
-/// vendor installer ships.
-/// (live-verified 2026-09-18; the installer materializes no bare `kiro`).
+/// Binary name resolved on PATH during detection; live-verified 2026-09-18
+/// as the only binary the installer ships (no bare `kiro`).
 pub const EXECUTABLE: &str = "kiro-cli";
 
 /// Alias: bare `kiro` exists only where a wrapper or bridge provides it.

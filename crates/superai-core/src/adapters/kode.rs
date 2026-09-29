@@ -94,12 +94,18 @@ impl KodeAdapter {
                     let cfg = Self::config_path_for_root(&root);
                     if cfg.exists() {
                         evidence.push(format!("config.json found at {}", cfg.display()));
-                        if let Ok(text) = std::fs::read_to_string(&cfg)
-                            && (text.contains("modelProfiles") || text.contains("modelPointers"))
-                        {
-                            evidence.push(
-                                "config.json contains modelProfiles/modelPointers".to_owned(),
-                            );
+                        match std::fs::read_to_string(&cfg) {
+                            Ok(text)
+                                if (text.contains("modelProfiles")
+                                    || text.contains("modelPointers")) =>
+                            {
+                                evidence.push(
+                                    "config.json contains modelProfiles/modelPointers".to_owned(),
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(err) => evidence
+                                .push(format!("config unreadable at {}: {err}", cfg.display())),
                         }
                     } else {
                         // Legacy flat-file location, pre-relocation installs.

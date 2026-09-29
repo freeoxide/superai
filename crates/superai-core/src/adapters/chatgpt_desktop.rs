@@ -85,12 +85,16 @@ impl ChatGptDesktopAdapter {
                 let config = root.join("config.toml");
                 if config.exists() {
                     evidence.push(format!("shared config.toml exists at {}", config.display()));
-                    if let Ok(text) = std::fs::read_to_string(&config)
-                        && text.contains("desktop.")
-                    {
-                        evidence.push(
-                            "config.toml carries desktop.* keys (app-written marker)".to_owned(),
-                        );
+                    match std::fs::read_to_string(&config) {
+                        Ok(text) if text.contains("desktop.") => {
+                            evidence.push(
+                                "config.toml carries desktop.* keys (app-written marker)"
+                                    .to_owned(),
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(err) => evidence
+                            .push(format!("config unreadable at {}: {err}", config.display())),
                     }
                 } else {
                     evidence.push(format!(

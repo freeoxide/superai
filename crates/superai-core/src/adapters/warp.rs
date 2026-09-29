@@ -136,10 +136,15 @@ impl WarpAdapter {
             Some(path) => {
                 if path.exists() {
                     evidence.push(format!("CLI settings.toml found at {}", path.display()));
-                    if let Ok(text) = std::fs::read_to_string(&path)
-                        && (text.contains("[appearance]") || text.contains("theme"))
-                    {
-                        evidence.push("CLI settings.toml contains appearance/theme".to_owned());
+                    match std::fs::read_to_string(&path) {
+                        Ok(text) if (text.contains("[appearance]") || text.contains("theme")) => {
+                            evidence.push("CLI settings.toml contains appearance/theme".to_owned());
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            evidence
+                                .push(format!("config unreadable at {}: {err}", path.display()));
+                        }
                     }
                 } else {
                     evidence.push(format!("CLI settings.toml missing at {}", path.display()));
@@ -154,10 +159,15 @@ impl WarpAdapter {
                     "global .mcp.json found at {}",
                     global_mcp.display()
                 ));
-                if let Ok(text) = std::fs::read_to_string(&global_mcp)
-                    && text.contains("mcpServers")
-                {
-                    evidence.push("global .mcp.json contains mcpServers".to_owned());
+                match std::fs::read_to_string(&global_mcp) {
+                    Ok(text) if text.contains("mcpServers") => {
+                        evidence.push("global .mcp.json contains mcpServers".to_owned());
+                    }
+                    Ok(_) => {}
+                    Err(err) => evidence.push(format!(
+                        "config unreadable at {}: {err}",
+                        global_mcp.display()
+                    )),
                 }
             } else {
                 evidence.push(format!(

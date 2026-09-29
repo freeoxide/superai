@@ -141,16 +141,29 @@ impl PlandexAdapter {
             Some(path) => {
                 if path.exists() {
                     evidence.push(format!("custom models JSON found at {}", path.display()));
-                    if let Ok(text) = std::fs::read_to_string(&path)
-                        && (text.contains("\"providers\"") || text.contains("modelPacks"))
-                    {
-                        evidence
-                            .push("custom models JSON contains providers/modelPacks".to_owned());
+                    match std::fs::read_to_string(&path) {
+                        Ok(text)
+                            if (text.contains("\"providers\"") || text.contains("modelPacks")) =>
+                        {
+                            evidence.push(
+                                "custom models JSON contains providers/modelPacks".to_owned(),
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            evidence
+                                .push(format!("config unreadable at {}: {err}", path.display()));
+                        }
                     }
-                    if let Ok(text) = std::fs::read_to_string(&path)
-                        && text.contains("$schema")
-                    {
-                        evidence.push("custom models JSON contains $schema".to_owned());
+                    match std::fs::read_to_string(&path) {
+                        Ok(text) if text.contains("$schema") => {
+                            evidence.push("custom models JSON contains $schema".to_owned());
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            evidence
+                                .push(format!("config unreadable at {}: {err}", path.display()));
+                        }
                     }
                 } else {
                     evidence.push(format!("custom models JSON missing at {}", path.display()));

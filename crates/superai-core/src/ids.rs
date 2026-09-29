@@ -204,10 +204,8 @@ define_id!(
 define_id!(BackupId, "BackupId", "Identifier for a backup artifact.");
 
 impl HarnessId {
-    /// Build from a compile-time constant (`HARNESS_ID_STR` literals).
-    /// Validity of every such literal is pinned by
-    /// `harness_catalog::all_ids_are_valid_harness_ids`, so construction
-    /// skips per-call validation.
+    /// Build from a compile-time constant; only a debug assertion checks the
+    /// value here, so the literals themselves are pinned by the decl tests.
     pub(crate) fn from_validated_const(value: &'static str) -> Self {
         debug_assert!(validate("HarnessId", value).is_ok());
         Self(value.to_owned())

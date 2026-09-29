@@ -87,10 +87,15 @@ impl ForgeAdapter {
                     let cfg = Self::config_path_for_root(&root);
                     if cfg.exists() {
                         evidence.push(format!(".forge.toml found at {}", cfg.display()));
-                        if let Ok(text) = std::fs::read_to_string(&cfg)
-                            && (text.contains("providers") || text.contains("[session"))
-                        {
-                            evidence.push(".forge.toml contains providers/session".to_owned());
+                        match std::fs::read_to_string(&cfg) {
+                            Ok(text)
+                                if (text.contains("providers") || text.contains("[session")) =>
+                            {
+                                evidence.push(".forge.toml contains providers/session".to_owned());
+                            }
+                            Ok(_) => {}
+                            Err(err) => evidence
+                                .push(format!("config unreadable at {}: {err}", cfg.display())),
                         }
                     } else {
                         evidence.push(format!(".forge.toml missing at {}", cfg.display()));

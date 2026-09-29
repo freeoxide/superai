@@ -84,11 +84,18 @@ impl SculptorAdapter {
             Some(path) => {
                 if path.exists() {
                     evidence.push(format!("global env exists at {}", path.display()));
-                    if let Ok(text) = std::fs::read_to_string(&path)
-                        && (text.contains("ANTHROPIC_BASE_URL")
-                            || text.contains("ANTHROPIC_API_KEY"))
-                    {
-                        evidence.push("global env contains ANTHROPIC_*".to_owned());
+                    match std::fs::read_to_string(&path) {
+                        Ok(text)
+                            if text.contains("ANTHROPIC_BASE_URL")
+                                || text.contains("ANTHROPIC_API_KEY") =>
+                        {
+                            evidence.push("global env contains ANTHROPIC_*".to_owned());
+                        }
+                        Ok(_) => {}
+                        Err(err) => evidence.push(format!(
+                            "global env unreadable at {}: {err}",
+                            path.display()
+                        )),
                     }
                 } else {
                     evidence.push(format!("global env missing at {}", path.display()));

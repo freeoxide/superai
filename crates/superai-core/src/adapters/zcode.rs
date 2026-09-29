@@ -92,10 +92,17 @@ impl ZcodeAdapter {
             Some(path) => {
                 if path.exists() {
                     evidence.push(format!("config exists at {}", path.display()));
-                    if let Ok(text) = std::fs::read_to_string(&path)
-                        && (text.contains("\"provider\"") || text.contains("\"options\""))
-                    {
-                        evidence.push("config contains provider/options marker".to_owned());
+                    match std::fs::read_to_string(&path) {
+                        Ok(text)
+                            if (text.contains("\"provider\"") || text.contains("\"options\"")) =>
+                        {
+                            evidence.push("config contains provider/options marker".to_owned());
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            evidence
+                                .push(format!("config unreadable at {}: {err}", path.display()));
+                        }
                     }
                 } else {
                     evidence.push(format!("config missing at {}", path.display()));

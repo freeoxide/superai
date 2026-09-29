@@ -97,10 +97,15 @@ impl AmpAdapter {
                     let settings_jc = root.join("settings.jsonc");
                     if settings.exists() {
                         evidence.push(format!("settings.json found at {}", settings.display()));
-                        if let Ok(text) = std::fs::read_to_string(&settings)
-                            && text.contains("amp.")
-                        {
-                            evidence.push("settings.json contains amp. prefix".to_owned());
+                        match std::fs::read_to_string(&settings) {
+                            Ok(text) if text.contains("amp.") => {
+                                evidence.push("settings.json contains amp. prefix".to_owned());
+                            }
+                            Ok(_) => {}
+                            Err(err) => evidence.push(format!(
+                                "config unreadable at {}: {err}",
+                                settings.display()
+                            )),
                         }
                     } else if settings_jc.exists() {
                         evidence.push(format!("settings.jsonc found at {}", settings_jc.display()));

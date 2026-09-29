@@ -138,10 +138,15 @@ impl CursorAdapter {
                     let alt = root.join("cli.json");
                     if cli_config.exists() {
                         evidence.push(format!("cli-config.json found at {}", cli_config.display()));
-                        if let Ok(text) = std::fs::read_to_string(&cli_config)
-                            && text.contains("permissions")
-                        {
-                            evidence.push("cli-config.json contains permissions".to_owned());
+                        match std::fs::read_to_string(&cli_config) {
+                            Ok(text) if text.contains("permissions") => {
+                                evidence.push("cli-config.json contains permissions".to_owned());
+                            }
+                            Ok(_) => {}
+                            Err(err) => evidence.push(format!(
+                                "config unreadable at {}: {err}",
+                                cli_config.display()
+                            )),
                         }
                     } else if alt.exists() {
                         evidence.push(format!("cli.json found at {}", alt.display()));

@@ -86,10 +86,17 @@ impl CopilotCliAdapter {
                     let settings = Self::settings_path_for_root(&root);
                     if settings.exists() {
                         evidence.push(format!("settings.json found at {}", settings.display()));
-                        if let Ok(text) = std::fs::read_to_string(&settings)
-                            && (text.contains("\"$schema\"") || text.contains("$schema"))
-                        {
-                            evidence.push("settings.json contains $schema marker".to_owned());
+                        match std::fs::read_to_string(&settings) {
+                            Ok(text)
+                                if (text.contains("\"$schema\"") || text.contains("$schema")) =>
+                            {
+                                evidence.push("settings.json contains $schema marker".to_owned());
+                            }
+                            Ok(_) => {}
+                            Err(err) => evidence.push(format!(
+                                "config unreadable at {}: {err}",
+                                settings.display()
+                            )),
                         }
                     } else {
                         evidence.push(format!("settings.json missing at {}", settings.display()));

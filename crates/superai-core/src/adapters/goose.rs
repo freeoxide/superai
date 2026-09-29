@@ -92,11 +92,18 @@ impl GooseAdapter {
                     let cfg = Self::config_path_for_root(&root);
                     if cfg.exists() {
                         evidence.push(format!("config.yaml found at {}", cfg.display()));
-                        if let Ok(text) = std::fs::read_to_string(&cfg)
-                            && (text.contains("GOOSE_PROVIDER") || text.contains("extensions"))
-                        {
-                            evidence
-                                .push("config.yaml contains GOOSE_PROVIDER/extensions".to_owned());
+                        match std::fs::read_to_string(&cfg) {
+                            Ok(text)
+                                if (text.contains("GOOSE_PROVIDER")
+                                    || text.contains("extensions")) =>
+                            {
+                                evidence.push(
+                                    "config.yaml contains GOOSE_PROVIDER/extensions".to_owned(),
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(err) => evidence
+                                .push(format!("config unreadable at {}: {err}", cfg.display())),
                         }
                     } else {
                         evidence.push(format!("config.yaml missing at {}", cfg.display()));

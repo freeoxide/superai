@@ -94,16 +94,22 @@ impl ZedAcpAdapter {
             Some(p) => {
                 if p.exists() {
                     evidence.push(format!("settings.json exists at {}", p.display()));
-                    if let Ok(text) = std::fs::read_to_string(&p) {
-                        if text.contains("agent_servers") {
-                            evidence.push("settings.json contains agent_servers".to_owned());
+                    match std::fs::read_to_string(&p) {
+                        Ok(text) => {
+                            if text.contains("agent_servers") {
+                                evidence.push("settings.json contains agent_servers".to_owned());
+                            }
+                            if text.contains("context_servers") {
+                                evidence.push("settings.json contains context_servers".to_owned());
+                            }
+                            if text.contains("language_models") {
+                                evidence.push("settings.json contains language_models".to_owned());
+                            }
                         }
-                        if text.contains("context_servers") {
-                            evidence.push("settings.json contains context_servers".to_owned());
-                        }
-                        if text.contains("language_models") {
-                            evidence.push("settings.json contains language_models".to_owned());
-                        }
+                        Err(err) => evidence.push(format!(
+                            "settings.json unreadable at {}: {err}",
+                            p.display()
+                        )),
                     }
                 } else {
                     evidence.push(format!("settings.json missing at {}", p.display()));

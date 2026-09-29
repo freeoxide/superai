@@ -90,10 +90,13 @@ impl MimoAdapter {
                     let cfg_json = Self::config_json_path_for_root(&root);
                     if cfg.exists() {
                         evidence.push(format!("mimocode.jsonc found at {}", cfg.display()));
-                        if let Ok(text) = std::fs::read_to_string(&cfg)
-                            && (text.contains("model") || text.contains("provider"))
-                        {
-                            evidence.push("mimocode.jsonc contains model/provider".to_owned());
+                        match std::fs::read_to_string(&cfg) {
+                            Ok(text) if (text.contains("model") || text.contains("provider")) => {
+                                evidence.push("mimocode.jsonc contains model/provider".to_owned());
+                            }
+                            Ok(_) => {}
+                            Err(err) => evidence
+                                .push(format!("config unreadable at {}: {err}", cfg.display())),
                         }
                     } else if cfg_json.exists() {
                         evidence.push(format!("mimocode.json found at {}", cfg_json.display()));

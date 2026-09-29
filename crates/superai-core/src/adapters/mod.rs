@@ -1,10 +1,11 @@
 //! Harness adapters: concrete implementations.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::adapter::DetectionConfidence;
 use crate::instance::Instance;
@@ -163,32 +164,92 @@ pub(crate) fn parse_version_output(output: &str) -> Option<String> {
 }
 
 /// Run `<binary> args...` under `budget` and return the combined stdout and
-/// stderr. A hung child outlives the budget; its thread dies with it.
+/// stderr; a child still running at the budget is killed and reaped.
 pub(crate) fn run_capturing(binary: &Path, args: &[&str], budget: Duration) -> Option<String> {
     let owned = binary.to_path_buf();
     let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
     let (tx, rx) = mpsc::channel();
     // The send Result is the closure's value: a timed-out caller has dropped
     // the receiver, and that failure is expected, not an error to log.
-    thread::spawn(move || {
-        let mut command = Command::new(&owned);
-        for arg in &args {
-            command.arg(arg);
-        }
-        let output = command
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output();
-        tx.send(output)
-    });
-    let Ok(Ok(output)) = rx.recv_timeout(budget) else {
-        return None;
+    thread::spawn(move || tx.send(run_probe(&owned, &args, budget)));
+    // A timeout here never leaves the probe running: the worker kills the
+    // child at its own identical deadline.
+    rx.recv_timeout(budget).unwrap_or_default()
+}
+
+/// Drain `pipe` into `buf`; a read error is logged, not silently dropped.
+fn drain_pipe(pipe: Option<impl Read>, buf: &mut Vec<u8>, binary: &Path, side: &str) {
+    let Some(mut pipe) = pipe else {
+        return;
     };
-    if !output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
+    if let Err(err) = pipe.read_to_end(buf) {
+        eprintln!(
+            "superai-core: probe of {} lost {side} output: {err}",
+            binary.display()
+        );
+    }
+}
+
+/// Spawn, poll until exit or `deadline` (kill at the deadline), reap, and
+/// merge the captured output. `None` on spawn failure, timeout, or a failing
+/// probe with no output.
+fn run_probe(binary: &Path, args: &[String], budget: Duration) -> Option<String> {
+    let spawned = Command::new(binary)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+    let mut child: Child = match spawned {
+        Ok(child) => child,
+        Err(err) => {
+            eprintln!(
+                "superai-core: probe spawn failed for {}: {err}",
+                binary.display()
+            );
+            return None;
+        }
+    };
+    let deadline = Instant::now() + budget;
+    let status: ExitStatus = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => {
+                if let Err(err) = child.kill() {
+                    eprintln!(
+                        "superai-core: killing timed-out probe of {}: {err}",
+                        binary.display()
+                    );
+                }
+                break match child.wait() {
+                    Ok(status) => status,
+                    Err(err) => {
+                        eprintln!(
+                            "superai-core: reaping killed probe of {}: {err}",
+                            binary.display()
+                        );
+                        return None;
+                    }
+                };
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Err(err) => {
+                eprintln!(
+                    "superai-core: probe of {} wait failed: {err}",
+                    binary.display()
+                );
+                return None;
+            }
+        }
+    };
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    drain_pipe(child.stdout.take(), &mut out, binary, "stdout");
+    drain_pipe(child.stderr.take(), &mut err, binary, "stderr");
+    if !status.success() && out.is_empty() && err.is_empty() {
         return None;
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&out);
+    let stderr = String::from_utf8_lossy(&err);
     Some(if stdout.trim().is_empty() {
         stderr.into_owned()
     } else if stderr.trim().is_empty() {
@@ -272,18 +333,7 @@ pub(crate) fn all_operations_full() -> Vec<(String, AdapterSupport)> {
     .collect()
 }
 
-/// Skill modes, copy-first preference: `relink_skills` takes the first mode.
-pub(crate) fn skill_modes_copy_first() -> Vec<crate::adapter::SkillMode> {
-    use crate::adapter::SkillMode;
-    vec![
-        SkillMode::CopySelected,
-        SkillMode::LinkAll,
-        SkillMode::LinkSelected,
-    ]
-}
-
-/// Skill modes, link-first preference: harnesses whose skills live in a
-/// registry the copy would detach from.
+/// Skill modes, link-first: `relink_skills` takes the first mode.
 pub(crate) fn skill_modes_link_first() -> Vec<crate::adapter::SkillMode> {
     use crate::adapter::SkillMode;
     vec![
@@ -420,6 +470,46 @@ mod decl_tests {
                 );
             }
         }
+    }
+
+    /// A probe past its budget returns None and the child is killed, not
+    /// left running: the /proc sweep fails if any `sleep 30` probe survives.
+    #[test]
+    #[cfg(unix)]
+    fn run_capturing_kills_a_hung_child() {
+        let out = super::run_capturing(
+            std::path::Path::new("sh"),
+            &["-c", "sleep 30"],
+            std::time::Duration::from_millis(150),
+        );
+        assert!(out.is_none(), "a hung probe must yield None");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        for entry in std::fs::read_dir("/proc").unwrap() {
+            let entry = entry.unwrap();
+            let cmd = std::fs::read_to_string(entry.path().join("cmdline")).unwrap_or_default();
+            let argv: Vec<&str> = cmd.split('\0').filter(|a| !a.is_empty()).collect();
+            assert!(
+                argv != ["sh", "-c", "sleep 30"],
+                "timed-out probe child survived: {argv:?}"
+            );
+        }
+    }
+
+    /// Runtime backstop for `from_validated_const`: every adapter literal,
+    /// including kimi-code's alias-keyed catalog entry, passes validation.
+    #[test]
+    fn adapter_harness_id_literals_validate() {
+        for adapter in harness_catalog::all_adapters() {
+            let id = adapter.id();
+            assert!(
+                crate::ids::HarnessId::new(id.as_str()).is_ok(),
+                "catalog id `{id}` must validate"
+            );
+        }
+        assert!(
+            crate::ids::HarnessId::new(crate::adapters::kimi_code::HARNESS_ID_STR).is_ok(),
+            "kimi-code literal must validate"
+        );
     }
 
     /// Detection is a pure function of machine state: two runs must agree.

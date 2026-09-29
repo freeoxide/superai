@@ -93,10 +93,13 @@ impl HermesAdapter {
                     let cfg = Self::config_path_for_root(&root);
                     if cfg.exists() {
                         evidence.push(format!("config.yaml found at {}", cfg.display()));
-                        if let Ok(text) = std::fs::read_to_string(&cfg)
-                            && (text.contains("model:") || text.contains("providers"))
-                        {
-                            evidence.push("config.yaml contains model/providers".to_owned());
+                        match std::fs::read_to_string(&cfg) {
+                            Ok(text) if (text.contains("model:") || text.contains("providers")) => {
+                                evidence.push("config.yaml contains model/providers".to_owned());
+                            }
+                            Ok(_) => {}
+                            Err(err) => evidence
+                                .push(format!("config unreadable at {}: {err}", cfg.display())),
                         }
                     } else {
                         evidence.push(format!("config.yaml missing at {}", cfg.display()));

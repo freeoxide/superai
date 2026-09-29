@@ -71,10 +71,14 @@ impl AiderAdapter {
             let yml = home.join(".aider.conf.yml");
             if yml.exists() {
                 evidence.push(format!("yaml config exists at {}", yml.display()));
-                if let Ok(text) = std::fs::read_to_string(&yml)
-                    && text.contains("model:")
-                {
-                    evidence.push("yaml config contains model key".to_owned());
+                match std::fs::read_to_string(&yml) {
+                    Ok(text) if text.contains("model:") => {
+                        evidence.push("yaml config contains model key".to_owned());
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        evidence.push(format!("config unreadable at {}: {err}", yml.display()));
+                    }
                 }
             } else {
                 evidence.push(format!("yaml config missing at {}", yml.display()));

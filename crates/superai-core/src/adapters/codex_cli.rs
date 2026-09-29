@@ -92,16 +92,23 @@ impl CodexCliAdapter {
                     let config = Self::config_path_for_root(&root);
                     if config.exists() {
                         evidence.push(format!("config.toml found at {}", config.display()));
-                        if let Ok(text) = std::fs::read_to_string(&config) {
-                            if text.contains("model =") || text.contains("model_provider") {
-                                evidence.push("config.toml contains model keys".to_owned());
+                        match std::fs::read_to_string(&config) {
+                            Ok(text) => {
+                                if text.contains("model =") || text.contains("model_provider") {
+                                    evidence.push("config.toml contains model keys".to_owned());
+                                }
+                                if text.contains("[model_providers") {
+                                    evidence
+                                        .push("config.toml contains model_providers".to_owned());
+                                }
+                                if text.contains("[mcp_servers") {
+                                    evidence.push("config.toml contains mcp_servers".to_owned());
+                                }
                             }
-                            if text.contains("[model_providers") {
-                                evidence.push("config.toml contains model_providers".to_owned());
-                            }
-                            if text.contains("[mcp_servers") {
-                                evidence.push("config.toml contains mcp_servers".to_owned());
-                            }
+                            Err(err) => evidence.push(format!(
+                                "config.toml unreadable at {}: {err}",
+                                config.display()
+                            )),
                         }
                     } else {
                         evidence.push(format!("config.toml missing at {}", config.display()));
@@ -450,7 +457,10 @@ impl Adapter for CodexCliAdapter {
     }
 
     fn supported_skill_modes(&self) -> Vec<crate::adapter::SkillMode> {
-        super::skill_modes_copy_first()
+        vec![
+            crate::adapter::SkillMode::LinkSelected,
+            crate::adapter::SkillMode::CopySelected,
+        ]
     }
 
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {

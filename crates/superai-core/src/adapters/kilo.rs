@@ -118,10 +118,13 @@ impl KiloAdapter {
                     let global_json = root.join("kilo.json");
                     if global.exists() {
                         evidence.push(format!("kilo.jsonc found at {}", global.display()));
-                        if let Ok(text) = std::fs::read_to_string(&global)
-                            && text.contains("mcp")
-                        {
-                            evidence.push("kilo.jsonc contains mcp".to_owned());
+                        match std::fs::read_to_string(&global) {
+                            Ok(text) if text.contains("mcp") => {
+                                evidence.push("kilo.jsonc contains mcp".to_owned());
+                            }
+                            Ok(_) => {}
+                            Err(err) => evidence
+                                .push(format!("config unreadable at {}: {err}", global.display())),
                         }
                     } else if global_json.exists() {
                         evidence.push(format!("kilo.json found at {}", global_json.display()));

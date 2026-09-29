@@ -88,12 +88,21 @@ impl IflowAdapter {
                             "user settings.json found at {}",
                             settings.display()
                         ));
-                        if let Ok(text) = std::fs::read_to_string(&settings)
-                            && (text.contains("selectedAuthType") || text.contains("apiKey"))
-                        {
-                            evidence.push(
-                                "user settings.json contains selectedAuthType/apiKey".to_owned(),
-                            );
+                        match std::fs::read_to_string(&settings) {
+                            Ok(text)
+                                if (text.contains("selectedAuthType")
+                                    || text.contains("apiKey")) =>
+                            {
+                                evidence.push(
+                                    "user settings.json contains selectedAuthType/apiKey"
+                                        .to_owned(),
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(err) => evidence.push(format!(
+                                "config unreadable at {}: {err}",
+                                settings.display()
+                            )),
                         }
                     } else {
                         evidence.push(format!(

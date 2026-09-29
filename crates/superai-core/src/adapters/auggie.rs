@@ -83,10 +83,15 @@ impl AuggieAdapter {
                     let settings = root.join("settings.json");
                     if settings.exists() {
                         evidence.push(format!("settings.json found at {}", settings.display()));
-                        if let Ok(text) = std::fs::read_to_string(&settings)
-                            && text.contains("mcpServers")
-                        {
-                            evidence.push("settings.json contains mcpServers".to_owned());
+                        match std::fs::read_to_string(&settings) {
+                            Ok(text) if text.contains("mcpServers") => {
+                                evidence.push("settings.json contains mcpServers".to_owned());
+                            }
+                            Ok(_) => {}
+                            Err(err) => evidence.push(format!(
+                                "config unreadable at {}: {err}",
+                                settings.display()
+                            )),
                         }
                     } else {
                         evidence.push(format!("settings.json missing at {}", settings.display()));

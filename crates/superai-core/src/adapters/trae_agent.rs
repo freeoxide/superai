@@ -79,10 +79,15 @@ impl TraeAgentAdapter {
         let default_path = Self::default_config_path();
         if default_path.exists() {
             evidence.push(format!("config file exists at {}", default_path.display()));
-            if let Ok(text) = std::fs::read_to_string(&default_path)
-                && text.contains("model_providers")
-            {
-                evidence.push("config contains model_providers".to_owned());
+            match std::fs::read_to_string(&default_path) {
+                Ok(text) if text.contains("model_providers") => {
+                    evidence.push("config contains model_providers".to_owned());
+                }
+                Ok(_) => {}
+                Err(err) => evidence.push(format!(
+                    "config unreadable at {}: {err}",
+                    default_path.display()
+                )),
             }
         } else {
             evidence.push(format!("config file missing at {}", default_path.display()));

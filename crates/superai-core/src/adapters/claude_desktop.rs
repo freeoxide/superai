@@ -122,10 +122,13 @@ impl ClaudeDesktopAdapter {
                 let config = root.join(CONFIG_FILE);
                 if config.exists() {
                     evidence.push(format!("config exists at {}", config.display()));
-                    if let Ok(text) = std::fs::read_to_string(&config)
-                        && text.contains("\"mcpServers\"")
-                    {
-                        evidence.push("config contains mcpServers".to_owned());
+                    match std::fs::read_to_string(&config) {
+                        Ok(text) if text.contains("\"mcpServers\"") => {
+                            evidence.push("config contains mcpServers".to_owned());
+                        }
+                        Ok(_) => {}
+                        Err(err) => evidence
+                            .push(format!("config unreadable at {}: {err}", config.display())),
                     }
                 } else if root.exists() {
                     evidence.push(format!(

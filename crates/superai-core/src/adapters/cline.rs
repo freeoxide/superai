@@ -156,12 +156,20 @@ impl ClineAdapter {
                         if providers.exists() {
                             evidence
                                 .push(format!("providers.json found at {}", providers.display()));
-                            if let Ok(text) = std::fs::read_to_string(&providers)
-                                && (text.contains("apiProvider") || text.contains("mcpServers"))
-                            {
-                                evidence.push(
-                                    "providers.json contains apiProvider/mcpServers".to_owned(),
-                                );
+                            match std::fs::read_to_string(&providers) {
+                                Ok(text)
+                                    if (text.contains("apiProvider")
+                                        || text.contains("mcpServers")) =>
+                                {
+                                    evidence.push(
+                                        "providers.json contains apiProvider/mcpServers".to_owned(),
+                                    );
+                                }
+                                Ok(_) => {}
+                                Err(err) => evidence.push(format!(
+                                    "config unreadable at {}: {err}",
+                                    providers.display()
+                                )),
                             }
                         } else {
                             evidence
@@ -236,10 +244,14 @@ impl ClineAdapter {
                 for cand in candidates {
                     if cand.exists() {
                         evidence.push(format!("VS Code settings.json found at {}", cand.display()));
-                        if let Ok(text) = std::fs::read_to_string(&cand)
-                            && text.contains("cline.")
-                        {
-                            evidence.push("VS Code settings.json contains cline.* keys".to_owned());
+                        match std::fs::read_to_string(&cand) {
+                            Ok(text) if text.contains("cline.") => {
+                                evidence
+                                    .push("VS Code settings.json contains cline.* keys".to_owned());
+                            }
+                            Ok(_) => {}
+                            Err(err) => evidence
+                                .push(format!("config unreadable at {}: {err}", cand.display())),
                         }
                     }
                 }
@@ -642,7 +654,10 @@ impl Adapter for ClineAdapter {
     }
 
     fn supported_skill_modes(&self) -> Vec<crate::adapter::SkillMode> {
-        super::skill_modes_copy_first()
+        vec![
+            crate::adapter::SkillMode::LinkSelected,
+            crate::adapter::SkillMode::CopySelected,
+        ]
     }
 
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
