@@ -326,9 +326,8 @@ pub fn platform_gate_for_adapter(adapter: &dyn Adapter) -> PlatformGate {
     }
 }
 
-/// Required `FailurePoint` variants for the QAL-06 matrix; the list is
-/// intentionally exhaustive, CI fails if `failure.rs` drops one. Test-side
-/// consumers iterate it (failure.rs and this module).
+/// Required `FailurePoint` variants for the QAL-06 matrix; exhaustively
+/// pinned so CI fails if `failure.rs` drops one.
 #[cfg(test)]
 pub(crate) fn required_failure_points() -> Vec<crate::failure::FailurePoint> {
     use crate::failure::FailurePoint;

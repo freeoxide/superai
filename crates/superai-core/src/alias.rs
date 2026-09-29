@@ -882,9 +882,8 @@ fn rollback_wrapper_file(
         }
         Err(_) => return Ok(format!("wrapper {} already absent", path.display())),
     }
-    // A backup from this run is the pre-create state write_wrapper saved.
-    // If the backups cannot be listed, the pre-create state is unknown, so
-    // the wrapper must be left in place rather than deleted.
+    // The backup from this run is the pre-create state; if backups cannot
+    // be listed that state is unknown, so the wrapper stays in place.
     let ours = match superai_config::backup::list_backups(path) {
         Ok(mut all) => {
             all.retain(|b| b.timestamp_millis >= started_millis);

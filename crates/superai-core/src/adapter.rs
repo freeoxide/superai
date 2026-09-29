@@ -1419,9 +1419,8 @@ impl Adapter for GenericAdapter {
     }
 
     fn detection(&self) -> DetectionResult {
-        // Generic adapters do not probe the filesystem; they report unknown
-        // version so callers know to treat the install as absent. The ledger
-        // reason travels in the evidence so the support ceiling is explained.
+        // Generic adapters never probe the filesystem: absent with unknown
+        // version, the ledger reason carried in the evidence to explain it.
         DetectionResult {
             present: InstallPresence::Absent,
             version: None,

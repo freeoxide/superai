@@ -393,8 +393,7 @@ pub fn restore_entry(entry: &BackupEntry) -> Result<()> {
 }
 
 /// Sibling backup files of `original_path` as `(path, millis, suffix)`,
-/// sorted by timestamp then suffix. Reading file names only; contents are
-/// the caller's job.
+/// sorted by timestamp then suffix; name-scan only, contents untouched.
 fn scan_backup_files(original_path: &Path) -> Result<Vec<(PathBuf, u128, String)>> {
     let parent = original_path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = original_path

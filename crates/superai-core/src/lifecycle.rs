@@ -3725,9 +3725,8 @@ pub fn preview_reconfigure_with_home(
                 }
             }
             ReconfigureAction::ReapplyTemplate { template } => {
-                // codec-honesty: JSONC settings refuse, never strip. Absent
-                // settings are template-only content; any other read error
-                // is surfaced, never silently rewritten.
+                // codec-honesty: JSONC settings refuse, never strip; absent
+                // settings are template-only, any other read error surfaces.
                 let current = match std::fs::read(&settings_path) {
                     Ok(bytes) => Some(bytes),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,

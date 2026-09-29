@@ -513,9 +513,8 @@ impl FixedPathProfileStore {
         Ok(out)
     }
 
-    /// Fresh-read the recorded active identity, if any. A file that exists
-    /// but cannot be read or parsed is an error: callers must not confuse
-    /// corruption with "nothing is active".
+    /// Fresh-read the recorded active identity, if any. An existing but
+    /// unreadable or unparsable file is an error, never "nothing active".
     pub fn active_identity(&self) -> Result<Option<ActiveIdentity>> {
         let path = self.active_path();
         let bytes = match std::fs::read(&path) {

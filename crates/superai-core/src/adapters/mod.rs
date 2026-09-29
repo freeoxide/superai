@@ -269,8 +269,7 @@ pub(crate) fn probe_version(binary: &Path) -> Option<String> {
 }
 
 /// The one mirror-exclusion matcher, shared by the adapters' exclusion tests:
-/// exact, trailing `/*` prefix, leading `*.` suffix, and single-star infix
-/// glob patterns.
+/// exact, `/*` prefix, `*.` suffix, and single-star infix glob patterns.
 #[cfg(test)]
 pub(crate) fn exclusion_matches(patterns: &[String], file: &str) -> bool {
     patterns.iter().any(|pat| {
@@ -351,9 +350,8 @@ pub(crate) fn install_presence(binary_found: bool, version_found: bool) -> Insta
     }
 }
 
-/// Shared detection rule: a missing binary is decisive (High) unless leftover
-/// config evidence marks the harness uninstalled (Low); an unparsable version
-/// probe is the only Medium.
+/// Shared detection rule: a missing binary is High unless leftover config
+/// evidence marks the harness uninstalled (Low); unparsable probe is Medium.
 pub(crate) fn detection_confidence(
     binary_found: bool,
     version_found: bool,

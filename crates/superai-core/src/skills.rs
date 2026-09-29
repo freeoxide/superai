@@ -258,7 +258,7 @@ pub struct SkillUpdatePreview {
 /// Consumers report before breaking a link.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillConsumers {
-    /// Skill id.
+    /// Skill whose consumers [`Self::consumers`] reports.
     pub skill_id: SkillId,
     /// Instances/destinations that currently consume the skill via link or copy.
     pub consumers: Vec<Consumer>,
@@ -307,8 +307,6 @@ fn staging_root(tag: &str) -> PathBuf {
     ))
 }
 
-/// Remove a symlink regardless of directory-ness: Windows rejects
-/// `remove_file` on a dir symlink; `remove_dir` removes the link itself.
 /// Hint every symlink-privilege failure must carry: `CopySelected` is the
 /// explicit alternate, never a silent fallback.
 const COPY_SELECTED_HINT: &str = "Use CopySelected as explicit alternate";
@@ -323,6 +321,8 @@ fn is_link_privilege_error(msg: &str) -> bool {
         || msg.contains("requires elevation")
 }
 
+/// Remove a symlink regardless of directory-ness: Windows rejects
+/// `remove_file` on a dir symlink; `remove_dir` removes the link itself.
 fn remove_symlink_any(path: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
@@ -870,10 +870,8 @@ pub fn registry_file_for_root(root: &Path) -> PathBuf {
     root.join(REGISTRY_FILE_NAME)
 }
 
-/// Unmodelled top-level keys from the on-disk registry, freshly read. A
-/// registry that exists but cannot be read or parsed is fatal: the callers'
-/// transactions rewrite this file, and proceeding would silently destroy
-/// those keys.
+/// Unmodelled top-level keys from the on-disk registry, freshly read. An
+/// unreadable registry is fatal: rewriting it would destroy these keys.
 fn foreign_keys_from_disk(root: &Path) -> Result<Map<String, Value>> {
     let registry_file = registry_file_for_root(root);
     if !registry_file.exists() {
@@ -1351,9 +1349,8 @@ impl SkillRegistry {
 
         let registry_file = registry_file_for_root(&self.root);
         let mut foreign_preserved: Map<String, Value> = self.foreign.clone();
-        // Disk keys missing from the in-memory set are picked up here; a
-        // registry that cannot be read or parsed is fatal, because the
-        // transaction below would rewrite it and destroy those keys.
+        // Disk keys missing from the in-memory set are picked up; unreadable
+        // is fatal because the transaction below rewrites the registry.
         for (k, v) in foreign_keys_from_disk(&self.root).inspect_err(|_e| {
             cleanup_staging(&staging_root);
         })? {
@@ -2465,7 +2462,8 @@ fn create_symlink(target: &Path, link: &Path) -> Result<()> {
     }
 }
 
-/// Helper to copy a directory recursively (used for staging, not transaction).
+/// Copy `src` into `dest` for staging: recreated symlinks stay links, files
+/// are copied by content. Callers own any transaction around the staging dir.
 fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
     std::fs::create_dir_all(dest).map_err(|e| CoreError::InvalidPath {
         kind: "copy_dir".to_owned(),
@@ -3356,8 +3354,7 @@ pub fn provenance_path_for(
 }
 
 /// Load the recorded provenance for `(skill, destination)`, if any (EXT-05).
-/// A file that exists but cannot be read or parsed is an error: treating it
-/// as absent would skip the drift guard and overwrite local edits.
+/// Unreadable or unparsable is an error: absence would skip the drift guard.
 fn load_provenance(
     registry_root: &Path,
     skill_id: &SkillId,
@@ -3387,7 +3384,7 @@ fn load_provenance(
 /// Drift preview for re-copying selected skills to a destination (EXT-05).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CopyUpdatePreview {
-    /// Skill id.
+    /// Skill whose re-copy this preview describes.
     pub skill_id: SkillId,
     /// Three-way drift status for the destination.
     pub drift: DriftStatus,

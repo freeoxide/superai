@@ -363,8 +363,6 @@ pub fn find_receipt(
     Ok(None)
 }
 
-/// Whether a version satisfies a requested range/channel: channels always
-/// satisfy; otherwise `semver` `VersionReq` against the detected version.
 /// Package-manager executable for a method; one map shared by the update
 /// and uninstall previews.
 fn executable_for_method(method: &InstallMethodKind) -> &'static str {
@@ -379,9 +377,8 @@ fn executable_for_method(method: &InstallMethodKind) -> &'static str {
     }
 }
 
-/// Package-manager query argv for "newest available version"; `package`
-/// carries either a package name or a `name@version` spec. Shared by the
-/// update preview and the install-plan availability probe.
+/// Package-manager argv for the newest available version; `package` is a
+/// name or `name@version` spec. Shared by the update preview and probes.
 pub(crate) fn availability_argv(
     method: &InstallMethodKind,
     package: &str,
@@ -434,6 +431,8 @@ pub(crate) fn is_channel(value: &str) -> bool {
     CHANNELS.contains(&value)
 }
 
+/// Whether a version satisfies a requested range/channel: channels always
+/// satisfy; otherwise `semver` `VersionReq` against the detected version.
 fn version_satisfies(requested: &str, detected: &str) -> bool {
     if is_channel(requested.trim()) {
         return true;

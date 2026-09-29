@@ -1,9 +1,8 @@
 //! Mutation-boundary failure injection (QAL-06): production paths take an
 //! optional [`Injector`] fired at every [`Point`]; `None` costs one branch.
 
-/// A boundary in the mutation pipeline that can fail. The set mirrors the
-/// failure tests plus the §4.2 recheck; variant order is stable and each
-/// point fires immediately before the step it names.
+/// A boundary in the mutation pipeline that can fail; the set mirrors the
+/// failure tests plus the §4.2 recheck, fired just before the step it names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Point {
     /// The target is opened/read for backup; any bytes are still untouched.

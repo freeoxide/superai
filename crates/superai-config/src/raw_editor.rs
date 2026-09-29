@@ -143,75 +143,6 @@ impl RawDocument {
     }
 }
 
-/// Stateless raw editor service; `commit` validates, checks the conflict
-/// token, backs up, atomically replaces, and verifies.
-#[derive(Debug, Clone, Default)]
-pub struct RawEditor;
-
-impl RawEditor {
-    /// Create a stateless service handle.
-    pub fn new() -> Self {
-        Self
-    }
-
-    /// Open `path` fresh as a `SourceDocument`; a missing file is an error,
-    /// distinct from empty.
-    pub fn open(&self, path: &Path) -> Result<crate::document::SourceDocument> {
-        crate::document::SourceDocument::load(path)
-    }
-
-    /// Open via the sensitive [`RawDocument`] wrapper (preserves `Snapshot` token).
-    pub fn open_raw(&self, path: &Path) -> Result<RawDocument> {
-        read(path)
-    }
-
-    /// Validate `content` for `kind` without touching disk.
-    pub fn validate(&self, content: &[u8], kind: DocumentKind) -> Vec<Diagnostic> {
-        validate(content, kind)
-    }
-
-    /// Syntax plus adapter semantic-validator and deprecation diagnostics
-    /// (DOC-09); never touches disk.
-    pub fn validate_with_schema(
-        &self,
-        content: &[u8],
-        kind: DocumentKind,
-        schema: Option<&crate::document::SemanticSchema>,
-    ) -> Vec<Diagnostic> {
-        validate_with_schema(content, kind, schema)
-    }
-
-    /// Diff `old` vs `new` for `kind`: redacted lexical diff plus semantic ops.
-    pub fn diff(&self, old: &[u8], new: &[u8], kind: DocumentKind) -> DiffResult {
-        diff(old, new, kind)
-    }
-
-    /// Find secret-bearing spans in `content` for UI redaction.
-    pub fn find_redaction_spans(&self, content: &[u8], kind: DocumentKind) -> Vec<RedactionSpan> {
-        find_redaction_spans(content, kind)
-    }
-
-    /// Commit `new_content` to `path` after validation and conflict check.
-    pub fn commit(
-        &self,
-        path: &Path,
-        new_content: &[u8],
-        expected_digest: Option<&str>,
-    ) -> Result<CommitReport> {
-        commit(path, new_content, expected_digest)
-    }
-
-    /// Commit with explicit [`Snapshot`] conflict token.
-    pub fn commit_with_snapshot(
-        &self,
-        path: &Path,
-        new_content: &[u8],
-        expected: Option<&Snapshot>,
-    ) -> Result<CommitReport> {
-        commit_with_snapshot(path, new_content, expected)
-    }
-}
-
 /// Size bound on validation (RAW-02); larger drafts diagnose before any parse.
 pub const MAX_VALIDATION_BYTES: usize = 1_048_576;
 
@@ -1894,127 +1825,76 @@ mod tests {
 
     #[test]
     fn raw_editor_service_open_detects_kind() {
-        let editor = RawEditor::new();
         let path = unique_scratch("svc-open", ".json");
         std::fs::write(&path, br#"{"a":1}"#).unwrap();
-        let doc = editor.open(&path).unwrap();
+        let doc = crate::document::SourceDocument::load(&path).unwrap();
         assert_eq!(doc.kind, DocumentKind::StrictJson);
         assert!(!doc.has_diagnostics());
         drop(std::fs::remove_file(&path));
 
         let toml_path = unique_scratch("svc-open-toml", ".toml");
         std::fs::write(&toml_path, b"a = 1\n").unwrap();
-        let doc2 = editor.open(&toml_path).unwrap();
+        let doc2 = crate::document::SourceDocument::load(&toml_path).unwrap();
         assert_eq!(doc2.kind, DocumentKind::Toml);
         drop(std::fs::remove_file(&toml_path));
 
         let yaml_path = unique_scratch("svc-open-yaml", ".yaml");
         std::fs::write(&yaml_path, b"a: 1\n").unwrap();
-        let doc3 = editor.open(&yaml_path).unwrap();
+        let doc3 = crate::document::SourceDocument::load(&yaml_path).unwrap();
         assert_eq!(doc3.kind, DocumentKind::Yaml);
         drop(std::fs::remove_file(&yaml_path));
 
         let env_path = unique_scratch("svc-open-env", ".env");
         std::fs::write(&env_path, b"API_KEY=val\n").unwrap();
-        let doc4 = editor.open(&env_path).unwrap();
+        let doc4 = crate::document::SourceDocument::load(&env_path).unwrap();
         assert_eq!(doc4.kind, DocumentKind::Env);
         drop(std::fs::remove_file(&env_path));
     }
 
     #[test]
     fn raw_editor_service_validate_each_kind() {
-        let editor = RawEditor::new();
-        assert!(
-            editor
-                .validate(br#"{"a":1}"#, DocumentKind::StrictJson)
-                .is_empty()
-        );
-        assert!(
-            !editor
-                .validate(b"{ invalid }", DocumentKind::StrictJson)
-                .is_empty()
-        );
-        assert!(
-            editor
-                .validate(b"{\"a\": 1, // comment\n}", DocumentKind::JsonC)
-                .is_empty()
-        );
-        assert!(
-            editor
-                .validate(br#"{"a":1,}"#, DocumentKind::JsonC)
-                .is_empty()
-        );
-        assert!(
-            !editor
-                .validate(b"{ invalid json }", DocumentKind::JsonC)
-                .is_empty()
-        );
-        assert!(editor.validate(b"a = 1\n", DocumentKind::Toml).is_empty());
-        assert!(!editor.validate(b"a = [\n", DocumentKind::Toml).is_empty());
-        assert!(editor.validate(b"a: 1\n", DocumentKind::Yaml).is_empty());
-        assert!(
-            !editor
-                .validate(b"a: [unclosed\n", DocumentKind::Yaml)
-                .is_empty()
-        );
-        assert!(
-            editor
-                .validate(b"API_KEY=val\nMODEL=opus\n", DocumentKind::Env)
-                .is_empty()
-        );
-        assert!(
-            !editor
-                .validate(b"INVALID LINE\n", DocumentKind::Env)
-                .is_empty()
-        );
-        assert!(
-            !editor
-                .validate(b"1INVALID=value\n", DocumentKind::Env)
-                .is_empty()
-        );
-        assert!(
-            editor
-                .validate(b"just some text\nmore\n", DocumentKind::TextFragment)
-                .is_empty()
-        );
-        assert!(
-            !editor
-                .validate(&[0xFF, 0xFE], DocumentKind::TextFragment)
-                .is_empty()
-        );
+        assert!(validate(br#"{"a":1}"#, DocumentKind::StrictJson).is_empty());
+        assert!(!validate(b"{ invalid }", DocumentKind::StrictJson).is_empty());
+        assert!(validate(b"{\"a\": 1, // comment\n}", DocumentKind::JsonC).is_empty());
+        assert!(validate(br#"{"a":1,}"#, DocumentKind::JsonC).is_empty());
+        assert!(!validate(b"{ invalid json }", DocumentKind::JsonC).is_empty());
+        assert!(validate(b"a = 1\n", DocumentKind::Toml).is_empty());
+        assert!(!validate(b"a = [\n", DocumentKind::Toml).is_empty());
+        assert!(validate(b"a: 1\n", DocumentKind::Yaml).is_empty());
+        assert!(!validate(b"a: [unclosed\n", DocumentKind::Yaml).is_empty());
+        assert!(validate(b"API_KEY=val\nMODEL=opus\n", DocumentKind::Env).is_empty());
+        assert!(!validate(b"INVALID LINE\n", DocumentKind::Env).is_empty());
+        assert!(!validate(b"1INVALID=value\n", DocumentKind::Env).is_empty());
+        assert!(validate(b"just some text\nmore\n", DocumentKind::TextFragment).is_empty());
+        assert!(!validate(&[0xFF, 0xFE], DocumentKind::TextFragment).is_empty());
     }
 
     #[test]
     fn raw_editor_service_diff_and_redaction() {
-        let editor = RawEditor::new();
         let old = br#"{"a":1}"#;
         let new = br#"{"a":2}"#;
-        let res = editor.diff(old, new, DocumentKind::StrictJson);
+        let res = diff(old, new, DocumentKind::StrictJson);
         assert!(!res.semantic_ops.is_empty());
         assert!(!res.lexical_unified_diff.is_empty());
         let old2 = br#"{"api_key":"old"}"#;
         let new2 = br#"{"api_key":"super-secret-value"}"#;
-        let res2 = editor.diff(old2, new2, DocumentKind::StrictJson);
+        let res2 = diff(old2, new2, DocumentKind::StrictJson);
         assert!(!res2.redaction_spans.is_empty());
         assert!(!res2.lexical_unified_diff.contains("super-secret-value"));
-        let spans = editor.find_redaction_spans(b"API_KEY=secret123\n", DocumentKind::Env);
+        let spans = find_redaction_spans(b"API_KEY=secret123\n", DocumentKind::Env);
         assert!(!spans.is_empty());
-        let toml_spans =
-            editor.find_redaction_spans(b"api_key = \"secret123\"\n", DocumentKind::Toml);
+        let toml_spans = find_redaction_spans(b"api_key = \"secret123\"\n", DocumentKind::Toml);
         assert!(!toml_spans.is_empty());
-        let yaml_spans = editor.find_redaction_spans(b"password: mysecret\n", DocumentKind::Yaml);
+        let yaml_spans = find_redaction_spans(b"password: mysecret\n", DocumentKind::Yaml);
         assert!(!yaml_spans.is_empty());
     }
 
     #[test]
     fn raw_editor_service_invalid_never_written_per_kind() {
-        let editor = RawEditor::new();
         let path_json = unique_scratch("svc-invalid-json", ".json");
         std::fs::write(&path_json, br#"{"a":1}"#).unwrap();
         let snap = snapshot(&path_json);
-        let err = editor
-            .commit(&path_json, b"{ bad }", snap.digest.as_deref())
-            .unwrap_err();
+        let err = commit(&path_json, b"{ bad }", snap.digest.as_deref()).unwrap_err();
         match err {
             ConfigError::Json { .. } => {}
             other => panic!("expected Json {other:?}"),
@@ -2024,9 +1904,7 @@ mod tests {
         let path_toml = unique_scratch("svc-invalid-toml", ".toml");
         std::fs::write(&path_toml, b"a = 1\n").unwrap();
         let snap = snapshot(&path_toml);
-        let err = editor
-            .commit(&path_toml, b"a = [\n", snap.digest.as_deref())
-            .unwrap_err();
+        let err = commit(&path_toml, b"a = [\n", snap.digest.as_deref()).unwrap_err();
         match err {
             ConfigError::Toml { .. } => {}
             other => panic!("expected Toml {other:?}"),
@@ -2036,9 +1914,7 @@ mod tests {
         let path_yaml = unique_scratch("svc-invalid-yaml", ".yaml");
         std::fs::write(&path_yaml, b"a: 1\n").unwrap();
         let snap = snapshot(&path_yaml);
-        let err = editor
-            .commit(&path_yaml, b"a: [unclosed\n", snap.digest.as_deref())
-            .unwrap_err();
+        let err = commit(&path_yaml, b"a: [unclosed\n", snap.digest.as_deref()).unwrap_err();
         match err {
             ConfigError::Yaml { .. } => {}
             other => panic!("expected Yaml {other:?}"),
@@ -2048,9 +1924,7 @@ mod tests {
         let path_env = unique_scratch("svc-invalid-env", ".env");
         std::fs::write(&path_env, b"API_KEY=val\n").unwrap();
         let snap = snapshot(&path_env);
-        let err = editor
-            .commit(&path_env, b"INVALID LINE\n", snap.digest.as_deref())
-            .unwrap_err();
+        let err = commit(&path_env, b"INVALID LINE\n", snap.digest.as_deref()).unwrap_err();
         match err {
             ConfigError::Env { .. } => {}
             other => panic!("expected Env {other:?}"),
@@ -2061,11 +1935,10 @@ mod tests {
 
     #[test]
     fn raw_editor_service_jsonc_and_text_fragment_commit() {
-        let editor = RawEditor::new();
         let path_jsonc = unique_scratch("svc-jsonc", ".jsonc");
         drop(std::fs::remove_file(&path_jsonc));
         let content = b"{\"a\": 1, // comment\n}";
-        let report = editor.commit(&path_jsonc, content, None).unwrap();
+        let report = commit(&path_jsonc, content, None).unwrap();
         assert!(!report.is_noop);
         let after = std::fs::read(&path_jsonc).unwrap();
         assert_eq!(after, content);
@@ -2078,7 +1951,7 @@ mod tests {
         drop(std::fs::remove_file(&path_txt));
         // Plain whole-file creation is opaque and refused.
         let txt_content = b"hello text fragment\nsecond line\n";
-        match editor.commit(&path_txt, txt_content, None) {
+        match commit(&path_txt, txt_content, None) {
             Err(ConfigError::UnmanagedSpanWrite { .. }) => {}
             other => panic!("expected UnmanagedSpanWrite, got {other:?}"),
         }
@@ -2087,12 +1960,12 @@ mod tests {
             "refused fragment creation must not touch disk"
         );
         let span_only = b"# superai:begin:managed\nowned body\n# superai:end:managed\n";
-        let report2 = editor.commit(&path_txt, span_only, None).unwrap();
+        let report2 = commit(&path_txt, span_only, None).unwrap();
         assert!(!report2.is_noop);
         assert_eq!(std::fs::read(&path_txt).unwrap(), span_only);
         let rewrite =
             b"different prelude\n# superai:begin:managed\nowned body\n# superai:end:managed\n";
-        match editor.commit(&path_txt, rewrite, None) {
+        match commit(&path_txt, rewrite, None) {
             Err(ConfigError::UnmanagedSpanWrite { .. }) => {}
             other => panic!("expected UnmanagedSpanWrite, got {other:?}"),
         }
@@ -2183,7 +2056,6 @@ mod tests {
 
     #[test]
     fn validate_with_schema_runs_semantic_and_deprecation_checks() {
-        let editor = RawEditor::new();
         let schema = crate::document::SemanticSchema::default()
             .with_validator(std::sync::Arc::new(|value: &Value, _kind| {
                 let mut diags = Vec::new();
@@ -2199,7 +2071,7 @@ mod tests {
                 Some("model".to_owned()),
             )]);
 
-        let diags = editor.validate_with_schema(
+        let diags = validate_with_schema(
             br#"{"model":1,"oldModel":"x"}"#,
             DocumentKind::StrictJson,
             Some(&schema),
@@ -2213,24 +2085,19 @@ mod tests {
             == crate::document::DiagnosticSeverity::Deprecation
             && d.message.contains("oldModel")));
 
-        let clean = editor.validate_with_schema(
+        let clean = validate_with_schema(
             br#"{"model":"opus"}"#,
             DocumentKind::StrictJson,
             Some(&schema),
         );
         assert!(clean.is_empty(), "{clean:?}");
 
-        let broken =
-            editor.validate_with_schema(b"{ nope", DocumentKind::StrictJson, Some(&schema));
+        let broken = validate_with_schema(b"{ nope", DocumentKind::StrictJson, Some(&schema));
         assert!(!broken.is_empty());
         assert!(broken.iter().all(|d| d.message.contains("invalid")
             || d.severity == crate::document::DiagnosticSeverity::Error));
 
-        assert!(
-            editor
-                .validate_with_schema(br#"{"a":1}"#, DocumentKind::StrictJson, None)
-                .is_empty()
-        );
+        assert!(validate_with_schema(br#"{"a":1}"#, DocumentKind::StrictJson, None).is_empty());
     }
 
     #[test]

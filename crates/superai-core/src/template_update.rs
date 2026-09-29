@@ -109,6 +109,19 @@ fn quarantine_target(path: &Path, op_id: &str) {
     }
 }
 
+fn rollback_logged(transaction: &mut Transaction, op_id: &str) {
+    // Best-effort unwind on an already-failing path: the primary error wins,
+    // but a failed rollback or an unrolled-back residual must not vanish.
+    match transaction.rollback() {
+        Ok(outcome) => {
+            for residual in &outcome.residuals {
+                quarantine_target(residual, op_id);
+            }
+        }
+        Err(e) => eprintln!("superai-core: rollback failed: {e}"),
+    }
+}
+
 fn resolve_config_path(instance: &Instance, adapter: &dyn Adapter) -> PathBuf {
     for surface in adapter.config_surfaces() {
         if surface.id.contains("settings") {
@@ -894,7 +907,7 @@ pub fn apply_update_with_catalog_digests(
             format!("{:016x}", hasher.finish())
         };
         if snap_after.digest.as_deref() != Some(expected_digest.as_str()) {
-            drop(transaction.rollback());
+            rollback_logged(&mut transaction, &op_id_str);
             quarantine_target(&config_path, &op_id_str);
             return Err(CoreError::ConcurrentModification {
                 path: config_path,
@@ -952,7 +965,7 @@ pub fn apply_update_with_catalog_digests(
         .position(|i| i.id == updated_instance.id);
     let Some(idx) = idx_opt else {
         // Registry changed concurrently: rollback
-        drop(transaction.rollback());
+        rollback_logged(&mut transaction, &op_id_str);
         quarantine_target(&config_path, &op_id_str);
         return Err(CoreError::Validation {
             field: "registry".to_owned(),
@@ -981,7 +994,7 @@ pub fn apply_update_with_catalog_digests(
     }
     if let Err(e) = rebuilt.store(registry_path) {
         // Rollback transaction on registry failure
-        drop(transaction.rollback());
+        rollback_logged(&mut transaction, &op_id_str);
         quarantine_target(&config_path, &op_id_str);
         return Err(e);
     }

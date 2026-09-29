@@ -23,9 +23,8 @@ pub(crate) fn has_glob(path: &Path) -> bool {
     s.contains('*') || s.contains('?') || s.contains('[')
 }
 
-/// Whether `path` still holds an unresolved `$`/`%` variable, or a
-/// whole-component `~` (unexpanded home shorthand; Windows 8.3 short names
-/// like `RUNNER~1` are legal and pass).
+/// Whether `path` still holds an unresolved `$`/`%` variable or a
+/// whole-component `~` (8.3 short names like `RUNNER~1` are legal).
 pub(crate) fn has_unresolved_variable(path: &Path) -> bool {
     let s = path.to_string_lossy();
     if s.contains('$') || s.contains('%') {
@@ -34,10 +33,8 @@ pub(crate) fn has_unresolved_variable(path: &Path) -> bool {
     path.components().any(|c| c.as_os_str() == "~")
 }
 
-/// Broad roots no quarantine or removal may target: the unix system roots in
-/// bare and trailing-slash spellings, plus the Windows-shaped roots
-/// ([`crate::transaction::windows_shaped_broad_root`]), which are inert on
-/// unix hosts.
+/// Broad roots no quarantine or removal may target: unix system roots in
+/// bare and trailing-slash spellings, plus the Windows-shaped roots.
 pub(crate) fn is_broad_root(path: &Path) -> bool {
     if crate::transaction::windows_shaped_broad_root(path) {
         return true;
