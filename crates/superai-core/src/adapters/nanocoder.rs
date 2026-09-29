@@ -107,11 +107,18 @@ impl NanocoderAdapter {
                     let cfg = Self::config_path_for_root(&root);
                     if cfg.exists() {
                         evidence.push(format!("agents.config.json found at {}", cfg.display()));
-                        if let Ok(text) = std::fs::read_to_string(&cfg)
-                            && (text.contains("providers") || text.contains("nanocoder"))
-                        {
-                            evidence
-                                .push("agents.config.json contains providers/nanocoder".to_owned());
+                        match std::fs::read_to_string(&cfg) {
+                            Ok(text)
+                                if text.contains("providers") || text.contains("nanocoder") =>
+                            {
+                                evidence.push(
+                                    "agents.config.json contains providers/nanocoder".to_owned(),
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                evidence.push(format!("agents.config.json unreadable: {e}"));
+                            }
                         }
                     } else {
                         evidence.push(format!("agents.config.json missing at {}", cfg.display()));
