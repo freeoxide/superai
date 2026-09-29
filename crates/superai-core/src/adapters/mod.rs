@@ -190,9 +190,8 @@ fn drain_pipe(pipe: Option<impl Read>, buf: &mut Vec<u8>, binary: &Path, side: &
     }
 }
 
-/// Spawn, poll until exit or `deadline` (kill at the deadline), reap, and
-/// merge the captured output. `None` on spawn failure, timeout, or a failing
-/// probe with no output.
+/// Spawn, kill at the deadline, reap, and merge the captured output; `None`
+/// on spawn failure, timeout, or a failing probe with no output.
 fn run_probe(binary: &Path, args: &[String], budget: Duration) -> Option<String> {
     let spawned = Command::new(binary)
         .args(args)
