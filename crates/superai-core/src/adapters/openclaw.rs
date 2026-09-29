@@ -583,7 +583,7 @@ mod tests {
         assert!(
             diags
                 .iter()
-                .any(|d| d.message.contains("root must be a object")
+                .any(|d| d.message.contains("root must be of kind object")
                     && d.message.starts_with("[openclaw/openclaw.json]")),
             "diags: {diags:?}"
         );

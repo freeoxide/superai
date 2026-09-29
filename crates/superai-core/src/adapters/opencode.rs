@@ -1110,7 +1110,7 @@ mod tests {
         assert!(
             diags
                 .iter()
-                .any(|d| d.message.contains("root must be a object")),
+                .any(|d| d.message.contains("root must be of kind object")),
             "diags: {diags:?}"
         );
         let typed = crate::adapter::validate_surface_content(
