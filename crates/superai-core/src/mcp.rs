@@ -633,50 +633,6 @@ fn merge_server_native(existing: Option<&Value>, new: &Value) -> Value {
     Value::Object(merged)
 }
 
-fn toml_document_to_value(doc: &toml_edit::DocumentMut) -> Value {
-    fn table_to_value(table: &toml_edit::Table) -> Value {
-        let mut map = Map::new();
-        for (key, item) in table {
-            if item.is_none() {
-                continue;
-            }
-            map.insert(key.to_owned(), item_to_value(item));
-        }
-        Value::Object(map)
-    }
-    fn item_to_value(item: &toml_edit::Item) -> Value {
-        match item {
-            toml_edit::Item::Value(v) => toml_value_to_value(v),
-            toml_edit::Item::Table(t) => table_to_value(t),
-            toml_edit::Item::ArrayOfTables(a) => {
-                Value::Array(a.iter().map(table_to_value).collect())
-            }
-            toml_edit::Item::None => Value::Null,
-        }
-    }
-    fn toml_value_to_value(v: &toml_edit::Value) -> Value {
-        use toml_edit::Value as Tv;
-        match v {
-            Tv::String(s) => Value::String(s.value().to_owned()),
-            Tv::Integer(i) => Value::Number((*i.value()).into()),
-            Tv::Float(f) => {
-                serde_json::Number::from_f64(*f.value()).map_or(Value::Null, Value::Number)
-            }
-            Tv::Boolean(b) => Value::Bool(*b.value()),
-            Tv::Datetime(d) => Value::String(d.to_string()),
-            Tv::Array(a) => Value::Array(a.iter().map(toml_value_to_value).collect()),
-            Tv::InlineTable(t) => {
-                let mut map = Map::new();
-                for (key, value) in t {
-                    map.insert(key.to_owned(), toml_value_to_value(value));
-                }
-                Value::Object(map)
-            }
-        }
-    }
-    table_to_value(doc.as_table())
-}
-
 /// Missing and empty destination files read as an empty object; no file
 /// is created.
 fn read_outer_value(path: &Path, kind: DocumentKind) -> Result<Value> {
@@ -684,7 +640,9 @@ fn read_outer_value(path: &Path, kind: DocumentKind) -> Result<Value> {
         DocumentKind::Json => superai_config::json::load_value(path)?,
         DocumentKind::Jsonc => superai_config::jsonc::load_value(path)?,
         DocumentKind::Yaml => superai_config::yaml::load_value(path)?,
-        DocumentKind::Toml => toml_document_to_value(&superai_config::toml_file::load(path)?),
+        DocumentKind::Toml => {
+            crate::toml_convert::document_to_value(&superai_config::toml_file::load(path)?)
+        }
         other => {
             return Err(CoreError::UnsupportedOperation {
                 harness: "mcp".to_owned(),
@@ -997,41 +955,6 @@ fn write_json_server(
     commit_document(path, decl.kind, bytes)
 }
 
-fn json_to_toml_item(value: &Value) -> std::result::Result<toml_edit::Item, String> {
-    use toml_edit::value as toml_value;
-    match value {
-        Value::Null => Err("toml cannot represent null in mcp server entries".to_owned()),
-        Value::Bool(b) => Ok(toml_value(*b)),
-        Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Ok(toml_value(i))
-            } else {
-                Ok(toml_value(n.as_f64().unwrap_or_default()))
-            }
-        }
-        Value::String(s) => Ok(toml_value(s.as_str())),
-        Value::Array(arr) => {
-            let mut toml_arr = toml_edit::Array::new();
-            for item in arr {
-                let toml_edit::Item::Value(converted) = json_to_toml_item(item)? else {
-                    return Err("nested tables inside mcp arrays are not supported".to_owned());
-                };
-                toml_arr.push(converted);
-            }
-            Ok(toml_value(toml_arr))
-        }
-        Value::Object(map) => {
-            let mut table = toml_edit::Table::new();
-            for (k, v) in map {
-                table.insert(k.as_str(), json_to_toml_item(v)?);
-            }
-            Ok(toml_edit::Item::Value(toml_edit::Value::InlineTable(
-                table.into_inline_table(),
-            )))
-        }
-    }
-}
-
 /// Convert a server entry to a TOML table; sub-tables become
 /// `[mcp_servers.<id>.<key>]` sections.
 fn json_server_to_toml_table(value: &Value) -> std::result::Result<toml_edit::Table, String> {
@@ -1044,12 +967,18 @@ fn json_server_to_toml_table(value: &Value) -> std::result::Result<toml_edit::Ta
             Value::Object(nested) => {
                 let mut nested_table = toml_edit::Table::new();
                 for (nk, nv) in nested {
-                    nested_table.insert(nk.as_str(), json_to_toml_item(nv)?);
+                    nested_table.insert(
+                        nk.as_str(),
+                        crate::toml_convert::json_value_to_toml_strict(nv)?,
+                    );
                 }
                 table.insert(k.as_str(), toml_edit::Item::Table(nested_table));
             }
             other => {
-                table.insert(k.as_str(), json_to_toml_item(other)?);
+                table.insert(
+                    k.as_str(),
+                    crate::toml_convert::json_value_to_toml_strict(other)?,
+                );
             }
         }
     }

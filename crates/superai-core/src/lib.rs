@@ -41,6 +41,7 @@ pub mod raw_editor;
 mod registry;
 /// Lifecycle and ownership states.
 pub mod state;
+mod toml_convert;
 /// Verification harness for plan 13 gates: fixtures, secret-free checks, platform gates.
 pub mod verification;
 /// Wrapper generation.
