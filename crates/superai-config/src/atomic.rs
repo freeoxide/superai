@@ -137,7 +137,7 @@ pub(crate) fn windows_clear_readonly(path: &Path) {
         )]
         perm.set_readonly(false);
         if let Err(e) = std::fs::set_permissions(path, perm) {
-            crate::warn_io("readonly restore", path, &e);
+            warn_io("readonly restore", path, &e);
         }
     }
 }
