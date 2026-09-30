@@ -122,8 +122,6 @@ pub enum DiagnosticSeverity {
     Warning,
     /// Use of a deprecated key or feature (DOC-09 deprecation diagnostics).
     Deprecation,
-    /// Informational hint.
-    Hint,
 }
 
 impl DiagnosticSeverity {
@@ -133,7 +131,6 @@ impl DiagnosticSeverity {
             Self::Error => "error",
             Self::Warning => "warning",
             Self::Deprecation => "deprecation",
-            Self::Hint => "hint",
         }
     }
 }
@@ -147,12 +144,13 @@ pub struct Diagnostic {
     pub col: usize,
     /// Severity (DOC-09); syntax diagnostics default to `Error`.
     pub severity: DiagnosticSeverity,
-    /// Human-readable message.
+    /// What went wrong, as display text (it may repeat the location in
+    /// words); `line`/`col` carry the span in machine-readable form.
     pub message: String,
 }
 
 impl Diagnostic {
-    /// Create a new error-severity diagnostic.
+    /// Clamps `line`/`col` to at least one; severity defaults to `Error`.
     pub fn new(line: usize, col: usize, message: impl Into<String>) -> Self {
         Self {
             line: usize::max(line, 1),
@@ -162,7 +160,7 @@ impl Diagnostic {
         }
     }
 
-    /// Create a warning-severity diagnostic (DOC-09).
+    /// Warning severity; position and message handling as [`Diagnostic::new`].
     pub fn warning(line: usize, col: usize, message: impl Into<String>) -> Self {
         Self {
             severity: DiagnosticSeverity::Warning,
@@ -189,14 +187,6 @@ impl Diagnostic {
             ..Self::new(line, col, message)
         }
     }
-
-    /// Create a hint-severity diagnostic (DOC-09).
-    pub fn hint(line: usize, col: usize, message: impl Into<String>) -> Self {
-        Self {
-            severity: DiagnosticSeverity::Hint,
-            ..Self::new(line, col, message)
-        }
-    }
 }
 
 impl std::fmt::Display for Diagnostic {
@@ -206,7 +196,7 @@ impl std::fmt::Display for Diagnostic {
 }
 
 /// Detect newline style: presence of `\r\n` means `Crlf`, otherwise `Lf`.
-fn detect_newline(bytes: &[u8]) -> NewlineStyle {
+pub(crate) fn detect_newline(bytes: &[u8]) -> NewlineStyle {
     let has_crlf = bytes
         .windows(2)
         .any(|w| w.first().copied() == Some(b'\r') && w.get(1).copied() == Some(b'\n'));
@@ -263,7 +253,8 @@ fn offset_to_line_col(bytes: &[u8], offset: usize) -> (usize, usize) {
 /// [`SourceDocument::load`] errors, keeping missing vs empty distinct.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceDocument {
-    /// Original path the document was loaded from.
+    /// Path from the constructor; saves write back through it, never a
+    /// re-derived one.
     pub path: PathBuf,
     /// Raw source bytes exactly as read from disk.
     pub bytes: Vec<u8>,
@@ -735,45 +726,6 @@ impl ValueType {
     }
 }
 
-/// Check the dotted `path` exists and holds `expected`. The error names
-/// the failing segment, never a value, so it is safe to surface.
-pub fn check_path_type(
-    value: &Value,
-    path: &str,
-    expected: ValueType,
-) -> std::result::Result<(), String> {
-    let mut current = value;
-    let segments: Vec<&str> = path.split('.').map(str::trim).collect();
-    for (idx, segment) in segments.iter().enumerate() {
-        if segment.is_empty() {
-            return Err(format!("path `{path}` has an empty segment"));
-        }
-        let Value::Object(map) = current else {
-            return Err(format!(
-                "path `{path}`: segment {} of `{}` is not an object",
-                idx.saturating_add(1),
-                segments.first().unwrap_or(&"")
-            ));
-        };
-        match map.get(*segment) {
-            Some(next) => current = next,
-            None => {
-                return Err(format!("path `{path}`: segment `{segment}` is missing"));
-            }
-        }
-    }
-    let actual = ValueType::of(current);
-    if actual == expected {
-        Ok(())
-    } else {
-        Err(format!(
-            "path `{path}` holds a {}, expected a {}",
-            actual.as_str(),
-            expected.as_str()
-        ))
-    }
-}
-
 /// Deprecation diagnostics for deprecated keys present in `value`;
 /// positions are approximate (1:1): the value tree carries no spans.
 pub fn deprecation_diagnostics(value: &Value, deprecated: &[DeprecatedKey]) -> Vec<Diagnostic> {
@@ -965,7 +917,6 @@ pub(crate) fn strip_jsonc_comments(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::Map;
 
     fn doc(path: &str, bytes: &[u8]) -> SourceDocument {
         SourceDocument::from_bytes(Path::new(path), bytes.to_vec())
@@ -1296,32 +1247,6 @@ mod tests {
     }
 
     #[test]
-    fn operation_all_variants_constructible() {
-        let _ = Operation::new(EditOperation::Remove {
-            selector: Selector::Key("old".to_owned()),
-        });
-        let mut map = Map::new();
-        map.insert("x".to_owned(), Value::Bool(true));
-        let _ = Operation::new(EditOperation::Merge {
-            selector: Selector::Key("obj".to_owned()),
-            value: Value::Object(map),
-        });
-        let _ = Operation::new(EditOperation::EnableDisable {
-            selector: Selector::Key("feature".to_owned()),
-            enabled: false,
-        });
-        let _ = Operation::new(EditOperation::AppendIdentityItem {
-            selector: Selector::Key("servers".to_owned()),
-            value: Value::String("x".to_owned()),
-            identity_key: "name".to_owned(),
-        });
-        let _ = Operation::new(EditOperation::EnsureDirEntry {
-            selector: Selector::Key("plugins".to_owned()),
-            path: tmp_path("foo"),
-        });
-    }
-
-    #[test]
     fn diagnostic_severity_defaults_to_error_and_has_constructors() {
         let error = Diagnostic::new(1, 1, "syntax");
         assert_eq!(error.severity, DiagnosticSeverity::Error);
@@ -1330,17 +1255,16 @@ mod tests {
         assert_eq!(warning.severity, DiagnosticSeverity::Warning);
         assert_eq!((warning.line, warning.col), (2, 3));
 
-        let hint = Diagnostic::hint(4, 1, "fyi");
-        assert_eq!(hint.severity, DiagnosticSeverity::Hint);
+        let zeroed = Diagnostic::new(0, 0, "clamped");
+        assert_eq!((zeroed.line, zeroed.col), (1, 1));
 
         let severities = [
             DiagnosticSeverity::Error,
             DiagnosticSeverity::Warning,
             DiagnosticSeverity::Deprecation,
-            DiagnosticSeverity::Hint,
         ];
         let labels: Vec<&str> = severities.iter().map(DiagnosticSeverity::as_str).collect();
-        assert_eq!(labels, ["error", "warning", "deprecation", "hint"]);
+        assert_eq!(labels, ["error", "warning", "deprecation"]);
     }
 
     #[test]
@@ -1353,25 +1277,6 @@ mod tests {
         let without = Diagnostic::deprecation(1, 1, "legacyKey", None);
         assert!(without.message.contains("legacyKey"));
         assert!(!without.message.contains("use `"));
-    }
-
-    #[test]
-    fn check_path_type_passes_and_fails_on_type_mismatch() {
-        let value: Value = serde_json::from_str(r#"{"model":{"name":"opus"},"list":[1]}"#).unwrap();
-        check_path_type(&value, "model", ValueType::Object).unwrap();
-        check_path_type(&value, "model.name", ValueType::String).unwrap();
-        check_path_type(&value, "list", ValueType::Array).unwrap();
-
-        let mismatch = check_path_type(&value, "model.name", ValueType::Number).unwrap_err();
-        assert!(mismatch.contains("model.name"));
-        assert!(mismatch.contains("string"));
-
-        let missing = check_path_type(&value, "model.absent", ValueType::String).unwrap_err();
-        assert!(missing.contains("absent"));
-
-        let not_object =
-            check_path_type(&value, "model.name.deeper", ValueType::String).unwrap_err();
-        assert!(not_object.contains("not an object"));
     }
 
     #[test]

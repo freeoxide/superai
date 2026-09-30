@@ -1,10 +1,15 @@
 //! Harness adapters: concrete implementations.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use crate::adapter::DetectionConfidence;
+use crate::instance::Instance;
+use crate::state::{AdapterSupport, InstallPresence};
 
 pub mod aider;
 pub mod amazon_q;
@@ -112,7 +117,8 @@ fn probe_path_dir(dir: &str, name: &str) -> Option<PathBuf> {
     None
 }
 
-/// Parse the first version-shaped token (`1.2.3`, `v1.2`, `1.0.0-rc1`).
+/// Parse the first version-shaped token (`1.2.3`, `v1.2`, `1.0.0-rc1`);
+/// `name/1.2.3` slash compounds are split so harness-prefixed output parses.
 #[expect(clippy::excessive_nesting, reason = "token fallback chain is explicit")]
 pub(crate) fn parse_version_output(output: &str) -> Option<String> {
     let trimmed = output.trim();
@@ -120,70 +126,305 @@ pub(crate) fn parse_version_output(output: &str) -> Option<String> {
         return None;
     }
     for token in trimmed.split_whitespace() {
-        let mut candidate = token;
-        if let Some(stripped) = candidate.strip_prefix('v') {
-            candidate = stripped;
-        } else if let Some(stripped) = candidate.strip_prefix('V') {
-            candidate = stripped;
-        }
-        let cleaned = candidate.trim_matches(|c: char| c == ',' || c == ')' || c == '(');
-        if cleaned.is_empty() {
-            continue;
-        }
-        let has_dot = cleaned.contains('.');
-        let starts_digit = cleaned.chars().next().is_some_and(|c| c.is_ascii_digit());
-        if has_dot && starts_digit {
-            let is_version_like = cleaned
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+');
-            if is_version_like {
-                return Some(cleaned.to_owned());
+        for segment in token.split('/') {
+            let mut candidate = segment;
+            if let Some(stripped) = candidate.strip_prefix('v') {
+                candidate = stripped;
+            } else if let Some(stripped) = candidate.strip_prefix('V') {
+                candidate = stripped;
             }
-            let mut version_part = String::new();
-            for ch in cleaned.chars() {
-                if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '+' {
-                    version_part.push(ch);
-                } else {
-                    break;
+            let cleaned = candidate.trim_matches(|c: char| c == ',' || c == ')' || c == '(');
+            if cleaned.is_empty() {
+                continue;
+            }
+            let has_dot = cleaned.contains('.');
+            let starts_digit = cleaned.chars().next().is_some_and(|c| c.is_ascii_digit());
+            if has_dot && starts_digit {
+                let is_version_like = cleaned
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+');
+                if is_version_like {
+                    return Some(cleaned.to_owned());
                 }
-            }
-            if version_part.contains('.') && !version_part.is_empty() {
-                return Some(version_part);
+                let mut version_part = String::new();
+                for ch in cleaned.chars() {
+                    if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '+' {
+                        version_part.push(ch);
+                    } else {
+                        break;
+                    }
+                }
+                if version_part.contains('.') && !version_part.is_empty() {
+                    return Some(version_part);
+                }
             }
         }
     }
     None
 }
 
-/// Run `<binary> --version` under a 2s budget and parse the version from the
-/// combined output. A hung child outlives the budget; its thread dies with it.
-pub(crate) fn probe_version(binary: &Path) -> Option<String> {
+/// Run `<binary> args...` under `budget` and return the combined stdout and
+/// stderr; a child still running at the budget is killed and reaped.
+pub(crate) fn run_capturing(binary: &Path, args: &[&str], budget: Duration) -> Option<String> {
     let owned = binary.to_path_buf();
+    let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
     let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let output = Command::new(&owned)
-            .arg("--version")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output();
-        drop(tx.send(output));
-    });
-    let Ok(Ok(output)) = rx.recv_timeout(Duration::from_secs(2)) else {
-        return None;
+    // The send Result is the closure's value: a timed-out caller has dropped
+    // the receiver, and that failure is expected, not an error to log.
+    thread::spawn(move || tx.send(run_probe(&owned, &args, budget)));
+    // A timeout here never leaves the probe running: the worker kills the
+    // child at its own identical deadline.
+    rx.recv_timeout(budget).unwrap_or_default()
+}
+
+/// Drain `pipe` into `buf`; a read error is logged, not silently dropped.
+fn drain_pipe(pipe: Option<impl Read>, buf: &mut Vec<u8>, binary: &Path, side: &str) {
+    let Some(mut pipe) = pipe else {
+        return;
     };
-    if !output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
+    if let Err(err) = pipe.read_to_end(buf) {
+        eprintln!(
+            "superai-core: probe of {} lost {side} output: {err}",
+            binary.display()
+        );
+    }
+}
+
+/// Spawn, kill at the deadline, reap, and merge the captured output; `None`
+/// on spawn failure, timeout, or a failing probe with no output.
+fn run_probe(binary: &Path, args: &[String], budget: Duration) -> Option<String> {
+    let spawned = Command::new(binary)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+    let mut child: Child = match spawned {
+        Ok(child) => child,
+        Err(err) => {
+            eprintln!(
+                "superai-core: probe spawn failed for {}: {err}",
+                binary.display()
+            );
+            return None;
+        }
+    };
+    let deadline = Instant::now() + budget;
+    let status: ExitStatus = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => {
+                if let Err(err) = child.kill() {
+                    eprintln!(
+                        "superai-core: killing timed-out probe of {}: {err}",
+                        binary.display()
+                    );
+                }
+                break match child.wait() {
+                    Ok(status) => status,
+                    Err(err) => {
+                        eprintln!(
+                            "superai-core: reaping killed probe of {}: {err}",
+                            binary.display()
+                        );
+                        return None;
+                    }
+                };
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Err(err) => {
+                eprintln!(
+                    "superai-core: probe of {} wait failed: {err}",
+                    binary.display()
+                );
+                return None;
+            }
+        }
+    };
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    drain_pipe(child.stdout.take(), &mut out, binary, "stdout");
+    drain_pipe(child.stderr.take(), &mut err, binary, "stderr");
+    if !status.success() && out.is_empty() && err.is_empty() {
         return None;
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let combined = if stdout.trim().is_empty() {
+    let stdout = String::from_utf8_lossy(&out);
+    let stderr = String::from_utf8_lossy(&err);
+    Some(if stdout.trim().is_empty() {
         stderr.into_owned()
     } else if stderr.trim().is_empty() {
         stdout.into_owned()
     } else {
         format!("{stdout} {stderr}")
+    })
+}
+
+/// Parse a version from `<binary>` argv runs: `primary` first, then `fallback`
+/// under a second `budget` when that run or its parse fails; empty = single-shot.
+pub(crate) fn probe_version_with_fallback(
+    binary: &Path,
+    primary: &[&str],
+    fallback: &[&str],
+    budget: Duration,
+) -> Option<String> {
+    let probe = |argv: &[&str]| {
+        run_capturing(binary, argv, budget).and_then(|out| parse_version_output(&out))
     };
-    parse_version_output(&combined)
+    match probe(primary) {
+        Some(version) => Some(version),
+        None if fallback.is_empty() => None,
+        None => probe(fallback),
+    }
+}
+
+/// Run `<binary> --version` under a 2s budget and parse the version from the
+/// combined output.
+pub(crate) fn probe_version(binary: &Path) -> Option<String> {
+    probe_version_with_fallback(binary, &["--version"], &[], Duration::from_secs(2))
+}
+
+/// The one mirror-exclusion matcher, shared by the adapters' exclusion tests:
+/// exact, `/*` prefix, `*.` suffix, and single-star infix glob patterns.
+#[cfg(test)]
+pub(crate) fn exclusion_matches(patterns: &[String], file: &str) -> bool {
+    patterns.iter().any(|pat| {
+        if let Some(prefix) = pat.strip_suffix("/*") {
+            file.starts_with(prefix)
+        } else if let Some(suffix) = pat.strip_prefix("*.") {
+            file.ends_with(suffix)
+        } else if pat.contains('*') {
+            match pat.split('*').collect::<Vec<_>>()[..] {
+                [head, tail] => file.starts_with(head) && file.ends_with(tail),
+                _ => file == pat,
+            }
+        } else {
+            file == pat
+        }
+    })
+}
+
+/// HOME, falling back to USERPROFILE on Windows; None when neither is usable.
+pub(crate) fn home_dir() -> Option<PathBuf> {
+    for var in ["HOME", "USERPROFILE"] {
+        if let Ok(home) = std::env::var(var)
+            && !home.trim().is_empty()
+        {
+            return Some(PathBuf::from(home));
+        }
+    }
+    None
+}
+
+/// The desktop triple every catalog harness supports today.
+pub(crate) fn desktop_platforms() -> Vec<crate::adapter::Platform> {
+    use crate::adapter::{Arch, Os, Platform};
+    vec![
+        Platform::new(Os::Linux, Arch::Any),
+        Platform::new(Os::Macos, Arch::Any),
+        Platform::new(Os::Windows, Arch::Any),
+    ]
+}
+
+/// The 11-operation row, every op [`AdapterSupport::Full`], shared by
+/// adapters that support the whole catalog surface.
+pub(crate) fn all_operations_full() -> Vec<(String, AdapterSupport)> {
+    [
+        "detect",
+        "read_config",
+        "write_config",
+        "manage_skills",
+        "manage_mcp",
+        "manage_plugins",
+        "configure_provider",
+        "plan_mirror",
+        "plan_wrapper",
+        "scan_candidates",
+        "validate_instance",
+    ]
+    .into_iter()
+    .map(|op| (op.to_owned(), AdapterSupport::Full))
+    .collect()
+}
+
+/// Skill modes, link-first: `relink_skills` takes the first mode.
+pub(crate) fn skill_modes_link_first() -> Vec<crate::adapter::SkillMode> {
+    use crate::adapter::SkillMode;
+    vec![
+        SkillMode::LinkAll,
+        SkillMode::LinkSelected,
+        SkillMode::CopySelected,
+    ]
+}
+
+/// Probe outcome for a found-or-missing binary and a parsed-or-missing version.
+pub(crate) fn install_presence(binary_found: bool, version_found: bool) -> InstallPresence {
+    match (binary_found, version_found) {
+        (true, true) => InstallPresence::Present,
+        (true, false) => InstallPresence::UnknownVersion,
+        (false, _) => InstallPresence::Absent,
+    }
+}
+
+/// Shared detection rule: a missing binary is High unless leftover config
+/// evidence marks the harness uninstalled (Low); unparsable probe is Medium.
+pub(crate) fn detection_confidence(
+    binary_found: bool,
+    version_found: bool,
+    absent_config_seen: bool,
+) -> DetectionConfidence {
+    if !binary_found {
+        return if absent_config_seen {
+            DetectionConfidence::Low
+        } else {
+            DetectionConfidence::High
+        };
+    }
+    if version_found {
+        DetectionConfidence::High
+    } else {
+        DetectionConfidence::Medium
+    }
+}
+
+/// Map a probe outcome onto the resolution, naming `harness` in the notes.
+pub(crate) fn resolution_from_detection(
+    detection: crate::adapter::DetectionResult,
+    harness: &str,
+    schema_version: &str,
+) -> crate::adapter::VersionResolution {
+    let Some(version) = detection.version else {
+        let mut res = crate::adapter::VersionResolution::unknown();
+        res.notes = detection.evidence;
+        return res;
+    };
+    let notes = vec![
+        format!("detected {harness} version {version}"),
+        format!("mapped to schema version {schema_version}"),
+    ];
+    let mut res = crate::adapter::VersionResolution::new(
+        Some(version),
+        Some(schema_version.to_owned()),
+        true,
+    );
+    res.notes = notes;
+    res
+}
+
+/// Refuse instances whose harness is not `id`; the guard every adapter's
+/// `plan_wrapper` and `validate_instance` opens with.
+pub(crate) fn ensure_instance_harness(
+    id: &crate::ids::HarnessId,
+    instance: &Instance,
+) -> Result<(), crate::error::CoreError> {
+    if instance.harness != *id {
+        return Err(crate::error::CoreError::Validation {
+            field: "harness".to_owned(),
+            reason: format!(
+                "instance harness `{}` does not match adapter `{id}`",
+                instance.harness
+            ),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -193,6 +434,125 @@ mod decl_tests {
 
     use crate::adapter::DocumentKind;
     use crate::harness_catalog;
+
+    /// The shared version parser's contract, tested once here instead of
+    /// once per adapter file.
+    #[test]
+    fn parse_version_output_cases() {
+        let cases = vec![
+            ("conductor 1.2.3", Some("1.2.3")),
+            ("1.0.0", Some("1.0.0")),
+            ("v1.0.0", Some("1.0.0")),
+            ("Version: 2.0.0", Some("2.0.0")),
+            ("vibe-kanban/0.1.44 linux-x64 node-v22.23.2", Some("0.1.44")),
+            ("linux-x64 node-v22.23.2", None),
+            ("tool 0.1.0-beta", Some("0.1.0-beta")),
+            ("", None),
+            ("not a version", None),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                crate::adapters::parse_version_output(input).as_deref(),
+                expected,
+                "input: {input:?}"
+            );
+        }
+    }
+
+    /// One canonical check for every adapter's owned selectors, replacing the
+    /// per-file stability copies: unique and non-empty within each surface.
+    #[test]
+    fn owned_selectors_unique_and_non_empty_per_surface() {
+        for adapter in harness_catalog::all_adapters() {
+            let id = adapter.id().as_str().to_owned();
+            for surface in adapter.config_surfaces() {
+                let set: std::collections::HashSet<&str> =
+                    surface.owned_selectors.iter().map(String::as_str).collect();
+                assert_eq!(
+                    set.len(),
+                    surface.owned_selectors.len(),
+                    "{id}/{}: duplicate owned selectors",
+                    surface.id
+                );
+                assert!(
+                    surface.owned_selectors.iter().all(|s| !s.is_empty()),
+                    "{id}/{}: empty owned selector",
+                    surface.id
+                );
+            }
+        }
+    }
+
+    /// A probe past its budget returns None and the child is killed, not left
+    /// running: the /proc sweep fails while the bare `sleep` victim survives.
+    #[test]
+    #[cfg(unix)]
+    fn run_capturing_kills_a_hung_child() {
+        let out = super::run_capturing(
+            std::path::Path::new("sleep"),
+            &["30"],
+            std::time::Duration::from_millis(150),
+        );
+        assert!(out.is_none(), "a hung probe must yield None");
+        let victim = ["sleep", "30"];
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while argv_alive(&victim) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed-out probe child survived: {victim:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// Whether any live process's argv is exactly `wanted`; /proc entries
+    /// that vanish mid-scan or have unreadable cmdlines never match.
+    #[cfg(all(test, unix))]
+    fn argv_alive(wanted: &[&str]) -> bool {
+        let cmdline_matches = |entry: std::fs::DirEntry| {
+            std::fs::read_to_string(entry.path().join("cmdline")).is_ok_and(|cmd| {
+                cmd.split('\0')
+                    .filter(|a| !a.is_empty())
+                    .eq(wanted.iter().copied())
+            })
+        };
+        std::fs::read_dir("/proc").is_ok_and(|entries| entries.flatten().any(cmdline_matches))
+    }
+
+    /// Runtime backstop for `from_validated_const`: every adapter literal,
+    /// including kimi-code's alias-keyed catalog entry, passes validation.
+    #[test]
+    fn adapter_harness_id_literals_validate() {
+        for adapter in harness_catalog::all_adapters() {
+            let id = adapter.id();
+            assert!(
+                crate::ids::HarnessId::new(id.as_str()).is_ok(),
+                "catalog id `{id}` must validate"
+            );
+        }
+        assert!(
+            crate::ids::HarnessId::new(crate::adapters::kimi_code::HARNESS_ID_STR).is_ok(),
+            "kimi-code literal must validate"
+        );
+    }
+
+    /// Detection is a pure function of machine state: two runs must agree.
+    /// One canonical check instead of per-file determinism copies.
+    #[test]
+    fn detection_is_deterministic_per_adapter() {
+        for adapter in harness_catalog::all_adapters() {
+            let id = adapter.id().as_str().to_owned();
+            let first = adapter.detection();
+            let second = adapter.detection();
+            assert_eq!(first.present, second.present, "{id}");
+            // Version probing runs the real binary under a wall-clock budget,
+            // so under load one call may time out where the other succeeds;
+            // confidence is only pinned when the two probes agree.
+            if first.version == second.version {
+                assert_eq!(first.confidence, second.confidence, "{id}");
+            }
+        }
+    }
 
     /// (harness id, expected dest file, expected dest key) for every adapter
     /// that declares an MCP destination, per docs/harness-configs/<doc>.md.

@@ -4,22 +4,22 @@
 use std::path::{Path, PathBuf};
 
 use crate::adapter::{
-    ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
-    DetectionResult, DocumentKind, Os, PathResolver, Platform, ProductStatus, RestartBehavior,
-    SurfaceOwnership, VersionResolution, WrapperPlan,
+    ADAPTER_REVISION, Adapter, ConfigScope, ConfigSurface, DetectionResult, DocumentKind,
+    PathResolver, Platform, ProductStatus, RestartBehavior, SurfaceOwnership, VersionResolution,
+    WrapperPlan,
 };
 use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
-use crate::state::{AdapterSupport, InstallPresence, Isolation};
+use crate::state::{AdapterSupport, Isolation};
 
-/// Harness identifier for `OpenHands`.
+/// Catalog id superai registers this harness under.
 pub const HARNESS_ID_STR: &str = "openhands";
 
-/// Human display name.
+/// Name shown for this harness in listings and errors.
 pub const DISPLAY_NAME: &str = "OpenHands";
 
-/// Primary executable name.
+/// Binary name resolved on PATH during detection.
 pub const EXECUTABLE: &str = "openhands";
 
 /// Alternative binary name (legacy CLI).
@@ -35,13 +35,10 @@ pub const LLM_API_KEY_ENV_VAR: &str = "LLM_API_KEY";
 /// LLM base URL env.
 pub const LLM_BASE_URL_ENV_VAR: &str = "LLM_BASE_URL";
 
-/// Default persistence root fallback.
-pub const DEFAULT_PERSISTENCE_FALLBACK: &str = "~/.openhands";
-
-/// Research document link.
+/// Research doc whose findings the constants in this file encode.
 pub const RESEARCH_DOC: &str = "docs/harness-configs/openhands.md";
 
-/// Last verified date.
+/// Date the research doc was last checked against the harness.
 pub const LAST_VERIFIED: &str = "2026-08-25";
 
 /// Schema version for current config shape (V1+ V0 combined).
@@ -81,39 +78,31 @@ impl OpenHandsAdapter {
         Ok(Self { id })
     }
 
-    /// Borrow the harness id.
-    pub fn harness_id(&self) -> &HarnessId {
-        &self.id
-    }
-
-    /// Executable name for this harness.
-    pub fn executable_name(&self) -> &str {
-        EXECUTABLE
-    }
-
-    /// Persistence env var.
-    pub fn persistence_env_var(&self) -> &str {
-        PERSISTENCE_ENV_VAR
-    }
-
-    /// Version split note.
-    pub fn version_split_note(&self) -> &str {
-        VERSION_SPLIT_NOTE
-    }
-
     fn default_persistence_root() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var(PERSISTENCE_ENV_VAR)
             && !dir.trim().is_empty()
         {
             return Some(PathBuf::from(dir));
         }
-        let home = std::env::var("HOME")
-            .ok()
-            .or_else(|| std::env::var("USERPROFILE").ok())?;
-        if home.trim().is_empty() {
-            return None;
+        let home = super::home_dir()?;
+        Some(home.join(".openhands"))
+    }
+
+    /// Evidence line for a readable config carrying any marker, or for the
+    /// read failure itself; a readable file without markers stays silent.
+    fn probe_config_markers(
+        path: &Path,
+        markers: &[&str],
+        label: &str,
+        evidence: &mut Vec<String>,
+    ) {
+        match std::fs::read_to_string(path) {
+            Ok(text) if markers.iter().any(|m| text.contains(m)) => {
+                evidence.push(format!("{label} carries an owned marker"));
+            }
+            Ok(_) => {}
+            Err(err) => evidence.push(format!("config unreadable at {}: {err}", path.display())),
         }
-        Some(PathBuf::from(home).join(".openhands"))
     }
 
     #[expect(
@@ -133,11 +122,12 @@ impl OpenHandsAdapter {
                             "V1 agent_settings.json found at {}",
                             v1_settings.display()
                         ));
-                        if let Ok(text) = std::fs::read_to_string(&v1_settings)
-                            && (text.contains("\"llm\"") || text.contains("model"))
-                        {
-                            evidence.push("agent_settings.json contains llm/model".to_owned());
-                        }
+                        Self::probe_config_markers(
+                            &v1_settings,
+                            &["\"llm\"", "model"],
+                            "agent_settings.json",
+                            evidence,
+                        );
                     } else {
                         evidence.push(format!(
                             "V1 agent_settings.json missing at {}",
@@ -147,11 +137,12 @@ impl OpenHandsAdapter {
                     let v0_global = root.join("config.toml");
                     if v0_global.exists() {
                         evidence.push(format!("V0 config.toml found at {}", v0_global.display()));
-                        if let Ok(text) = std::fs::read_to_string(&v0_global)
-                            && (text.contains("[llm]") || text.contains("[core]"))
-                        {
-                            evidence.push("V0 config.toml contains [llm]/[core]".to_owned());
-                        }
+                        Self::probe_config_markers(
+                            &v0_global,
+                            &["[llm]", "[core]"],
+                            "V0 config.toml",
+                            evidence,
+                        );
                     } else {
                         evidence.push(format!("V0 config.toml missing at {}", v0_global.display()));
                     }
@@ -223,8 +214,7 @@ impl OpenHandsAdapter {
 
 impl Default for OpenHandsAdapter {
     fn default() -> Self {
-        #[expect(clippy::unwrap_used, reason = "openhands is static valid HarnessId")]
-        let id = HarnessId::new(HARNESS_ID_STR).unwrap();
+        let id = HarnessId::from_validated_const(HARNESS_ID_STR);
         Self { id }
     }
 }
@@ -243,11 +233,7 @@ impl Adapter for OpenHandsAdapter {
     }
 
     fn supported_platforms(&self) -> Vec<Platform> {
-        vec![
-            Platform::new(Os::Linux, Arch::Any),
-            Platform::new(Os::Macos, Arch::Any),
-            Platform::new(Os::Windows, Arch::Any),
-        ]
+        super::desktop_platforms()
     }
 
     fn adapter_revision(&self) -> &str {
@@ -294,19 +280,11 @@ impl Adapter for OpenHandsAdapter {
 
         self.collect_config_evidence(&mut evidence);
 
-        let present = match (&binary_path, &version) {
-            (Some(_), Some(_)) => InstallPresence::Present,
-            (Some(_), None) => InstallPresence::UnknownVersion,
-            (None, _) => InstallPresence::Absent,
-        };
+        let present = super::install_presence(binary_path.is_some(), version.is_some());
 
-        // Absent forces High, so the Low "persistence root exists" arm can
         // never survive.
-        let confidence = match (&binary_path, &version) {
-            (Some(_), None) => DetectionConfidence::Medium,
-            (Some(_), Some(_)) | (None, _) => DetectionConfidence::High,
-        };
-
+        let confidence =
+            super::detection_confidence(binary_path.is_some(), version.is_some(), false);
         DetectionResult::new(present, version, evidence, confidence)
     }
 
@@ -526,15 +504,7 @@ impl Adapter for OpenHandsAdapter {
     }
 
     fn plan_wrapper(&self, instance: &Instance) -> Result<WrapperPlan, CoreError> {
-        if instance.harness != self.id {
-            return Err(CoreError::Validation {
-                field: "harness".to_owned(),
-                reason: format!(
-                    "instance harness `{}` does not match adapter `{}`",
-                    instance.harness, self.id
-                ),
-            });
-        }
+        super::ensure_instance_harness(&self.id, instance)?;
         instance.validate()?;
         let mut plan = WrapperPlan::new("os_bound via OH_PERSISTENCE_DIR + LLM_* + Docker");
         plan.env_vars.push((
@@ -576,12 +546,7 @@ impl Adapter for OpenHandsAdapter {
     }
 
     fn validate_instance(&self, instance: &Instance) -> Result<(), CoreError> {
-        if instance.harness != self.id {
-            return Err(CoreError::Validation {
-                field: "harness".to_owned(),
-                reason: format!("expected harness `{}`, got `{}`", self.id, instance.harness),
-            });
-        }
+        super::ensure_instance_harness(&self.id, instance)?;
         instance.validate()?;
         match instance.isolation {
             Isolation::OsBound
@@ -598,11 +563,7 @@ impl Adapter for OpenHandsAdapter {
     }
 
     fn supported_skill_modes(&self) -> Vec<crate::adapter::SkillMode> {
-        vec![
-            crate::adapter::SkillMode::LinkAll,
-            crate::adapter::SkillMode::LinkSelected,
-            crate::adapter::SkillMode::CopySelected,
-        ]
+        super::skill_modes_link_first()
     }
 
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
@@ -629,11 +590,8 @@ impl Adapter for OpenHandsAdapter {
 mod tests {
     use std::collections::HashSet;
 
-    use super::{
-        DEFAULT_PERSISTENCE_FALLBACK, DISPLAY_NAME, EXECUTABLE, HARNESS_ID_STR, OWNED_SELECTORS,
-        OpenHandsAdapter, PERSISTENCE_ENV_VAR, RESEARCH_DOC, VERSION_SPLIT_NOTE,
-    };
-    use crate::adapter::{Adapter, ConfigScope, DocumentKind, ProductStatus, SurfaceOwnership};
+    use super::{HARNESS_ID_STR, OWNED_SELECTORS, OpenHandsAdapter, PERSISTENCE_ENV_VAR};
+    use crate::adapter::{Adapter, ConfigScope, DocumentKind, SurfaceOwnership};
     use crate::error::CoreError;
     use crate::ids::{HarnessId, InstanceId, InstanceName};
     use crate::instance::Instance;
@@ -664,18 +622,11 @@ mod tests {
     #[test]
     fn adapter_identity() {
         let a = adapter();
+        // Constructor wiring plus catalog registration: an id the catalog
+        // does not know can never reconcile with detection or instances.
+        let entry = crate::harness_catalog::find_by_id(HARNESS_ID_STR).unwrap();
         assert_eq!(a.id().as_str(), HARNESS_ID_STR);
-        assert_eq!(a.display_name(), DISPLAY_NAME);
-        assert_eq!(a.executable_name(), EXECUTABLE);
-        assert_eq!(a.persistence_env_var(), PERSISTENCE_ENV_VAR);
-        assert_eq!(a.product_status(), ProductStatus::Active);
-        assert_eq!(a.research_doc_link(), RESEARCH_DOC);
-        assert!(!a.last_verified_date().is_empty());
-        assert_eq!(a.adapter_revision(), crate::adapter::ADAPTER_REVISION);
-        assert!(a.version_split_note().contains("V0"));
-        assert!(a.version_split_note().contains("V1"));
-        assert!(VERSION_SPLIT_NOTE.contains("Docker"));
-        assert_eq!(DEFAULT_PERSISTENCE_FALLBACK, "~/.openhands");
+        assert_eq!(a.product_status(), entry.product_status);
     }
 
     #[test]
@@ -703,7 +654,6 @@ mod tests {
             }
             InstallPresence::Broken => assert!(!result.evidence.is_empty()),
         }
-        assert_ne!(result.confidence.to_string(), "");
     }
 
     #[test]
@@ -727,24 +677,6 @@ mod tests {
             assert!(res.notes.iter().any(|n| n.contains("split")));
         }
         assert!(!res.notes.is_empty());
-    }
-
-    #[test]
-    fn parse_version_output_cases() {
-        let cases = vec![
-            ("openhands 1.8.0", Some("1.8.0")),
-            ("openhands 0.44.0", Some("0.44.0")),
-            ("0.44.0", Some("0.44.0")),
-            ("v1.0.0", Some("1.0.0")),
-            ("Version: 2.0.0", Some("2.0.0")),
-            ("1.26.0-python", Some("1.26.0-python")),
-            ("", None),
-            ("not a version", None),
-        ];
-        for (input, expected) in cases {
-            let got = crate::adapters::parse_version_output(input);
-            assert_eq!(got.as_deref(), expected, "input: {input:?}");
-        }
     }
 
     #[test]

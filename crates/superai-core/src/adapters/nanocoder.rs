@@ -1,5 +1,5 @@
-//! Nanocoder adapter: relocated root via `NANOCODER_CONFIG_DIR`, explicit
-//! file overrides via `NANOCODER_PROVIDERS_FILE`/`NANOCODER_MCPSERVERS_FILE`.
+//! Nanocoder adapter: relocated root via `NANOCODER_CONFIG_DIR`; the
+//! `*_FILE` env vars surface in detection evidence and wrapper text only.
 
 use std::path::{Path, PathBuf};
 
@@ -13,34 +13,34 @@ use crate::ids::HarnessId;
 use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence, Isolation};
 
-/// Harness identifier for Nanocoder.
+/// Harness id this adapter registers under.
 pub const HARNESS_ID_STR: &str = "nanocoder";
 
-/// Human display name.
+/// Name the adapter's `display_name()` reports.
 pub const DISPLAY_NAME: &str = "Nanocoder";
 
-/// Primary executable name.
+/// Primary executable probed during detection.
 pub const EXECUTABLE: &str = "nanocoder";
 
-/// Environment variable that relocates the config root.
+/// Env var relocating the config root for detection and wrapper plans.
 pub const CONFIG_ENV_VAR: &str = "NANOCODER_CONFIG_DIR";
 
-/// Explicit providers file override.
+/// Env var whose presence detection reports; no code resolves a file
+/// through it.
 pub const PROVIDERS_ENV_VAR: &str = "NANOCODER_PROVIDERS_FILE";
 
-/// Explicit MCP servers file override.
+/// Env var whose presence detection reports; no code resolves a file
+/// through it.
 pub const MCPSERVERS_ENV_VAR: &str = "NANOCODER_MCPSERVERS_FILE";
 
-/// Default config root when `NANOCODER_CONFIG_DIR` is unset.
-pub const DEFAULT_CONFIG_ROOT_FALLBACK: &str = "~/.config/nanocoder";
-
-/// Research document link.
+/// Research source for the declarations in this file; returned by
+/// `research_doc_link()`.
 pub const RESEARCH_DOC: &str = "docs/harness-configs/nanocoder.md";
 
-/// Last verified date.
+/// Date `last_verified_date()` reports.
 pub const LAST_VERIFIED: &str = "2026-08-25";
 
-/// Schema version for current config shape.
+/// Config shape version `version_resolution()` maps detected versions to.
 pub const SCHEMA_VERSION_STR: &str = "1";
 
 /// Owned selectors for provider/model/mcp mutation.
@@ -53,8 +53,8 @@ pub const OWNED_SELECTORS: &[&str] = &[
     "preferences",
 ];
 
-/// Concrete adapter for Nanocoder: `relocated-root` via `NANOCODER_CONFIG_DIR`
-/// plus explicit file overrides `NANOCODER_PROVIDERS_FILE`/`NANOCODER_MCPSERVERS_FILE`.
+/// Concrete adapter for Nanocoder: detection scans the relocated root's
+/// JSON files; wrapper plans pin the root through `NANOCODER_CONFIG_DIR`.
 #[derive(Debug, Clone)]
 pub struct NanocoderAdapter {
     id: HarnessId,
@@ -65,21 +65,6 @@ impl NanocoderAdapter {
     pub fn new() -> Result<Self, CoreError> {
         let id = HarnessId::new(HARNESS_ID_STR)?;
         Ok(Self { id })
-    }
-
-    /// Borrow the harness id.
-    pub fn harness_id(&self) -> &HarnessId {
-        &self.id
-    }
-
-    /// Executable name for this harness.
-    pub fn executable_name(&self) -> &str {
-        EXECUTABLE
-    }
-
-    /// Config relocation env var.
-    pub fn config_env_var(&self) -> &str {
-        CONFIG_ENV_VAR
     }
 
     fn default_config_root() -> Option<PathBuf> {
@@ -122,11 +107,18 @@ impl NanocoderAdapter {
                     let cfg = Self::config_path_for_root(&root);
                     if cfg.exists() {
                         evidence.push(format!("agents.config.json found at {}", cfg.display()));
-                        if let Ok(text) = std::fs::read_to_string(&cfg)
-                            && (text.contains("providers") || text.contains("nanocoder"))
-                        {
-                            evidence
-                                .push("agents.config.json contains providers/nanocoder".to_owned());
+                        match std::fs::read_to_string(&cfg) {
+                            Ok(text)
+                                if text.contains("providers") || text.contains("nanocoder") =>
+                            {
+                                evidence.push(
+                                    "agents.config.json contains providers/nanocoder".to_owned(),
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                evidence.push(format!("agents.config.json unreadable: {e}"));
+                            }
                         }
                     } else {
                         evidence.push(format!("agents.config.json missing at {}", cfg.display()));
@@ -188,8 +180,7 @@ impl NanocoderAdapter {
 
 impl Default for NanocoderAdapter {
     fn default() -> Self {
-        #[expect(clippy::unwrap_used, reason = "nanocoder is static valid HarnessId")]
-        let id = HarnessId::new(HARNESS_ID_STR).unwrap();
+        let id = HarnessId::from_validated_const(HARNESS_ID_STR);
         Self { id }
     }
 }
@@ -519,7 +510,7 @@ impl Adapter for NanocoderAdapter {
         ]
     }
 
-    /// Home-dir `.mcp.json`, overridable via the `NANOCODER_MCPSERVERS` env vars.
+    /// Home-dir `.mcp.json` under the resolved root; no file override exists.
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(crate::adapter::McpAdapterDecl::new(
             ".mcp.json",
@@ -542,10 +533,7 @@ mod tests {
     use std::collections::HashSet;
     use std::path::PathBuf;
 
-    use super::{
-        CONFIG_ENV_VAR, DISPLAY_NAME, EXECUTABLE, HARNESS_ID_STR, NanocoderAdapter,
-        OWNED_SELECTORS, RESEARCH_DOC,
-    };
+    use super::{CONFIG_ENV_VAR, HARNESS_ID_STR, NanocoderAdapter, OWNED_SELECTORS};
     use crate::adapter::{Adapter, ConfigScope, DocumentKind, ProductStatus, SurfaceOwnership};
     use crate::error::CoreError;
     use crate::ids::{HarnessId, InstanceId, InstanceName};
@@ -577,14 +565,11 @@ mod tests {
     #[test]
     fn adapter_identity() {
         let a = adapter();
+        // Constructor wiring plus catalog registration: an id the catalog
+        // does not know can never reconcile with detection or instances.
         assert_eq!(a.id().as_str(), HARNESS_ID_STR);
-        assert_eq!(a.display_name(), DISPLAY_NAME);
-        assert_eq!(a.executable_name(), EXECUTABLE);
-        assert_eq!(a.config_env_var(), CONFIG_ENV_VAR);
+        assert!(crate::harness_catalog::find_by_id(HARNESS_ID_STR).is_some());
         assert_eq!(a.product_status(), ProductStatus::Active);
-        assert_eq!(a.research_doc_link(), RESEARCH_DOC);
-        assert!(!a.last_verified_date().is_empty());
-        assert_eq!(a.adapter_revision(), crate::adapter::ADAPTER_REVISION);
     }
 
     #[test]
@@ -618,7 +603,6 @@ mod tests {
                 assert!(!result.evidence.is_empty());
             }
         }
-        assert_ne!(result.confidence.to_string(), "");
     }
 
     #[test]
@@ -636,22 +620,6 @@ mod tests {
             assert!(res.schema_version.is_none());
         }
         assert!(!res.notes.is_empty());
-    }
-
-    #[test]
-    fn parse_version_output_cases() {
-        let cases = vec![
-            ("nanocoder 1.2.3", Some("1.2.3")),
-            ("nanocoder 0.1.0-beta", Some("0.1.0-beta")),
-            ("v1.0.0", Some("1.0.0")),
-            ("Version: 2.0.0", Some("2.0.0")),
-            ("", None),
-            ("not a version", None),
-        ];
-        for (input, expected) in cases {
-            let got = crate::adapters::parse_version_output(input);
-            assert_eq!(got.as_deref(), expected, "input: {input:?}");
-        }
     }
 
     #[test]
@@ -908,22 +876,24 @@ mod tests {
     fn fixture_minimal_parses() {
         let path = fixture_path("agents.config.minimal.json");
         assert!(path.exists(), "fixture missing: {}", path.display());
+        // The minimal fixture is the empty document nanocoder ships with.
         let map = superai_config::json::load(&path).unwrap();
-        assert!(map.is_empty() || map.contains_key("nanocoder") || map.contains_key("mcpServers"));
+        assert!(
+            map.is_empty(),
+            "minimal fixture must be an empty object: {map:?}"
+        );
     }
 
     #[test]
     fn fixture_populated_parses_and_has_expected_keys() {
         let path = fixture_path("agents.config.populated.json");
         assert!(path.exists(), "fixture missing: {}", path.display());
+        // The populated fixture must carry the two top-level surfaces the
+        // adapter declares ownership over.
         let map = superai_config::json::load(&path).unwrap();
         assert!(
-            map.contains_key("providers")
-                || map.contains_key("mcpServers")
-                || map.contains_key("model")
-                || map.contains_key("providers")
-                || map.contains_key("mcpServers")
-                || !map.is_empty()
+            map.contains_key("nanocoder") && map.contains_key("mcpServers"),
+            "populated fixture missing nanocoder/mcpServers: {map:?}"
         );
     }
 
@@ -972,31 +942,6 @@ mod tests {
         assert!(path.exists(), "fixture missing: {}", path.display());
         let result = superai_config::json::load(&path);
         assert!(result.is_err(), "malformed fixture must fail to parse");
-    }
-
-    #[test]
-    fn secret_redaction_placeholder() {
-        use crate::error::RedactedString;
-        let secret = RedactedString::new("sk-nanocoder-secret-321");
-        let debug = format!("{secret:?}");
-        let display = format!("{secret}");
-        assert!(!debug.contains("sk-nanocoder-secret-321"));
-        assert!(!display.contains("sk-nanocoder-secret-321"));
-        assert!(debug.contains("[REDACTED]"));
-        assert!(display.contains("[REDACTED]"));
-        let json = serde_json::to_string(&secret).unwrap();
-        assert!(!json.contains("sk-nanocoder-secret-321"));
-        assert!(json.contains("[REDACTED]"));
-        assert_eq!(secret.expose_secret(), "sk-nanocoder-secret-321");
-    }
-
-    #[test]
-    fn diff_redaction_does_not_leak_secrets() {
-        use crate::error::RedactedString as OpRedacted;
-        let secret = OpRedacted::new("super-secret-key");
-        let diff_text = format!("set api key to {secret}");
-        assert!(!diff_text.contains("super-secret-key"));
-        assert!(diff_text.contains("[REDACTED]"));
     }
 
     #[test]

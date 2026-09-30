@@ -6,15 +6,15 @@ use std::path::PathBuf;
 
 /// Reference date for the freshness ledger (QAL-14); updated by the
 /// pre-release recheck after re-verifying the catalog.
-pub const FRESHNESS_AS_OF: &str = "2026-09-18";
+const FRESHNESS_AS_OF: &str = "2026-09-18";
 
 /// Maximum tolerated age of a catalog `last_verified` date, in days, at the
 /// last recorded recheck.
-pub const MAX_ENTRY_AGE_DAYS: i64 = 365;
+const MAX_ENTRY_AGE_DAYS: i64 = 365;
 
 /// A piece of evidence backing one ledger row.
 #[derive(Debug, Clone, Copy)]
-pub enum Evidence {
+enum Evidence {
     /// A test function: `name` must appear as `fn <name>(` in `file`.
     Test {
         /// Source file, relative to this crate's manifest directory.
@@ -99,26 +99,19 @@ fn cached_source(file: &str, cache: &mut HashMap<String, String>) -> Result<Stri
     Ok(src)
 }
 
-/// Verify one evidence item; returns a human-readable problem on failure.
-pub fn verify_evidence(evidence: &Evidence) -> Result<(), String> {
-    let mut cache = HashMap::new();
-    let src = cached_source(evidence.file(), &mut cache)?;
-    verify_evidence_src(evidence, &src)
-}
-
 /// One master-plan §9 row: the goal requirement sentence (must match the
 /// plan's table text exactly), plus its evidence.
 #[derive(Debug)]
-pub struct GoalRow {
+struct GoalRow {
     /// The requirement sentence, first column of the §9 table.
-    pub requirement: &'static str,
+    requirement: &'static str,
     /// Evidence: tests or explicit artifacts.
-    pub evidence: &'static [Evidence],
+    evidence: &'static [Evidence],
 }
 
 /// The full §9 ledger. The bidirectional test guarantees this list covers
 /// exactly the plan's rows, no orphans, no missing.
-pub const GOAL_ROWS: &[GoalRow] = &[
+const GOAL_ROWS: &[GoalRow] = &[
     GoalRow {
         requirement: "Existing/default installs are managed targets",
         evidence: &[
@@ -338,17 +331,17 @@ pub const GOAL_ROWS: &[GoalRow] = &[
 
 /// One master-plan §10 checkbox: the 1-based checkbox number plus evidence.
 #[derive(Debug)]
-pub struct DodItem {
+struct DodItem {
     /// 1-based checkbox position in §10 (order-stable in the document).
-    pub number: usize,
+    number: usize,
     /// Short label for diagnostics.
-    pub label: &'static str,
+    label: &'static str,
     /// Evidence: tests or explicit artifacts.
-    pub evidence: &'static [Evidence],
+    evidence: &'static [Evidence],
 }
 
 /// The §10 ledger (16 checkboxes).
-pub const DOD_ITEMS: &[DodItem] = &[
+const DOD_ITEMS: &[DodItem] = &[
     DodItem {
         number: 1,
         label: "goal sentence mapping",
@@ -607,7 +600,7 @@ pub const DOD_ITEMS: &[DodItem] = &[
 
 /// Extract the §9 requirement sentences (first column of the goal-coverage
 /// table), skipping the header and separator rows.
-pub fn section9_requirements(plan: &str) -> Vec<String> {
+fn section9_requirements(plan: &str) -> Vec<String> {
     let mut in_section = false;
     let mut rows = Vec::new();
     for line in plan.lines() {
@@ -636,7 +629,7 @@ pub fn section9_requirements(plan: &str) -> Vec<String> {
 }
 
 /// Count the `§10` `DoD` checkboxes and return their first-line texts.
-pub fn section10_items(plan: &str) -> Vec<String> {
+fn section10_items(plan: &str) -> Vec<String> {
     let mut in_section = false;
     let mut items = Vec::new();
     for line in plan.lines() {
@@ -657,7 +650,7 @@ pub fn section10_items(plan: &str) -> Vec<String> {
 }
 
 /// Parse `YYYY-MM-DD` into `(year, month, day)`.
-pub fn parse_ymd(s: &str) -> Option<(i32, u32, u32)> {
+fn parse_ymd(s: &str) -> Option<(i32, u32, u32)> {
     let mut parts = s.trim().split('-');
     let year: i32 = parts.next()?.parse().ok()?;
     let month: u32 = parts.next()?.parse().ok()?;
@@ -669,7 +662,7 @@ pub fn parse_ymd(s: &str) -> Option<(i32, u32, u32)> {
 }
 
 /// Days since 1970-01-01 for a civil date (Howard Hinnant's algorithm).
-pub fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
     let y = i64::from(if month <= 2 { year - 1 } else { year });
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = y - era * 400; // [0, 399]
@@ -682,13 +675,11 @@ pub fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
 
 /// Age in days of a `last_verified` date relative to `as_of` (both
 /// `YYYY-MM-DD`). `None` when either date does not parse.
-pub fn staleness_days(last_verified: &str, as_of: &str) -> Option<i64> {
+fn staleness_days(last_verified: &str, as_of: &str) -> Option<i64> {
     let (ly, lm, ld) = parse_ymd(last_verified)?;
     let (ay, am, ad) = parse_ymd(as_of)?;
     Some(days_from_civil(ay, am, ad) - days_from_civil(ly, lm, ld))
 }
-
-// Tests: the ledger is a tested artifact (QAL-13)
 
 #[cfg(test)]
 mod tests {

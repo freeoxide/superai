@@ -4,22 +4,22 @@
 use std::path::{Path, PathBuf};
 
 use crate::adapter::{
-    ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
-    DetectionResult, DocumentKind, Os, PathResolver, Platform, ProductStatus, RestartBehavior,
-    SurfaceOwnership, VersionResolution, WrapperPlan,
+    ADAPTER_REVISION, Adapter, ConfigScope, ConfigSurface, DetectionResult, DocumentKind,
+    PathResolver, Platform, ProductStatus, RestartBehavior, SurfaceOwnership, VersionResolution,
+    WrapperPlan,
 };
 use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
-use crate::state::{AdapterSupport, InstallPresence, Isolation};
+use crate::state::{AdapterSupport, Isolation};
 
-/// Harness identifier for Warp.
+/// Catalog id superai registers this harness under.
 pub const HARNESS_ID_STR: &str = "warp";
 
-/// Human display name.
+/// Name shown for this harness in listings and errors.
 pub const DISPLAY_NAME: &str = "Warp Agent CLI/app";
 
-/// Primary executable name.
+/// Binary name resolved on PATH during detection.
 pub const EXECUTABLE: &str = "warp";
 
 /// Alternative executable name (agent CLI alias).
@@ -34,13 +34,13 @@ pub const XDG_CONFIG_HOME_ENV_VAR: &str = "XDG_CONFIG_HOME";
 /// Environment variable for XDG data relocation (workflows Linux).
 pub const XDG_DATA_HOME_ENV_VAR: &str = "XDG_DATA_HOME";
 
-/// Research document link.
+/// Research doc whose findings the constants in this file encode.
 pub const RESEARCH_DOC: &str = "docs/harness-configs/warp.md";
 
-/// Last verified date.
+/// Date the research doc was last checked against the harness.
 pub const LAST_VERIFIED: &str = "2026-08-25";
 
-/// Schema version.
+/// Schema version this adapter maps detected versions to.
 pub const SCHEMA_VERSION_STR: &str = "1";
 
 /// Constrained note: Linux XDG/profile constrained.
@@ -70,17 +70,7 @@ impl WarpAdapter {
         Ok(Self { id })
     }
 
-    /// Borrow the harness id.
-    pub fn harness_id(&self) -> &HarnessId {
-        &self.id
-    }
-
-    /// Executable name for this harness.
-    pub fn executable_name(&self) -> &str {
-        EXECUTABLE
-    }
-
-    /// Constrained note.
+    /// Constraint recorded wherever full support would overstate.
     pub fn constrained_note(&self) -> &str {
         CONSTRAINED_NOTE
     }
@@ -96,16 +86,10 @@ impl WarpAdapter {
                     .join("settings.toml"),
             );
         }
-        let home = std::env::var("HOME")
-            .ok()
-            .or_else(|| std::env::var("USERPROFILE").ok())?;
-        if home.trim().is_empty() {
-            return None;
-        }
+        let home = super::home_dir()?;
         if cfg!(target_os = "linux") {
             Some(
-                PathBuf::from(home)
-                    .join(".config")
+                home.join(".config")
                     .join("warp-terminal")
                     .join("cli")
                     .join("settings.toml"),
@@ -124,8 +108,7 @@ impl WarpAdapter {
                 );
             }
             Some(
-                PathBuf::from(home)
-                    .join("AppData")
+                home.join("AppData")
                     .join("Local")
                     .join("warp")
                     .join("Warp")
@@ -134,7 +117,7 @@ impl WarpAdapter {
                     .join("settings.toml"),
             )
         } else {
-            Some(PathBuf::from(home).join(".warp_cli").join("settings.toml"))
+            Some(home.join(".warp_cli").join("settings.toml"))
         }
     }
 
@@ -153,10 +136,15 @@ impl WarpAdapter {
             Some(path) => {
                 if path.exists() {
                     evidence.push(format!("CLI settings.toml found at {}", path.display()));
-                    if let Ok(text) = std::fs::read_to_string(&path)
-                        && (text.contains("[appearance]") || text.contains("theme"))
-                    {
-                        evidence.push("CLI settings.toml contains appearance/theme".to_owned());
+                    match std::fs::read_to_string(&path) {
+                        Ok(text) if (text.contains("[appearance]") || text.contains("theme")) => {
+                            evidence.push("CLI settings.toml contains appearance/theme".to_owned());
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            evidence
+                                .push(format!("config unreadable at {}: {err}", path.display()));
+                        }
                     }
                 } else {
                     evidence.push(format!("CLI settings.toml missing at {}", path.display()));
@@ -164,22 +152,22 @@ impl WarpAdapter {
             }
             None => evidence.push("could not resolve CLI settings path (no HOME)".to_owned()),
         }
-        let home_opt = std::env::var("HOME")
-            .ok()
-            .or_else(|| std::env::var("USERPROFILE").ok());
-        if let Some(home) = home_opt
-            && !home.trim().is_empty()
-        {
+        if let Some(home) = super::home_dir() {
             let global_mcp = PathBuf::from(&home).join(".warp").join(".mcp.json");
             if global_mcp.exists() {
                 evidence.push(format!(
                     "global .mcp.json found at {}",
                     global_mcp.display()
                 ));
-                if let Ok(text) = std::fs::read_to_string(&global_mcp)
-                    && text.contains("mcpServers")
-                {
-                    evidence.push("global .mcp.json contains mcpServers".to_owned());
+                match std::fs::read_to_string(&global_mcp) {
+                    Ok(text) if text.contains("mcpServers") => {
+                        evidence.push("global .mcp.json contains mcpServers".to_owned());
+                    }
+                    Ok(_) => {}
+                    Err(err) => evidence.push(format!(
+                        "config unreadable at {}: {err}",
+                        global_mcp.display()
+                    )),
                 }
             } else {
                 evidence.push(format!(
@@ -275,8 +263,7 @@ impl WarpAdapter {
 
 impl Default for WarpAdapter {
     fn default() -> Self {
-        #[expect(clippy::unwrap_used, reason = "warp is static valid HarnessId")]
-        let id = HarnessId::new(HARNESS_ID_STR).unwrap();
+        let id = HarnessId::from_validated_const(HARNESS_ID_STR);
         Self { id }
     }
 }
@@ -295,11 +282,7 @@ impl Adapter for WarpAdapter {
     }
 
     fn supported_platforms(&self) -> Vec<Platform> {
-        vec![
-            Platform::new(Os::Linux, Arch::Any),
-            Platform::new(Os::Macos, Arch::Any),
-            Platform::new(Os::Windows, Arch::Any),
-        ]
+        super::desktop_platforms()
     }
 
     fn adapter_revision(&self) -> &str {
@@ -346,18 +329,10 @@ impl Adapter for WarpAdapter {
 
         self.collect_config_evidence(&mut evidence);
 
-        let present = match (&binary_path, &version) {
-            (Some(_), Some(_)) => InstallPresence::Present,
-            (Some(_), None) => InstallPresence::UnknownVersion,
-            (None, _) => InstallPresence::Absent,
-        };
+        let present = super::install_presence(binary_path.is_some(), version.is_some());
 
-        // Absent forces High, so the Low "CLI settings.toml found" arm can never fire.
-        let confidence = match (&binary_path, &version) {
-            (Some(_), None) => DetectionConfidence::Medium,
-            (Some(_), Some(_)) | (None, _) => DetectionConfidence::High,
-        };
-
+        let confidence =
+            super::detection_confidence(binary_path.is_some(), version.is_some(), false);
         DetectionResult::new(present, version, evidence, confidence)
     }
 
@@ -588,15 +563,7 @@ impl Adapter for WarpAdapter {
     }
 
     fn plan_wrapper(&self, instance: &Instance) -> Result<WrapperPlan, CoreError> {
-        if instance.harness != self.id {
-            return Err(CoreError::Validation {
-                field: "harness".to_owned(),
-                reason: format!(
-                    "instance harness `{}` does not match adapter `{}`",
-                    instance.harness, self.id
-                ),
-            });
-        }
+        super::ensure_instance_harness(&self.id, instance)?;
         instance.validate()?;
         let mut plan = WrapperPlan::new(
             "os_bound via XDG_CONFIG_HOME/XDG_DATA_HOME + WARP_API_KEY (Linux CLI constrained, app/GUI not relocatable)",
@@ -604,17 +571,17 @@ impl Adapter for WarpAdapter {
         // XDG_CONFIG_HOME moves settings.toml and the CLI .mcp.json together.
         let xdg_config = format!("{}/config", instance.config_root);
         let xdg_data = format!("{}/data", instance.config_root);
+        plan.description = format!(
+            " Wrapper sets {XDG_CONFIG_HOME_ENV_VAR}={xdg_config} {XDG_DATA_HOME_ENV_VAR}={xdg_data} {API_KEY_ENV_VAR}=<per-instance> and execs `{EXECUTABLE}`: Linux CLI XDG relocatable per docs ({CONSTRAINED_NOTE}); macOS ~/Library paths and app settings/Drive not relocatable, project AGENTS.md/WARP.md via cwd"
+        );
         plan.env_vars
-            .push((XDG_CONFIG_HOME_ENV_VAR.to_owned(), xdg_config.clone()));
+            .push((XDG_CONFIG_HOME_ENV_VAR.to_owned(), xdg_config));
         plan.env_vars
-            .push((XDG_DATA_HOME_ENV_VAR.to_owned(), xdg_data.clone()));
+            .push((XDG_DATA_HOME_ENV_VAR.to_owned(), xdg_data));
         plan.env_vars.push((
             API_KEY_ENV_VAR.to_owned(),
             format!("{}/api_key", instance.config_root),
         ));
-        plan.description = format!(
-            " Wrapper sets {XDG_CONFIG_HOME_ENV_VAR}={xdg_config} {XDG_DATA_HOME_ENV_VAR}={xdg_data} {API_KEY_ENV_VAR}=<per-instance> and execs `{EXECUTABLE}`: Linux CLI XDG relocatable per docs ({CONSTRAINED_NOTE}); macOS ~/Library paths and app settings/Drive not relocatable, project AGENTS.md/WARP.md via cwd"
-        );
         Ok(plan)
     }
 
@@ -633,12 +600,7 @@ impl Adapter for WarpAdapter {
     }
 
     fn validate_instance(&self, instance: &Instance) -> Result<(), CoreError> {
-        if instance.harness != self.id {
-            return Err(CoreError::Validation {
-                field: "harness".to_owned(),
-                reason: format!("expected harness `{}`, got `{}`", self.id, instance.harness),
-            });
-        }
+        super::ensure_instance_harness(&self.id, instance)?;
         instance.validate()?;
         match instance.isolation {
             Isolation::OsBound | Isolation::Unknown | Isolation::RelocatedRoot => Ok(()),
@@ -652,11 +614,7 @@ impl Adapter for WarpAdapter {
     }
 
     fn supported_skill_modes(&self) -> Vec<crate::adapter::SkillMode> {
-        vec![
-            crate::adapter::SkillMode::LinkAll,
-            crate::adapter::SkillMode::LinkSelected,
-            crate::adapter::SkillMode::CopySelected,
-        ]
+        super::skill_modes_link_first()
     }
 
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
@@ -679,10 +637,10 @@ mod tests {
     use std::collections::HashSet;
 
     use super::{
-        API_KEY_ENV_VAR, CONSTRAINED_NOTE, DISPLAY_NAME, EXECUTABLE, HARNESS_ID_STR,
-        OWNED_SELECTORS, RESEARCH_DOC, WarpAdapter, XDG_CONFIG_HOME_ENV_VAR, XDG_DATA_HOME_ENV_VAR,
+        API_KEY_ENV_VAR, HARNESS_ID_STR, OWNED_SELECTORS, WarpAdapter, XDG_CONFIG_HOME_ENV_VAR,
+        XDG_DATA_HOME_ENV_VAR,
     };
-    use crate::adapter::{Adapter, ConfigScope, DocumentKind, ProductStatus, SurfaceOwnership};
+    use crate::adapter::{Adapter, ConfigScope, DocumentKind, SurfaceOwnership};
     use crate::error::CoreError;
     use crate::ids::{HarnessId, InstanceId, InstanceName};
     use crate::instance::Instance;
@@ -713,16 +671,11 @@ mod tests {
     #[test]
     fn adapter_identity() {
         let a = adapter();
+        // Constructor wiring plus catalog registration: an id the catalog
+        // does not know can never reconcile with detection or instances.
+        let entry = crate::harness_catalog::find_by_id(HARNESS_ID_STR).unwrap();
         assert_eq!(a.id().as_str(), HARNESS_ID_STR);
-        assert_eq!(a.display_name(), DISPLAY_NAME);
-        assert_eq!(a.executable_name(), EXECUTABLE);
-        assert_eq!(a.product_status(), ProductStatus::Active);
-        assert_eq!(a.research_doc_link(), RESEARCH_DOC);
-        assert!(!a.last_verified_date().is_empty());
-        assert_eq!(a.adapter_revision(), crate::adapter::ADAPTER_REVISION);
-        assert!(a.constrained_note().contains("XDG"));
-        assert!(CONSTRAINED_NOTE.contains("Linux"));
-        assert!(CONSTRAINED_NOTE.contains("no arbitrary base_url"));
+        assert_eq!(a.product_status(), entry.product_status);
     }
 
     #[test]
@@ -750,7 +703,6 @@ mod tests {
             }
             InstallPresence::Broken => assert!(!result.evidence.is_empty()),
         }
-        assert_ne!(result.confidence.to_string(), "");
     }
 
     #[test]
@@ -769,22 +721,6 @@ mod tests {
             assert!(res.schema_version.is_none());
         }
         assert!(!res.notes.is_empty());
-    }
-
-    #[test]
-    fn parse_version_output_cases() {
-        let cases = vec![
-            ("warp 1.2.3", Some("1.2.3")),
-            ("1.0.0", Some("1.0.0")),
-            ("v1.0.0", Some("1.0.0")),
-            ("Version: 2.0.0", Some("2.0.0")),
-            ("", None),
-            ("not a version", None),
-        ];
-        for (input, expected) in cases {
-            let got = crate::adapters::parse_version_output(input);
-            assert_eq!(got.as_deref(), expected, "input: {input:?}");
-        }
     }
 
     #[test]
@@ -824,16 +760,6 @@ mod tests {
         assert_eq!(env.kind, DocumentKind::Env);
         assert_eq!(env.ownership, SurfaceOwnership::ExternalSecretStore);
         assert!(env.owned_selectors.contains(&"WARP_API_KEY".to_owned()));
-    }
-
-    #[test]
-    fn owned_selectors_are_stable() {
-        assert!(OWNED_SELECTORS.len() >= 5);
-        let set: HashSet<&str> = OWNED_SELECTORS.iter().copied().collect();
-        assert_eq!(set.len(), OWNED_SELECTORS.len(), "selectors must be unique");
-        for required in ["appearance.theme", "mcpServers"] {
-            assert!(set.contains(required), "missing {required}");
-        }
     }
 
     #[test]

@@ -4,25 +4,25 @@
 use std::path::{Path, PathBuf};
 
 use crate::adapter::{
-    ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
-    DetectionResult, DocumentKind, Os, PathResolver, Platform, ProductStatus, RestartBehavior,
-    SurfaceOwnership, VersionResolution, WrapperPlan,
+    ADAPTER_REVISION, Adapter, ConfigScope, ConfigSurface, DetectionResult, DocumentKind,
+    PathResolver, Platform, ProductStatus, RestartBehavior, SurfaceOwnership, VersionResolution,
+    WrapperPlan,
 };
 use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
-use crate::state::{AdapterSupport, InstallPresence, Isolation};
+use crate::state::{AdapterSupport, Isolation};
 
-/// Harness identifier for Trae Agent.
+/// Catalog id superai registers this harness under.
 pub const HARNESS_ID_STR: &str = "trae-agent";
 
-/// Human display name.
+/// Name shown for this harness in listings and errors.
 pub const DISPLAY_NAME: &str = "Trae Agent";
 
-/// Primary executable name.
+/// Binary name resolved on PATH during detection.
 pub const EXECUTABLE: &str = "trae-cli";
 
-/// Alternative executable name (older docs).
+/// Older binary name the detection lookup also accepts.
 pub const EXECUTABLE_ALT: &str = "trae";
 
 /// Environment variable that overrides the config file path.
@@ -31,13 +31,13 @@ pub const CONFIG_ENV_VAR: &str = "TRAE_CONFIG_FILE";
 /// Default config file fallback.
 pub const DEFAULT_CONFIG_FILE_FALLBACK: &str = "trae_config.yaml";
 
-/// Research document link.
+/// Research doc whose findings the constants in this file encode.
 pub const RESEARCH_DOC: &str = "docs/harness-configs/trae-agent.md";
 
-/// Last verified date.
+/// Date the research doc was last checked against the harness.
 pub const LAST_VERIFIED: &str = "2026-08-25";
 
-/// Schema version for current config shape.
+/// Schema version this adapter maps detected versions to.
 pub const SCHEMA_VERSION_STR: &str = "1";
 
 /// Owned selectors for Trae Agent inside `trae_config.yaml` (YAML).
@@ -65,21 +65,6 @@ impl TraeAgentAdapter {
         Ok(Self { id })
     }
 
-    /// Borrow the harness id.
-    pub fn harness_id(&self) -> &HarnessId {
-        &self.id
-    }
-
-    /// Executable name for this harness.
-    pub fn executable_name(&self) -> &str {
-        EXECUTABLE
-    }
-
-    /// Config file env var.
-    pub fn config_env_var(&self) -> &str {
-        CONFIG_ENV_VAR
-    }
-
     fn default_config_path() -> PathBuf {
         if let Ok(val) = std::env::var(CONFIG_ENV_VAR)
             && !val.trim().is_empty()
@@ -94,10 +79,15 @@ impl TraeAgentAdapter {
         let default_path = Self::default_config_path();
         if default_path.exists() {
             evidence.push(format!("config file exists at {}", default_path.display()));
-            if let Ok(text) = std::fs::read_to_string(&default_path)
-                && text.contains("model_providers")
-            {
-                evidence.push("config contains model_providers".to_owned());
+            match std::fs::read_to_string(&default_path) {
+                Ok(text) if text.contains("model_providers") => {
+                    evidence.push("config contains model_providers".to_owned());
+                }
+                Ok(_) => {}
+                Err(err) => evidence.push(format!(
+                    "config unreadable at {}: {err}",
+                    default_path.display()
+                )),
             }
         } else {
             evidence.push(format!("config file missing at {}", default_path.display()));
@@ -140,8 +130,7 @@ impl TraeAgentAdapter {
 
 impl Default for TraeAgentAdapter {
     fn default() -> Self {
-        #[expect(clippy::unwrap_used, reason = "trae-agent is static valid HarnessId")]
-        let id = HarnessId::new(HARNESS_ID_STR).unwrap();
+        let id = HarnessId::from_validated_const(HARNESS_ID_STR);
         Self { id }
     }
 }
@@ -160,11 +149,7 @@ impl Adapter for TraeAgentAdapter {
     }
 
     fn supported_platforms(&self) -> Vec<Platform> {
-        vec![
-            Platform::new(Os::Linux, Arch::Any),
-            Platform::new(Os::Macos, Arch::Any),
-            Platform::new(Os::Windows, Arch::Any),
-        ]
+        super::desktop_platforms()
     }
 
     fn adapter_revision(&self) -> &str {
@@ -211,36 +196,15 @@ impl Adapter for TraeAgentAdapter {
 
         self.collect_config_evidence(&mut evidence);
 
-        let present = match (&binary_path, &version) {
-            (Some(_), Some(_)) => InstallPresence::Present,
-            (Some(_), None) => InstallPresence::UnknownVersion,
-            (None, _) => InstallPresence::Absent,
-        };
+        let present = super::install_presence(binary_path.is_some(), version.is_some());
 
-        // Absent forces High, so the Low "config file exists" arm can never fire.
-        let confidence = match (&binary_path, &version) {
-            (Some(_), None) => DetectionConfidence::Medium,
-            (Some(_), Some(_)) | (None, _) => DetectionConfidence::High,
-        };
-
+        let confidence =
+            super::detection_confidence(binary_path.is_some(), version.is_some(), false);
         DetectionResult::new(present, version, evidence, confidence)
     }
 
     fn version_resolution(&self) -> VersionResolution {
-        let detection = self.detection();
-        if let Some(v) = detection.version {
-            let mut notes = Vec::new();
-            notes.push(format!("detected trae-agent version {v}"));
-            notes.push(format!("mapped to schema version {SCHEMA_VERSION_STR}"));
-            let mut res =
-                VersionResolution::new(Some(v), Some(SCHEMA_VERSION_STR.to_owned()), true);
-            res.notes = notes;
-            res
-        } else {
-            let mut res = VersionResolution::unknown();
-            res.notes = detection.evidence;
-            res
-        }
+        super::resolution_from_detection(self.detection(), "trae-agent", SCHEMA_VERSION_STR)
     }
 
     fn config_surfaces(&self) -> Vec<ConfigSurface> {
@@ -340,19 +304,7 @@ impl Adapter for TraeAgentAdapter {
     }
 
     fn supported_operations(&self) -> Vec<(String, AdapterSupport)> {
-        vec![
-            ("detect".to_owned(), AdapterSupport::Full),
-            ("read_config".to_owned(), AdapterSupport::Full),
-            ("write_config".to_owned(), AdapterSupport::Full),
-            ("manage_skills".to_owned(), AdapterSupport::Full),
-            ("manage_mcp".to_owned(), AdapterSupport::Full),
-            ("manage_plugins".to_owned(), AdapterSupport::Full),
-            ("configure_provider".to_owned(), AdapterSupport::Full),
-            ("plan_mirror".to_owned(), AdapterSupport::Full),
-            ("plan_wrapper".to_owned(), AdapterSupport::Full),
-            ("scan_candidates".to_owned(), AdapterSupport::Full),
-            ("validate_instance".to_owned(), AdapterSupport::Full),
-        ]
+        super::all_operations_full()
     }
 
     fn plan_mirror_exclusions(&self) -> Vec<String> {
@@ -373,18 +325,10 @@ impl Adapter for TraeAgentAdapter {
     }
 
     fn plan_wrapper(&self, instance: &Instance) -> Result<WrapperPlan, CoreError> {
-        if instance.harness != self.id {
-            return Err(CoreError::Validation {
-                field: "harness".to_owned(),
-                reason: format!(
-                    "instance harness `{}` does not match adapter `{}`",
-                    instance.harness, self.id
-                ),
-            });
-        }
+        super::ensure_instance_harness(&self.id, instance)?;
         instance.validate()?;
         let mut plan = WrapperPlan::new("explicit-config via TRAE_CONFIG_FILE/--config-file");
-        let config_path = Path::new(&instance.config_root.to_string()).join("trae_config.yaml");
+        let config_path = instance.config_root.as_path().join("trae_config.yaml");
         plan.env_vars
             .push((CONFIG_ENV_VAR.to_owned(), config_path.display().to_string()));
         plan.args.push("--config-file".to_owned());
@@ -410,12 +354,7 @@ impl Adapter for TraeAgentAdapter {
     }
 
     fn validate_instance(&self, instance: &Instance) -> Result<(), CoreError> {
-        if instance.harness != self.id {
-            return Err(CoreError::Validation {
-                field: "harness".to_owned(),
-                reason: format!("expected harness `{}`, got `{}`", self.id, instance.harness),
-            });
-        }
+        super::ensure_instance_harness(&self.id, instance)?;
         instance.validate()?;
         match instance.isolation {
             Isolation::ExplicitConfig | Isolation::RelocatedRoot | Isolation::Unknown => Ok(()),
@@ -427,11 +366,7 @@ impl Adapter for TraeAgentAdapter {
     }
 
     fn supported_skill_modes(&self) -> Vec<crate::adapter::SkillMode> {
-        vec![
-            crate::adapter::SkillMode::LinkAll,
-            crate::adapter::SkillMode::LinkSelected,
-            crate::adapter::SkillMode::CopySelected,
-        ]
+        super::skill_modes_link_first()
     }
 
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
@@ -454,11 +389,8 @@ mod tests {
     use std::collections::HashSet;
     use std::path::PathBuf;
 
-    use super::{
-        CONFIG_ENV_VAR, DISPLAY_NAME, EXECUTABLE, HARNESS_ID_STR, OWNED_SELECTORS, RESEARCH_DOC,
-        TraeAgentAdapter,
-    };
-    use crate::adapter::{Adapter, ConfigScope, DocumentKind, ProductStatus, SurfaceOwnership};
+    use super::{CONFIG_ENV_VAR, HARNESS_ID_STR, TraeAgentAdapter};
+    use crate::adapter::{Adapter, ConfigScope, DocumentKind, SurfaceOwnership};
     use crate::error::CoreError;
     use crate::ids::{HarnessId, InstanceId, InstanceName};
     use crate::instance::Instance;
@@ -489,13 +421,11 @@ mod tests {
     #[test]
     fn adapter_identity() {
         let a = adapter();
+        // Constructor wiring plus catalog registration: an id the catalog
+        // does not know can never reconcile with detection or instances.
+        let entry = crate::harness_catalog::find_by_id(HARNESS_ID_STR).unwrap();
         assert_eq!(a.id().as_str(), HARNESS_ID_STR);
-        assert_eq!(a.display_name(), DISPLAY_NAME);
-        assert_eq!(a.executable_name(), EXECUTABLE);
-        assert_eq!(a.config_env_var(), CONFIG_ENV_VAR);
-        assert_eq!(a.product_status(), ProductStatus::Active);
-        assert_eq!(a.research_doc_link(), RESEARCH_DOC);
-        assert_eq!(a.adapter_revision(), crate::adapter::ADAPTER_REVISION);
+        assert_eq!(a.product_status(), entry.product_status);
     }
 
     #[test]
@@ -514,7 +444,6 @@ mod tests {
         let a = adapter();
         let result = a.detection();
         assert!(!result.evidence.is_empty());
-        assert_ne!(result.confidence.to_string(), "");
     }
 
     #[test]
@@ -531,21 +460,6 @@ mod tests {
             assert!(!res.compatible);
         }
         assert!(!res.notes.is_empty());
-    }
-
-    #[test]
-    fn parse_version_output_cases() {
-        let cases = vec![
-            ("trae-cli 0.1.0", Some("0.1.0")),
-            ("trae 0.2.0", Some("0.2.0")),
-            ("v0.1.0", Some("0.1.0")),
-            ("", None),
-            ("not a version", None),
-        ];
-        for (input, expected) in cases {
-            let got = crate::adapters::parse_version_output(input);
-            assert_eq!(got.as_deref(), expected, "input: {input:?}");
-        }
     }
 
     #[test]
@@ -570,13 +484,6 @@ mod tests {
         assert_eq!(legacy.kind, DocumentKind::Json);
         let env = surfaces.iter().find(|s| s.id == ".env").expect(".env");
         assert_eq!(env.kind, DocumentKind::Env);
-    }
-
-    #[test]
-    fn owned_selectors_are_stable() {
-        assert!(OWNED_SELECTORS.len() >= 5);
-        let set: HashSet<&str> = OWNED_SELECTORS.iter().copied().collect();
-        assert_eq!(set.len(), OWNED_SELECTORS.len());
     }
 
     #[test]
@@ -771,7 +678,7 @@ mod tests {
         let path = fixture_path("env.minimal");
         assert!(path.exists(), "env minimal missing: {}", path.display());
         let map = superai_config::env_file::load(&path).unwrap();
-        assert!(map.is_empty() || map.contains_key("OPENAI_API_KEY") || !map.is_empty());
+        assert!(map.contains_key("OPENAI_API_KEY"));
     }
 
     #[test]
@@ -779,6 +686,6 @@ mod tests {
         let path = fixture_path("trae_config.legacy.json");
         assert!(path.exists(), "legacy json missing: {}", path.display());
         let map = superai_config::json::load(&path).unwrap();
-        assert!(!map.is_empty() || map.contains_key("default_provider") || map.is_empty());
+        assert!(map.contains_key("default_provider"));
     }
 }

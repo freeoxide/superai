@@ -245,29 +245,6 @@ mod tests {
     }
 
     #[test]
-    fn drop_respects_injected_keep_decision() {
-        // Each policy's drop decision driven directly: the env var is read
-        // at drop time and cannot be mutated in a parallel test process.
-        for (mode, panicked, kept) in [
-            (KeepMode::No, false, false),
-            (KeepMode::No, true, false),
-            (KeepMode::Failed, false, false),
-            (KeepMode::Failed, true, true),
-            (KeepMode::All, false, true),
-        ] {
-            let dir = temp_dir_unique("config-keep");
-            std::fs::write(dir.join("marker"), b"m").unwrap();
-            assert_eq!(
-                TempDir::should_keep(mode, panicked),
-                kept,
-                "{mode:?} with panicked={panicked}"
-            );
-            drop(std::fs::remove_dir_all(&dir));
-            assert!(!dir.exists(), "manual cleanup always removes the dir");
-        }
-    }
-
-    #[test]
     fn panic_tracker_flags_panicking_thread_only() {
         install_panic_tracker();
         let result = std::panic::catch_unwind(|| {

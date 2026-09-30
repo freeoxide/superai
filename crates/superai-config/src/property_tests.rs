@@ -2,17 +2,13 @@
 //! no-op identity, unrelated survival, exact restore, deterministic previews.
 
 #![expect(
+    clippy::excessive_nesting,
+    reason = "each property loop nests the generation, mutation, and assertion passes it exercises"
+)]
+#![expect(
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
-    clippy::cast_sign_loss,
-    clippy::collapsible_if,
-    clippy::excessive_nesting,
-    clippy::format_push_string,
-    clippy::len_zero,
-    clippy::manual_is_multiple_of,
-    clippy::uninlined_format_args,
-    clippy::unreadable_literal,
-    reason = "property loops keep PRNG casts and manual nesting"
+    reason = "PRNG output is squeezed into number, byte, and index ranges bounded by construction"
 )]
 
 #[cfg(test)]
@@ -35,15 +31,15 @@ mod tests {
     impl Prng {
         fn new(seed: u64) -> Self {
             Self {
-                state: seed.wrapping_add(0x9e3779b97f4a7c15),
+                state: seed.wrapping_add(0x9e37_79b9_7f4a_7c15),
             }
         }
 
         fn next_u64(&mut self) -> u64 {
-            let mut z = self.state.wrapping_add(0x9e3779b97f4a7c15);
+            let mut z = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15);
             self.state = z;
-            z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
             z ^ (z >> 31)
         }
 
@@ -65,7 +61,7 @@ mod tests {
         }
 
         fn gen_bool(&mut self) -> bool {
-            self.next_u32() % 2 == 0
+            self.next_u32().is_multiple_of(2)
         }
 
         fn gen_string(&mut self, min_len: usize, max_len: usize, charset: &[u8]) -> String {
@@ -88,11 +84,11 @@ mod tests {
         // Keys are 1..10 chars; a leading digit gets an alpha prefix so the
         // key stays valid for env and TOML.
         let mut k = rng.gen_string(1, 10, KEY_CHARSET);
-        if let Some(first) = k.chars().next() {
-            if first.is_ascii_digit() {
-                let prefix = if rng.gen_bool() { "k" } else { "a" };
-                k = format!("{prefix}{k}");
-            }
+        if let Some(first) = k.chars().next()
+            && first.is_ascii_digit()
+        {
+            let prefix = if rng.gen_bool() { "k" } else { "a" };
+            k = format!("{prefix}{k}");
         }
         k
     }
@@ -165,8 +161,8 @@ mod tests {
 
     #[test]
     fn property_no_op_byte_identity_json() {
-        for iter in 0..100 {
-            let mut rng = Prng::new(iter as u64 + 0xabc123);
+        for iter in 0..100u64 {
+            let mut rng = Prng::new(iter + 0x00ab_c123);
             let map = random_json_map(&mut rng, 5);
             let json_text = if rng.gen_bool() {
                 serde_json::to_string_pretty(&Value::Object(map.clone())).unwrap()
@@ -201,8 +197,8 @@ mod tests {
 
     #[test]
     fn property_no_op_byte_identity_toml() {
-        for iter in 0..80 {
-            let mut rng = Prng::new(iter as u64 + 0x00def33);
+        for iter in 0..80u64 {
+            let mut rng = Prng::new(iter + 0x00d_ef33);
             let mut doc = toml_edit::DocumentMut::new();
             let n = rng.gen_range(0, 5);
             for _ in 0..n {
@@ -229,8 +225,8 @@ mod tests {
 
     #[test]
     fn property_no_op_byte_identity_yaml() {
-        for iter in 0..80 {
-            let mut rng = Prng::new(iter as u64 + 0x112233);
+        for iter in 0..80u64 {
+            let mut rng = Prng::new(iter + 0x11_2233);
             let map = random_json_map(&mut rng, 4);
             let text = if map.is_empty() {
                 String::new()
@@ -255,8 +251,8 @@ mod tests {
 
     #[test]
     fn property_unrelated_survive_json() {
-        for iter in 0..100 {
-            let mut rng = Prng::new(iter as u64 + 0x7777);
+        for iter in 0..100u64 {
+            let mut rng = Prng::new(iter + 0x7777);
             let mut map = random_json_map(&mut rng, 5);
             while map.len() < 2 {
                 let k = random_key(&mut rng);
@@ -326,13 +322,13 @@ mod tests {
 
     #[test]
     fn property_unrelated_survive_env() {
-        for iter in 0..100 {
-            let mut rng = Prng::new(iter as u64 + 0x8888);
+        for iter in 0..100u64 {
+            let mut rng = Prng::new(iter + 0x8888);
             let n = rng.gen_range(2, 6);
             let mut vars = BTreeMap::new();
             let mut keys = Vec::new();
             for i in 0..n {
-                let k = format!("KEY_{}_{}", iter, i);
+                let k = format!("KEY_{iter}_{i}");
                 let v = rng.gen_string(2, 12, SIMPLE_CHARSET);
                 vars.insert(k.clone(), v);
                 keys.push(k);
@@ -341,7 +337,10 @@ mod tests {
             text.push_str("# generated\n");
             for k in &keys {
                 let v = &vars[k];
-                text.push_str(&format!("{k}={v}\n"));
+                text.push_str(k);
+                text.push('=');
+                text.push_str(v);
+                text.push('\n');
                 if rng.gen_bool() {
                     text.push_str("# comment\n");
                 }
@@ -372,8 +371,8 @@ mod tests {
 
     #[test]
     fn property_restore_exact_backup() {
-        for iter in 0..50 {
-            let mut rng = Prng::new(iter as u64 + 0x9999);
+        for iter in 0..50u64 {
+            let mut rng = Prng::new(iter + 0x9999);
             let size = rng.gen_range(0, 4096);
             let mut bytes = Vec::with_capacity(size);
             for _ in 0..size {
@@ -433,8 +432,8 @@ mod tests {
             DocumentKind::Env,
             DocumentKind::Opaque,
         ];
-        for iter in 0..100 {
-            let mut rng = Prng::new(iter as u64 + 0xaaaa);
+        for iter in 0..100u64 {
+            let mut rng = Prng::new(iter + 0xaaaa);
             let old_len = rng.gen_range(0, 200);
             let new_len = rng.gen_range(0, 200);
             let old: Vec<u8> = (0..old_len).map(|_| rng.gen_range(32, 127) as u8).collect();
@@ -509,8 +508,8 @@ mod tests {
 
     #[test]
     fn property_commit_matches_preview_or_aborts_raw_editor() {
-        for iter in 0..50 {
-            let mut rng = Prng::new(iter as u64 + 0xbbbb);
+        for iter in 0..50u64 {
+            let mut rng = Prng::new(iter + 0x0b_bb);
             let initial = format!("{{\"a\":{}}}", rng.gen_range(0, 100));
             let path = scratch_path("prop-commit-preview", &format!("iter-{iter}.json"));
             std::fs::write(&path, initial.as_bytes()).unwrap();
@@ -590,7 +589,7 @@ mod tests {
             assert!(verify_backup(&entry).unwrap());
             assert_eq!(std::fs::read(&entry.backup_path).unwrap(), original);
             let backups = list_backups(&path).unwrap();
-            assert!(backups.len() >= 1, "at least one backup at {iter}");
+            assert!(!backups.is_empty(), "at least one backup at {iter}");
             for b in &backups {
                 let dbg = format!("{b:?}");
                 assert!(!dbg.contains("sk-superai-test-sentinel"));
@@ -659,9 +658,21 @@ mod tests {
 
     #[test]
     fn mutant_template_selector_traversal_is_rejected() {
+        // Selector::parse accepts names verbatim (executor ownership checks
+        // enforce traversal safety), so any Err is a behaviour change naming its input.
         let traversals = ["../", "a/../b", "..\\", "key:../escape", "table:../"];
         for t in traversals {
-            drop(Selector::parse(t));
+            let selector = match Selector::parse(t) {
+                Ok(selector) => selector,
+                Err(err) => panic!("selector parse rejected {t:?}: {err}"),
+            };
+            let serialized = selector.to_typed_string();
+            let reparsed = Selector::parse(&serialized).expect("typed string must re-parse");
+            assert_eq!(
+                reparsed.to_typed_string(),
+                serialized,
+                "traversal selector must round-trip unchanged: {t:?}"
+            );
         }
         assert!(validate_quarantine_target(&std::env::temp_dir().join("../etc")).is_err());
         assert!(validate_quarantine_target(std::path::Path::new("relative")).is_err());

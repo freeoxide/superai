@@ -149,19 +149,11 @@ impl VersionProbe for SystemVersionProbe {
                 // Concrete versions ask the registry for that exact spec;
                 // channels and latest ask for the newest.
                 let spec = match requested {
-                    Some(r) if !is_channel(r) => format!("{package}@{r}"),
+                    Some(r) if !crate::install_execute::is_channel(r) => format!("{package}@{r}"),
                     _ => package.to_owned(),
                 };
-                let out = match run_command(
-                    "npm",
-                    &[
-                        "view".to_owned(),
-                        spec,
-                        "version".to_owned(),
-                        "--json".to_owned(),
-                    ],
-                    &opts,
-                ) {
+                let (executable, args) = crate::install_execute::availability_argv(method, &spec);
+                let out = match run_command(executable, &args, &opts) {
                     Ok(out) => out,
                     Err(e) => return unavailable(format!("npm probe failed: {e}")),
                 };
@@ -181,15 +173,8 @@ impl VersionProbe for SystemVersionProbe {
                 }
             }
             InstallMethodKind::Homebrew | InstallMethodKind::HomebrewCask => {
-                let out = match run_command(
-                    "brew",
-                    &[
-                        "info".to_owned(),
-                        "--json=v2".to_owned(),
-                        package.to_owned(),
-                    ],
-                    &opts,
-                ) {
+                let (executable, args) = crate::install_execute::availability_argv(method, package);
+                let out = match run_command(executable, &args, &opts) {
                     Ok(out) => out,
                     Err(e) => return unavailable(format!("brew probe failed: {e}")),
                 };
@@ -204,16 +189,8 @@ impl VersionProbe for SystemVersionProbe {
                 }
             }
             InstallMethodKind::Cargo => {
-                let out = match run_command(
-                    "cargo",
-                    &[
-                        "search".to_owned(),
-                        package.to_owned(),
-                        "--limit".to_owned(),
-                        "1".to_owned(),
-                    ],
-                    &opts,
-                ) {
+                let (executable, args) = crate::install_execute::availability_argv(method, package);
+                let out = match run_command(executable, &args, &opts) {
                     Ok(out) => out,
                     Err(e) => return unavailable(format!("cargo probe failed: {e}")),
                 };
@@ -231,12 +208,11 @@ impl VersionProbe for SystemVersionProbe {
                 }
             }
             InstallMethodKind::Mise => {
-                let out =
-                    match run_command("mise", &["ls-remote".to_owned(), package.to_owned()], &opts)
-                    {
-                        Ok(out) => out,
-                        Err(e) => return unavailable(format!("mise probe failed: {e}")),
-                    };
+                let (executable, args) = crate::install_execute::availability_argv(method, package);
+                let out = match run_command(executable, &args, &opts) {
+                    Ok(out) => out,
+                    Err(e) => return unavailable(format!("mise probe failed: {e}")),
+                };
                 if !out.success {
                     return unavailable(format!(
                         "mise ls-remote failed: {}",
@@ -257,15 +233,8 @@ impl VersionProbe for SystemVersionProbe {
                 }
             }
             InstallMethodKind::Pipx | InstallMethodKind::Uv => {
-                let out = match run_command(
-                    "pip",
-                    &[
-                        "index".to_owned(),
-                        "versions".to_owned(),
-                        package.to_owned(),
-                    ],
-                    &opts,
-                ) {
+                let (executable, args) = crate::install_execute::availability_argv(method, package);
+                let out = match run_command(executable, &args, &opts) {
                     Ok(out) => out,
                     Err(e) => return unavailable(format!("pip probe failed: {e}")),
                 };
@@ -290,14 +259,6 @@ impl VersionProbe for SystemVersionProbe {
     }
 }
 
-/// Whether a requested string is a channel name rather than a concrete version.
-fn is_channel(value: &str) -> bool {
-    const CHANNELS: &[&str] = &[
-        "latest", "stable", "beta", "nightly", "next", "canary", "lts",
-    ];
-    CHANNELS.contains(&value)
-}
-
 fn first_line(text: &str) -> String {
     text.lines()
         .find(|l| !l.trim().is_empty())
@@ -315,7 +276,7 @@ impl VersionAvailability {
         let Some(requested) = requested else {
             return self;
         };
-        if is_channel(requested) {
+        if crate::install_execute::is_channel(requested) {
             return self;
         }
         let Available { resolved } = &self else {

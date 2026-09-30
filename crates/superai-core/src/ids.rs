@@ -203,6 +203,15 @@ define_id!(
 );
 define_id!(BackupId, "BackupId", "Identifier for a backup artifact.");
 
+impl HarnessId {
+    /// Build from a compile-time constant; only a debug assertion checks the
+    /// value here, so the literals themselves are pinned by the decl tests.
+    pub(crate) fn from_validated_const(value: &'static str) -> Self {
+        debug_assert!(validate("HarnessId", value).is_ok());
+        Self(value.to_owned())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

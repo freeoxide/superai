@@ -740,7 +740,12 @@ pub fn activate_profile(
     create_symlink(record.root.as_path(), &temp_link)?;
     if let Err(e) = std::fs::rename(&temp_link, fixed_path) {
         // Best-effort cleanup of the temporary link; the swap did not happen.
-        drop(remove_symlink_any(&temp_link));
+        if let Err(cleanup) = remove_symlink_any(&temp_link) {
+            eprintln!(
+                "superai-core: temp link cleanup failed for {}: {cleanup}",
+                temp_link.display()
+            );
+        }
         return Err(CoreError::Commit {
             path: fixed_path.to_path_buf(),
             reason: format!(

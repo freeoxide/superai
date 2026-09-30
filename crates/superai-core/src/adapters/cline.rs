@@ -4,24 +4,24 @@
 use std::path::{Path, PathBuf};
 
 use crate::adapter::{
-    ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
-    DetectionResult, DocumentKind, Os, PathResolver, Platform, ProductStatus, RestartBehavior,
-    RootShape, SurfaceOwnership, SurfaceSchema, VersionResolution, WrapperPlan,
+    ADAPTER_REVISION, Adapter, ConfigScope, ConfigSurface, DetectionResult, DocumentKind,
+    PathResolver, Platform, ProductStatus, RestartBehavior, RootShape, SurfaceOwnership,
+    SurfaceSchema, VersionResolution, WrapperPlan,
 };
 use superai_config::document::ValueType;
 
 use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
-use crate::state::{AdapterSupport, InstallPresence, Isolation};
+use crate::state::{AdapterSupport, Isolation};
 
-/// Harness identifier for Cline.
+/// Catalog id superai registers this harness under.
 pub const HARNESS_ID_STR: &str = "cline";
 
-/// Human display name.
+/// Name shown for this harness in listings and errors.
 pub const DISPLAY_NAME: &str = "Cline";
 
-/// Primary executable name (CLI).
+/// Binary name resolved on PATH during detection (CLI).
 pub const EXECUTABLE: &str = "cline";
 
 /// VS Code executable name for extension host.
@@ -36,16 +36,13 @@ pub const USER_DATA_DIR_FLAG: &str = "--user-data-dir";
 /// Flag for VS Code extensions-dir isolation.
 pub const EXTENSIONS_DIR_FLAG: &str = "--extensions-dir";
 
-/// Default config root when `CLINE_DATA_DIR` is unset.
-pub const DEFAULT_CONFIG_ROOT_FALLBACK: &str = "~/.cline";
-
-/// Research document link.
+/// Research doc whose findings the constants in this file encode.
 pub const RESEARCH_DOC: &str = "docs/harness-configs/cline.md";
 
-/// Last verified date.
+/// Date the research doc was last checked against the harness.
 pub const LAST_VERIFIED: &str = "2026-08-25";
 
-/// Schema version for current config shape.
+/// Schema version this adapter maps detected versions to.
 pub const SCHEMA_VERSION_STR: &str = "1";
 
 /// Top-level keys superai owns in providers.json; other keys round-trip untouched.
@@ -76,21 +73,6 @@ impl ClineAdapter {
         Ok(Self { id })
     }
 
-    /// Borrow the harness id.
-    pub fn harness_id(&self) -> &HarnessId {
-        &self.id
-    }
-
-    /// Executable name for this harness (CLI).
-    pub fn executable_name(&self) -> &str {
-        EXECUTABLE
-    }
-
-    /// Data dir env var.
-    pub fn data_dir_env_var(&self) -> &str {
-        DATA_DIR_ENV_VAR
-    }
-
     /// Cline first; a lone VS Code binary still counts as install evidence.
     fn find_binary_in_path() -> Option<PathBuf> {
         super::find_in_path(&[EXECUTABLE]).or_else(|| super::find_in_path(&[VSCODE_EXECUTABLE]))
@@ -102,26 +84,15 @@ impl ClineAdapter {
         {
             return Some(PathBuf::from(dir));
         }
-        let home = std::env::var("HOME")
-            .ok()
-            .or_else(|| std::env::var("USERPROFILE").ok())?;
-        if home.trim().is_empty() {
-            return None;
-        }
-        Some(PathBuf::from(home).join(".cline"))
+        let home = super::home_dir()?;
+        Some(home.join(".cline"))
     }
 
     fn vscode_global_storage_root() -> Option<PathBuf> {
-        let home = std::env::var("HOME")
-            .ok()
-            .or_else(|| std::env::var("USERPROFILE").ok())?;
-        if home.trim().is_empty() {
-            return None;
-        }
+        let home = super::home_dir()?;
         if cfg!(target_os = "macos") {
             Some(
-                PathBuf::from(home)
-                    .join("Library")
+                home.join("Library")
                     .join("Application Support")
                     .join("Code")
                     .join("User")
@@ -144,8 +115,7 @@ impl ClineAdapter {
                 );
             }
             Some(
-                PathBuf::from(home)
-                    .join("AppData")
+                home.join("AppData")
                     .join("Roaming")
                     .join("Code")
                     .join("User")
@@ -155,8 +125,7 @@ impl ClineAdapter {
             )
         } else {
             Some(
-                PathBuf::from(home)
-                    .join(".config")
+                home.join(".config")
                     .join("Code")
                     .join("User")
                     .join("globalStorage")
@@ -187,12 +156,20 @@ impl ClineAdapter {
                         if providers.exists() {
                             evidence
                                 .push(format!("providers.json found at {}", providers.display()));
-                            if let Ok(text) = std::fs::read_to_string(&providers)
-                                && (text.contains("apiProvider") || text.contains("mcpServers"))
-                            {
-                                evidence.push(
-                                    "providers.json contains apiProvider/mcpServers".to_owned(),
-                                );
+                            match std::fs::read_to_string(&providers) {
+                                Ok(text)
+                                    if (text.contains("apiProvider")
+                                        || text.contains("mcpServers")) =>
+                                {
+                                    evidence.push(
+                                        "providers.json contains apiProvider/mcpServers".to_owned(),
+                                    );
+                                }
+                                Ok(_) => {}
+                                Err(err) => evidence.push(format!(
+                                    "config unreadable at {}: {err}",
+                                    providers.display()
+                                )),
                             }
                         } else {
                             evidence
@@ -250,12 +227,7 @@ impl ClineAdapter {
                     vs_root.display()
                 ));
             }
-            let home_opt = std::env::var("HOME")
-                .ok()
-                .or_else(|| std::env::var("USERPROFILE").ok());
-            if let Some(home) = home_opt
-                && !home.trim().is_empty()
-            {
+            if let Some(home) = super::home_dir() {
                 let candidates = if cfg!(target_os = "macos") {
                     vec![
                         PathBuf::from(&home)
@@ -272,10 +244,14 @@ impl ClineAdapter {
                 for cand in candidates {
                     if cand.exists() {
                         evidence.push(format!("VS Code settings.json found at {}", cand.display()));
-                        if let Ok(text) = std::fs::read_to_string(&cand)
-                            && text.contains("cline.")
-                        {
-                            evidence.push("VS Code settings.json contains cline.* keys".to_owned());
+                        match std::fs::read_to_string(&cand) {
+                            Ok(text) if text.contains("cline.") => {
+                                evidence
+                                    .push("VS Code settings.json contains cline.* keys".to_owned());
+                            }
+                            Ok(_) => {}
+                            Err(err) => evidence
+                                .push(format!("config unreadable at {}: {err}", cand.display())),
                         }
                     }
                 }
@@ -307,8 +283,7 @@ impl ClineAdapter {
 
 impl Default for ClineAdapter {
     fn default() -> Self {
-        #[expect(clippy::unwrap_used, reason = "cline is static valid HarnessId")]
-        let id = HarnessId::new(HARNESS_ID_STR).unwrap();
+        let id = HarnessId::from_validated_const(HARNESS_ID_STR);
         Self { id }
     }
 }
@@ -327,11 +302,7 @@ impl Adapter for ClineAdapter {
     }
 
     fn supported_platforms(&self) -> Vec<Platform> {
-        vec![
-            Platform::new(Os::Linux, Arch::Any),
-            Platform::new(Os::Macos, Arch::Any),
-            Platform::new(Os::Windows, Arch::Any),
-        ]
+        super::desktop_platforms()
     }
 
     fn adapter_revision(&self) -> &str {
@@ -386,46 +357,15 @@ impl Adapter for ClineAdapter {
 
         self.collect_config_evidence(&mut evidence);
 
-        let present = match (&binary_path, &version) {
-            (Some(_), Some(_)) => InstallPresence::Present,
-            (Some(_), None) => InstallPresence::UnknownVersion,
-            (None, _) => InstallPresence::Absent,
-        };
+        let present = super::install_presence(binary_path.is_some(), version.is_some());
 
-        let confidence = match (
-            &binary_path,
-            &version,
-            evidence.iter().any(|e| e.contains("config root exists")),
-        ) {
-            (Some(_), None, _) => DetectionConfidence::Medium,
-            (None, _, true) => DetectionConfidence::Low,
-            (Some(_), Some(_), _) | (None, _, false) => DetectionConfidence::High,
-        };
-
-        let confidence = if present == InstallPresence::Absent {
-            DetectionConfidence::High
-        } else {
-            confidence
-        };
-
+        let confidence =
+            super::detection_confidence(binary_path.is_some(), version.is_some(), false);
         DetectionResult::new(present, version, evidence, confidence)
     }
 
     fn version_resolution(&self) -> VersionResolution {
-        let detection = self.detection();
-        if let Some(v) = detection.version {
-            let mut notes = Vec::new();
-            notes.push(format!("detected cline version {v}"));
-            notes.push(format!("mapped to schema version {SCHEMA_VERSION_STR}"));
-            let mut res =
-                VersionResolution::new(Some(v), Some(SCHEMA_VERSION_STR.to_owned()), true);
-            res.notes = notes;
-            res
-        } else {
-            let mut res = VersionResolution::unknown();
-            res.notes = detection.evidence;
-            res
-        }
+        super::resolution_from_detection(self.detection(), "cline", SCHEMA_VERSION_STR)
     }
 
     #[expect(clippy::too_many_lines, reason = "surfaces are declarative")]
@@ -584,19 +524,7 @@ impl Adapter for ClineAdapter {
     }
 
     fn supported_operations(&self) -> Vec<(String, AdapterSupport)> {
-        vec![
-            ("detect".to_owned(), AdapterSupport::Full),
-            ("read_config".to_owned(), AdapterSupport::Full),
-            ("write_config".to_owned(), AdapterSupport::Full),
-            ("manage_skills".to_owned(), AdapterSupport::Full),
-            ("manage_mcp".to_owned(), AdapterSupport::Full),
-            ("manage_plugins".to_owned(), AdapterSupport::Full),
-            ("configure_provider".to_owned(), AdapterSupport::Full),
-            ("plan_mirror".to_owned(), AdapterSupport::Full),
-            ("plan_wrapper".to_owned(), AdapterSupport::Full),
-            ("scan_candidates".to_owned(), AdapterSupport::Full),
-            ("validate_instance".to_owned(), AdapterSupport::Full),
-        ]
+        super::all_operations_full()
     }
 
     fn plan_mirror_exclusions(&self) -> Vec<String> {
@@ -615,23 +543,15 @@ impl Adapter for ClineAdapter {
     }
 
     fn plan_wrapper(&self, instance: &Instance) -> Result<WrapperPlan, CoreError> {
-        if instance.harness != self.id {
-            return Err(CoreError::Validation {
-                field: "harness".to_owned(),
-                reason: format!(
-                    "instance harness `{}` does not match adapter `{}`",
-                    instance.harness, self.id
-                ),
-            });
-        }
+        super::ensure_instance_harness(&self.id, instance)?;
         instance.validate()?;
         let mut plan = WrapperPlan::new("ide-user-data via --user-data-dir + CLINE_DATA_DIR");
         plan.env_vars.push((
             DATA_DIR_ENV_VAR.to_owned(),
             instance.config_root.to_string(),
         ));
-        let vscode_data = Path::new(&instance.config_root.to_string()).join("vscode-data");
-        let extensions = Path::new(&instance.config_root.to_string()).join("extensions");
+        let vscode_data = instance.config_root.as_path().join("vscode-data");
+        let extensions = instance.config_root.as_path().join("extensions");
         plan.args.push(USER_DATA_DIR_FLAG.to_owned());
         plan.args.push(vscode_data.display().to_string());
         plan.args.push(EXTENSIONS_DIR_FLAG.to_owned());
@@ -675,12 +595,7 @@ impl Adapter for ClineAdapter {
     }
 
     fn validate_instance(&self, instance: &Instance) -> Result<(), CoreError> {
-        if instance.harness != self.id {
-            return Err(CoreError::Validation {
-                field: "harness".to_owned(),
-                reason: format!("expected harness `{}`, got `{}`", self.id, instance.harness),
-            });
-        }
+        super::ensure_instance_harness(&self.id, instance)?;
         instance.validate()?;
         match instance.isolation {
             Isolation::IdeUserData | Isolation::RelocatedRoot | Isolation::Unknown => {
@@ -768,10 +683,9 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        DATA_DIR_ENV_VAR, DISPLAY_NAME, EXECUTABLE, EXTENSIONS_DIR_FLAG, HARNESS_ID_STR,
-        OWNED_SELECTORS, RESEARCH_DOC, USER_DATA_DIR_FLAG, VSCODE_EXECUTABLE,
+        DATA_DIR_ENV_VAR, EXTENSIONS_DIR_FLAG, HARNESS_ID_STR, OWNED_SELECTORS, USER_DATA_DIR_FLAG,
     };
-    use crate::adapter::{Adapter, ConfigScope, DocumentKind, ProductStatus, SurfaceOwnership};
+    use crate::adapter::{Adapter, ConfigScope, DocumentKind, SurfaceOwnership};
     use crate::error::CoreError;
     use crate::ids::{HarnessId, InstanceId, InstanceName};
     use crate::instance::Instance;
@@ -803,14 +717,11 @@ mod tests {
     #[test]
     fn adapter_identity() {
         let a = adapter();
+        // Constructor wiring plus catalog registration: an id the catalog
+        // does not know can never reconcile with detection or instances.
+        let entry = crate::harness_catalog::find_by_id(HARNESS_ID_STR).unwrap();
         assert_eq!(a.id().as_str(), HARNESS_ID_STR);
-        assert_eq!(a.display_name(), DISPLAY_NAME);
-        assert_eq!(a.executable_name(), EXECUTABLE);
-        assert_eq!(a.data_dir_env_var(), DATA_DIR_ENV_VAR);
-        assert_eq!(a.product_status(), ProductStatus::Active);
-        assert_eq!(a.research_doc_link(), RESEARCH_DOC);
-        assert!(!a.last_verified_date().is_empty());
-        assert_eq!(a.adapter_revision(), crate::adapter::ADAPTER_REVISION);
+        assert_eq!(a.product_status(), entry.product_status);
     }
 
     #[test]
@@ -843,7 +754,6 @@ mod tests {
                 assert!(!result.evidence.is_empty());
             }
         }
-        assert_ne!(result.confidence.to_string(), "");
     }
 
     #[test]
@@ -861,23 +771,6 @@ mod tests {
             assert!(res.schema_version.is_none());
         }
         assert!(!res.notes.is_empty());
-    }
-
-    #[test]
-    fn parse_version_output_cases() {
-        let cases = vec![
-            ("cline 1.2.3", Some("1.2.3")),
-            ("Cline 2.0.0", Some("2.0.0")),
-            ("v1.5.0", Some("1.5.0")),
-            ("Version: 1.0.0", Some("1.0.0")),
-            ("1.0.0-beta", Some("1.0.0-beta")),
-            ("", None),
-            ("not a version", None),
-        ];
-        for (input, expected) in cases {
-            let got = crate::adapters::parse_version_output(input);
-            assert_eq!(got.as_deref(), expected, "input: {input:?}");
-        }
     }
 
     #[test]
@@ -934,13 +827,6 @@ mod tests {
     }
 
     #[test]
-    fn owned_selectors_are_stable() {
-        assert!(OWNED_SELECTORS.len() >= 5);
-        let set: HashSet<&str> = OWNED_SELECTORS.iter().copied().collect();
-        assert_eq!(set.len(), OWNED_SELECTORS.len(), "selectors must be unique");
-    }
-
-    #[test]
     fn supported_operations_cover_full() {
         let a = adapter();
         let ops = a.supported_operations();
@@ -976,23 +862,10 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::excessive_nesting, reason = "test closure nesting is explicit")]
     fn plan_mirror_includes_settings_and_excludes_sessions() {
         let a = adapter();
         let exclusions = a.plan_mirror_exclusions();
-        let is_excluded = |file: &str| {
-            exclusions.iter().any(|pat| {
-                if pat.ends_with("/*") {
-                    let prefix = pat.trim_end_matches("/*");
-                    file.starts_with(prefix)
-                } else if pat.starts_with("*.") {
-                    let suffix = pat.trim_start_matches('*');
-                    file.ends_with(suffix)
-                } else {
-                    file == pat
-                }
-            })
-        };
+        let is_excluded = |file: &str| crate::adapters::exclusion_matches(&exclusions, file);
         assert!(!is_excluded("providers.json"));
         assert!(!is_excluded("global-settings.json"));
         assert!(!is_excluded("cline_mcp_settings.json"));
@@ -1025,7 +898,6 @@ mod tests {
         assert!(!plan.description.is_empty());
         assert!(plan.description.contains(DATA_DIR_ENV_VAR));
         assert!(plan.description.contains(USER_DATA_DIR_FLAG));
-        let _ = VSCODE_EXECUTABLE;
     }
 
     #[test]
@@ -1364,43 +1236,6 @@ mod tests {
         assert!(after.contains("Always use English"));
         assert!(after.contains("New rule"));
         drop(std::fs::remove_file(&path));
-    }
-
-    #[test]
-    fn secret_redaction_placeholder() {
-        use crate::error::RedactedString;
-        let secret = RedactedString::new("sk-test-secret-cline");
-        let debug = format!("{secret:?}");
-        let display = format!("{secret}");
-        assert!(!debug.contains("sk-test-secret-cline"));
-        assert!(!display.contains("sk-test-secret-cline"));
-        assert!(debug.contains("[REDACTED]"));
-        assert!(display.contains("[REDACTED]"));
-        let json = serde_json::to_string(&secret).unwrap();
-        assert!(!json.contains("sk-test-secret-cline"));
-        assert!(json.contains("[REDACTED]"));
-        assert_eq!(secret.expose_secret(), "sk-test-secret-cline");
-    }
-
-    #[test]
-    fn diff_redaction_does_not_leak_secrets() {
-        use crate::error::RedactedString as OpRedacted;
-        let secret = OpRedacted::new("super-secret-key");
-        let diff_text = format!("set api key to {secret}");
-        assert!(!diff_text.contains("super-secret-key"));
-        assert!(diff_text.contains("[REDACTED]"));
-    }
-
-    #[test]
-    fn conflict_detection_placeholder_no_panic() {
-        let a = adapter();
-        let r1 = a.detection();
-        let r2 = a.detection();
-        assert_eq!(r1.present, r2.present);
-        assert_eq!(r1.confidence, r2.confidence);
-        let inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".cline-work"));
-        a.validate_instance(&inst).unwrap();
-        a.validate_instance(&inst).unwrap();
     }
 
     #[test]

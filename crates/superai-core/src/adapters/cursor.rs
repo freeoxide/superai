@@ -1,22 +1,22 @@
 //! Cursor adapter: `CURSOR_CONFIG_DIR` plus IDE `--user-data-dir` isolation.
-//! Research source: `docs/harness-configs/cursor.md` (last verified 2026-09-18).
+//! Research source: `docs/harness-configs/cursor.md` (last verified 2026-08-25).
 
 use std::path::{Path, PathBuf};
 
 use crate::adapter::{
-    ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
-    DetectionResult, DocumentKind, Os, PathResolver, Platform, ProductStatus, RestartBehavior,
-    SurfaceOwnership, VersionResolution, WrapperPlan,
+    ADAPTER_REVISION, Adapter, ConfigScope, ConfigSurface, DetectionResult, DocumentKind,
+    PathResolver, Platform, ProductStatus, RestartBehavior, SurfaceOwnership, VersionResolution,
+    WrapperPlan,
 };
 use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
-use crate::state::{AdapterSupport, InstallPresence, Isolation};
+use crate::state::{AdapterSupport, Isolation};
 
-/// Harness identifier for Cursor.
+/// Catalog id superai registers this harness under.
 pub const HARNESS_ID_STR: &str = "cursor";
 
-/// Human display name.
+/// Name shown for this harness in listings and errors.
 pub const DISPLAY_NAME: &str = "Cursor IDE and Agent CLI";
 
 /// Primary IDE executable.
@@ -40,19 +40,16 @@ pub const USER_DATA_DIR_FLAG: &str = "--user-data-dir";
 /// Flag for extensions dir isolation.
 pub const EXTENSIONS_DIR_FLAG: &str = "--extensions-dir";
 
-/// Default CLI config fallback.
-pub const DEFAULT_CONFIG_ROOT_FALLBACK: &str = "~/.cursor";
-
 /// The agent ignores `CURSOR_CONFIG_DIR`/`XDG_CONFIG_HOME` for `mcp.json` (probe-verified 2026-09-18, mcp-readpath-r6.log).
 pub const MCP_READ_PATH_FALLBACK: &str = "~/.cursor/mcp.json";
 
-/// Research document link.
+/// Research doc whose findings the constants in this file encode.
 pub const RESEARCH_DOC: &str = "docs/harness-configs/cursor.md";
 
-/// Last verified date.
+/// Date the research doc was last checked against the harness.
 pub const LAST_VERIFIED: &str = "2026-08-25";
 
-/// Schema version.
+/// Schema version this adapter maps detected versions to.
 pub const SCHEMA_VERSION_STR: &str = "1";
 
 /// Owned selectors inside `cli-config.json`.
@@ -66,7 +63,7 @@ pub const OWNED_SELECTORS: &[&str] = &[
     "permissions",
 ];
 
-/// Owned selectors for MCP.
+/// Selectors superai owns on the MCP surface; other keys round-trip.
 pub const MCP_OWNED_SELECTORS: &[&str] = &["mcpServers"];
 
 /// Concrete adapter for Cursor.
@@ -82,21 +79,6 @@ impl CursorAdapter {
         Ok(Self { id })
     }
 
-    /// Borrow harness id.
-    pub fn harness_id(&self) -> &HarnessId {
-        &self.id
-    }
-
-    /// Executable name.
-    pub fn executable_name(&self) -> &str {
-        EXECUTABLE
-    }
-
-    /// Config env var.
-    pub fn config_env_var(&self) -> &str {
-        CONFIG_ENV_VAR
-    }
-
     fn default_config_root() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var(CONFIG_ENV_VAR)
             && !dir.trim().is_empty()
@@ -108,38 +90,22 @@ impl CursorAdapter {
         {
             return Some(PathBuf::from(xdg).join("cursor"));
         }
-        let home = std::env::var("HOME")
-            .ok()
-            .or_else(|| std::env::var("USERPROFILE").ok())?;
-        if home.trim().is_empty() {
-            return None;
-        }
-        Some(PathBuf::from(home).join(".cursor"))
+        let home = super::home_dir()?;
+        Some(home.join(".cursor"))
     }
 
     /// The agent reads user MCP only from `$HOME/.cursor/mcp.json` and
     /// ignores env relocation (probe-verified 2026-09-18).
     fn mcp_read_path() -> Option<PathBuf> {
-        let home = std::env::var("HOME")
-            .ok()
-            .or_else(|| std::env::var("USERPROFILE").ok())?;
-        if home.trim().is_empty() {
-            return None;
-        }
-        Some(PathBuf::from(home).join(".cursor").join("mcp.json"))
+        let home = super::home_dir()?;
+        Some(home.join(".cursor").join("mcp.json"))
     }
 
     fn default_user_data_root() -> Option<PathBuf> {
-        let home = std::env::var("HOME")
-            .ok()
-            .or_else(|| std::env::var("USERPROFILE").ok())?;
-        if home.trim().is_empty() {
-            return None;
-        }
+        let home = super::home_dir()?;
         if cfg!(target_os = "macos") {
             Some(
-                PathBuf::from(home)
-                    .join("Library")
+                home.join("Library")
                     .join("Application Support")
                     .join("Cursor")
                     .join("User"),
@@ -151,19 +117,13 @@ impl CursorAdapter {
                 return Some(PathBuf::from(appdata).join("Cursor").join("User"));
             }
             Some(
-                PathBuf::from(home)
-                    .join("AppData")
+                home.join("AppData")
                     .join("Roaming")
                     .join("Cursor")
                     .join("User"),
             )
         } else {
-            Some(
-                PathBuf::from(home)
-                    .join(".config")
-                    .join("Cursor")
-                    .join("User"),
-            )
+            Some(home.join(".config").join("Cursor").join("User"))
         }
     }
 
@@ -178,10 +138,15 @@ impl CursorAdapter {
                     let alt = root.join("cli.json");
                     if cli_config.exists() {
                         evidence.push(format!("cli-config.json found at {}", cli_config.display()));
-                        if let Ok(text) = std::fs::read_to_string(&cli_config)
-                            && text.contains("permissions")
-                        {
-                            evidence.push("cli-config.json contains permissions".to_owned());
+                        match std::fs::read_to_string(&cli_config) {
+                            Ok(text) if text.contains("permissions") => {
+                                evidence.push("cli-config.json contains permissions".to_owned());
+                            }
+                            Ok(_) => {}
+                            Err(err) => evidence.push(format!(
+                                "config unreadable at {}: {err}",
+                                cli_config.display()
+                            )),
                         }
                     } else if alt.exists() {
                         evidence.push(format!("cli.json found at {}", alt.display()));
@@ -247,8 +212,7 @@ impl CursorAdapter {
 
 impl Default for CursorAdapter {
     fn default() -> Self {
-        #[expect(clippy::unwrap_used, reason = "cursor is static valid")]
-        let id = HarnessId::new(HARNESS_ID_STR).unwrap();
+        let id = HarnessId::from_validated_const(HARNESS_ID_STR);
         Self { id }
     }
 }
@@ -267,11 +231,7 @@ impl Adapter for CursorAdapter {
     }
 
     fn supported_platforms(&self) -> Vec<Platform> {
-        vec![
-            Platform::new(Os::Linux, Arch::Any),
-            Platform::new(Os::Macos, Arch::Any),
-            Platform::new(Os::Windows, Arch::Any),
-        ]
+        super::desktop_platforms()
     }
 
     fn adapter_revision(&self) -> &str {
@@ -317,43 +277,14 @@ impl Adapter for CursorAdapter {
             }
         }
         self.collect_config_evidence(&mut evidence);
-        let present = match (&binary_path, &version) {
-            (Some(_), Some(_)) => InstallPresence::Present,
-            (Some(_), None) => InstallPresence::UnknownVersion,
-            (None, _) => InstallPresence::Absent,
-        };
-        let confidence = match (
-            &binary_path,
-            &version,
-            evidence.iter().any(|e| e.contains("config root exists")),
-        ) {
-            (Some(_), None, _) => DetectionConfidence::Medium,
-            (None, _, true) => DetectionConfidence::Low,
-            (Some(_), Some(_), _) | (None, _, false) => DetectionConfidence::High,
-        };
-        let confidence = if present == InstallPresence::Absent {
-            DetectionConfidence::High
-        } else {
-            confidence
-        };
+        let present = super::install_presence(binary_path.is_some(), version.is_some());
+        let confidence =
+            super::detection_confidence(binary_path.is_some(), version.is_some(), false);
         DetectionResult::new(present, version, evidence, confidence)
     }
 
     fn version_resolution(&self) -> VersionResolution {
-        let detection = self.detection();
-        if let Some(v) = detection.version {
-            let mut notes = Vec::new();
-            notes.push(format!("detected cursor version {v}"));
-            notes.push(format!("mapped to schema version {SCHEMA_VERSION_STR}"));
-            let mut res =
-                VersionResolution::new(Some(v), Some(SCHEMA_VERSION_STR.to_owned()), true);
-            res.notes = notes;
-            res
-        } else {
-            let mut res = VersionResolution::unknown();
-            res.notes = detection.evidence;
-            res
-        }
+        super::resolution_from_detection(self.detection(), "cursor", SCHEMA_VERSION_STR)
     }
 
     fn config_surfaces(&self) -> Vec<ConfigSurface> {
@@ -505,21 +436,13 @@ impl Adapter for CursorAdapter {
     }
 
     fn plan_wrapper(&self, instance: &Instance) -> Result<WrapperPlan, CoreError> {
-        if instance.harness != self.id {
-            return Err(CoreError::Validation {
-                field: "harness".to_owned(),
-                reason: format!(
-                    "instance harness `{}` does not match adapter `{}`",
-                    instance.harness, self.id
-                ),
-            });
-        }
+        super::ensure_instance_harness(&self.id, instance)?;
         instance.validate()?;
         let mut plan = WrapperPlan::new("ide-user-data via --user-data-dir + CURSOR_CONFIG_DIR");
         plan.env_vars
             .push((CONFIG_ENV_VAR.to_owned(), instance.config_root.to_string()));
-        let user_data = Path::new(&instance.config_root.to_string()).join("vscode-data");
-        let extensions = Path::new(&instance.config_root.to_string()).join("extensions");
+        let user_data = instance.config_root.as_path().join("vscode-data");
+        let extensions = instance.config_root.as_path().join("extensions");
         plan.args.push(USER_DATA_DIR_FLAG.to_owned());
         plan.args.push(user_data.display().to_string());
         plan.args.push(EXTENSIONS_DIR_FLAG.to_owned());
@@ -550,12 +473,7 @@ impl Adapter for CursorAdapter {
     }
 
     fn validate_instance(&self, instance: &Instance) -> Result<(), CoreError> {
-        if instance.harness != self.id {
-            return Err(CoreError::Validation {
-                field: "harness".to_owned(),
-                reason: format!("expected harness `{}`, got `{}`", self.id, instance.harness),
-            });
-        }
+        super::ensure_instance_harness(&self.id, instance)?;
         instance.validate()?;
         match instance.isolation {
             Isolation::IdeUserData
@@ -570,11 +488,7 @@ impl Adapter for CursorAdapter {
     }
 
     fn supported_skill_modes(&self) -> Vec<crate::adapter::SkillMode> {
-        vec![
-            crate::adapter::SkillMode::LinkAll,
-            crate::adapter::SkillMode::LinkSelected,
-            crate::adapter::SkillMode::CopySelected,
-        ]
+        super::skill_modes_link_first()
     }
 
     /// The agent never reads `$CURSOR_CONFIG_DIR/mcp.json` (probe 2026-09-18).
@@ -598,10 +512,10 @@ impl Adapter for CursorAdapter {
 #[cfg(test)]
 mod tests {
     use super::{
-        CONFIG_ENV_VAR, CursorAdapter, DISPLAY_NAME, EXECUTABLE, HARNESS_ID_STR,
-        MCP_READ_PATH_FALLBACK, OWNED_SELECTORS, RESEARCH_DOC, USER_DATA_DIR_FLAG,
+        CONFIG_ENV_VAR, CursorAdapter, HARNESS_ID_STR, MCP_READ_PATH_FALLBACK, OWNED_SELECTORS,
+        USER_DATA_DIR_FLAG,
     };
-    use crate::adapter::{Adapter, ConfigScope, DocumentKind, ProductStatus, SurfaceOwnership};
+    use crate::adapter::{Adapter, ConfigScope, DocumentKind, SurfaceOwnership};
     use crate::error::CoreError;
     use crate::ids::{HarnessId, InstanceId, InstanceName};
     use crate::instance::Instance;
@@ -633,13 +547,11 @@ mod tests {
     #[test]
     fn adapter_identity() {
         let a = adapter();
+        // Constructor wiring plus catalog registration: an id the catalog
+        // does not know can never reconcile with detection or instances.
+        let entry = crate::harness_catalog::find_by_id(HARNESS_ID_STR).unwrap();
         assert_eq!(a.id().as_str(), HARNESS_ID_STR);
-        assert_eq!(a.display_name(), DISPLAY_NAME);
-        assert_eq!(a.executable_name(), EXECUTABLE);
-        assert_eq!(a.config_env_var(), CONFIG_ENV_VAR);
-        assert_eq!(a.product_status(), ProductStatus::Active);
-        assert_eq!(a.research_doc_link(), RESEARCH_DOC);
-        assert!(!a.last_verified_date().is_empty());
+        assert_eq!(a.product_status(), entry.product_status);
     }
 
     #[test]

@@ -13,43 +13,45 @@ use crate::ids::HarnessId;
 use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence, Isolation};
 
-/// Harness identifier for Gemini CLI.
+/// Harness id this retired adapter still registers under.
 pub const HARNESS_ID_STR: &str = "gemini-cli";
 
-/// Human display name.
+/// Name the adapter's `display_name()` reports.
 pub const DISPLAY_NAME: &str = "Gemini CLI";
 
-/// Primary executable name.
+/// Primary executable probed during detection.
 pub const EXECUTABLE: &str = "gemini";
 
-/// Environment variable that relocates the config root.
+/// Env var whose presence relocates detection and surfaces to `$var/.gemini`.
 pub const CONFIG_ENV_VAR: &str = "GEMINI_CLI_HOME";
 
-/// Default config root when `GEMINI_CLI_HOME` is unset.
+/// Config root `default_config_root()` falls back to when the env var is unset.
 pub const DEFAULT_CONFIG_ROOT_FALLBACK: &str = "~/.gemini";
 
 /// With `GEMINI_CLI_HOME` set, the CLI creates a `.gemini/` dir inside it (live-verified 0.60.0).
 pub const ISOLATED_CONFIG_ROOT_HINT: &str = "$GEMINI_CLI_HOME/.gemini";
 
-/// Research document link.
+/// Research source for the declarations in this file; returned by
+/// `research_doc_link()`.
 pub const RESEARCH_DOC: &str = "docs/harness-configs/gemini-cli.md";
 
-/// Last verified date.
+/// Date `last_verified_date()` reports.
 pub const LAST_VERIFIED: &str = "2026-08-25";
 
-/// Schema version for current settings shape.
+/// Settings shape version `version_resolution()` maps detected versions to.
 pub const SCHEMA_VERSION_STR: &str = "1";
 
-/// Retirement date for consumer tiers.
+/// Retirement date the migration tip and `MigrationOnly` gating cite.
 pub const RETIREMENT_DATE: &str = "2026-06-18";
 
-/// Successor harness id.
+/// Harness id migration guidance points users to.
 pub const SUCCESSOR_ID: &str = "antigravity-cli";
 
-/// Successor executable.
+/// Executable of the successor harness.
 pub const SUCCESSOR_EXECUTABLE: &str = "agy";
 
-/// Tip shown for migration.
+/// Refusal text every mutating operation returns; names the successor and
+/// the import command.
 pub const MIGRATION_TIP: &str = "Gemini CLI consumer tiers retired 2026-06-18; migrate to Antigravity CLI (agy) via `agy plugin import gemini`: skills .gemini/skills/ -> .gemini/antigravity-cli/skills/, mcpServers url/httpUrl -> serverUrl in mcp_config.json";
 
 /// `MigrationOnly`: detect/inspect/backup/export; every mutating attempt returns the successor tip.
@@ -63,26 +65,6 @@ impl GeminiCliAdapter {
     pub fn new() -> Result<Self, CoreError> {
         let id = HarnessId::new(HARNESS_ID_STR)?;
         Ok(Self { id })
-    }
-
-    /// Borrow the harness id.
-    pub fn harness_id(&self) -> &HarnessId {
-        &self.id
-    }
-
-    /// Executable name for this harness.
-    pub fn executable_name(&self) -> &str {
-        EXECUTABLE
-    }
-
-    /// Config relocation env var.
-    pub fn config_env_var(&self) -> &str {
-        CONFIG_ENV_VAR
-    }
-
-    /// Successor tip.
-    pub fn successor_tip(&self) -> &str {
-        MIGRATION_TIP
     }
 
     fn default_config_root() -> Option<PathBuf> {
@@ -142,8 +124,7 @@ impl GeminiCliAdapter {
 
 impl Default for GeminiCliAdapter {
     fn default() -> Self {
-        #[expect(clippy::unwrap_used, reason = "gemini-cli is static valid HarnessId")]
-        let id = HarnessId::new(HARNESS_ID_STR).unwrap();
+        let id = HarnessId::from_validated_const(HARNESS_ID_STR);
         Self { id }
     }
 }
@@ -221,9 +202,7 @@ impl Adapter for GeminiCliAdapter {
 
         let confidence = if present == InstallPresence::Absent {
             DetectionConfidence::High
-        } else if binary_path.is_some() && version.is_none()
-            || evidence.iter().any(|e| e.contains("config root exists"))
-        {
+        } else if version.is_none() {
             DetectionConfidence::Medium
         } else {
             DetectionConfidence::High
@@ -421,8 +400,7 @@ mod tests {
     use std::collections::HashSet;
 
     use super::{
-        DISPLAY_NAME, EXECUTABLE, GeminiCliAdapter, HARNESS_ID_STR, ISOLATED_CONFIG_ROOT_HINT,
-        MIGRATION_TIP, RESEARCH_DOC, SUCCESSOR_ID,
+        GeminiCliAdapter, HARNESS_ID_STR, ISOLATED_CONFIG_ROOT_HINT, MIGRATION_TIP, SUCCESSOR_ID,
     };
     use crate::adapter::{Adapter, ConfigScope, DocumentKind, ProductStatus, SurfaceOwnership};
     use crate::error::CoreError;
@@ -455,15 +433,14 @@ mod tests {
     #[test]
     fn adapter_identity() {
         let a = adapter();
+        // Constructor wiring plus catalog registration: an id the catalog
+        // does not know can never reconcile with detection or instances.
         assert_eq!(a.id().as_str(), HARNESS_ID_STR);
-        assert_eq!(a.display_name(), DISPLAY_NAME);
-        assert_eq!(a.executable_name(), EXECUTABLE);
+        assert!(crate::harness_catalog::find_by_id(HARNESS_ID_STR).is_some());
         assert_eq!(a.product_status(), ProductStatus::Retired);
-        assert_eq!(a.research_doc_link(), RESEARCH_DOC);
-        assert!(!a.last_verified_date().is_empty());
-        assert_eq!(a.adapter_revision(), crate::adapter::ADAPTER_REVISION);
-        assert!(a.successor_tip().contains(SUCCESSOR_ID));
-        assert!(a.successor_tip().contains("agy"));
+        // The refusal tip must name the successor and its import command.
+        assert!(MIGRATION_TIP.contains(SUCCESSOR_ID));
+        assert!(MIGRATION_TIP.contains("agy"));
     }
 
     #[test]
@@ -510,21 +487,6 @@ mod tests {
                 .iter()
                 .any(|n| n.contains(SUCCESSOR_ID) || n.contains("migration"))
         );
-    }
-
-    #[test]
-    fn parse_version_output_cases() {
-        let cases = vec![
-            ("gemini 2.1.0", Some("2.1.0")),
-            ("0.9.0", Some("0.9.0")),
-            ("v1.2.3", Some("1.2.3")),
-            ("", None),
-            ("not a version", None),
-        ];
-        for (input, expected) in cases {
-            let got = crate::adapters::parse_version_output(input);
-            assert_eq!(got.as_deref(), expected, "input: {input:?}");
-        }
     }
 
     #[test]

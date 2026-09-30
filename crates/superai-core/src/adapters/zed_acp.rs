@@ -4,22 +4,22 @@
 use std::path::{Path, PathBuf};
 
 use crate::adapter::{
-    ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
-    DetectionResult, DocumentKind, Os, PathResolver, Platform, ProductStatus, RestartBehavior,
-    SurfaceOwnership, VersionResolution, WrapperPlan,
+    ADAPTER_REVISION, Adapter, ConfigScope, ConfigSurface, DetectionResult, DocumentKind,
+    PathResolver, Platform, ProductStatus, RestartBehavior, SurfaceOwnership, VersionResolution,
+    WrapperPlan,
 };
 use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
-use crate::state::{AdapterSupport, InstallPresence, Isolation};
+use crate::state::{AdapterSupport, Isolation};
 
-/// Harness identifier for Zed ACP.
+/// Catalog id superai registers this harness under.
 pub const HARNESS_ID_STR: &str = "zed-acp";
 
-/// Human display name.
+/// Name shown for this harness in listings and errors.
 pub const DISPLAY_NAME: &str = "Zed AI/ACP";
 
-/// Primary executable.
+/// Binary name resolved on PATH during detection.
 pub const EXECUTABLE: &str = "zed";
 
 /// Alternative binary name.
@@ -34,13 +34,13 @@ pub const EXTENSIONS_DIR_FLAG: &str = "--extensions-dir";
 /// Default settings fallback.
 pub const DEFAULT_SETTINGS_FALLBACK: &str = "~/.config/zed/settings.json";
 
-/// Research document link.
+/// Research doc whose findings the constants in this file encode.
 pub const RESEARCH_DOC: &str = "docs/harness-configs/zed-acp.md";
 
-/// Last verified date.
+/// Date the research doc was last checked against the harness.
 pub const LAST_VERIFIED: &str = "2026-08-25";
 
-/// Schema version.
+/// Schema version this adapter maps detected versions to.
 pub const SCHEMA_VERSION_STR: &str = "1";
 
 /// Owned selectors inside `settings.json` for Zed AI.
@@ -68,23 +68,8 @@ impl ZedAcpAdapter {
         Ok(Self { id })
     }
 
-    /// Borrow harness id.
-    pub fn harness_id(&self) -> &HarnessId {
-        &self.id
-    }
-
-    /// Executable name.
-    pub fn executable_name(&self) -> &str {
-        EXECUTABLE
-    }
-
     fn default_settings_path() -> Option<PathBuf> {
-        let home = std::env::var("HOME")
-            .ok()
-            .or_else(|| std::env::var("USERPROFILE").ok())?;
-        if home.trim().is_empty() {
-            return None;
-        }
+        let home = super::home_dir()?;
         if cfg!(windows) {
             if let Ok(appdata) = std::env::var("APPDATA")
                 && !appdata.trim().is_empty()
@@ -92,19 +77,13 @@ impl ZedAcpAdapter {
                 return Some(PathBuf::from(appdata).join("Zed").join("settings.json"));
             }
             Some(
-                PathBuf::from(home)
-                    .join("AppData")
+                home.join("AppData")
                     .join("Roaming")
                     .join("Zed")
                     .join("settings.json"),
             )
         } else {
-            Some(
-                PathBuf::from(home)
-                    .join(".config")
-                    .join("zed")
-                    .join("settings.json"),
-            )
+            Some(home.join(".config").join("zed").join("settings.json"))
         }
     }
 
@@ -115,16 +94,22 @@ impl ZedAcpAdapter {
             Some(p) => {
                 if p.exists() {
                     evidence.push(format!("settings.json exists at {}", p.display()));
-                    if let Ok(text) = std::fs::read_to_string(&p) {
-                        if text.contains("agent_servers") {
-                            evidence.push("settings.json contains agent_servers".to_owned());
+                    match std::fs::read_to_string(&p) {
+                        Ok(text) => {
+                            if text.contains("agent_servers") {
+                                evidence.push("settings.json contains agent_servers".to_owned());
+                            }
+                            if text.contains("context_servers") {
+                                evidence.push("settings.json contains context_servers".to_owned());
+                            }
+                            if text.contains("language_models") {
+                                evidence.push("settings.json contains language_models".to_owned());
+                            }
                         }
-                        if text.contains("context_servers") {
-                            evidence.push("settings.json contains context_servers".to_owned());
-                        }
-                        if text.contains("language_models") {
-                            evidence.push("settings.json contains language_models".to_owned());
-                        }
+                        Err(err) => evidence.push(format!(
+                            "settings.json unreadable at {}: {err}",
+                            p.display()
+                        )),
                     }
                 } else {
                     evidence.push(format!("settings.json missing at {}", p.display()));
@@ -146,8 +131,7 @@ impl ZedAcpAdapter {
 
 impl Default for ZedAcpAdapter {
     fn default() -> Self {
-        #[expect(clippy::unwrap_used, reason = "zed-acp is static valid")]
-        let id = HarnessId::new(HARNESS_ID_STR).unwrap();
+        let id = HarnessId::from_validated_const(HARNESS_ID_STR);
         Self { id }
     }
 }
@@ -166,11 +150,7 @@ impl Adapter for ZedAcpAdapter {
     }
 
     fn supported_platforms(&self) -> Vec<Platform> {
-        vec![
-            Platform::new(Os::Linux, Arch::Any),
-            Platform::new(Os::Macos, Arch::Any),
-            Platform::new(Os::Windows, Arch::Any),
-        ]
+        super::desktop_platforms()
     }
 
     fn adapter_revision(&self) -> &str {
@@ -212,16 +192,9 @@ impl Adapter for ZedAcpAdapter {
             }
         }
         self.collect_config_evidence(&mut evidence);
-        let present = match (&binary_path, &version) {
-            (Some(_), Some(_)) => InstallPresence::Present,
-            (Some(_), None) => InstallPresence::UnknownVersion,
-            (None, _) => InstallPresence::Absent,
-        };
-        // Absent forces High, so the Low "settings.json exists" arm can never fire.
-        let confidence = match (&binary_path, &version) {
-            (Some(_), None) => DetectionConfidence::Medium,
-            (Some(_), Some(_)) | (None, _) => DetectionConfidence::High,
-        };
+        let present = super::install_presence(binary_path.is_some(), version.is_some());
+        let confidence =
+            super::detection_confidence(binary_path.is_some(), version.is_some(), false);
         DetectionResult::new(present, version, evidence, confidence)
     }
 
@@ -369,15 +342,7 @@ impl Adapter for ZedAcpAdapter {
     }
 
     fn plan_wrapper(&self, instance: &Instance) -> Result<WrapperPlan, CoreError> {
-        if instance.harness != self.id {
-            return Err(CoreError::Validation {
-                field: "harness".to_owned(),
-                reason: format!(
-                    "instance harness `{}` does not match adapter `{}`",
-                    instance.harness, self.id
-                ),
-            });
-        }
+        super::ensure_instance_harness(&self.id, instance)?;
         instance.validate()?;
         let mut plan =
             WrapperPlan::new("ide-user-data via --user-data-dir with ACP wrapper registrations");
@@ -386,13 +351,15 @@ impl Adapter for ZedAcpAdapter {
             "XDG_CONFIG_HOME".to_owned(),
             instance.config_root.to_string(),
         ));
-        let user_data = Path::new(&instance.config_root.to_string()).join("zed-data");
-        let extensions = Path::new(&instance.config_root.to_string()).join("extensions");
+        let user_data = instance.config_root.as_path().join("zed-data");
+        let extensions = instance.config_root.as_path().join("extensions");
         plan.args.push(USER_DATA_DIR_FLAG.to_owned());
         plan.args.push(user_data.display().to_string());
         plan.args.push(EXTENSIONS_DIR_FLAG.to_owned());
         plan.args.push(extensions.display().to_string());
-        let wrapper_marker = Path::new(&instance.config_root.to_string())
+        let wrapper_marker = instance
+            .config_root
+            .as_path()
             .join("zed")
             .join("settings.json");
         plan.description = format!(
@@ -420,12 +387,7 @@ impl Adapter for ZedAcpAdapter {
     }
 
     fn validate_instance(&self, instance: &Instance) -> Result<(), CoreError> {
-        if instance.harness != self.id {
-            return Err(CoreError::Validation {
-                field: "harness".to_owned(),
-                reason: format!("expected harness `{}`, got `{}`", self.id, instance.harness),
-            });
-        }
+        super::ensure_instance_harness(&self.id, instance)?;
         instance.validate()?;
         match instance.isolation {
             Isolation::IdeUserData | Isolation::RelocatedRoot | Isolation::Unknown => Ok(()),
@@ -437,11 +399,7 @@ impl Adapter for ZedAcpAdapter {
     }
 
     fn supported_skill_modes(&self) -> Vec<crate::adapter::SkillMode> {
-        vec![
-            crate::adapter::SkillMode::LinkAll,
-            crate::adapter::SkillMode::LinkSelected,
-            crate::adapter::SkillMode::CopySelected,
-        ]
+        super::skill_modes_link_first()
     }
 
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
@@ -463,10 +421,8 @@ impl Adapter for ZedAcpAdapter {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        DISPLAY_NAME, EXECUTABLE, HARNESS_ID_STR, RESEARCH_DOC, USER_DATA_DIR_FLAG, ZedAcpAdapter,
-    };
-    use crate::adapter::{Adapter, DocumentKind, ProductStatus};
+    use super::{HARNESS_ID_STR, USER_DATA_DIR_FLAG, ZedAcpAdapter};
+    use crate::adapter::{Adapter, DocumentKind};
     use crate::error::CoreError;
     use crate::ids::{HarnessId, InstanceId, InstanceName};
     use crate::instance::Instance;
@@ -497,11 +453,11 @@ mod tests {
     #[test]
     fn adapter_identity() {
         let a = adapter();
+        // Constructor wiring plus catalog registration: an id the catalog
+        // does not know can never reconcile with detection or instances.
+        let entry = crate::harness_catalog::find_by_id(HARNESS_ID_STR).unwrap();
         assert_eq!(a.id().as_str(), HARNESS_ID_STR);
-        assert_eq!(a.display_name(), DISPLAY_NAME);
-        assert_eq!(a.executable_name(), EXECUTABLE);
-        assert_eq!(a.product_status(), ProductStatus::Active);
-        assert_eq!(a.research_doc_link(), RESEARCH_DOC);
+        assert_eq!(a.product_status(), entry.product_status);
     }
 
     #[test]

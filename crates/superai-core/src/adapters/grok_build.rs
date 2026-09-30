@@ -4,22 +4,22 @@
 use std::path::{Path, PathBuf};
 
 use crate::adapter::{
-    ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
-    DetectionResult, DocumentKind, Os, PathResolver, Platform, ProductStatus, RestartBehavior,
-    SurfaceOwnership, VersionResolution, WrapperPlan,
+    ADAPTER_REVISION, Adapter, ConfigScope, ConfigSurface, DetectionResult, DocumentKind,
+    PathResolver, Platform, ProductStatus, RestartBehavior, SurfaceOwnership, VersionResolution,
+    WrapperPlan,
 };
 use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
-use crate::state::{AdapterSupport, InstallPresence, Isolation};
+use crate::state::{AdapterSupport, Isolation};
 
-/// Harness identifier for Grok Build.
+/// Catalog id superai registers this harness under.
 pub const HARNESS_ID_STR: &str = "grok-build";
 
-/// Human display name.
+/// Name shown for this harness in listings and errors.
 pub const DISPLAY_NAME: &str = "Grok Build";
 
-/// Primary executable name.
+/// Binary name resolved on PATH during detection.
 pub const EXECUTABLE: &str = "grok";
 
 /// Environment variable that relocates the config root.
@@ -31,16 +31,13 @@ pub const CONFIG_OVERLAY_ENV_VAR: &str = "GROK_CONFIG";
 /// File overlay env var.
 pub const CONFIG_PATH_ENV_VAR: &str = "GROK_CONFIG_PATH";
 
-/// Default config root when `GROK_HOME` is unset.
-pub const DEFAULT_CONFIG_ROOT_FALLBACK: &str = "~/.grok";
-
-/// Research document link.
+/// Research doc whose findings the constants in this file encode.
 pub const RESEARCH_DOC: &str = "docs/harness-configs/grok-build.md";
 
-/// Last verified date.
+/// Date the research doc was last checked against the harness.
 pub const LAST_VERIFIED: &str = "2026-08-25";
 
-/// Schema version for current config shape.
+/// Schema version this adapter maps detected versions to.
 pub const SCHEMA_VERSION_STR: &str = "1";
 
 /// Owned selectors for provider/model mutation inside `config.toml`.
@@ -68,34 +65,14 @@ impl GrokBuildAdapter {
         Ok(Self { id })
     }
 
-    /// Borrow the harness id.
-    pub fn harness_id(&self) -> &HarnessId {
-        &self.id
-    }
-
-    /// Executable name for this harness.
-    pub fn executable_name(&self) -> &str {
-        EXECUTABLE
-    }
-
-    /// Config relocation env var.
-    pub fn config_env_var(&self) -> &str {
-        CONFIG_ENV_VAR
-    }
-
     fn default_config_root() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var(CONFIG_ENV_VAR)
             && !dir.trim().is_empty()
         {
             return Some(PathBuf::from(dir));
         }
-        let home = std::env::var("HOME")
-            .ok()
-            .or_else(|| std::env::var("USERPROFILE").ok())?;
-        if home.trim().is_empty() {
-            return None;
-        }
-        Some(PathBuf::from(home).join(".grok"))
+        let home = super::home_dir()?;
+        Some(home.join(".grok"))
     }
 
     fn config_path_for_root(root: &Path) -> PathBuf {
@@ -115,10 +92,13 @@ impl GrokBuildAdapter {
                     let cfg = Self::config_path_for_root(&root);
                     if cfg.exists() {
                         evidence.push(format!("config.toml found at {}", cfg.display()));
-                        if let Ok(text) = std::fs::read_to_string(&cfg)
-                            && (text.contains("models") || text.contains("[model"))
-                        {
-                            evidence.push("config.toml contains models/model".to_owned());
+                        match std::fs::read_to_string(&cfg) {
+                            Ok(text) if (text.contains("models") || text.contains("[model")) => {
+                                evidence.push("config.toml contains models/model".to_owned());
+                            }
+                            Ok(_) => {}
+                            Err(err) => evidence
+                                .push(format!("config unreadable at {}: {err}", cfg.display())),
                         }
                     } else {
                         evidence.push(format!("config.toml missing at {}", cfg.display()));
@@ -143,12 +123,14 @@ impl GrokBuildAdapter {
             if let Ok(val) = std::env::var(var)
                 && !val.trim().is_empty()
             {
-                let preview = if val.len() > 80 {
+                // GROK_CONFIG is an inline JSON overlay that can carry provider
+                // keys; only the path variable is safe to quote.
+                let preview = if var == CONFIG_PATH_ENV_VAR {
                     // Chars, not bytes, so the cut cannot split UTF-8.
                     let truncated: String = val.chars().take(80).collect();
                     format!("{truncated}…")
                 } else {
-                    val
+                    format!("<{} chars>", val.chars().count())
                 };
                 evidence.push(format!("{var} set to {preview}"));
             } else {
@@ -167,8 +149,7 @@ impl GrokBuildAdapter {
 
 impl Default for GrokBuildAdapter {
     fn default() -> Self {
-        #[expect(clippy::unwrap_used, reason = "grok-build is static valid HarnessId")]
-        let id = HarnessId::new(HARNESS_ID_STR).unwrap();
+        let id = HarnessId::from_validated_const(HARNESS_ID_STR);
         Self { id }
     }
 }
@@ -187,11 +168,7 @@ impl Adapter for GrokBuildAdapter {
     }
 
     fn supported_platforms(&self) -> Vec<Platform> {
-        vec![
-            Platform::new(Os::Linux, Arch::Any),
-            Platform::new(Os::Macos, Arch::Any),
-            Platform::new(Os::Windows, Arch::Any),
-        ]
+        super::desktop_platforms()
     }
 
     fn adapter_revision(&self) -> &str {
@@ -238,37 +215,15 @@ impl Adapter for GrokBuildAdapter {
 
         self.collect_config_evidence(&mut evidence);
 
-        let present = match (&binary_path, &version) {
-            (Some(_), Some(_)) => InstallPresence::Present,
-            (Some(_), None) => InstallPresence::UnknownVersion,
-            (None, _) => InstallPresence::Absent,
-        };
+        let present = super::install_presence(binary_path.is_some(), version.is_some());
 
-        // Absent forces High, so the Low "config root exists" arm can never
-        // survive.
-        let confidence = match (&binary_path, &version) {
-            (Some(_), None) => DetectionConfidence::Medium,
-            (Some(_), Some(_)) | (None, _) => DetectionConfidence::High,
-        };
-
+        let confidence =
+            super::detection_confidence(binary_path.is_some(), version.is_some(), false);
         DetectionResult::new(present, version, evidence, confidence)
     }
 
     fn version_resolution(&self) -> VersionResolution {
-        let detection = self.detection();
-        if let Some(v) = detection.version {
-            let mut notes = Vec::new();
-            notes.push(format!("detected grok-build version {v}"));
-            notes.push(format!("mapped to schema version {SCHEMA_VERSION_STR}"));
-            let mut res =
-                VersionResolution::new(Some(v), Some(SCHEMA_VERSION_STR.to_owned()), true);
-            res.notes = notes;
-            res
-        } else {
-            let mut res = VersionResolution::unknown();
-            res.notes = detection.evidence;
-            res
-        }
+        super::resolution_from_detection(self.detection(), "grok-build", SCHEMA_VERSION_STR)
     }
 
     #[expect(clippy::too_many_lines, reason = "surfaces are declarative")]
@@ -414,19 +369,7 @@ impl Adapter for GrokBuildAdapter {
     }
 
     fn supported_operations(&self) -> Vec<(String, AdapterSupport)> {
-        vec![
-            ("detect".to_owned(), AdapterSupport::Full),
-            ("read_config".to_owned(), AdapterSupport::Full),
-            ("write_config".to_owned(), AdapterSupport::Full),
-            ("manage_skills".to_owned(), AdapterSupport::Full),
-            ("manage_mcp".to_owned(), AdapterSupport::Full),
-            ("manage_plugins".to_owned(), AdapterSupport::Full),
-            ("configure_provider".to_owned(), AdapterSupport::Full),
-            ("plan_mirror".to_owned(), AdapterSupport::Full),
-            ("plan_wrapper".to_owned(), AdapterSupport::Full),
-            ("scan_candidates".to_owned(), AdapterSupport::Full),
-            ("validate_instance".to_owned(), AdapterSupport::Full),
-        ]
+        super::all_operations_full()
     }
 
     fn plan_mirror_exclusions(&self) -> Vec<String> {
@@ -447,15 +390,7 @@ impl Adapter for GrokBuildAdapter {
     }
 
     fn plan_wrapper(&self, instance: &Instance) -> Result<WrapperPlan, CoreError> {
-        if instance.harness != self.id {
-            return Err(CoreError::Validation {
-                field: "harness".to_owned(),
-                reason: format!(
-                    "instance harness `{}` does not match adapter `{}`",
-                    instance.harness, self.id
-                ),
-            });
-        }
+        super::ensure_instance_harness(&self.id, instance)?;
         instance.validate()?;
         let mut plan = WrapperPlan::new("relocated-root via GROK_HOME with GROK_CONFIG overlay");
         plan.env_vars
@@ -478,12 +413,7 @@ impl Adapter for GrokBuildAdapter {
     }
 
     fn validate_instance(&self, instance: &Instance) -> Result<(), CoreError> {
-        if instance.harness != self.id {
-            return Err(CoreError::Validation {
-                field: "harness".to_owned(),
-                reason: format!("expected harness `{}`, got `{}`", self.id, instance.harness),
-            });
-        }
+        super::ensure_instance_harness(&self.id, instance)?;
         instance.validate()?;
         match instance.isolation {
             Isolation::RelocatedRoot | Isolation::Unknown => Ok(()),
@@ -495,11 +425,7 @@ impl Adapter for GrokBuildAdapter {
     }
 
     fn supported_skill_modes(&self) -> Vec<crate::adapter::SkillMode> {
-        vec![
-            crate::adapter::SkillMode::LinkAll,
-            crate::adapter::SkillMode::LinkSelected,
-            crate::adapter::SkillMode::CopySelected,
-        ]
+        super::skill_modes_link_first()
     }
 
     /// `grok mcp add` writes `[mcp_servers.<name>]` into `$GROK_HOME/config.toml`
@@ -530,10 +456,9 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        CONFIG_ENV_VAR, CONFIG_OVERLAY_ENV_VAR, DISPLAY_NAME, EXECUTABLE, GrokBuildAdapter,
-        HARNESS_ID_STR, OWNED_SELECTORS, RESEARCH_DOC,
+        CONFIG_ENV_VAR, CONFIG_OVERLAY_ENV_VAR, GrokBuildAdapter, HARNESS_ID_STR, OWNED_SELECTORS,
     };
-    use crate::adapter::{Adapter, ConfigScope, DocumentKind, ProductStatus, SurfaceOwnership};
+    use crate::adapter::{Adapter, ConfigScope, DocumentKind, SurfaceOwnership};
     use crate::error::CoreError;
     use crate::ids::{HarnessId, InstanceId, InstanceName};
     use crate::instance::Instance;
@@ -564,14 +489,11 @@ mod tests {
     #[test]
     fn adapter_identity() {
         let a = adapter();
+        // Constructor wiring plus catalog registration: an id the catalog
+        // does not know can never reconcile with detection or instances.
+        let entry = crate::harness_catalog::find_by_id(HARNESS_ID_STR).unwrap();
         assert_eq!(a.id().as_str(), HARNESS_ID_STR);
-        assert_eq!(a.display_name(), DISPLAY_NAME);
-        assert_eq!(a.executable_name(), EXECUTABLE);
-        assert_eq!(a.config_env_var(), CONFIG_ENV_VAR);
-        assert_eq!(a.product_status(), ProductStatus::Active);
-        assert_eq!(a.research_doc_link(), RESEARCH_DOC);
-        assert!(!a.last_verified_date().is_empty());
-        assert_eq!(a.adapter_revision(), crate::adapter::ADAPTER_REVISION);
+        assert_eq!(a.product_status(), entry.product_status);
     }
 
     #[test]
@@ -605,7 +527,6 @@ mod tests {
                 assert!(!result.evidence.is_empty());
             }
         }
-        assert_ne!(result.confidence.to_string(), "");
     }
 
     #[test]
@@ -623,22 +544,6 @@ mod tests {
             assert!(res.schema_version.is_none());
         }
         assert!(!res.notes.is_empty());
-    }
-
-    #[test]
-    fn parse_version_output_cases() {
-        let cases = vec![
-            ("grok 0.5.0", Some("0.5.0")),
-            ("grok 1.0.0-beta", Some("1.0.0-beta")),
-            ("v1.0.0", Some("1.0.0")),
-            ("Version: 2.0.0", Some("2.0.0")),
-            ("", None),
-            ("not a version", None),
-        ];
-        for (input, expected) in cases {
-            let got = crate::adapters::parse_version_output(input);
-            assert_eq!(got.as_deref(), expected, "input: {input:?}");
-        }
     }
 
     #[test]
@@ -683,13 +588,6 @@ mod tests {
     }
 
     #[test]
-    fn owned_selectors_are_stable() {
-        assert!(OWNED_SELECTORS.len() >= 5);
-        let set: HashSet<&str> = OWNED_SELECTORS.iter().copied().collect();
-        assert_eq!(set.len(), OWNED_SELECTORS.len(), "selectors must be unique");
-    }
-
-    #[test]
     fn supported_operations_cover_full() {
         let a = adapter();
         let ops = a.supported_operations();
@@ -725,23 +623,10 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::excessive_nesting, reason = "test closure nesting is explicit")]
     fn plan_mirror_includes_config_and_excludes_sessions() {
         let a = adapter();
         let exclusions = a.plan_mirror_exclusions();
-        let is_excluded = |file: &str| {
-            exclusions.iter().any(|pat| {
-                if pat.ends_with("/*") {
-                    let prefix = pat.trim_end_matches("/*");
-                    file.starts_with(prefix)
-                } else if pat.starts_with("*.") {
-                    let suffix = pat.trim_start_matches('*');
-                    file.ends_with(suffix)
-                } else {
-                    file == pat
-                }
-            })
-        };
+        let is_excluded = |file: &str| crate::adapters::exclusion_matches(&exclusions, file);
         assert!(!is_excluded("config.toml"));
         assert!(!is_excluded("auth.json"));
         assert!(is_excluded("sessions/abc.jsonl"));
@@ -925,43 +810,6 @@ mod tests {
         assert!(path.exists(), "fixture missing: {}", path.display());
         let result = superai_config::toml_file::load(&path);
         assert!(result.is_err(), "malformed fixture must fail to parse");
-    }
-
-    #[test]
-    fn secret_redaction_placeholder() {
-        use crate::error::RedactedString;
-        let secret = RedactedString::new("sk-grok-secret-123");
-        let debug = format!("{secret:?}");
-        let display = format!("{secret}");
-        assert!(!debug.contains("sk-grok-secret-123"));
-        assert!(!display.contains("sk-grok-secret-123"));
-        assert!(debug.contains("[REDACTED]"));
-        assert!(display.contains("[REDACTED]"));
-        let json = serde_json::to_string(&secret).unwrap();
-        assert!(!json.contains("sk-grok-secret-123"));
-        assert!(json.contains("[REDACTED]"));
-        assert_eq!(secret.expose_secret(), "sk-grok-secret-123");
-    }
-
-    #[test]
-    fn diff_redaction_does_not_leak_secrets() {
-        use crate::error::RedactedString as OpRedacted;
-        let secret = OpRedacted::new("super-secret-key");
-        let diff_text = format!("set api key to {secret}");
-        assert!(!diff_text.contains("super-secret-key"));
-        assert!(diff_text.contains("[REDACTED]"));
-    }
-
-    #[test]
-    fn conflict_detection_placeholder_no_panic() {
-        let a = adapter();
-        let r1 = a.detection();
-        let r2 = a.detection();
-        assert_eq!(r1.present, r2.present);
-        assert_eq!(r1.confidence, r2.confidence);
-        let inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".grok-work"));
-        a.validate_instance(&inst).unwrap();
-        a.validate_instance(&inst).unwrap();
     }
 
     #[test]

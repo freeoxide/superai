@@ -39,7 +39,7 @@ const MANIFEST_ALIASES_KEY: &str = "aliases";
 /// Current alias manifest schema version.
 pub const ALIAS_MANIFEST_SCHEMA_VERSION: u32 = 1;
 
-/// Per-alias provider reference file (run-5): names, URL, and model pinning
+/// Per-alias provider reference file: names, URL, and model pinning
 /// only, never a secret; the token rides the launch env.
 pub const ALIAS_PROVIDER_REF_FILE: &str = ".superai/provider.json";
 
@@ -390,7 +390,7 @@ pub struct AliasSpec {
     /// Binary the alias launches when the adapter's plan names no executable.
     /// Resolution precedence: plan executable, then this pin, then PATH default.
     pub binary: Option<ExecutableRef>,
-    /// Third-party provider override (run-5): env-carried for claude-code,
+    /// Third-party provider override: env-carried for claude-code,
     /// config-carried for the codex family. Never carries a secret value.
     pub provider: Option<ProviderProfile>,
     /// HOME-virtualized instance mode: launch exports `HOME=<alias-root>` and
@@ -481,7 +481,7 @@ pub struct AliasRecord {
     /// Generated wrapper, when one was written at creation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wrapper: Option<WrapperRef>,
-    /// HOME-virtualized instance mode (run-5): the record still carries no
+    /// HOME-virtualized instance mode: the record still carries no
     /// model/provider/secret data; the provider reference lives under the root.
     #[serde(default)]
     pub home_virt: bool,
@@ -688,8 +688,7 @@ fn wrapper_plan_for_alias(
                 operation: "home_virt".to_owned(),
                 reason: format!(
                     "HOME-virtualization is modeled only for {} (binaries demonstrably \
-                     honoring HOME, run-4 live evidence); the relocation guard is not \
-                     weakened for `{}`",
+                     honoring HOME); the relocation guard is not weakened for `{}`",
                     HOME_VIRT_HARNESSES.join(", "),
                     instance.harness
                 ),
@@ -883,13 +882,21 @@ fn rollback_wrapper_file(
         }
         Err(_) => return Ok(format!("wrapper {} already absent", path.display())),
     }
-    // A backup from this run is the pre-create state write_wrapper saved.
-    let ours = superai_config::backup::list_backups(path)
-        .ok()
-        .and_then(|mut all| {
+    // The backup from this run is the pre-create state; if backups cannot
+    // be listed that state is unknown, so the wrapper stays in place.
+    let ours = match superai_config::backup::list_backups(path) {
+        Ok(mut all) => {
             all.retain(|b| b.timestamp_millis >= started_millis);
             all.pop()
-        });
+        }
+        Err(e) => {
+            return Err(format!(
+                "wrapper {} is this run's generation but its backups could not be listed ({e}); \
+                 left in place",
+                path.display()
+            ));
+        }
+    };
     match ours {
         Some(entry) => superai_config::backup::restore(&entry.backup_path, path)
             .map(|()| {
@@ -1535,7 +1542,7 @@ mod tests {
         }
         assert!(!base.join("kimi-code-cli").join("mk").exists());
         // The half-created root is recoverable UNDER THE ALIAS BASE, not in
-        // the user's home (run-4 round-3 finding 2).
+        // the user's home.
         let qbase = base.join(".superai").join("quarantine");
         let recovered: Vec<std::ffi::OsString> = std::fs::read_dir(&qbase)
             .map(|rd| {
@@ -2008,7 +2015,7 @@ mod tests {
         );
     }
 
-    /// Run-5 desktop harnesses have no relocation mechanism, so creation is
+    /// Desktop harnesses have no relocation mechanism, so creation is
     /// refused up front, before any root, marker, or manifest write.
     #[test]
     fn desktop_harnesses_refuse_alias_creation_at_the_relocation_guard() {
@@ -2096,8 +2103,6 @@ mod tests {
             other => panic!("expected MCP-absence refusal, got {other:?}"),
         }
     }
-
-    // Run-5: third-party provider profiles + HOME-virtualized instances
 
     fn provider_anthropic() -> ProviderProfile {
         ProviderProfile::new(

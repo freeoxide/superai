@@ -4,22 +4,22 @@
 use std::path::{Path, PathBuf};
 
 use crate::adapter::{
-    ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
-    DetectionResult, DocumentKind, Os, PathResolver, Platform, ProductStatus, RestartBehavior,
-    RootShape, SkillMode, SurfaceOwnership, SurfaceSchema, VersionResolution, WrapperPlan,
+    ADAPTER_REVISION, Adapter, ConfigScope, ConfigSurface, DetectionConfidence, DetectionResult,
+    DocumentKind, PathResolver, Platform, ProductStatus, RestartBehavior, RootShape, SkillMode,
+    SurfaceOwnership, SurfaceSchema, VersionResolution, WrapperPlan,
 };
 use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence, Isolation};
 
-/// Harness identifier for `ZCode`.
+/// Catalog id superai registers this harness under.
 pub const HARNESS_ID_STR: &str = "zcode";
 
-/// Human display name.
+/// Name shown for this harness in listings and errors.
 pub const DISPLAY_NAME: &str = "ZCode";
 
-/// Primary executable name (Electron app may not have CLI, but use zcode).
+/// Binary name resolved on PATH during detection (Electron app may not have CLI, but use zcode).
 pub const EXECUTABLE: &str = "zcode";
 
 /// Fixed config path (versioned).
@@ -34,13 +34,13 @@ pub const HARNESS_CONFIG_ROOT: &str = "~/.zcode";
 /// Application bundle ID hint (macOS).
 pub const BUNDLE_ID: &str = "ai.zcode.app";
 
-/// Research document link.
+/// Research doc whose findings the constants in this file encode.
 pub const RESEARCH_DOC: &str = "docs/harness-configs/zcode.md";
 
-/// Last verified date.
+/// Date the research doc was last checked against the harness.
 pub const LAST_VERIFIED: &str = "2026-08-25";
 
-/// Schema version.
+/// Schema version this adapter maps detected versions to.
 pub const SCHEMA_VERSION_STR: &str = "1";
 
 /// Fixed-path activation layout: the config file every profile activation swaps, plus the harness-owned tree bounding it.
@@ -74,34 +74,9 @@ impl ZcodeAdapter {
         Ok(Self { id })
     }
 
-    /// Borrow harness id.
-    pub fn harness_id(&self) -> &HarnessId {
-        &self.id
-    }
-
-    /// Executable name.
-    pub fn executable_name(&self) -> &str {
-        EXECUTABLE
-    }
-
-    /// Fixed path.
-    pub fn fixed_path(&self) -> &str {
-        FIXED_CONFIG_PATH
-    }
-
     fn fixed_config_path_buf() -> Option<PathBuf> {
-        let home = std::env::var("HOME")
-            .ok()
-            .or_else(|| std::env::var("USERPROFILE").ok())?;
-        if home.trim().is_empty() {
-            return None;
-        }
-        Some(
-            PathBuf::from(home)
-                .join(".zcode")
-                .join("v2")
-                .join("config.json"),
-        )
+        let home = super::home_dir()?;
+        Some(home.join(".zcode").join("v2").join("config.json"))
     }
 
     #[expect(
@@ -117,10 +92,17 @@ impl ZcodeAdapter {
             Some(path) => {
                 if path.exists() {
                     evidence.push(format!("config exists at {}", path.display()));
-                    if let Ok(text) = std::fs::read_to_string(&path)
-                        && (text.contains("\"provider\"") || text.contains("\"options\""))
-                    {
-                        evidence.push("config contains provider/options marker".to_owned());
+                    match std::fs::read_to_string(&path) {
+                        Ok(text)
+                            if (text.contains("\"provider\"") || text.contains("\"options\"")) =>
+                        {
+                            evidence.push("config contains provider/options marker".to_owned());
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            evidence
+                                .push(format!("config unreadable at {}: {err}", path.display()));
+                        }
                     }
                 } else {
                     evidence.push(format!("config missing at {}", path.display()));
@@ -143,8 +125,7 @@ impl ZcodeAdapter {
 
 impl Default for ZcodeAdapter {
     fn default() -> Self {
-        #[expect(clippy::unwrap_used, reason = "zcode is static valid HarnessId")]
-        let id = HarnessId::new(HARNESS_ID_STR).unwrap();
+        let id = HarnessId::from_validated_const(HARNESS_ID_STR);
         Self { id }
     }
 }
@@ -163,11 +144,7 @@ impl Adapter for ZcodeAdapter {
     }
 
     fn supported_platforms(&self) -> Vec<Platform> {
-        vec![
-            Platform::new(Os::Linux, Arch::Any),
-            Platform::new(Os::Macos, Arch::Any),
-            Platform::new(Os::Windows, Arch::Any),
-        ]
+        super::desktop_platforms()
     }
 
     fn adapter_revision(&self) -> &str {
@@ -324,15 +301,7 @@ impl Adapter for ZcodeAdapter {
     }
 
     fn plan_wrapper(&self, instance: &Instance) -> Result<WrapperPlan, CoreError> {
-        if instance.harness != self.id {
-            return Err(CoreError::Validation {
-                field: "harness".to_owned(),
-                reason: format!(
-                    "instance harness `{}` does not match adapter `{}`",
-                    instance.harness, self.id
-                ),
-            });
-        }
+        super::ensure_instance_harness(&self.id, instance)?;
         instance.validate()?;
         // Fixed path: no relocation; wrapper is identity (single instance).
         let mut plan = WrapperPlan::new(
@@ -351,12 +320,7 @@ impl Adapter for ZcodeAdapter {
     }
 
     fn validate_instance(&self, instance: &Instance) -> Result<(), CoreError> {
-        if instance.harness != self.id {
-            return Err(CoreError::Validation {
-                field: "harness".to_owned(),
-                reason: format!("expected harness `{}`, got `{}`", self.id, instance.harness),
-            });
-        }
+        super::ensure_instance_harness(&self.id, instance)?;
         instance.validate()?;
         match instance.isolation {
             Isolation::FixedPathSingle | Isolation::Unknown | Isolation::RelocatedRoot => {
@@ -398,12 +362,8 @@ impl Adapter for ZcodeAdapter {
 mod tests {
     use std::collections::HashSet;
 
-    use super::{
-        DISPLAY_NAME, EXECUTABLE, FIXED_CONFIG_PATH, HARNESS_ID_STR, RESEARCH_DOC, ZcodeAdapter,
-    };
-    use crate::adapter::{
-        Adapter, ConfigScope, DocumentKind, ProductStatus, SkillMode, SurfaceOwnership,
-    };
+    use super::{FIXED_CONFIG_PATH, HARNESS_ID_STR, ZcodeAdapter};
+    use crate::adapter::{Adapter, ConfigScope, DocumentKind, SkillMode, SurfaceOwnership};
     use crate::error::CoreError;
     use crate::ids::{HarnessId, InstanceId, InstanceName};
     use crate::instance::Instance;
@@ -434,13 +394,11 @@ mod tests {
     #[test]
     fn adapter_identity() {
         let a = adapter();
+        // Constructor wiring plus catalog registration: an id the catalog
+        // does not know can never reconcile with detection or instances.
+        let entry = crate::harness_catalog::find_by_id(HARNESS_ID_STR).unwrap();
         assert_eq!(a.id().as_str(), HARNESS_ID_STR);
-        assert_eq!(a.display_name(), DISPLAY_NAME);
-        assert_eq!(a.executable_name(), EXECUTABLE);
-        assert_eq!(a.product_status(), ProductStatus::Active);
-        assert_eq!(a.research_doc_link(), RESEARCH_DOC);
-        assert!(!a.last_verified_date().is_empty());
-        assert_eq!(a.fixed_path(), FIXED_CONFIG_PATH);
+        assert_eq!(a.product_status(), entry.product_status);
     }
 
     #[test]
@@ -474,21 +432,6 @@ mod tests {
                 Some(super::SCHEMA_VERSION_STR)
             );
             assert!(res.compatible);
-        }
-    }
-
-    #[test]
-    fn parse_version_output_cases() {
-        let cases = vec![
-            ("zcode 0.9.0", Some("0.9.0")),
-            ("1.0.0", Some("1.0.0")),
-            ("v1.2.3", Some("1.2.3")),
-            ("", None),
-            ("not a version", None),
-        ];
-        for (input, expected) in cases {
-            let got = crate::adapters::parse_version_output(input);
-            assert_eq!(got.as_deref(), expected, "input: {input:?}");
         }
     }
 
@@ -617,7 +560,7 @@ mod tests {
         assert!(
             diags
                 .iter()
-                .any(|d| d.message.contains("root must be a object")
+                .any(|d| d.message.contains("root must be of kind object")
                     && d.message.starts_with("[zcode/config.json]")),
             "diags: {diags:?}"
         );

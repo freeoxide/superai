@@ -6,7 +6,6 @@
     reason = "detection logic intentionally deep"
 )]
 #![expect(clippy::collapsible_if, reason = "explicit nesting for readability")]
-use std::borrow::ToOwned as _;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -404,11 +403,7 @@ pub fn detect_all_for_entry(entry: &InstallCatalogEntry, opts: &DetectOptions) -
             )
         }) {
             if let Some(d) = probe_homebrew(&method.package_name, entry, opts) {
-                let canon = canonical_or_clone(&d.path);
-                if !seen_paths.contains(&canon) {
-                    seen_paths.insert(canon);
-                    detections.push(d);
-                }
+                push_unique(&mut seen_paths, &mut detections, d);
             }
         }
     }
@@ -420,11 +415,7 @@ pub fn detect_all_for_entry(entry: &InstallCatalogEntry, opts: &DetectOptions) -
             .filter(|m| matches!(m.kind, crate::install_catalog::InstallMethodKind::Npm))
         {
             if let Some(d) = probe_npm(&method.package_name, entry, opts) {
-                let canon = canonical_or_clone(&d.path);
-                if !seen_paths.contains(&canon) {
-                    seen_paths.insert(canon);
-                    detections.push(d);
-                }
+                push_unique(&mut seen_paths, &mut detections, d);
             }
         }
     }
@@ -437,11 +428,7 @@ pub fn detect_all_for_entry(entry: &InstallCatalogEntry, opts: &DetectOptions) -
         {
             if let Some(ds) = probe_cargo(&method.package_name, entry, opts) {
                 for d in ds {
-                    let canon = canonical_or_clone(&d.path);
-                    if !seen_paths.contains(&canon) {
-                        seen_paths.insert(canon);
-                        detections.push(d);
-                    }
+                    push_unique(&mut seen_paths, &mut detections, d);
                 }
             }
         }
@@ -455,11 +442,7 @@ pub fn detect_all_for_entry(entry: &InstallCatalogEntry, opts: &DetectOptions) -
         {
             if let Some(ds) = probe_pipx(&method.package_name, entry, opts) {
                 for d in ds {
-                    let canon = canonical_or_clone(&d.path);
-                    if !seen_paths.contains(&canon) {
-                        seen_paths.insert(canon);
-                        detections.push(d);
-                    }
+                    push_unique(&mut seen_paths, &mut detections, d);
                 }
             }
         }
@@ -473,11 +456,7 @@ pub fn detect_all_for_entry(entry: &InstallCatalogEntry, opts: &DetectOptions) -
         {
             if let Some(ds) = probe_uv(&method.package_name, entry, opts) {
                 for d in ds {
-                    let canon = canonical_or_clone(&d.path);
-                    if !seen_paths.contains(&canon) {
-                        seen_paths.insert(canon);
-                        detections.push(d);
-                    }
+                    push_unique(&mut seen_paths, &mut detections, d);
                 }
             }
         }
@@ -491,11 +470,7 @@ pub fn detect_all_for_entry(entry: &InstallCatalogEntry, opts: &DetectOptions) -
             .filter(|m| m.kind == crate::install_catalog::InstallMethodKind::Direct)
         {
             if let Some(d) = probe_system_package(&method.package_name, entry, opts) {
-                let canon = canonical_or_clone(&d.path);
-                if !seen_paths.contains(&canon) {
-                    seen_paths.insert(canon);
-                    detections.push(d);
-                }
+                push_unique(&mut seen_paths, &mut detections, d);
             }
         }
     }
@@ -503,41 +478,38 @@ pub fn detect_all_for_entry(entry: &InstallCatalogEntry, opts: &DetectOptions) -
     if opts.probe_apps {
         for app_path in &entry.apps {
             let p = PathBuf::from(app_path);
-            if p.exists() && !seen_paths.contains(&canonical_or_clone(&p)) {
-                let mut d = Detection::new(
-                    &entry.harness,
-                    app_path,
-                    p.clone(),
-                    DetectionSource::AppBundle,
-                    DetectionConfidence::High,
-                );
-                d.evidence
-                    .push(format!("app bundle exists: {}", p.display()));
-                if let Some(ver) = probe_app_bundle_version(&p) {
-                    d.version = Some(ver.clone());
-                    d.evidence.push(format!("bundle version: {ver}"));
-                }
-                seen_paths.insert(canonical_or_clone(&p));
-                detections.push(d);
+            if !p.exists() {
+                continue;
             }
+            let mut d = Detection::new(
+                &entry.harness,
+                app_path,
+                p.clone(),
+                DetectionSource::AppBundle,
+                DetectionConfidence::High,
+            );
+            d.evidence
+                .push(format!("app bundle exists: {}", p.display()));
+            if let Some(ver) = probe_app_bundle_version(&p) {
+                d.version = Some(ver.clone());
+                d.evidence.push(format!("bundle version: {ver}"));
+            }
+            push_unique(&mut seen_paths, &mut detections, d);
         }
         for bundle_id in &entry.bundle_ids {
             if let Some(path) = probe_bundle_id(bundle_id, opts) {
-                if !seen_paths.contains(&canonical_or_clone(&path)) {
-                    let mut d = Detection::new(
-                        &entry.harness,
-                        bundle_id,
-                        path.clone(),
-                        DetectionSource::AppBundle,
-                        DetectionConfidence::Medium,
-                    );
-                    d.evidence.push(format!(
-                        "bundle_id {bundle_id} resolved to {}",
-                        path.display()
-                    ));
-                    seen_paths.insert(canonical_or_clone(&path));
-                    detections.push(d);
-                }
+                let mut d = Detection::new(
+                    &entry.harness,
+                    bundle_id,
+                    path.clone(),
+                    DetectionSource::AppBundle,
+                    DetectionConfidence::Medium,
+                );
+                d.evidence.push(format!(
+                    "bundle_id {bundle_id} resolved to {}",
+                    path.display()
+                ));
+                push_unique(&mut seen_paths, &mut detections, d);
             }
         }
     }
@@ -564,6 +536,16 @@ fn scan_path_for_executable(exe: &str, path_dirs: &[PathBuf]) -> Vec<PathBuf> {
         }
     }
     hits
+}
+
+/// Dedupe by canonical path: the first sighting of an install wins, later
+/// probes of the same path are dropped so detections never repeat.
+fn push_unique(seen_paths: &mut HashSet<PathBuf>, detections: &mut Vec<Detection>, d: Detection) {
+    let canon = canonical_or_clone(&d.path);
+    if !seen_paths.contains(&canon) {
+        seen_paths.insert(canon);
+        detections.push(d);
+    }
 }
 
 fn canonical_or_clone(path: &Path) -> PathBuf {

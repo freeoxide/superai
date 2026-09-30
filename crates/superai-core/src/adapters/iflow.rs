@@ -4,40 +4,37 @@
 use std::path::{Path, PathBuf};
 
 use crate::adapter::{
-    ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
-    DetectionResult, DocumentKind, Os, PathResolver, Platform, ProductStatus, RestartBehavior,
-    SurfaceOwnership, VersionResolution, WrapperPlan,
+    ADAPTER_REVISION, Adapter, ConfigScope, ConfigSurface, DetectionResult, DocumentKind,
+    PathResolver, Platform, ProductStatus, RestartBehavior, SurfaceOwnership, VersionResolution,
+    WrapperPlan,
 };
 use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
-use crate::state::{AdapterSupport, InstallPresence, Isolation};
+use crate::state::{AdapterSupport, Isolation};
 
-/// Harness identifier for iFlow CLI.
+/// Catalog id superai registers this harness under.
 pub const HARNESS_ID_STR: &str = "iflow-cli";
 
-/// Human display name.
+/// Name shown for this harness in listings and errors.
 pub const DISPLAY_NAME: &str = "iFlow CLI";
 
-/// Primary executable name.
+/// Binary name resolved on PATH during detection.
 pub const EXECUTABLE: &str = "iflow";
 
-/// Alternative binary name (legacy).
+/// Older binary name the detection lookup also accepts.
 pub const EXECUTABLE_ALT: &str = "iflow-cli";
 
 /// Environment variable that relocates the system-tier settings file.
 pub const SYSTEM_SETTINGS_ENV_VAR: &str = "IFLOW_CLI_SYSTEM_SETTINGS_PATH";
 
-/// Default user config root fallback.
-pub const DEFAULT_CONFIG_ROOT_FALLBACK: &str = "~/.iflow";
-
-/// Research document link.
+/// Research doc whose findings the constants in this file encode.
 pub const RESEARCH_DOC: &str = "docs/harness-configs/iflow-cli.md";
 
-/// Last verified date.
+/// Date the research doc was last checked against the harness.
 pub const LAST_VERIFIED: &str = "2026-08-25";
 
-/// Schema version for current settings shape.
+/// Schema version this adapter maps detected versions to.
 pub const SCHEMA_VERSION_STR: &str = "1";
 
 /// Shutdown date for iFlow CLI.
@@ -66,34 +63,9 @@ impl IflowAdapter {
         Ok(Self { id })
     }
 
-    /// Borrow the harness id.
-    pub fn harness_id(&self) -> &HarnessId {
-        &self.id
-    }
-
-    /// Executable name for this harness.
-    pub fn executable_name(&self) -> &str {
-        EXECUTABLE
-    }
-
-    /// System settings env var.
-    pub fn system_settings_env_var(&self) -> &str {
-        SYSTEM_SETTINGS_ENV_VAR
-    }
-
-    /// Successor tip.
-    pub fn successor_tip(&self) -> &str {
-        MIGRATION_TIP
-    }
-
     fn default_config_root() -> Option<PathBuf> {
-        let home = std::env::var("HOME")
-            .ok()
-            .or_else(|| std::env::var("USERPROFILE").ok())?;
-        if home.trim().is_empty() {
-            return None;
-        }
-        Some(PathBuf::from(home).join(".iflow"))
+        let home = super::home_dir()?;
+        Some(home.join(".iflow"))
     }
 
     #[expect(
@@ -116,12 +88,21 @@ impl IflowAdapter {
                             "user settings.json found at {}",
                             settings.display()
                         ));
-                        if let Ok(text) = std::fs::read_to_string(&settings)
-                            && (text.contains("selectedAuthType") || text.contains("apiKey"))
-                        {
-                            evidence.push(
-                                "user settings.json contains selectedAuthType/apiKey".to_owned(),
-                            );
+                        match std::fs::read_to_string(&settings) {
+                            Ok(text)
+                                if (text.contains("selectedAuthType")
+                                    || text.contains("apiKey")) =>
+                            {
+                                evidence.push(
+                                    "user settings.json contains selectedAuthType/apiKey"
+                                        .to_owned(),
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(err) => evidence.push(format!(
+                                "config unreadable at {}: {err}",
+                                settings.display()
+                            )),
                         }
                     } else {
                         evidence.push(format!(
@@ -183,8 +164,7 @@ impl IflowAdapter {
 
 impl Default for IflowAdapter {
     fn default() -> Self {
-        #[expect(clippy::unwrap_used, reason = "iflow-cli is static valid HarnessId")]
-        let id = HarnessId::new(HARNESS_ID_STR).unwrap();
+        let id = HarnessId::from_validated_const(HARNESS_ID_STR);
         Self { id }
     }
 }
@@ -203,11 +183,7 @@ impl Adapter for IflowAdapter {
     }
 
     fn supported_platforms(&self) -> Vec<Platform> {
-        vec![
-            Platform::new(Os::Linux, Arch::Any),
-            Platform::new(Os::Macos, Arch::Any),
-            Platform::new(Os::Windows, Arch::Any),
-        ]
+        super::desktop_platforms()
     }
 
     fn adapter_revision(&self) -> &str {
@@ -252,19 +228,10 @@ impl Adapter for IflowAdapter {
 
         self.collect_config_evidence(&mut evidence);
 
-        let present = match (&binary_path, &version) {
-            (Some(_), Some(_)) => InstallPresence::Present,
-            (Some(_), None) => InstallPresence::UnknownVersion,
-            (None, _) => InstallPresence::Absent,
-        };
+        let present = super::install_presence(binary_path.is_some(), version.is_some());
 
-        let confidence = if present == InstallPresence::Absent {
-            DetectionConfidence::High
-        } else if binary_path.is_some() && version.is_none() {
-            DetectionConfidence::Medium
-        } else {
-            DetectionConfidence::High
-        };
+        let confidence =
+            super::detection_confidence(binary_path.is_some(), version.is_some(), false);
 
         DetectionResult::new(present, version, evidence, confidence)
     }
@@ -433,15 +400,7 @@ impl Adapter for IflowAdapter {
     }
 
     fn plan_wrapper(&self, instance: &Instance) -> Result<WrapperPlan, CoreError> {
-        if instance.harness != self.id {
-            return Err(CoreError::Validation {
-                field: "harness".to_owned(),
-                reason: format!(
-                    "instance harness `{}` does not match adapter `{}`",
-                    instance.harness, self.id
-                ),
-            });
-        }
+        super::ensure_instance_harness(&self.id, instance)?;
         Err(CoreError::UnsupportedOperation {
             harness: self.id.to_string(),
             operation: "plan_wrapper".to_owned(),
@@ -463,12 +422,7 @@ impl Adapter for IflowAdapter {
     }
 
     fn validate_instance(&self, instance: &Instance) -> Result<(), CoreError> {
-        if instance.harness != self.id {
-            return Err(CoreError::Validation {
-                field: "harness".to_owned(),
-                reason: format!("expected harness `{}`, got `{}`", self.id, instance.harness),
-            });
-        }
+        super::ensure_instance_harness(&self.id, instance)?;
         instance.validate()?;
         match instance.isolation {
             Isolation::EnvOnly
@@ -511,11 +465,8 @@ mod tests {
     use std::collections::HashSet;
     use std::path::PathBuf;
 
-    use super::{
-        DISPLAY_NAME, EXECUTABLE, HARNESS_ID_STR, IflowAdapter, MIGRATION_TIP, RESEARCH_DOC,
-        SHUTDOWN_DATE, SUCCESSOR_ID,
-    };
-    use crate::adapter::{Adapter, ConfigScope, DocumentKind, ProductStatus, SurfaceOwnership};
+    use super::{HARNESS_ID_STR, IflowAdapter, MIGRATION_TIP, SHUTDOWN_DATE, SUCCESSOR_ID};
+    use crate::adapter::{Adapter, ConfigScope, DocumentKind, SurfaceOwnership};
     use crate::error::CoreError;
     use crate::ids::{HarnessId, InstanceId, InstanceName};
     use crate::instance::Instance;
@@ -546,16 +497,11 @@ mod tests {
     #[test]
     fn adapter_identity() {
         let a = adapter();
+        // Constructor wiring plus catalog registration: an id the catalog
+        // does not know can never reconcile with detection or instances.
+        let entry = crate::harness_catalog::find_by_id(HARNESS_ID_STR).unwrap();
         assert_eq!(a.id().as_str(), HARNESS_ID_STR);
-        assert_eq!(a.display_name(), DISPLAY_NAME);
-        assert_eq!(a.executable_name(), EXECUTABLE);
-        assert_eq!(a.system_settings_env_var(), super::SYSTEM_SETTINGS_ENV_VAR);
-        assert_eq!(a.product_status(), ProductStatus::Sunset);
-        assert_eq!(a.research_doc_link(), RESEARCH_DOC);
-        assert!(!a.last_verified_date().is_empty());
-        assert_eq!(a.adapter_revision(), crate::adapter::ADAPTER_REVISION);
-        assert!(a.successor_tip().contains(SHUTDOWN_DATE));
-        assert!(a.successor_tip().contains(SUCCESSOR_ID));
+        assert_eq!(a.product_status(), entry.product_status);
     }
 
     #[test]
@@ -581,7 +527,6 @@ mod tests {
                 .any(|e| e.contains("shut") || e.contains(SHUTDOWN_DATE) || e.contains("sunset"))
         );
         assert!(result.evidence.iter().any(|e| e.contains(SUCCESSOR_ID)));
-        assert_ne!(result.confidence.to_string(), "");
     }
 
     #[test]
@@ -592,22 +537,6 @@ mod tests {
         assert!(res.notes.iter().any(|n| n.contains(SUCCESSOR_ID)
             || n.contains("migration")
             || n.contains(SHUTDOWN_DATE)));
-    }
-
-    #[test]
-    fn parse_version_output_cases() {
-        let cases = vec![
-            ("iflow 0.9.0", Some("0.9.0")),
-            ("iflow 1.0.0-beta", Some("1.0.0-beta")),
-            ("0.9.0", Some("0.9.0")),
-            ("v1.2.3", Some("1.2.3")),
-            ("", None),
-            ("not a version", None),
-        ];
-        for (input, expected) in cases {
-            let got = crate::adapters::parse_version_output(input);
-            assert_eq!(got.as_deref(), expected, "input: {input:?}");
-        }
     }
 
     #[test]

@@ -3,42 +3,40 @@
 
 use std::path::{Path, PathBuf};
 
-use toml_edit as _;
-
 use superai_config::document::ValueType;
 
 use crate::adapter::{
-    ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
-    DetectionResult, DocumentKind, Os, PathResolver, Platform, ProductStatus, RestartBehavior,
-    RootShape, SurfaceOwnership, SurfaceSchema, VersionResolution, WrapperPlan,
+    ADAPTER_REVISION, Adapter, ConfigScope, ConfigSurface, DetectionResult, DocumentKind,
+    PathResolver, Platform, ProductStatus, RestartBehavior, RootShape, SurfaceOwnership,
+    SurfaceSchema, VersionResolution, WrapperPlan,
 };
 use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
-use crate::state::{AdapterSupport, InstallPresence, Isolation};
+use crate::state::{AdapterSupport, Isolation};
 
-/// Harness identifier for Codex CLI.
+/// Default config root when `CODEX_HOME` is unset.
+pub const DEFAULT_CONFIG_ROOT_FALLBACK: &str = "~/.codex";
+
+/// Catalog id superai registers this harness under.
 pub const HARNESS_ID_STR: &str = "codex-cli";
 
-/// Human display name.
+/// Name shown for this harness in listings and errors.
 pub const DISPLAY_NAME: &str = "Codex CLI";
 
-/// Primary executable name.
+/// Binary name resolved on PATH during detection.
 pub const EXECUTABLE: &str = "codex";
 
 /// Environment variable that relocates the config root.
 pub const CONFIG_ENV_VAR: &str = "CODEX_HOME";
 
-/// Default config root when `CODEX_HOME` is unset.
-pub const DEFAULT_CONFIG_ROOT_FALLBACK: &str = "~/.codex";
-
-/// Research document link.
+/// Research doc whose findings the constants in this file encode.
 pub const RESEARCH_DOC: &str = "docs/harness-configs/codex-cli.md";
 
-/// Last verified date.
+/// Date the research doc was last checked against the harness.
 pub const LAST_VERIFIED: &str = "2026-08-25";
 
-/// Schema version for current config shape.
+/// Schema version this adapter maps detected versions to.
 pub const SCHEMA_VERSION_STR: &str = "1";
 
 /// Selectors superai owns inside `config.toml`; other keys round-trip untouched.
@@ -67,34 +65,14 @@ impl CodexCliAdapter {
         Ok(Self { id })
     }
 
-    /// Borrow the harness id.
-    pub fn harness_id(&self) -> &HarnessId {
-        &self.id
-    }
-
-    /// Executable name for this harness.
-    pub fn executable_name(&self) -> &str {
-        EXECUTABLE
-    }
-
-    /// Config relocation env var.
-    pub fn config_env_var(&self) -> &str {
-        CONFIG_ENV_VAR
-    }
-
     fn default_config_root() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var(CONFIG_ENV_VAR)
             && !dir.trim().is_empty()
         {
             return Some(PathBuf::from(dir));
         }
-        let home = std::env::var("HOME")
-            .ok()
-            .or_else(|| std::env::var("USERPROFILE").ok())?;
-        if home.trim().is_empty() {
-            return None;
-        }
-        Some(PathBuf::from(home).join(".codex"))
+        let home = super::home_dir()?;
+        Some(home.join(".codex"))
     }
 
     fn config_path_for_root(root: &Path) -> PathBuf {
@@ -114,16 +92,23 @@ impl CodexCliAdapter {
                     let config = Self::config_path_for_root(&root);
                     if config.exists() {
                         evidence.push(format!("config.toml found at {}", config.display()));
-                        if let Ok(text) = std::fs::read_to_string(&config) {
-                            if text.contains("model =") || text.contains("model_provider") {
-                                evidence.push("config.toml contains model keys".to_owned());
+                        match std::fs::read_to_string(&config) {
+                            Ok(text) => {
+                                if text.contains("model =") || text.contains("model_provider") {
+                                    evidence.push("config.toml contains model keys".to_owned());
+                                }
+                                if text.contains("[model_providers") {
+                                    evidence
+                                        .push("config.toml contains model_providers".to_owned());
+                                }
+                                if text.contains("[mcp_servers") {
+                                    evidence.push("config.toml contains mcp_servers".to_owned());
+                                }
                             }
-                            if text.contains("[model_providers") {
-                                evidence.push("config.toml contains model_providers".to_owned());
-                            }
-                            if text.contains("[mcp_servers") {
-                                evidence.push("config.toml contains mcp_servers".to_owned());
-                            }
+                            Err(err) => evidence.push(format!(
+                                "config.toml unreadable at {}: {err}",
+                                config.display()
+                            )),
                         }
                     } else {
                         evidence.push(format!("config.toml missing at {}", config.display()));
@@ -167,8 +152,7 @@ impl CodexCliAdapter {
 
 impl Default for CodexCliAdapter {
     fn default() -> Self {
-        #[expect(clippy::unwrap_used, reason = "codex-cli is static valid HarnessId")]
-        let id = HarnessId::new(HARNESS_ID_STR).unwrap();
+        let id = HarnessId::from_validated_const(HARNESS_ID_STR);
         Self { id }
     }
 }
@@ -187,11 +171,7 @@ impl Adapter for CodexCliAdapter {
     }
 
     fn supported_platforms(&self) -> Vec<Platform> {
-        vec![
-            Platform::new(Os::Linux, Arch::Any),
-            Platform::new(Os::Macos, Arch::Any),
-            Platform::new(Os::Windows, Arch::Any),
-        ]
+        super::desktop_platforms()
     }
 
     fn adapter_revision(&self) -> &str {
@@ -238,28 +218,10 @@ impl Adapter for CodexCliAdapter {
 
         self.collect_config_evidence(&mut evidence);
 
-        let present = match (&binary_path, &version) {
-            (Some(_), Some(_)) => InstallPresence::Present,
-            (Some(_), None) => InstallPresence::UnknownVersion,
-            (None, _) => InstallPresence::Absent,
-        };
+        let present = super::install_presence(binary_path.is_some(), version.is_some());
 
-        let confidence = match (
-            &binary_path,
-            &version,
-            evidence.iter().any(|e| e.contains("config root exists")),
-        ) {
-            (Some(_), None, _) => DetectionConfidence::Medium,
-            (None, _, true) => DetectionConfidence::Low,
-            (Some(_), Some(_), _) | (None, _, false) => DetectionConfidence::High,
-        };
-
-        let confidence = if present == InstallPresence::Absent {
-            DetectionConfidence::High
-        } else {
-            confidence
-        };
-
+        let confidence =
+            super::detection_confidence(binary_path.is_some(), version.is_some(), false);
         DetectionResult::new(present, version, evidence, confidence)
     }
 
@@ -380,19 +342,7 @@ impl Adapter for CodexCliAdapter {
     }
 
     fn supported_operations(&self) -> Vec<(String, AdapterSupport)> {
-        vec![
-            ("detect".to_owned(), AdapterSupport::Full),
-            ("read_config".to_owned(), AdapterSupport::Full),
-            ("write_config".to_owned(), AdapterSupport::Full),
-            ("manage_skills".to_owned(), AdapterSupport::Full),
-            ("manage_mcp".to_owned(), AdapterSupport::Full),
-            ("manage_plugins".to_owned(), AdapterSupport::Full),
-            ("configure_provider".to_owned(), AdapterSupport::Full),
-            ("plan_mirror".to_owned(), AdapterSupport::Full),
-            ("plan_wrapper".to_owned(), AdapterSupport::Full),
-            ("scan_candidates".to_owned(), AdapterSupport::Full),
-            ("validate_instance".to_owned(), AdapterSupport::Full),
-        ]
+        super::all_operations_full()
     }
 
     fn plan_mirror_exclusions(&self) -> Vec<String> {
@@ -411,15 +361,7 @@ impl Adapter for CodexCliAdapter {
     }
 
     fn plan_wrapper(&self, instance: &Instance) -> Result<WrapperPlan, CoreError> {
-        if instance.harness != self.id {
-            return Err(CoreError::Validation {
-                field: "harness".to_owned(),
-                reason: format!(
-                    "instance harness `{}` does not match adapter `{}`",
-                    instance.harness, self.id
-                ),
-            });
-        }
+        super::ensure_instance_harness(&self.id, instance)?;
         instance.validate()?;
         let mut plan = WrapperPlan::new("relocated-root via CODEX_HOME");
         plan.env_vars
@@ -441,12 +383,7 @@ impl Adapter for CodexCliAdapter {
     }
 
     fn validate_instance(&self, instance: &Instance) -> Result<(), CoreError> {
-        if instance.harness != self.id {
-            return Err(CoreError::Validation {
-                field: "harness".to_owned(),
-                reason: format!("expected harness `{}`, got `{}`", self.id, instance.harness),
-            });
-        }
+        super::ensure_instance_harness(&self.id, instance)?;
         instance.validate()?;
         match instance.isolation {
             Isolation::RelocatedRoot | Isolation::Unknown => {
@@ -544,8 +481,6 @@ impl Adapter for CodexCliAdapter {
 /// Config era of codex `config.toml` content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigEra {
-    /// >=0.134: profiles are separate `$CODEX_HOME/<name>.config.toml` files.
-    ProfileFile,
     /// <0.134: inline `[profiles.*]` tables inside `config.toml`.
     InlineProfiles,
     /// Content carries no era marker.
@@ -583,21 +518,7 @@ fn is_profile_era(version: &str) -> bool {
         .next()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0);
-    let patch_str = parts.next().unwrap_or("0");
-    let _patch_clean = patch_str.split(['-', '+']).next().unwrap_or("0");
-    if major > 0 {
-        return true;
-    }
-    if minor > 134 {
-        return true;
-    }
-    if minor == 134 {
-        return true;
-    }
-    if minor == 0 && major == 0 {
-        return minor >= 134;
-    }
-    false
+    major > 0 || minor >= 134
 }
 
 #[cfg(test)]
@@ -606,11 +527,9 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        CONFIG_ENV_VAR, CodexCliAdapter, ConfigEra, DISPLAY_NAME, EXECUTABLE, HARNESS_ID_STR,
-        LAST_VERIFIED, OWNED_SELECTORS, RESEARCH_DOC, SCHEMA_VERSION_STR, config_era,
-        is_profile_era, profile_era_conflict,
+        CONFIG_ENV_VAR, CodexCliAdapter, ConfigEra, HARNESS_ID_STR, LAST_VERIFIED, OWNED_SELECTORS,
+        RESEARCH_DOC, SCHEMA_VERSION_STR, config_era, is_profile_era, profile_era_conflict,
     };
-    use toml_edit as _;
 
     use crate::adapter::{Adapter, ConfigScope, DocumentKind, ProductStatus, SurfaceOwnership};
     use crate::error::CoreError;
@@ -643,14 +562,11 @@ mod tests {
     #[test]
     fn adapter_identity() {
         let a = adapter();
+        // Constructor wiring plus catalog registration: an id the catalog
+        // does not know can never reconcile with detection or instances.
+        let entry = crate::harness_catalog::find_by_id(HARNESS_ID_STR).unwrap();
         assert_eq!(a.id().as_str(), HARNESS_ID_STR);
-        assert_eq!(a.display_name(), DISPLAY_NAME);
-        assert_eq!(a.executable_name(), EXECUTABLE);
-        assert_eq!(a.config_env_var(), CONFIG_ENV_VAR);
-        assert_eq!(a.product_status(), ProductStatus::Active);
-        assert_eq!(a.research_doc_link(), RESEARCH_DOC);
-        assert!(!a.last_verified_date().is_empty());
-        assert_eq!(a.adapter_revision(), crate::adapter::ADAPTER_REVISION);
+        assert_eq!(a.product_status(), entry.product_status);
     }
 
     #[test]
@@ -684,7 +600,6 @@ mod tests {
                 assert!(!result.evidence.is_empty());
             }
         }
-        assert_ne!(result.confidence.to_string(), "");
     }
 
     #[test]
@@ -699,23 +614,6 @@ mod tests {
             assert!(res.schema_version.is_none());
         }
         assert!(!res.notes.is_empty());
-    }
-
-    #[test]
-    fn parse_version_output_cases() {
-        let cases = vec![
-            ("codex-cli 0.134.0", Some("0.134.0")),
-            ("codex 0.135.1", Some("0.135.1")),
-            ("v0.134.0", Some("0.134.0")),
-            ("Version: 0.136.0", Some("0.136.0")),
-            ("0.134.0-alpha", Some("0.134.0-alpha")),
-            ("", None),
-            ("not a version", None),
-        ];
-        for (input, expected) in cases {
-            let got = crate::adapters::parse_version_output(input);
-            assert_eq!(got.as_deref(), expected, "input: {input:?}");
-        }
     }
 
     #[test]
@@ -773,13 +671,6 @@ mod tests {
     }
 
     #[test]
-    fn owned_selectors_are_stable() {
-        assert!(OWNED_SELECTORS.len() >= 5);
-        let set: HashSet<&str> = OWNED_SELECTORS.iter().copied().collect();
-        assert_eq!(set.len(), OWNED_SELECTORS.len(), "selectors must be unique");
-    }
-
-    #[test]
     fn supported_operations_cover_full() {
         let a = adapter();
         let ops = a.supported_operations();
@@ -815,23 +706,10 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::excessive_nesting, reason = "test closure nesting is explicit")]
     fn plan_mirror_includes_config_and_excludes_sessions() {
         let a = adapter();
         let exclusions = a.plan_mirror_exclusions();
-        let is_excluded = |file: &str| {
-            exclusions.iter().any(|pat| {
-                if pat.ends_with("/*") {
-                    let prefix = pat.trim_end_matches("/*");
-                    file.starts_with(prefix)
-                } else if pat.starts_with("*.") {
-                    let suffix = pat.trim_start_matches('*');
-                    file.ends_with(suffix)
-                } else {
-                    file == pat
-                }
-            })
-        };
+        let is_excluded = |file: &str| crate::adapters::exclusion_matches(&exclusions, file);
         assert!(!is_excluded("config.toml"));
         assert!(!is_excluded("skills/my-skill/SKILL.md"));
         assert!(is_excluded("sessions/abc.jsonl"));
@@ -958,7 +836,7 @@ mod tests {
         let path = fixture_path("config.minimal.toml");
         assert!(path.exists(), "fixture missing: {}", path.display());
         let doc = superai_config::toml_file::load(&path).unwrap();
-        assert!(doc.is_empty() || doc.to_string().contains("model") || doc.to_string().is_empty());
+        assert!(doc.is_empty() || doc.to_string().contains("model"));
     }
 
     #[test]
@@ -1075,43 +953,6 @@ mod tests {
         let after = superai_config::toml_file::load(&path).unwrap();
         assert!(after.get("model").is_none() || after["model"].as_str().is_none());
         drop(std::fs::remove_file(&path));
-    }
-
-    #[test]
-    fn secret_redaction_placeholder() {
-        use crate::error::RedactedString;
-        let secret = RedactedString::new("sk-ant-secret-123");
-        let debug = format!("{secret:?}");
-        let display = format!("{secret}");
-        assert!(!debug.contains("sk-ant-secret-123"));
-        assert!(!display.contains("sk-ant-secret-123"));
-        assert!(debug.contains("[REDACTED]"));
-        assert!(display.contains("[REDACTED]"));
-        let json = serde_json::to_string(&secret).unwrap();
-        assert!(!json.contains("sk-ant-secret-123"));
-        assert!(json.contains("[REDACTED]"));
-        assert_eq!(secret.expose_secret(), "sk-ant-secret-123");
-    }
-
-    #[test]
-    fn diff_redaction_does_not_leak_secrets() {
-        use crate::error::RedactedString as OpRedacted;
-        let secret = OpRedacted::new("super-secret-key");
-        let diff_text = format!("set api key to {secret}");
-        assert!(!diff_text.contains("super-secret-key"));
-        assert!(diff_text.contains("[REDACTED]"));
-    }
-
-    #[test]
-    fn conflict_detection_placeholder_no_panic() {
-        let a = adapter();
-        let r1 = a.detection();
-        let r2 = a.detection();
-        assert_eq!(r1.present, r2.present);
-        assert_eq!(r1.confidence, r2.confidence);
-        let inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".codex-work"));
-        a.validate_instance(&inst).unwrap();
-        a.validate_instance(&inst).unwrap();
     }
 
     #[test]

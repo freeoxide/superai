@@ -1,39 +1,39 @@
 //! Mutation-boundary failure injection (QAL-06): production paths take an
 //! optional [`Injector`] fired at every [`Point`]; `None` costs one branch.
 
-/// A boundary in the mutation pipeline that can fail. The set mirrors the
-/// failure tests plus the §4.2 recheck; variant order is stable.
+/// A boundary in the mutation pipeline that can fail; the set mirrors the
+/// failure tests plus the §4.2 recheck, fired just before the step it names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Point {
-    /// Opening the existing file for backup.
+    /// The target is opened/read for backup; any bytes are still untouched.
     BackupOpen,
-    /// Writing the backup copy.
+    /// The backup copy is about to be written.
     BackupWrite,
-    /// Flushing/syncing the backup.
+    /// The landed backup is about to be flushed and synced.
     BackupFlush,
-    /// Verifying the backup digest.
+    /// The fresh backup is about to be re-read for its digest.
     BackupVerify,
-    /// Creating the same-directory temp file.
+    /// The exclusive same-directory temp is about to be created.
     TempCreate,
-    /// Writing staged content to the temp.
+    /// Staged bytes are about to be written to the temp.
     TempWrite,
-    /// Flushing/syncing the temp.
+    /// The temp is about to be flushed and synced.
     TempFlush,
-    /// Validating staged output (parse).
+    /// Staged output is about to be parse-checked.
     ParseStaged,
     /// The prepare-to-commit recheck (§4.2): on-disk state vs the expectation.
     ConflictRecheck,
-    /// Atomic rename/replace.
+    /// The rename over the target is about to run.
     AtomicReplace,
-    /// Parent directory sync.
+    /// The parent directory is about to be synced.
     ParentSync,
-    /// Reading back and verifying the digest after commit.
+    /// The committed file is about to be read back and digest-checked.
     ReadBackVerify,
-    /// Verifying a rollback restore.
+    /// A rollback restore is about to be verified against its entry.
     RollbackVerify,
-    /// The second file of a multi-file transaction.
+    /// Step index 1 of a multi-file transaction is about to commit.
     SecondFile,
-    /// The third file of a multi-file transaction.
+    /// Step index 2 of a multi-file transaction is about to commit.
     ThirdFile,
     /// Journal written at `plan`; a failure simulates a crash there (MUT-09).
     JournalPlan,
@@ -81,7 +81,8 @@ impl std::fmt::Display for Point {
 /// Deterministic failure injection: `Err` simulates the boundary failing.
 /// Implementations stay cheap and side-effect free apart from counters.
 pub trait Injector: Send + Sync + std::fmt::Debug {
-    /// Possibly fail for `point`.
+    /// Return `Err` to simulate `point` failing; `Ok` lets the pipeline
+    /// continue.
     fn inject(&self, point: Point) -> crate::Result<()>;
 }
 

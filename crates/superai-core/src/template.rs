@@ -19,10 +19,6 @@ pub const TEMPLATE_SCHEMA_VERSION: u32 = 1;
 /// Current catalog schema version.
 pub const CATALOG_SCHEMA_VERSION: u32 = 1;
 
-/// Example template repository `owner/repo` used in docs and tests only;
-/// domain logic never hard-codes a single repository.
-pub const EXAMPLE_REPO: &str = "freeoxide/superai-templates";
-
 /// Maximum allowed template or catalog file size (1 MiB).
 pub const MAX_TEMPLATE_BYTES: usize = 1_048_576;
 
@@ -141,59 +137,64 @@ const SHELL_PATTERNS: &[&str] = &[
     "wget ",
 ];
 
+/// Check one string for forbidden secret/shell/binary content; `Err` names
+/// the first violation.
+fn check_str_forbidden(s: &str) -> Result<()> {
+    let lower = s.to_ascii_lowercase();
+    for pat in SECRET_PATTERNS {
+        if lower.contains(pat) {
+            return Err(CoreError::Validation {
+                field: "patches.value".to_owned(),
+                reason: format!(
+                    "patch value contains forbidden secret pattern `{pat}`: value contains `{pat}`"
+                ),
+            });
+        }
+    }
+    for pat in SHELL_PATTERNS {
+        // Patterns are lowercase constants; `lower` already subsumes any
+        // case-sensitive occurrence in `s`.
+        if lower.contains(pat) {
+            return Err(CoreError::Validation {
+                field: "patches.value".to_owned(),
+                reason: format!("patch value contains forbidden shell pattern `{pat}`"),
+            });
+        }
+    }
+    if s.contains('\0') {
+        return Err(CoreError::Validation {
+            field: "patches.value".to_owned(),
+            reason: "patch value must not contain NUL".to_owned(),
+        });
+    }
+    if s.len() > 16_384 {
+        return Err(CoreError::Validation {
+            field: "patches.value".to_owned(),
+            reason: "patch value exceeds 16 KiB limit".to_owned(),
+        });
+    }
+    // Binary payload heuristic: large base64-looking blob without spaces.
+    if s.len() > 1024
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=')
+    {
+        return Err(CoreError::Validation {
+            field: "patches.value".to_owned(),
+            reason: "patch value looks like an embedded binary/base64 blob".to_owned(),
+        });
+    }
+    Ok(())
+}
+
 /// Check a JSON value for forbidden secret/shell/binary content; `Err`
 /// names the first violation.
 #[expect(
     clippy::excessive_nesting,
-    reason = "forbidden payload checks are branched"
+    reason = "per-kind forbidden payload checks are branched"
 )]
 pub fn check_value_forbidden(value: &Value) -> Result<()> {
     match value {
-        Value::String(s) => {
-            let lower = s.to_ascii_lowercase();
-            for pat in SECRET_PATTERNS {
-                if lower.contains(pat) {
-                    return Err(CoreError::Validation {
-                        field: "patches.value".to_owned(),
-                        reason: format!(
-                            "patch value contains forbidden secret pattern `{pat}`: value contains `{pat}`"
-                        ),
-                    });
-                }
-            }
-            for pat in SHELL_PATTERNS {
-                let pat_lower = pat.to_ascii_lowercase();
-                if lower.contains(&pat_lower) || s.contains(pat) {
-                    return Err(CoreError::Validation {
-                        field: "patches.value".to_owned(),
-                        reason: format!("patch value contains forbidden shell pattern `{pat}`"),
-                    });
-                }
-            }
-            if s.contains('\0') {
-                return Err(CoreError::Validation {
-                    field: "patches.value".to_owned(),
-                    reason: "patch value must not contain NUL".to_owned(),
-                });
-            }
-            if s.len() > 16_384 {
-                return Err(CoreError::Validation {
-                    field: "patches.value".to_owned(),
-                    reason: "patch value exceeds 16 KiB limit".to_owned(),
-                });
-            }
-            // Binary payload heuristic: large base64-looking blob without spaces.
-            if s.len() > 1024
-                && s.chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=')
-            {
-                return Err(CoreError::Validation {
-                    field: "patches.value".to_owned(),
-                    reason: "patch value looks like an embedded binary/base64 blob".to_owned(),
-                });
-            }
-            Ok(())
-        }
+        Value::String(s) => check_str_forbidden(s),
         Value::Array(arr) => {
             for item in arr {
                 check_value_forbidden(item)?;
@@ -205,7 +206,7 @@ pub fn check_value_forbidden(value: &Value) -> Result<()> {
                 // Key itself must not look like a secret/shell pattern.
                 let klower = k.to_ascii_lowercase();
                 for pat in SHELL_PATTERNS {
-                    if klower.contains(&pat.to_ascii_lowercase()) || k.contains(pat) {
+                    if klower.contains(*pat) {
                         return Err(CoreError::Validation {
                             field: "patches.value".to_owned(),
                             reason: format!(
@@ -882,7 +883,7 @@ impl Template {
                     reason: "wrapper_env value must not contain control chars".to_owned(),
                 });
             }
-            check_value_forbidden(&Value::String(v.clone()))?;
+            check_str_forbidden(v)?;
         }
         for arg in &self.wrapper_args {
             if arg.chars().any(char::is_control) {
@@ -892,7 +893,7 @@ impl Template {
                 });
             }
             // Shell patterns in args are forbidden (no `sh -c` etc).
-            check_value_forbidden(&Value::String(arg.clone()))?;
+            check_str_forbidden(arg)?;
         }
         for asset in &self.assets {
             validate_template_path(asset)?;
@@ -1097,18 +1098,6 @@ pub enum UpdateStatus {
     },
 }
 
-impl UpdateStatus {
-    /// True if an update is available.
-    pub fn is_update_available(&self) -> bool {
-        matches!(self, Self::UpdateAvailable { .. })
-    }
-
-    /// True if the instance is up to date.
-    pub fn is_up_to_date(&self) -> bool {
-        matches!(self, Self::UpToDate)
-    }
-}
-
 /// Pure catalog-based update check (no network); harness compatibility
 /// beyond semver is refined by the network-aware [`check_update`].
 pub fn check_update_with_catalog(instance: &Instance, catalog: &Catalog) -> UpdateStatus {
@@ -1199,11 +1188,7 @@ fn check_template_compatible(
 
 /// Network-aware update check: fetches the catalog fresh (offline on
 /// failure), then verifies harness fit by fetching the latest template.
-pub fn check_update(
-    instance: &Instance,
-    _catalog: &Catalog,
-    repo: &TemplateRepoConfig,
-) -> UpdateStatus {
+pub fn check_update(instance: &Instance, repo: &TemplateRepoConfig) -> UpdateStatus {
     // Invalid repo is treated as offline; the freshly fetched catalog below
     // is authoritative, so the passed-in one is never trusted for status.
     if repo.validate().is_err() {
@@ -1251,7 +1236,9 @@ pub fn check_update(
     }
 }
 
-fn is_secret_like(value: &str) -> bool {
+/// Whether `value` carries a secret-shaped token; one pattern set for the
+/// diff and the update previews so redaction cannot drift between views.
+pub(crate) fn is_secret_like(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
     for pat in SECRET_PATTERNS {
         if lower.contains(pat) {
@@ -1592,12 +1579,6 @@ pub fn diff_templates(old: &Template, new: &Template) -> TemplateDiff {
             sel_added.push((sel.clone(), new_val.clone()));
         }
     }
-    let selector_changes = SelectorChanges {
-        added: sel_added.clone(),
-        removed: sel_removed.clone(),
-        changed: sel_changed.clone(),
-    };
-
     let mut model_added = Vec::new();
     let mut model_removed = Vec::new();
     let mut model_changed_entries = Vec::new();
@@ -1616,6 +1597,11 @@ pub fn diff_templates(old: &Template, new: &Template) -> TemplateDiff {
             model_changed_entries.push((sel.clone(), old_v.clone(), new_v.clone()));
         }
     }
+    let selector_changes = SelectorChanges {
+        added: sel_added,
+        removed: sel_removed,
+        changed: sel_changed,
+    };
     // Also consider provider-level model default change if a single model selector changed
     // value, expose as default_changed for convenience.
     let default_changed = if model_changed_entries.len() == 1 {
@@ -2217,18 +2203,17 @@ mod tests {
     fn check_update_offline_via_repo() {
         // A file:// repo is refused by the scheme gate before any fetch;
         // check_update reports an unusable repo as Offline.
-        let catalog = minimal_catalog();
         let instance = sample_instance_with_template("claude-code", "claude-glm", "1.1.0", "0.1.0");
         let mut repo = TemplateRepoConfig::example();
         let missing = crate::test_util::tmp_abs("offline-missing-parent")
             .join("superai-offline-missing-xyz-12345");
         repo.base_url = Some(format!("file://{}", missing.display()));
-        let status = check_update(&instance, &catalog, &repo);
+        let status = check_update(&instance, &repo);
         assert_eq!(status, UpdateStatus::Offline);
         // An unreachable local root behind the test-only constructor also
         // reports Offline (the fetch itself fails).
         let repo2 = TemplateRepoConfig::for_local_tests(&missing);
-        let status2 = check_update(&instance, &catalog, &repo2);
+        let status2 = check_update(&instance, &repo2);
         assert_eq!(status2, UpdateStatus::Offline);
     }
 
@@ -2289,7 +2274,7 @@ mod tests {
 
         let repo = TemplateRepoConfig::for_local_tests(&dir);
 
-        let status = check_update(&instance, &catalog, &repo);
+        let status = check_update(&instance, &repo);
         match status {
             UpdateStatus::Incompatible { reason } => assert!(
                 reason.contains("9.0.0") || reason.contains("harness version"),
@@ -2357,7 +2342,7 @@ mod tests {
 
         let repo = TemplateRepoConfig::for_local_tests(&dir);
 
-        let status = check_update(&instance, &catalog, &repo);
+        let status = check_update(&instance, &repo);
         match status {
             UpdateStatus::UpdateAvailable { latest } => assert_eq!(latest.as_str(), "1.2.0"),
             other => panic!("expected UpdateAvailable, got {other:?}"),

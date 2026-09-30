@@ -25,7 +25,11 @@ pub(crate) fn temp_dir_unique(prefix: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "superai-test-{prefix}-{millis}-{pid}-{count:04x}-{hash:04x}"
     ));
-    drop(std::fs::create_dir_all(&dir));
+    // A test fixture that silently skips creation would fail far away at
+    // the first write, so creation errors abort the calling test here.
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        panic!("temp dir creation failed for {}: {e}", dir.display());
+    }
     dir
 }
 

@@ -469,13 +469,13 @@ impl InstallCatalog {
 
     /// Load from the embedded asset. The parse is memoized (a compile-time
     /// constant); disk catalogs via `from_file` are always read fresh.
-    pub fn embedded() -> Result<Self, CoreError> {
+    pub fn embedded() -> Result<&'static Self, CoreError> {
         static CACHED: std::sync::OnceLock<InstallCatalog> = std::sync::OnceLock::new();
         if let Some(cached) = CACHED.get() {
-            return Ok(cached.clone());
+            return Ok(cached);
         }
         let parsed = Self::from_json_str(EMBEDDED_CATALOG)?;
-        Ok(CACHED.get_or_init(|| parsed.clone()).clone())
+        Ok(CACHED.get_or_init(|| parsed))
     }
 
     /// Load from a file path on disk. The file is read fresh, not cached

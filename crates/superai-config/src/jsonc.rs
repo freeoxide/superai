@@ -101,17 +101,16 @@ fn ensure_lossless_write(path: &Path) -> Result<()> {
     }
 }
 
-/// Back up, then write normalized JSON; refused with `LossyWrite` when the
-/// target carries comments or trailing commas (DOC-05).
-pub fn store(path: &Path, config: &Map<String, Value>) -> Result<()> {
-    ensure_lossless_write(path)?;
-
-    let mut text = serde_json::to_string_pretty(config).map_err(|source| ConfigError::Json {
+fn jsonc_text(path: &Path, value: impl serde::Serialize) -> Result<String> {
+    let mut text = serde_json::to_string_pretty(&value).map_err(|source| ConfigError::Json {
         path: path.to_path_buf(),
         source,
     })?;
     text.push('\n');
+    Ok(text)
+}
 
+fn commit_jsonc(path: &Path, text: &str) -> Result<()> {
     crate::transaction::commit_file(
         "jsonc-store",
         path,
@@ -121,23 +120,19 @@ pub fn store(path: &Path, config: &Map<String, Value>) -> Result<()> {
     Ok(())
 }
 
+/// Back up, then write normalized JSON; refused with `LossyWrite` when the
+/// target carries comments or trailing commas (DOC-05).
+pub fn store(path: &Path, config: &Map<String, Value>) -> Result<()> {
+    ensure_lossless_write(path)?;
+    let text = jsonc_text(path, config)?;
+    commit_jsonc(path, &text)
+}
+
 /// [`store`] for any root; same lossless-write gate.
 pub fn store_value(path: &Path, value: &Value) -> Result<()> {
     ensure_lossless_write(path)?;
-
-    let mut text = serde_json::to_string_pretty(value).map_err(|source| ConfigError::Json {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    text.push('\n');
-
-    crate::transaction::commit_file(
-        "jsonc-store",
-        path,
-        text.as_bytes(),
-        crate::document::DocumentKind::JsonC,
-    )?;
-    Ok(())
+    let text = jsonc_text(path, value)?;
+    commit_jsonc(path, &text)
 }
 
 /// Read fresh, apply `edit`, write back only if changed; no-ops stay
@@ -250,10 +245,7 @@ mod tests {
         )
         .unwrap();
         let map = load(&path).unwrap();
-        assert_eq!(
-            map["model"],
-            Value::String("opaque".replace("opaque", "opus"))
-        );
+        assert_eq!(map["model"], Value::String("opus".to_owned()));
         assert_eq!(map["x"], Value::Number(1.into()));
     }
 

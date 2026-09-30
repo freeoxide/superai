@@ -2,40 +2,37 @@
 //! env injection, MCP passthrough, and git worktrees; `MigrationOnly`.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
 use std::time::Duration;
 
 use crate::adapter::{
-    ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
-    DetectionResult, DocumentKind, Os, PathResolver, Platform, ProductStatus, RestartBehavior,
-    SurfaceOwnership, VersionResolution, WrapperPlan,
+    ADAPTER_REVISION, Adapter, ConfigScope, ConfigSurface, DetectionResult, DocumentKind,
+    PathResolver, Platform, ProductStatus, RestartBehavior, SurfaceOwnership, VersionResolution,
+    WrapperPlan,
 };
 use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
-use crate::state::{AdapterSupport, InstallPresence, Isolation};
+use crate::state::{AdapterSupport, Isolation};
 
-/// Harness identifier for Vibe Kanban.
+/// Catalog id superai registers this harness under.
 pub const HARNESS_ID_STR: &str = "vibe-kanban";
 
-/// Human display name.
+/// Name shown for this harness in listings and errors.
 pub const DISPLAY_NAME: &str = "Vibe Kanban";
 
-/// Primary executable name.
+/// Binary name resolved on PATH during detection.
 pub const EXECUTABLE: &str = "vibe-kanban";
 
 /// Alternative binary name (via npx).
 pub const EXECUTABLE_ALT: &str = "vk";
 
-/// Research document link.
+/// Research doc whose findings the constants in this file encode.
 pub const RESEARCH_DOC: &str = "docs/harness-configs/orchestrators.md";
 
-/// Last verified date.
+/// Date the research doc was last checked against the harness.
 pub const LAST_VERIFIED: &str = "2026-08-25";
 
-/// Schema version.
+/// Schema version this adapter maps detected versions to.
 pub const SCHEMA_VERSION_STR: &str = "1";
 
 /// Migration tip: sunsetting, now community maintained.
@@ -60,97 +57,14 @@ impl VibeKanbanAdapter {
         Ok(Self { id })
     }
 
-    /// Borrow the harness id.
-    pub fn harness_id(&self) -> &HarnessId {
-        &self.id
-    }
-
-    /// Executable name for this harness.
-    pub fn executable_name(&self) -> &str {
-        EXECUTABLE
-    }
-
-    /// Migration tip.
-    pub fn migration_tip(&self) -> &str {
-        MIGRATION_TIP
-    }
-
     fn probe_version(binary: &Path) -> Option<String> {
-        let binary_owned = binary.to_path_buf();
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let output = Command::new(&binary_owned)
-                .arg("--version")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output();
-            drop(tx.send(output));
-        });
-        let Ok(Ok(output)) = rx.recv_timeout(VERSION_PROBE_BUDGET) else {
-            return None;
-        };
-        if !output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
-            return None;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let combined = if stdout.trim().is_empty() {
-            stderr.into_owned()
-        } else if stderr.trim().is_empty() {
-            stdout.into_owned()
-        } else {
-            format!("{stdout} {stderr}")
-        };
-        Self::parse_version_output(&combined)
-    }
-
-    /// The npx entrypoint prints an npm-style first token (`vibe-kanban/0.1.44
-    /// linux-x64 ...`), so tokens are also split on `/`.
-    #[expect(
-        clippy::excessive_nesting,
-        reason = "version parsing branches are explicit"
-    )]
-    fn parse_version_output(output: &str) -> Option<String> {
-        let trimmed = output.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        for token in trimmed.split_whitespace() {
-            for segment in token.split('/') {
-                let mut candidate = segment;
-                if let Some(stripped) = candidate.strip_prefix('v') {
-                    candidate = stripped;
-                } else if let Some(stripped) = candidate.strip_prefix('V') {
-                    candidate = stripped;
-                }
-                let cleaned = candidate.trim_matches(|c: char| c == ',' || c == ')' || c == '(');
-                if cleaned.is_empty() {
-                    continue;
-                }
-                let has_dot = cleaned.contains('.');
-                let starts_digit = cleaned.chars().next().is_some_and(|c| c.is_ascii_digit());
-                if has_dot && starts_digit {
-                    let is_version_like = cleaned
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+');
-                    if is_version_like {
-                        return Some(cleaned.to_owned());
-                    }
-                    let mut version_part = String::new();
-                    for ch in cleaned.chars() {
-                        if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '+' {
-                            version_part.push(ch);
-                        } else {
-                            break;
-                        }
-                    }
-                    if version_part.contains('.') && !version_part.is_empty() {
-                        return Some(version_part);
-                    }
-                }
-            }
-        }
-        None
+        // Output may carry a git describe suffix (`1.2.3/abcdef`), which the
+        // shared parser's prefix scan reduces to the semver core.
+        super::parse_version_output(&super::run_capturing(
+            binary,
+            &["--version"],
+            VERSION_PROBE_BUDGET,
+        )?)
     }
 
     fn workspaces_dir() -> Option<PathBuf> {
@@ -158,13 +72,8 @@ impl VibeKanbanAdapter {
         if cwd_ws.exists() {
             return Some(cwd_ws.to_path_buf());
         }
-        let home = std::env::var("HOME")
-            .ok()
-            .or_else(|| std::env::var("USERPROFILE").ok())?;
-        if home.trim().is_empty() {
-            return None;
-        }
-        Some(PathBuf::from(home).join(".vibe-kanban-workspaces"))
+        let home = super::home_dir()?;
+        Some(home.join(".vibe-kanban-workspaces"))
     }
 
     #[expect(
@@ -209,8 +118,7 @@ impl VibeKanbanAdapter {
 
 impl Default for VibeKanbanAdapter {
     fn default() -> Self {
-        #[expect(clippy::unwrap_used, reason = "vibe-kanban is static valid HarnessId")]
-        let id = HarnessId::new(HARNESS_ID_STR).unwrap();
+        let id = HarnessId::from_validated_const(HARNESS_ID_STR);
         Self { id }
     }
 }
@@ -229,11 +137,7 @@ impl Adapter for VibeKanbanAdapter {
     }
 
     fn supported_platforms(&self) -> Vec<Platform> {
-        vec![
-            Platform::new(Os::Linux, Arch::Any),
-            Platform::new(Os::Macos, Arch::Any),
-            Platform::new(Os::Windows, Arch::Any),
-        ]
+        super::desktop_platforms()
     }
 
     fn adapter_revision(&self) -> &str {
@@ -278,19 +182,10 @@ impl Adapter for VibeKanbanAdapter {
 
         self.collect_config_evidence(&mut evidence);
 
-        let present = match (&binary_path, &version) {
-            (Some(_), Some(_)) => InstallPresence::Present,
-            (Some(_), None) => InstallPresence::UnknownVersion,
-            (None, _) => InstallPresence::Absent,
-        };
+        let present = super::install_presence(binary_path.is_some(), version.is_some());
 
-        let confidence = if present == InstallPresence::Absent {
-            DetectionConfidence::High
-        } else if binary_path.is_some() && version.is_none() {
-            DetectionConfidence::Medium
-        } else {
-            DetectionConfidence::High
-        };
+        let confidence =
+            super::detection_confidence(binary_path.is_some(), version.is_some(), false);
 
         DetectionResult::new(present, version, evidence, confidence)
     }
@@ -437,15 +332,7 @@ impl Adapter for VibeKanbanAdapter {
     }
 
     fn plan_wrapper(&self, instance: &Instance) -> Result<WrapperPlan, CoreError> {
-        if instance.harness != self.id {
-            return Err(CoreError::Validation {
-                field: "harness".to_owned(),
-                reason: format!(
-                    "instance harness `{}` does not match adapter `{}`",
-                    instance.harness, self.id
-                ),
-            });
-        }
+        super::ensure_instance_harness(&self.id, instance)?;
         Err(CoreError::UnsupportedOperation {
             harness: self.id.to_string(),
             operation: "plan_wrapper".to_owned(),
@@ -465,12 +352,7 @@ impl Adapter for VibeKanbanAdapter {
     }
 
     fn validate_instance(&self, instance: &Instance) -> Result<(), CoreError> {
-        if instance.harness != self.id {
-            return Err(CoreError::Validation {
-                field: "harness".to_owned(),
-                reason: format!("expected harness `{}`, got `{}`", self.id, instance.harness),
-            });
-        }
+        super::ensure_instance_harness(&self.id, instance)?;
         instance.validate()?;
         match instance.isolation {
             Isolation::ProjectScope | Isolation::Unknown | Isolation::RelocatedRoot => Ok(()),
@@ -502,10 +384,8 @@ impl Adapter for VibeKanbanAdapter {
 mod tests {
     use std::collections::HashSet;
 
-    use super::{
-        DISPLAY_NAME, EXECUTABLE, HARNESS_ID_STR, MIGRATION_TIP, RESEARCH_DOC,
-        VERSION_PROBE_BUDGET, VibeKanbanAdapter,
-    };
+    use super::{HARNESS_ID_STR, VERSION_PROBE_BUDGET, VibeKanbanAdapter};
+
     use crate::adapter::{Adapter, ConfigScope, DocumentKind, ProductStatus};
     use crate::error::CoreError;
     use crate::ids::{HarnessId, InstanceId, InstanceName};
@@ -544,15 +424,11 @@ mod tests {
     #[test]
     fn adapter_identity() {
         let a = adapter();
+        // Constructor wiring plus catalog registration: an id the catalog
+        // does not know can never reconcile with detection or instances.
         assert_eq!(a.id().as_str(), HARNESS_ID_STR);
-        assert_eq!(a.display_name(), DISPLAY_NAME);
-        assert_eq!(a.executable_name(), EXECUTABLE);
+        assert!(crate::harness_catalog::find_by_id(HARNESS_ID_STR).is_some());
         assert_eq!(a.product_status(), ProductStatus::Sunset);
-        assert_eq!(a.research_doc_link(), RESEARCH_DOC);
-        assert!(!a.last_verified_date().is_empty());
-        assert_eq!(a.adapter_revision(), crate::adapter::ADAPTER_REVISION);
-        assert!(a.migration_tip().contains("community"));
-        assert!(MIGRATION_TIP.contains("worktrees"));
     }
 
     #[test]
@@ -609,40 +485,6 @@ mod tests {
             );
         }
         assert!(!res.notes.is_empty());
-    }
-
-    #[test]
-    fn parse_version_output_cases() {
-        let cases = vec![
-            ("vibe-kanban 0.1.44", Some("0.1.44")),
-            ("0.1.44", Some("0.1.44")),
-            ("v1.0.0", Some("1.0.0")),
-            ("Version: 0.1.44", Some("0.1.44")),
-            ("", None),
-            ("not a version", None),
-        ];
-        for (input, expected) in cases {
-            let got = VibeKanbanAdapter::parse_version_output(input);
-            assert_eq!(got.as_deref(), expected, "input: {input:?}");
-        }
-    }
-
-    #[test]
-    fn parse_version_output_handles_real_name_slash_version_token() {
-        let real = "vibe-kanban/0.1.44 linux-x64 node-v22.23.2";
-        assert_eq!(
-            VibeKanbanAdapter::parse_version_output(real).as_deref(),
-            Some("0.1.44")
-        );
-        assert_eq!(
-            VibeKanbanAdapter::parse_version_output("vibe-kanban/0.1.44\n").as_deref(),
-            Some("0.1.44")
-        );
-        // The `node-v22.23.2` runtime tail alone must NOT yield `22.23.2`.
-        assert_eq!(
-            VibeKanbanAdapter::parse_version_output("linux-x64 node-v22.23.2"),
-            None
-        );
     }
 
     #[test]

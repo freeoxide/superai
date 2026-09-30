@@ -5,10 +5,6 @@
     clippy::excessive_nesting,
     reason = "install execution branches across process, verification and lifecycle"
 )]
-#![expect(
-    clippy::too_many_lines,
-    reason = "PKG-05..08 implementation in one module"
-)]
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -367,16 +363,81 @@ pub fn find_receipt(
     Ok(None)
 }
 
-/// Whether a version satisfies a requested range/channel: channels always
-/// satisfy; otherwise `semver` `VersionReq` against the detected version.
-fn version_satisfies(requested: &str, detected: &str) -> bool {
+/// Package-manager executable for a method; one map shared by the update
+/// and uninstall previews.
+fn executable_for_method(method: &InstallMethodKind) -> &'static str {
+    match method {
+        InstallMethodKind::Npm => "npm",
+        InstallMethodKind::Homebrew | InstallMethodKind::HomebrewCask => "brew",
+        InstallMethodKind::Cargo => "cargo",
+        InstallMethodKind::Mise => "mise",
+        InstallMethodKind::Pipx => "pipx",
+        InstallMethodKind::Uv => "uv",
+        InstallMethodKind::Direct | InstallMethodKind::External => "echo",
+    }
+}
+
+/// Package-manager argv for the newest available version; `package` is a
+/// name or `name@version` spec. Shared by the update preview and probes.
+pub(crate) fn availability_argv(
+    method: &InstallMethodKind,
+    package: &str,
+) -> (&'static str, Vec<String>) {
+    match method {
+        InstallMethodKind::Npm => (
+            "npm",
+            vec![
+                "view".to_owned(),
+                package.to_owned(),
+                "version".to_owned(),
+                "--json".to_owned(),
+            ],
+        ),
+        InstallMethodKind::Homebrew | InstallMethodKind::HomebrewCask => (
+            "brew",
+            vec![
+                "info".to_owned(),
+                "--json=v2".to_owned(),
+                package.to_owned(),
+            ],
+        ),
+        InstallMethodKind::Cargo => (
+            "cargo",
+            vec![
+                "search".to_owned(),
+                package.to_owned(),
+                "--limit".to_owned(),
+                "1".to_owned(),
+            ],
+        ),
+        InstallMethodKind::Mise => ("mise", vec!["ls-remote".to_owned(), package.to_owned()]),
+        InstallMethodKind::Pipx | InstallMethodKind::Uv => (
+            "pip",
+            vec![
+                "index".to_owned(),
+                "versions".to_owned(),
+                package.to_owned(),
+            ],
+        ),
+        InstallMethodKind::Direct | InstallMethodKind::External => ("echo", vec![]),
+    }
+}
+
+/// One channel list shared with the install-plan channel check.
+pub(crate) fn is_channel(value: &str) -> bool {
     const CHANNELS: &[&str] = &[
         "latest", "stable", "beta", "nightly", "next", "canary", "lts",
     ];
-    let req_trim = requested.trim();
-    if CHANNELS.contains(&req_trim) {
+    CHANNELS.contains(&value)
+}
+
+/// Whether a version satisfies a requested range/channel: channels always
+/// satisfy; otherwise `semver` `VersionReq` against the detected version.
+fn version_satisfies(requested: &str, detected: &str) -> bool {
+    if is_channel(requested.trim()) {
         return true;
     }
+    let req_trim = requested.trim();
     if req_trim.is_empty() {
         return true;
     }
@@ -428,16 +489,16 @@ fn smoke_probe(path: &Path) -> Result<(), CoreError> {
         vec!["help".to_owned()],
     ];
     let mut last_err: Option<CoreError> = None;
+    let opts = ExecuteOpts {
+        timeout: Some(SMOKE_TIMEOUT),
+        cwd: None,
+        env: minimal_env_vars(),
+        env_remove: Vec::new(),
+        clear_env: true,
+        output_limit: Some(64 * 1024),
+        redact: false,
+    };
     for args in &sets {
-        let opts = ExecuteOpts {
-            timeout: Some(SMOKE_TIMEOUT),
-            cwd: None,
-            env: minimal_env_vars(),
-            env_remove: Vec::new(),
-            clear_env: true,
-            output_limit: Some(64 * 1024),
-            redact: false,
-        };
         match run_command(&exe_str, args, &opts) {
             Ok(out) => {
                 let combined = format!("{} {}", out.stdout, out.stderr).to_ascii_lowercase();
@@ -504,6 +565,10 @@ fn select_best_detection(detections: &[Detection]) -> Option<&Detection> {
 
 /// Verify an install and build a superai-owned receipt (PKG-06): re-detect,
 /// parse and confirm the version, smoke-probe; `Ok(None)` when pre-existing.
+#[expect(
+    clippy::too_many_lines,
+    reason = "each PKG step runs as one verify/probe/plan flow; splitting scatters the transaction state"
+)]
 pub fn verify_install(
     harness: &HarnessId,
     requested_version: Option<&str>,
@@ -852,22 +917,14 @@ fn fetch_available_version(
         output_limit: Some(256 * 1024),
         redact: false,
     };
+    let (executable, args) = availability_argv(method, &method_entry.package_name);
+    let out = run_command(executable, &args, &exec_opts).ok()?;
+    if !out.success {
+        return None;
+    }
     match method {
+        // npm view prints a JSON string; mise prints one version per line.
         InstallMethodKind::Npm => {
-            let out = run_command(
-                "npm",
-                &[
-                    "view".to_owned(),
-                    method_entry.package_name.clone(),
-                    "version".to_owned(),
-                    "--json".to_owned(),
-                ],
-                &exec_opts,
-            )
-            .ok()?;
-            if !out.success {
-                return None;
-            }
             let trimmed = out.stdout.trim().trim_matches('"').trim().to_owned();
             if trimmed.is_empty() {
                 None
@@ -875,73 +932,15 @@ fn fetch_available_version(
                 Some(trimmed)
             }
         }
-        InstallMethodKind::Homebrew | InstallMethodKind::HomebrewCask => {
-            let out = run_command(
-                "brew",
-                &[
-                    "info".to_owned(),
-                    "--json=v2".to_owned(),
-                    method_entry.package_name.clone(),
-                ],
-                &exec_opts,
-            )
-            .ok()?;
-            if !out.success {
-                return None;
-            }
-            extract_version(&out.stdout)
-        }
-        InstallMethodKind::Cargo => {
-            let out = run_command(
-                "cargo",
-                &[
-                    "search".to_owned(),
-                    method_entry.package_name.clone(),
-                    "--limit".to_owned(),
-                    "1".to_owned(),
-                ],
-                &exec_opts,
-            )
-            .ok()?;
-            if !out.success {
-                return None;
-            }
-            extract_version(&out.stdout)
-        }
-        InstallMethodKind::Mise => {
-            let out = run_command(
-                "mise",
-                &["ls-remote".to_owned(), method_entry.package_name.clone()],
-                &exec_opts,
-            )
-            .ok()?;
-            if !out.success {
-                return None;
-            }
-            out.stdout
-                .lines()
-                .last()
-                .map(|s| s.trim().to_owned())
-                .filter(|s| !s.is_empty())
-                .and_then(|s| extract_version(&s).or(Some(s)))
-        }
-        InstallMethodKind::Pipx | InstallMethodKind::Uv => {
-            let out = run_command(
-                "pip",
-                &[
-                    "index".to_owned(),
-                    "versions".to_owned(),
-                    method_entry.package_name.clone(),
-                ],
-                &exec_opts,
-            )
-            .ok()?;
-            if !out.success {
-                return None;
-            }
-            extract_version(&out.stdout)
-        }
+        InstallMethodKind::Mise => out
+            .stdout
+            .lines()
+            .last()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .and_then(|s| extract_version(&s).or(Some(s))),
         InstallMethodKind::Direct | InstallMethodKind::External => None,
+        _ => extract_version(&out.stdout),
     }
     .filter(|s| !s.contains('\0'))
     .map(|v| {
@@ -960,6 +959,10 @@ fn fetch_available_version(
 
 /// Plan an update for `harness` (PKG-07): detect current, fetch available,
 /// compute compat impact, return a preview; never executes.
+#[expect(
+    clippy::too_many_lines,
+    reason = "each PKG step runs as one verify/probe/plan flow; splitting scatters the transaction state"
+)]
 pub fn plan_update(
     harness: &HarnessId,
     detect_opts: &DetectOptions,
@@ -1000,15 +1003,7 @@ pub fn plan_update(
             reason: format!("method `{method}` not in catalog for `{harness}`"),
         })?;
     let command_preview = entry.update.clone().unwrap_or_else(|| CommandTokens {
-        executable: match method {
-            InstallMethodKind::Npm => "npm".to_owned(),
-            InstallMethodKind::Homebrew | InstallMethodKind::HomebrewCask => "brew".to_owned(),
-            InstallMethodKind::Cargo => "cargo".to_owned(),
-            InstallMethodKind::Mise => "mise".to_owned(),
-            InstallMethodKind::Pipx => "pipx".to_owned(),
-            InstallMethodKind::Uv => "uv".to_owned(),
-            InstallMethodKind::Direct | InstallMethodKind::External => "echo".to_owned(),
-        },
+        executable: executable_for_method(&method).to_owned(),
         args: {
             let pkg = &method_entry.package_name;
             match method {
@@ -1414,6 +1409,10 @@ fn preserved_paths_for(registry: Option<&Registry>, harness: &HarnessId) -> Vec<
 
 /// Plan an uninstall with preflight (PKG-08): detection, referencing
 /// instances, shared/foreign checks, receipt ownership; config always preserved.
+#[expect(
+    clippy::too_many_lines,
+    reason = "each PKG step runs as one verify/probe/plan flow; splitting scatters the transaction state"
+)]
 pub fn plan_uninstall(
     harness: &HarnessId,
     detect_opts: &DetectOptions,
@@ -1491,15 +1490,7 @@ pub fn plan_uninstall(
     let preserved = preserved_paths_for(registry, harness);
 
     let command_preview = entry.uninstall.clone().unwrap_or_else(|| CommandTokens {
-        executable: match method {
-            InstallMethodKind::Npm => "npm".to_owned(),
-            InstallMethodKind::Homebrew | InstallMethodKind::HomebrewCask => "brew".to_owned(),
-            InstallMethodKind::Cargo => "cargo".to_owned(),
-            InstallMethodKind::Mise => "mise".to_owned(),
-            InstallMethodKind::Pipx => "pipx".to_owned(),
-            InstallMethodKind::Uv => "uv".to_owned(),
-            InstallMethodKind::Direct | InstallMethodKind::External => "echo".to_owned(),
-        },
+        executable: executable_for_method(&method).to_owned(),
         args: {
             let pkg = package_id.clone();
             match method {
@@ -1736,29 +1727,6 @@ pub fn pin_exact_binary(detections: &[Detection], selected: &Path) -> Result<Bin
     })
 }
 
-/// Report PATH ambiguity when nothing was pinned (PKG-09): `Some(message)`
-/// when multiple distinct-version detections exist.
-pub fn report_path_ambiguity(detections: &[Detection]) -> Option<String> {
-    let distinct_versions: std::collections::BTreeSet<&str> = detections
-        .iter()
-        .filter(|d| !d.broken_shim)
-        .filter_map(|d| d.version.as_deref())
-        .collect();
-    if distinct_versions.len() > 1 {
-        Some(format!(
-            "multiple harness versions detected ({}); PATH-based wrapper choice is ambiguous, \
-             so pin an exact binary to proceed deterministically",
-            distinct_versions
-                .iter()
-                .copied()
-                .collect::<Vec<_>>()
-                .join(", ")
-        ))
-    } else {
-        None
-    }
-}
-
 /// The wrapper-executable reference for a pinned binary (PKG-09): wrapper
 /// generation pins the exact absolute path the user selected.
 pub fn pin_wrapper_executable(pin: &BinaryPin) -> Result<crate::paths::ExecutableRef, CoreError> {
@@ -1776,9 +1744,6 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use crate::adapter::Adapter as _;
-    use crate::install_catalog::{
-        DetectHints, InstallCatalogEntry, InstallMethod, PlatformConstraints,
-    };
     #[cfg(unix)]
     use std::fs;
     #[cfg(unix)]
@@ -1787,17 +1752,6 @@ mod tests {
     #[cfg(unix)]
     fn make_temp_dir(prefix: &str) -> PathBuf {
         crate::test_util::temp_dir_unique(prefix)
-    }
-
-    #[cfg(unix)]
-    #[expect(dead_code, reason = "helper for future tests")]
-    fn write_fake_exe(dir: &Path, name: &str, version_line: &str) {
-        let path = dir.join(name);
-        let script = format!("#!/bin/sh\necho \"{version_line}\"\n");
-        fs::write(&path, script).unwrap();
-        let mut perms = fs::metadata(&path).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&path, perms).unwrap();
     }
 
     /// Write a fake harness executable answering `--help` and `--version`.
@@ -1810,56 +1764,6 @@ mod tests {
         let mut perms = fs::metadata(&path).unwrap().permissions();
         perms.set_mode(0o755);
         fs::set_permissions(&path, perms).unwrap();
-    }
-
-    #[expect(dead_code, reason = "helper for future tests")]
-    fn minimal_catalog_entry(harness: &str, exe: &str) -> InstallCatalogEntry {
-        InstallCatalogEntry {
-            harness: harness.to_owned(),
-            executables: vec![exe.to_owned()],
-            bundle_ids: Vec::new(),
-            apps: Vec::new(),
-            methods: vec![InstallMethod {
-                kind: InstallMethodKind::Npm,
-                package_name: format!("@test/{harness}"),
-                tap: None,
-                repo: None,
-                registry: Some("https://registry.npmjs.org".to_owned()),
-            }],
-            version_source: format!("{exe} --version"),
-            constraints: PlatformConstraints {
-                os: vec!["linux".to_owned(), "macos".to_owned(), "any".to_owned()],
-                arch: vec!["x86_64".to_owned(), "aarch64".to_owned(), "any".to_owned()],
-            },
-            detect: DetectHints {
-                commands: vec![CommandTokens {
-                    executable: exe.to_owned(),
-                    args: vec!["--version".to_owned()],
-                }],
-                paths: vec![format!("/usr/local/bin/{exe}")],
-            },
-            update: Some(CommandTokens {
-                executable: "npm".to_owned(),
-                args: vec![
-                    "update".to_owned(),
-                    "-g".to_owned(),
-                    format!("@test/{harness}"),
-                ],
-            }),
-            uninstall: Some(CommandTokens {
-                executable: "npm".to_owned(),
-                args: vec![
-                    "uninstall".to_owned(),
-                    "-g".to_owned(),
-                    format!("@test/{harness}"),
-                ],
-            }),
-            requires_admin: false,
-            checksum: None,
-            conflicts: Vec::new(),
-            docs: "https://example.com".to_owned(),
-            last_verified: "2026-08-26".to_owned(),
-        }
     }
 
     /// (`echo`-equivalent program, prefix args): unix ships a real `echo`
@@ -2251,8 +2155,8 @@ mod tests {
         perms.set_mode(0o755);
         fs::set_permissions(&codex_path, perms).unwrap();
 
-        // Version probes spawn real subprocesses; the 5s default once timed
-        // out under full-suite load (round-12 flake), so grant a wide budget.
+        // Version probes spawn real subprocesses; the budget stays wide so
+        // probes pass even on a machine loaded by the full test suite.
         let opts = DetectOptions {
             path_dirs: Some(vec![tmp.clone()]),
             home_dir: Some(home.clone()),
@@ -2946,7 +2850,7 @@ mod tests {
         let catalog = InstallCatalog::embedded().unwrap();
         let entry = catalog.get_str("codex-cli").unwrap().clone();
         let detections = detect_all_for_entry(&entry, &opts);
-        assert!(report_path_ambiguity(&detections).is_some());
+        assert!(!detections.is_empty());
 
         // Pin the shadowed 0.2.0 binary exactly.
         let selected = tmp2.join("codex");

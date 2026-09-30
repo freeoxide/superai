@@ -7,7 +7,6 @@ use superai_config::document::{Diagnostic, DocumentKind, SourceDocument};
 use superai_config::raw_editor::{find_redaction_spans, validate};
 
 use crate::adapter::{Adapter, Arch, Os, Platform};
-use crate::harness_catalog;
 
 /// Markers that indicate a credential is intentionally fake and allowed in fixtures.
 const FAKE_MARKERS: &[&str] = &[
@@ -150,12 +149,25 @@ pub fn verify_fixture_file(path: &Path) -> FixtureOutcome {
 }
 
 /// Verify all fixtures recursively under `dir`.
-#[expect(clippy::manual_let_else, reason = "explicit match clearer")]
 pub fn verify_fixtures_in_dir(dir: &Path) -> Vec<FixtureOutcome> {
     let mut outcomes = Vec::new();
-    let entries = match std::fs::read_dir(dir) {
-        Ok(it) => it,
-        Err(_) => return outcomes,
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        // An unreadable fixture root must surface as a failed check, never
+        // as an empty list that reads as all-pass.
+        outcomes.push(FixtureOutcome {
+            path: dir.to_path_buf(),
+            kind: DocumentKind::Opaque,
+            exists: true,
+            diagnostics: vec![Diagnostic::new(
+                1,
+                1,
+                format!("fixture root unreadable: {}", dir.display()),
+            )],
+            is_valid: false,
+            secret_free: true,
+            expected_valid: true,
+        });
+        return outcomes;
     };
     for entry in entries.flatten() {
         let p = entry.path();
@@ -247,9 +259,9 @@ pub struct PlatformGate {
     pub harness: String,
     /// Current platform derived from `std::env::consts`.
     pub current: Platform,
-    /// Verdict.
+    /// Supported, unsupported, constrained, or unknown for this host.
     pub verdict: PlatformVerdict,
-    /// Human reason.
+    /// Why the verdict holds; names the deciding axis, never a secret.
     pub reason: String,
 }
 
@@ -314,52 +326,10 @@ pub fn platform_gate_for_adapter(adapter: &dyn Adapter) -> PlatformGate {
     }
 }
 
-/// Run platform gates for every catalog entry.
-pub fn catalog_platform_gates() -> Vec<PlatformGate> {
-    let mut gates = Vec::new();
-    for entry in harness_catalog::ENTRIES {
-        let Ok(id) = crate::ids::HarnessId::new(entry.id) else {
-            continue;
-        };
-        let adapter = crate::adapter::GenericAdapter::new(
-            id,
-            entry.display_name,
-            entry.product_status,
-            entry.research_doc,
-            entry.last_verified,
-            entry.support,
-            entry.reason,
-            entry.source,
-        );
-        gates.push(platform_gate_for_adapter(&adapter));
-    }
-    gates
-}
-
-/// Whether every harness entry has a fixture dir: the catalog id
-/// underscored (`roo_code`), raw, or product-suffix-stripped (`junie`).
-pub fn ledger_fixture_coverage(fixtures_root: &Path) -> Vec<(String, bool)> {
-    let mut coverage = Vec::new();
-    for entry in harness_catalog::ENTRIES {
-        let underscore = entry.id.replace('-', "_");
-        let mut exists =
-            fixtures_root.join(&underscore).exists() || fixtures_root.join(entry.id).exists();
-        if !exists {
-            // Product-suffix ids whose adapter modules drop the suffix.
-            exists = ["_cli", "_agent", "_code"].iter().any(|suffix| {
-                underscore
-                    .strip_suffix(suffix)
-                    .is_some_and(|stripped| fixtures_root.join(stripped).exists())
-            });
-        }
-        coverage.push((entry.id.to_owned(), exists));
-    }
-    coverage
-}
-
-/// Required `FailurePoint` variants for the QAL-06 matrix; the list is
-/// intentionally exhaustive, CI fails if `failure.rs` drops one.
-pub fn required_failure_points() -> Vec<crate::failure::FailurePoint> {
+/// Required `FailurePoint` variants for the QAL-06 matrix; exhaustively
+/// pinned so CI fails if `failure.rs` drops one.
+#[cfg(test)]
+pub(crate) fn required_failure_points() -> Vec<crate::failure::FailurePoint> {
     use crate::failure::FailurePoint;
     vec![
         FailurePoint::BackupOpen,
@@ -383,99 +353,10 @@ pub fn required_failure_points() -> Vec<crate::failure::FailurePoint> {
     ]
 }
 
-/// Coverage report for the QAL-06 failure matrix.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FailureMatrixReport {
-    /// All required points.
-    pub required: Vec<crate::failure::FailurePoint>,
-    /// Surfaces that the matrix exercises.
-    pub surfaces: Vec<String>,
-    /// Whether every required point is present.
-    pub complete: bool,
-}
-
-/// QAL-06 matrix report: each of the six surfaces must have at least one
-/// failure-injection test asserting recovery or rollback.
-pub fn failure_matrix_report() -> FailureMatrixReport {
-    let required = required_failure_points();
-    let surfaces = vec![
-        "single_file_config".to_owned(),
-        "multi_file_instance_creation".to_owned(),
-        "template_update".to_owned(),
-        "bulk_skill_mcp".to_owned(),
-        "wrapper_replace".to_owned(),
-        "daemon_start_via_process_fixtures".to_owned(),
-    ];
-    let complete = !required.is_empty() && surfaces.len() == 6;
-    FailureMatrixReport {
-        required,
-        surfaces,
-        complete,
-    }
-}
-
-/// Fake harness coverage report for QAL-07.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FakeHarnessReport {
-    /// Version output fixtures present (spaces, missing, non-zero, timeout, huge 10 MiB, etc.).
-    pub version_fixtures: Vec<String>,
-    /// Network/GitHub fixtures present.
-    pub network_fixtures: Vec<String>,
-    /// Health classifications covered.
-    pub health_cases: Vec<String>,
-    /// Whether cross-host redirect stripping is covered.
-    pub cross_host_redirect_covered: bool,
-    /// Whether the whole report is complete.
-    pub complete: bool,
-}
-
-/// QAL-07 fake harness coverage; version/network fixtures delegate to
-/// `failure`, health/redirect cases enumerated for the CI ledger.
-pub fn fake_harness_report() -> FakeHarnessReport {
-    let version_fixtures = crate::failure::version_output_fixtures()
-        .into_iter()
-        .map(|f| f.name)
-        .collect::<Vec<_>>();
-    let network_fixtures = crate::failure::FakeNetworkHarness::with_github_matrix().keys();
-    let health_cases = vec![
-        "healthy".to_owned(),
-        "rate_limited".to_owned(),
-        "auth_error".to_owned(),
-        "tls_error".to_owned(),
-        "not_found".to_owned(),
-        "server_error".to_owned(),
-        "timeout".to_owned(),
-        "oversized".to_owned(),
-        "redirect_loop".to_owned(),
-        "digest_mismatch".to_owned(),
-        "cross_host_redirect".to_owned(),
-    ];
-    let cross_host_redirect_covered = crate::failure::should_strip_auth_for_redirect(
-        "https://github.com/org/repo",
-        "https://evil.example.com/other",
-    );
-    let complete = !version_fixtures.is_empty()
-        && !network_fixtures.is_empty()
-        && health_cases.len() == 11
-        && cross_host_redirect_covered;
-    FakeHarnessReport {
-        version_fixtures,
-        network_fixtures,
-        health_cases,
-        cross_host_redirect_covered,
-        complete,
-    }
-}
-
-/// Combined QAL-06/07 ledger entry: fails CI when either matrix is incomplete.
-pub fn qal_06_07_complete() -> bool {
-    failure_matrix_report().complete && fake_harness_report().complete
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeSet;
+    use crate::harness_catalog;
 
     use crate::adapter::{DetectionResult, ProductStatus, VersionResolution};
     use crate::ids::HarnessId;
@@ -724,6 +605,28 @@ mod tests {
         assert_eq!(gate.verdict, PlatformVerdict::Unknown);
     }
 
+    /// Run platform gates for every catalog entry (test-side ledger only).
+    fn catalog_platform_gates() -> Vec<PlatformGate> {
+        let mut gates = Vec::new();
+        for entry in harness_catalog::ENTRIES {
+            let Ok(id) = HarnessId::new(entry.id) else {
+                continue;
+            };
+            let adapter = crate::adapter::GenericAdapter::new(
+                id,
+                entry.display_name,
+                entry.product_status,
+                entry.research_doc,
+                entry.last_verified,
+                entry.support,
+                entry.reason,
+                entry.source,
+            );
+            gates.push(platform_gate_for_adapter(&adapter));
+        }
+        gates
+    }
+
     #[test]
     fn catalog_gates_cover_all_entries() {
         let gates = catalog_platform_gates();
@@ -734,6 +637,28 @@ mod tests {
                 .iter()
                 .any(|g| g.verdict == PlatformVerdict::Supported)
         );
+    }
+
+    /// Whether every harness entry has a fixture dir: the catalog id
+    /// underscored (`roo_code`), raw, or product-suffix-stripped (`junie`).
+    #[expect(clippy::excessive_nesting, reason = "suffix fallbacks nest by design")]
+    fn ledger_fixture_coverage(fixtures_root: &Path) -> Vec<(String, bool)> {
+        let mut coverage = Vec::new();
+        for entry in harness_catalog::ENTRIES {
+            let underscore = entry.id.replace('-', "_");
+            let mut exists =
+                fixtures_root.join(&underscore).exists() || fixtures_root.join(entry.id).exists();
+            if !exists {
+                // Product-suffix ids whose adapter modules drop the suffix.
+                exists = ["_cli", "_agent", "_code"].iter().any(|suffix| {
+                    underscore
+                        .strip_suffix(suffix)
+                        .is_some_and(|stripped| fixtures_root.join(stripped).exists())
+                });
+            }
+            coverage.push((entry.id.to_owned(), exists));
+        }
+        coverage
     }
 
     #[test]
@@ -960,31 +885,60 @@ mod tests {
     }
 
     #[test]
-    fn qal_06_failure_matrix_is_complete() {
-        let report = failure_matrix_report();
-        assert!(
-            report.complete,
-            "failure matrix must be complete: {report:?}"
-        );
-        assert_eq!(report.required.len(), 18);
-        assert_eq!(report.surfaces.len(), 6);
-        let mut distinct = BTreeSet::new();
-        for p in &report.required {
-            assert!(distinct.insert(*p), "duplicate point {p:?}");
+    fn failure_point_variants_are_pinned_without_wildcard() {
+        use crate::failure::FailurePoint;
+        // No wildcard: a FailurePoint variant added to or removed from
+        // failure.rs breaks this match, so the matrix cannot drift silently.
+        let all = [
+            FailurePoint::BackupOpen,
+            FailurePoint::BackupWrite,
+            FailurePoint::BackupFlush,
+            FailurePoint::BackupVerify,
+            FailurePoint::TempCreate,
+            FailurePoint::TempWrite,
+            FailurePoint::TempFlush,
+            FailurePoint::ParseStaged,
+            FailurePoint::ConflictRecheck,
+            FailurePoint::AtomicReplace,
+            FailurePoint::ParentSync,
+            FailurePoint::ReadBackVerify,
+            FailurePoint::SecondFile,
+            FailurePoint::ThirdFile,
+            FailurePoint::RollbackVerify,
+            FailurePoint::ProcessSpawn,
+            FailurePoint::ProcessTimeout,
+            FailurePoint::NetworkFetch,
+        ];
+        for point in all {
+            let described = match point {
+                FailurePoint::BackupOpen => "backup open",
+                FailurePoint::BackupWrite => "backup write",
+                FailurePoint::BackupFlush => "backup flush",
+                FailurePoint::BackupVerify => "backup verify",
+                FailurePoint::TempCreate => "temp create",
+                FailurePoint::TempWrite => "temp write",
+                FailurePoint::TempFlush => "temp flush",
+                FailurePoint::ParseStaged => "parse staged",
+                FailurePoint::ConflictRecheck => "conflict recheck",
+                FailurePoint::AtomicReplace => "atomic replace",
+                FailurePoint::ParentSync => "parent sync",
+                FailurePoint::ReadBackVerify => "read-back verify",
+                FailurePoint::SecondFile => "second file",
+                FailurePoint::ThirdFile => "third file",
+                FailurePoint::RollbackVerify => "rollback verify",
+                FailurePoint::ProcessSpawn => "process spawn",
+                FailurePoint::ProcessTimeout => "process timeout",
+                FailurePoint::NetworkFetch => "network fetch",
+            };
+            assert!(!described.is_empty());
         }
     }
 
     #[test]
-    fn qal_07_fake_harness_is_complete() {
-        let report = fake_harness_report();
-        assert!(
-            report.complete,
-            "fake harness report must be complete: {report:?}"
-        );
-        let lower: Vec<String> = report
-            .version_fixtures
-            .iter()
-            .map(|s| s.to_ascii_lowercase())
+    fn qal_07_fixtures_cover_the_documented_axes() {
+        let lower: Vec<String> = crate::failure::version_output_fixtures()
+            .into_iter()
+            .map(|f| f.name.to_ascii_lowercase())
             .collect();
         for needle in ["spaces", "missing", "non-zero", "timeout", "huge"] {
             assert!(
@@ -992,6 +946,7 @@ mod tests {
                 "version fixture missing {needle}: {lower:?}"
             );
         }
+        let network_keys = crate::failure::FakeNetworkHarness::with_github_matrix().keys();
         for needle in [
             "catalog_success",
             "digest_mismatch",
@@ -1003,21 +958,15 @@ mod tests {
             "cross_host_redirect",
         ] {
             assert!(
-                report.network_fixtures.iter().any(|k| k == needle),
-                "network fixture missing {needle}: {:?}",
-                report.network_fixtures
+                network_keys.iter().any(|k| k == needle),
+                "network fixture missing {needle}: {network_keys:?}"
             );
         }
-        assert_eq!(report.health_cases.len(), 11);
-        assert!(report.cross_host_redirect_covered);
-    }
-
-    #[test]
-    fn qal_06_07_combined_complete() {
-        assert!(
-            qal_06_07_complete(),
-            "QAL-06/07 combined coverage must be complete"
-        );
+        // The redirect-strip rule is a real predicate, not a constant.
+        assert!(crate::failure::should_strip_auth_for_redirect(
+            "https://github.com/org/repo",
+            "https://evil.example.com/other",
+        ));
     }
 
     #[test]

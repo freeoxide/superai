@@ -551,18 +551,19 @@ pub fn fingerprint_candidate(path: &Path) -> Fingerprint {
     }
 }
 
-#[expect(clippy::indexing_slicing, reason = "len is bounded by data.len()")]
 fn read_bounded(path: &Path, max_bytes: usize) -> std::io::Result<String> {
     let data = std::fs::read(path)?;
     let len = std::cmp::min(data.len(), max_bytes);
-    // Respect UTF-8 char boundaries
-    let slice = &data[..len];
-    // Find last char boundary
+    let Some(slice) = data.get(..len) else {
+        return Ok(String::new());
+    };
+    // Back off to the last UTF-8 char boundary before decoding.
     let mut valid_len = slice.len();
-    while valid_len > 0 && std::str::from_utf8(&slice[..valid_len]).is_err() {
+    while valid_len > 0 && std::str::from_utf8(slice.get(..valid_len).unwrap_or_default()).is_err()
+    {
         valid_len = valid_len.saturating_sub(1);
     }
-    let text = String::from_utf8_lossy(&slice[..valid_len]).into_owned();
+    let text = String::from_utf8_lossy(slice.get(..valid_len).unwrap_or_default()).into_owned();
     Ok(text)
 }
 
@@ -1537,13 +1538,6 @@ fn classify_finding(
                     ],
                 );
             }
-            if fingerprint.harness.is_some() {
-                return (
-                    DriftCategory::RecordedHealthy,
-                    RiskLevel::Info,
-                    vec!["none: healthy".to_owned()],
-                );
-            }
         }
         return (
             DriftCategory::RecordedHealthy,
@@ -1598,15 +1592,21 @@ fn build_groups(
     reconciliations: &[Reconciliation],
 ) -> Vec<DriftGroup> {
     let mut groups: Vec<DriftGroup> = Vec::new();
+    // Normalization is loop-invariant per path; compute it once per side.
+    let normalized_findings: Vec<(&DriftFinding, PathBuf)> = findings
+        .iter()
+        .map(|f| (f, normalize_path(&f.path)))
+        .collect();
     for rec in reconciliations {
         let Some(inst) = registry.get_by_id(rec.instance.as_str()) else {
             continue;
         };
+        let inst_root = normalize_path(inst.config_root.as_path());
         let mut categories: Vec<DriftCategory> = Vec::new();
         let mut risks: Vec<RiskLevel> = Vec::new();
         let mut next_ops: Vec<String> = Vec::new();
-        for finding in findings {
-            if normalize_path(&finding.path) != normalize_path(inst.config_root.as_path()) {
+        for (finding, finding_root) in &normalized_findings {
+            if *finding_root != inst_root {
                 continue;
             }
             categories.push(finding.category.clone());
@@ -1672,26 +1672,20 @@ fn build_groups(
             continue;
         };
         let entry = crate::harness_catalog::find_by_id(harness.as_str());
+        let adapter_version =
+            crate::harness_catalog::concrete_adapter_for(harness.as_str()).map(|adapter| {
+                adapter
+                    .version_resolution()
+                    .detected_version
+                    .unwrap_or_else(|| "version unknown".to_owned())
+            });
         groups.push(DriftGroup {
             harness,
             instance: None,
             category: finding.category.clone(),
             risk: finding.risk,
             adapter_support: entry.map(|e| e.support),
-            adapter_version: crate::harness_catalog::concrete_adapter_for(
-                finding
-                    .fingerprint
-                    .harness
-                    .as_ref()
-                    .map_or(String::new(), |h| h.as_str().to_owned())
-                    .as_str(),
-            )
-            .map(|adapter| {
-                adapter
-                    .version_resolution()
-                    .detected_version
-                    .unwrap_or_else(|| "version unknown".to_owned())
-            }),
+            adapter_version,
             next_operations: finding.next_operations.clone(),
         });
     }
@@ -1738,9 +1732,16 @@ struct RecordDuplicate {
 fn detect_record_duplicates(registry: &Registry) -> Vec<RecordDuplicate> {
     let mut out: Vec<RecordDuplicate> = Vec::new();
     let instances = registry.instances();
+    let roots: Vec<PathBuf> = instances
+        .iter()
+        .map(|inst| normalize_path(inst.config_root.as_path()))
+        .collect();
     for (i, a) in instances.iter().enumerate() {
-        for b in instances.iter().skip(i + 1) {
-            if normalize_path(a.config_root.as_path()) == normalize_path(b.config_root.as_path()) {
+        for (j, b) in instances.iter().enumerate().skip(i + 1) {
+            let (Some(root_a), Some(root_b)) = (roots.get(i), roots.get(j)) else {
+                continue;
+            };
+            if root_a == root_b {
                 out.push(RecordDuplicate {
                     category: DriftCategory::DuplicateRoot,
                     risk: RiskLevel::High,
@@ -1791,15 +1792,18 @@ pub fn drift_report_with_options(
     let scan = scan_with_diagnostics(home, options);
     let candidates = scan.candidates;
     let wrapper_findings = scan_wrapper_dirs(&options.wrapper_dirs, registry);
+    let normalized_roots: Vec<PathBuf> = registry
+        .instances()
+        .iter()
+        .map(|i| normalize_path(i.config_root.as_path()))
+        .collect();
     let mut findings: Vec<DriftFinding> = Vec::new();
     for cand in &candidates {
         let fingerprint = fingerprint_candidate(cand);
         let foreign = is_foreign_managed(cand, Some(home));
         let ownership = classify_ownership_with_foreign(cand, registry, &foreign);
-        let is_recorded = registry
-            .instances()
-            .iter()
-            .any(|i| normalize_path(i.config_root.as_path()) == normalize_path(cand));
+        let cand_root = normalize_path(cand);
+        let is_recorded = normalized_roots.contains(&cand_root);
         let (category, risk, next_operations) =
             classify_finding(is_recorded, cand, &foreign, &fingerprint, registry, home);
         findings.push(DriftFinding {

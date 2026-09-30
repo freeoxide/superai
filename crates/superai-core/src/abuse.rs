@@ -1,10 +1,11 @@
 //! QAL-10/11 secret and path abuse verification (core layer).
 //! The sentinel may live only in the harness config file and its backup; every path abuse must be rejected without panic or leak.
 
-use std::path::Path;
-
 /// Sentinel for QAL-10 leak scanning.
 pub const SENTINEL: &str = "sk-superai-test-sentinel-12345-fake";
+
+#[cfg(test)]
+use std::path::Path;
 
 /// Returns true if bytes contain sentinel plain.
 pub fn contains_sentinel(bytes: &[u8]) -> bool {
@@ -14,11 +15,13 @@ pub fn contains_sentinel(bytes: &[u8]) -> bool {
     String::from_utf8_lossy(bytes).contains(SENTINEL)
 }
 
+#[cfg(test)]
 /// Returns true if string contains sentinel.
 pub fn scan_str(s: &str) -> bool {
     s.contains(SENTINEL)
 }
 
+#[cfg(test)]
 /// Assert no sentinel in bytes.
 pub fn assert_no_sentinel_bytes(bytes: &[u8], ctx: &str) {
     assert!(
@@ -27,6 +30,7 @@ pub fn assert_no_sentinel_bytes(bytes: &[u8], ctx: &str) {
     );
 }
 
+#[cfg(test)]
 /// Assert no sentinel in file if exists.
 pub fn assert_no_sentinel_in_file(path: &Path, ctx: &str) {
     if let Ok(b) = std::fs::read(path) {
@@ -38,6 +42,7 @@ pub fn assert_no_sentinel_in_file(path: &Path, ctx: &str) {
     }
 }
 
+#[cfg(test)]
 /// Assert debug string doesn't contain sentinel.
 pub fn assert_no_sentinel_in_debug<T: std::fmt::Debug>(v: &T, ctx: &str) {
     let d = format!("{v:?}");
@@ -47,6 +52,7 @@ pub fn assert_no_sentinel_in_debug<T: std::fmt::Debug>(v: &T, ctx: &str) {
     );
 }
 
+#[cfg(test)]
 /// Assert serialized JSON doesn't contain sentinel.
 pub fn assert_no_sentinel_in_json<T: serde::Serialize>(v: &T, ctx: &str) {
     let j = serde_json::to_string(v).unwrap_or_default();
@@ -127,9 +133,6 @@ mod tests {
             !diff_redacted.is_empty(),
             "api_key should be detected as secret span"
         );
-        let preview_lexical = "api_key: [REDACTED] model: sonnet".to_owned();
-        assert!(!preview_lexical.contains(SENTINEL));
-        assert!(preview_lexical.contains("[REDACTED]"));
 
         let snap = superai_config::snapshot::snapshot(&cfg_path);
         assert_no_sentinel_in_debug(&snap, "snapshot");
@@ -641,19 +644,36 @@ mod tests {
             }
             s
         };
-        let parsed: Result<serde_json::Value, _> = serde_json::from_str(&deep_value);
-        // Deep may be valid or not, but must not panic
-        drop(parsed);
+        // serde_json's default recursion limit rejects 250-deep nesting
+        // instead of overflowing the stack.
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&deep_value)
+                .err()
+                .is_some()
+        );
 
         let huge_json = format!(r#"{{"data":"{}"}}"#, "x".repeat(5 * 1024 * 1024));
         let bytes = huge_json.into_bytes();
         assert!(bytes.len() > 5 * 1024 * 1024);
-        // Validation must not panic; the document is valid but size-bounded elsewhere.
+        // The document is valid JSON, so parse and validate both succeed;
+        // size bounding lives in the transaction caps, not the validator.
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).is_ok(),
+            "fixture must be valid JSON"
+        );
+        // The validator refuses oversized documents with a size diagnostic
+        // instead of scanning or panicking.
         let diags = superai_config::raw_editor::validate(
             &bytes,
             superai_config::document::DocumentKind::StrictJson,
         );
-        drop(diags);
+        assert!(
+            diags.iter().any(
+                |d| d.severity == superai_config::document::DiagnosticSeverity::Error
+                    && d.message.contains("size limit")
+            ),
+            "expected a size-limit diagnostic, got {diags:?}"
+        );
     }
 
     #[test]
@@ -727,32 +747,18 @@ description: test skill
     fn pid_reuse_is_detected() {
         let dir = temp_dir("pid-reuse");
         std::fs::create_dir_all(&dir).unwrap();
-        let pid_file = dir.join("daemon.pid");
-        std::fs::write(&pid_file, b"99999").unwrap();
-        let pid_in_file: u32 = String::from_utf8_lossy(&std::fs::read(&pid_file).unwrap())
-            .trim()
-            .parse()
-            .unwrap();
-        assert_eq!(pid_in_file, 99999);
-
+        // A recorded pid that is not the launched process must read as
+        // not-ready with the unrelated reason, whatever the file said.
         let daemon = crate::failure::DaemonFixture::unrelated_pid("test-daemon", 99999);
         assert!(!daemon.ready);
         assert!(daemon.reason.as_ref().unwrap().contains("unrelated"));
-        // Our check: pid file content should not be trusted if process is unrelated
-        let actual_pid = 1111; // different from file
-        assert_ne!(pid_in_file, actual_pid);
-        let same_pid_but_different =
-            crate::failure::DaemonFixture::unrelated_pid("other-daemon", 99999);
-        assert_eq!(same_pid_but_different.pid, Some(99999));
-        assert!(!same_pid_but_different.ready);
-
         let ready = crate::failure::DaemonFixture::ready("test-daemon", 4242);
         assert!(ready.ready);
-        assert_eq!(ready.pid, Some(4242));
+        assert_ne!(daemon.pid, ready.pid);
 
         let err = crate::error::CoreError::DaemonNotReady {
             harness: "test".to_owned(),
-            reason: format!("pid {pid_in_file} unrelated"),
+            reason: format!("pid {} unrelated", daemon.pid.unwrap_or(0)),
         };
         let msg = format!("{err:?}");
         assert!(!msg.contains(SENTINEL));

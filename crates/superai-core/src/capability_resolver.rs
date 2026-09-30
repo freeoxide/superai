@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::LazyLock;
 
 use serde::{Deserialize, Serialize};
 
@@ -155,9 +156,9 @@ pub struct CapabilitySources<'a> {
     /// Template capability-map overrides (source 3).
     pub template_map: Option<&'a BTreeMap<Capability, Support>>,
     /// Installed extension state (source 4).
-    pub extensions: ExtensionState,
+    pub extensions: &'a ExtensionState,
     /// Policy rows (source 5); downgrades only.
-    pub policy: Vec<FileMatrixEntry>,
+    pub policy: &'a [FileMatrixEntry],
     /// Installed harness version, when known (CAP-04 native-vs-version).
     pub harness_version: Option<String>,
     /// Harness label for diagnostics (internal metadata).
@@ -177,25 +178,11 @@ impl<'a> CapabilitySources<'a> {
             adapter_verifies_mcp: adapter.mcp_decl().is_some(),
             provider,
             template_map,
-            extensions: ExtensionState::default(),
-            policy: Vec::new(),
+            extensions: &EMPTY_EXTENSION_STATE,
+            policy: NO_POLICY_ROWS,
             harness_version: None,
             harness_label: adapter.id().to_string(),
         }
-    }
-
-    /// Attach installed extension state (builder).
-    #[must_use]
-    pub fn with_extensions(mut self, extensions: ExtensionState) -> Self {
-        self.extensions = extensions;
-        self
-    }
-
-    /// Attach policy rows (builder).
-    #[must_use]
-    pub fn with_policy(mut self, policy: Vec<FileMatrixEntry>) -> Self {
-        self.policy = policy;
-        self
     }
 
     /// Attach the installed harness version (builder).
@@ -339,7 +326,7 @@ pub fn resolve_with_sources(
     }
 
     // Source 5: policy may only downgrade, never upgrade.
-    for row in &sources.policy {
+    for row in sources.policy {
         if !row.harness.eq_ignore_ascii_case(&sources.harness_label)
             || !row.provider.eq_ignore_ascii_case(provider_id.as_str())
             || row.capability != cap
@@ -403,8 +390,8 @@ fn gather_default_sources<'a>(
             adapter_verifies_mcp: false,
             provider,
             template_map: None,
-            extensions: ExtensionState::default(),
-            policy: Vec::new(),
+            extensions: &EMPTY_EXTENSION_STATE,
+            policy: NO_POLICY_ROWS,
             harness_version: None,
             harness_label: harness.to_string(),
         },
@@ -450,6 +437,8 @@ static EMPTY_PROVIDERS: Vec<ProviderDefinition> = Vec::new();
 static EMPTY_INSTANCE_PROVIDERS: BTreeMap<InstanceId, ProviderId> = BTreeMap::new();
 static EMPTY_OVERRIDES: BTreeMap<InstanceId, BTreeMap<Capability, Support>> = BTreeMap::new();
 static EMPTY_EXTENSIONS: BTreeMap<InstanceId, ExtensionState> = BTreeMap::new();
+static EMPTY_EXTENSION_STATE: LazyLock<ExtensionState> = LazyLock::new(ExtensionState::default);
+static NO_POLICY_ROWS: &[FileMatrixEntry] = &[];
 
 impl Default for InstanceCapabilitySources<'_> {
     fn default() -> Self {
@@ -525,8 +514,8 @@ fn resolve_for_instance_with(
         adapter_verifies_mcp: adapter.is_some_and(|a| a.mcp_decl().is_some()),
         provider: Some(provider),
         template_map: Some(template_map),
-        extensions: extensions.clone(),
-        policy: sources.policy.clone(),
+        extensions,
+        policy: &sources.policy,
         harness_version: None,
         harness_label: instance.harness.to_string(),
     };
@@ -604,23 +593,6 @@ pub fn validate_resolution_completeness(
     Ok(resolved)
 }
 
-/// One row in the static harness/provider/capability matrix.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MatrixEntry {
-    /// Harness identifier lowercased slug (e.g. `claude-code`).
-    pub harness: &'static str,
-    /// Provider identifier lowercased slug (e.g. `anthropic`).
-    pub provider: &'static str,
-    /// Capability this row covers.
-    pub capability: Capability,
-    /// Resolved support level.
-    pub support: Support,
-    /// Which source satisfies it.
-    pub source: CapabilitySource,
-    /// Concise explanation for UI.
-    pub explanation: &'static str,
-}
-
 /// Active harness/provider pairs that must be fully covered; a new pair
 /// needs matrix rows before it counts as complete.
 pub const ACTIVE_PAIRS: &[(&str, &str)] = &[
@@ -635,462 +607,6 @@ pub const ACTIVE_PAIRS: &[(&str, &str)] = &[
     ("aider", "openai"),
     ("cline", "anthropic"),
 ];
-
-/// Static harness/provider/capability matrix, reference data only: tests
-/// read it, the live resolution path never does.
-pub const MATRIX: &[MatrixEntry] = &[
-    MatrixEntry {
-        harness: "claude-code",
-        provider: "anthropic",
-        capability: Capability::WebSearch,
-        support: Support::Native,
-        source: CapabilitySource::Harness,
-        explanation: "Claude Code web_search native via client tool on Anthropic",
-    },
-    MatrixEntry {
-        harness: "claude-code",
-        provider: "anthropic",
-        capability: Capability::Vision,
-        support: Support::Native,
-        source: CapabilitySource::Harness,
-        explanation: "Claude Code vision native on Anthropic transport",
-    },
-    MatrixEntry {
-        harness: "claude-code",
-        provider: "anthropic",
-        capability: Capability::ComputerUse,
-        support: Support::Native,
-        source: CapabilitySource::Harness,
-        explanation: "Claude Code computer_use native on Anthropic",
-    },
-    MatrixEntry {
-        harness: "claude-code",
-        provider: "anthropic",
-        capability: Capability::Mcp,
-        support: Support::Native,
-        source: CapabilitySource::Harness,
-        explanation: "Claude Code MCP native",
-    },
-    MatrixEntry {
-        harness: "claude-code",
-        provider: "glm",
-        capability: Capability::WebSearch,
-        support: Support::Substituted,
-        source: CapabilitySource::Provider,
-        explanation: "Claude Code web_search substituted via GLM server-side search",
-    },
-    MatrixEntry {
-        harness: "claude-code",
-        provider: "glm",
-        capability: Capability::Vision,
-        support: Support::Absent,
-        source: CapabilitySource::Provider,
-        explanation: "Claude Code vision absent on GLM; transport incompatible even though the model advertises vision",
-    },
-    MatrixEntry {
-        harness: "claude-code",
-        provider: "glm",
-        capability: Capability::ComputerUse,
-        support: Support::Absent,
-        source: CapabilitySource::Harness,
-        explanation: "Claude Code computer_use absent on GLM",
-    },
-    MatrixEntry {
-        harness: "claude-code",
-        provider: "glm",
-        capability: Capability::Mcp,
-        support: Support::Native,
-        source: CapabilitySource::Harness,
-        explanation: "Claude Code MCP native (provider-independent)",
-    },
-    MatrixEntry {
-        harness: "claude-code",
-        provider: "openai",
-        capability: Capability::WebSearch,
-        support: Support::Substituted,
-        source: CapabilitySource::Provider,
-        explanation: "Claude Code web_search substituted via OpenAI server search",
-    },
-    MatrixEntry {
-        harness: "claude-code",
-        provider: "openai",
-        capability: Capability::Vision,
-        support: Support::Native,
-        source: CapabilitySource::Harness,
-        explanation: "Claude Code vision native on OpenAI transport",
-    },
-    MatrixEntry {
-        harness: "claude-code",
-        provider: "openai",
-        capability: Capability::ComputerUse,
-        support: Support::Absent,
-        source: CapabilitySource::Provider,
-        explanation: "Claude Code computer_use absent on OpenAI (no computer-use API)",
-    },
-    MatrixEntry {
-        harness: "claude-code",
-        provider: "openai",
-        capability: Capability::Mcp,
-        support: Support::Native,
-        source: CapabilitySource::Harness,
-        explanation: "Claude Code MCP native",
-    },
-    MatrixEntry {
-        harness: "codex-cli",
-        provider: "openai",
-        capability: Capability::WebSearch,
-        support: Support::Substituted,
-        source: CapabilitySource::Provider,
-        explanation: "Codex CLI web_search substituted via OpenAI server-side search",
-    },
-    MatrixEntry {
-        harness: "codex-cli",
-        provider: "openai",
-        capability: Capability::Vision,
-        support: Support::Native,
-        source: CapabilitySource::Harness,
-        explanation: "Codex CLI vision native on OpenAI",
-    },
-    MatrixEntry {
-        harness: "codex-cli",
-        provider: "openai",
-        capability: Capability::ComputerUse,
-        support: Support::Absent,
-        source: CapabilitySource::Provider,
-        explanation: "Codex CLI computer_use absent",
-    },
-    MatrixEntry {
-        harness: "codex-cli",
-        provider: "openai",
-        capability: Capability::Mcp,
-        support: Support::Native,
-        source: CapabilitySource::Harness,
-        explanation: "Codex CLI MCP native",
-    },
-    MatrixEntry {
-        harness: "codex-cli",
-        provider: "anthropic",
-        capability: Capability::WebSearch,
-        support: Support::Substituted,
-        source: CapabilitySource::Provider,
-        explanation: "Codex CLI web_search substituted via Anthropic server search",
-    },
-    MatrixEntry {
-        harness: "codex-cli",
-        provider: "anthropic",
-        capability: Capability::Vision,
-        support: Support::Substituted,
-        source: CapabilitySource::Provider,
-        explanation: "Codex CLI vision substituted via Anthropic OpenAI-compatible endpoint",
-    },
-    MatrixEntry {
-        harness: "codex-cli",
-        provider: "anthropic",
-        capability: Capability::ComputerUse,
-        support: Support::Absent,
-        source: CapabilitySource::Harness,
-        explanation: "Codex CLI computer_use absent",
-    },
-    MatrixEntry {
-        harness: "codex-cli",
-        provider: "anthropic",
-        capability: Capability::Mcp,
-        support: Support::Native,
-        source: CapabilitySource::Harness,
-        explanation: "Codex CLI MCP native",
-    },
-    MatrixEntry {
-        harness: "opencode",
-        provider: "anthropic",
-        capability: Capability::WebSearch,
-        support: Support::Native,
-        source: CapabilitySource::Harness,
-        explanation: "OpenCode web_search native on Anthropic",
-    },
-    MatrixEntry {
-        harness: "opencode",
-        provider: "anthropic",
-        capability: Capability::Vision,
-        support: Support::Native,
-        source: CapabilitySource::Harness,
-        explanation: "OpenCode vision native",
-    },
-    MatrixEntry {
-        harness: "opencode",
-        provider: "anthropic",
-        capability: Capability::ComputerUse,
-        support: Support::Absent,
-        source: CapabilitySource::Harness,
-        explanation: "OpenCode computer_use absent",
-    },
-    MatrixEntry {
-        harness: "opencode",
-        provider: "anthropic",
-        capability: Capability::Mcp,
-        support: Support::Native,
-        source: CapabilitySource::Harness,
-        explanation: "OpenCode MCP native",
-    },
-    MatrixEntry {
-        harness: "opencode",
-        provider: "glm",
-        capability: Capability::WebSearch,
-        support: Support::Substituted,
-        source: CapabilitySource::Provider,
-        explanation: "OpenCode web_search substituted via GLM",
-    },
-    MatrixEntry {
-        harness: "opencode",
-        provider: "glm",
-        capability: Capability::Vision,
-        support: Support::Absent,
-        source: CapabilitySource::Provider,
-        explanation: "OpenCode vision absent on GLM transport",
-    },
-    MatrixEntry {
-        harness: "opencode",
-        provider: "glm",
-        capability: Capability::ComputerUse,
-        support: Support::Absent,
-        source: CapabilitySource::Harness,
-        explanation: "OpenCode computer_use absent",
-    },
-    MatrixEntry {
-        harness: "opencode",
-        provider: "glm",
-        capability: Capability::Mcp,
-        support: Support::Native,
-        source: CapabilitySource::Harness,
-        explanation: "OpenCode MCP native",
-    },
-    MatrixEntry {
-        harness: "pi",
-        provider: "anthropic",
-        capability: Capability::WebSearch,
-        support: Support::Native,
-        source: CapabilitySource::Harness,
-        explanation: "Pi web_search native",
-    },
-    MatrixEntry {
-        harness: "pi",
-        provider: "anthropic",
-        capability: Capability::Vision,
-        support: Support::Native,
-        source: CapabilitySource::Harness,
-        explanation: "Pi vision native",
-    },
-    MatrixEntry {
-        harness: "pi",
-        provider: "anthropic",
-        capability: Capability::ComputerUse,
-        support: Support::Absent,
-        source: CapabilitySource::Harness,
-        explanation: "Pi computer_use absent",
-    },
-    MatrixEntry {
-        harness: "pi",
-        provider: "anthropic",
-        capability: Capability::Mcp,
-        support: Support::Absent,
-        source: CapabilitySource::Harness,
-        explanation: "Pi MCP absent natively; verified extension may provide substituted",
-    },
-    MatrixEntry {
-        harness: "aider",
-        provider: "openai",
-        capability: Capability::WebSearch,
-        support: Support::Absent,
-        source: CapabilitySource::Harness,
-        explanation: "Aider web_search absent",
-    },
-    MatrixEntry {
-        harness: "aider",
-        provider: "openai",
-        capability: Capability::Vision,
-        support: Support::Absent,
-        source: CapabilitySource::Harness,
-        explanation: "Aider vision absent",
-    },
-    MatrixEntry {
-        harness: "aider",
-        provider: "openai",
-        capability: Capability::ComputerUse,
-        support: Support::Absent,
-        source: CapabilitySource::Harness,
-        explanation: "Aider computer_use absent",
-    },
-    MatrixEntry {
-        harness: "aider",
-        provider: "openai",
-        capability: Capability::Mcp,
-        support: Support::Absent,
-        source: CapabilitySource::Harness,
-        explanation: "Aider MCP absent",
-    },
-    MatrixEntry {
-        harness: "cline",
-        provider: "anthropic",
-        capability: Capability::WebSearch,
-        support: Support::Substituted,
-        source: CapabilitySource::Provider,
-        explanation: "Cline web_search substituted via provider",
-    },
-    MatrixEntry {
-        harness: "cline",
-        provider: "anthropic",
-        capability: Capability::Vision,
-        support: Support::Native,
-        source: CapabilitySource::Harness,
-        explanation: "Cline vision native",
-    },
-    MatrixEntry {
-        harness: "cline",
-        provider: "anthropic",
-        capability: Capability::ComputerUse,
-        support: Support::Native,
-        source: CapabilitySource::Harness,
-        explanation: "Cline computer_use native",
-    },
-    MatrixEntry {
-        harness: "cline",
-        provider: "anthropic",
-        capability: Capability::Mcp,
-        support: Support::Native,
-        source: CapabilitySource::Harness,
-        explanation: "Cline MCP native",
-    },
-];
-
-/// Resolve using an explicit matrix slice (legacy path for tests and the
-/// invariant fixtures; the live resolver is [`resolve_with_sources`]).
-pub fn resolve_with_matrix(
-    harness: &HarnessId,
-    provider: &ProviderId,
-    cap: Capability,
-    matrix: &[MatrixEntry],
-) -> ResolvedCapability {
-    for entry in matrix {
-        if entry.capability != cap {
-            continue;
-        }
-        let harness_matches = harness.eq_case_fold_str(entry.harness);
-        let provider_matches = provider.eq_case_fold_str(entry.provider);
-        if harness_matches && provider_matches {
-            return ResolvedCapability {
-                support: entry.support,
-                source: entry.source,
-                explanation: entry.explanation.to_owned(),
-                evidence: None,
-                version_range: None,
-                limitations: None,
-            };
-        }
-    }
-    ResolvedCapability {
-        support: Support::Absent,
-        source: CapabilitySource::Unknown,
-        explanation: format!(
-            "no matrix entry for harness `{harness}` provider `{provider}` capability `{cap:?}`"
-        ),
-        evidence: None,
-        version_range: None,
-        limitations: None,
-    }
-}
-
-/// Resolve all using an explicit matrix (legacy path).
-pub fn resolve_all_with_matrix(
-    harness: &HarnessId,
-    provider: &ProviderId,
-    matrix: &[MatrixEntry],
-) -> Vec<(Capability, ResolvedCapability)> {
-    let mut out = Vec::with_capacity(ALL_CAPABILITIES.len());
-    for cap in ALL_CAPABILITIES {
-        let resolved = resolve_with_matrix(harness, provider, *cap, matrix);
-        out.push((*cap, resolved));
-    }
-    out
-}
-
-/// Validate that the static matrix is complete for every active pair: every
-/// capability covered, no duplicates, substituted rows name their source.
-pub fn validate_matrix_completeness() -> Result<()> {
-    validate_matrix_completeness_with(MATRIX, ACTIVE_PAIRS, ALL_CAPABILITIES)
-}
-
-#[expect(clippy::excessive_nesting, reason = "matrix validation")]
-fn validate_matrix_completeness_with(
-    matrix: &[MatrixEntry],
-    pairs: &[(&str, &str)],
-    caps: &[Capability],
-) -> Result<()> {
-    let mut seen: std::collections::HashSet<(String, String, Capability)> =
-        std::collections::HashSet::new();
-    for e in matrix {
-        let key = (
-            e.harness.to_lowercase(),
-            e.provider.to_lowercase(),
-            e.capability,
-        );
-        if seen.contains(&key) {
-            return Err(CoreError::Validation {
-                field: "matrix".to_owned(),
-                reason: format!(
-                    "duplicate matrix entry harness `{}` provider `{}` cap `{:?}`",
-                    e.harness, e.provider, e.capability
-                ),
-            });
-        }
-        seen.insert(key);
-    }
-    for (harness, provider) in pairs {
-        for cap in caps {
-            let mut found = false;
-            for e in matrix {
-                if e.harness.to_lowercase() == harness.to_lowercase()
-                    && e.provider.to_lowercase() == provider.to_lowercase()
-                    && &e.capability == cap
-                {
-                    found = true;
-                    // A substituted claim must name who substitutes it.
-                    if e.support == Support::Substituted
-                        && matches!(
-                            e.source,
-                            CapabilitySource::Harness | CapabilitySource::Unknown
-                        )
-                    {
-                        return Err(CoreError::Validation {
-                            field: "matrix".to_owned(),
-                            reason: format!(
-                                "substituted entry for harness `{harness}` provider `{provider}` cap `{cap:?}` must have provider/template/plugin source, got `{}`",
-                                e.source
-                            ),
-                        });
-                    }
-                    if e.explanation.trim().is_empty() {
-                        return Err(CoreError::Validation {
-                            field: "matrix".to_owned(),
-                            reason: format!(
-                                "matrix entry harness `{harness}` provider `{provider}` cap `{cap:?}` has empty explanation"
-                            ),
-                        });
-                    }
-                    break;
-                }
-            }
-            if !found {
-                return Err(CoreError::Validation {
-                    field: "matrix".to_owned(),
-                    reason: format!(
-                        "incomplete matrix: harness `{harness}` provider `{provider}` missing cap `{cap:?}`"
-                    ),
-                });
-            }
-        }
-    }
-    Ok(())
-}
-
 /// File-driven matrix row (JSON/YAML deserializable). Doubles as the policy
 /// override input for [`CapabilitySources`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1171,9 +687,24 @@ mod tests {
         ProviderId::new(s).unwrap()
     }
 
-    #[test]
-    fn matrix_completeness_static() {
-        validate_matrix_completeness().unwrap();
+    /// `for_adapter` with explicit extension/policy input, for the source-4
+    /// and source-5 precedence tests.
+    fn sources_with<'a>(
+        adapter: &dyn Adapter,
+        provider: Option<&'a ProviderDefinition>,
+        extensions: &'a ExtensionState,
+        policy: &'a [FileMatrixEntry],
+    ) -> CapabilitySources<'a> {
+        CapabilitySources {
+            adapter_decls: adapter.capability_declarations(),
+            adapter_verifies_mcp: adapter.mcp_decl().is_some(),
+            provider,
+            template_map: None,
+            extensions,
+            policy,
+            harness_version: None,
+            harness_label: adapter.id().to_string(),
+        }
     }
 
     #[test]
@@ -1232,11 +763,11 @@ mod tests {
         // With a verified MCP declaration + installed servers, absent rises
         // to substituted via the plugin source.
         let adapter = McpDeclAdapter;
-        let sources =
-            CapabilitySources::for_adapter(&adapter, None, None).with_extensions(ExtensionState {
-                installed_mcp_servers: vec!["context7".to_owned()],
-                enabled_plugins: vec![],
-            });
+        let ext = ExtensionState {
+            installed_mcp_servers: vec!["context7".to_owned()],
+            enabled_plugins: vec![],
+        };
+        let sources = sources_with(&adapter, None, &ext, &[]);
         let resolved = resolve_with_sources(
             &hid("mcp-decl"),
             &pid("anthropic"),
@@ -1260,8 +791,8 @@ mod tests {
             source: Some(CapabilitySource::Policy),
             explanation: "disabled by admin policy".to_owned(),
         }];
-        let sources =
-            CapabilitySources::for_adapter(&adapter, Some(&provider), None).with_policy(policy);
+        let ext = ExtensionState::default();
+        let sources = sources_with(&adapter, Some(&provider), &ext, &policy);
         let disabled = resolve_with_sources(
             &hid("native-h"),
             &pid("prov"),
@@ -1281,8 +812,7 @@ mod tests {
             explanation: "policy cannot grant transport".to_owned(),
         }];
         let no_transport = NoTransportAdapter;
-        let sources = CapabilitySources::for_adapter(&no_transport, Some(&provider), None)
-            .with_policy(upgrade);
+        let sources = sources_with(&no_transport, Some(&provider), &ext, &upgrade);
         let resolved = resolve_with_sources(
             &hid("no-transport"),
             &pid("prov"),
@@ -1382,6 +912,7 @@ mod tests {
         validate_resolution_completeness(&hid("claude-code"), &anthropic.id, &sources).unwrap();
 
         // An adapter declaring only one capability cannot cover the catalog.
+        let ext = ExtensionState::default();
         let partial = CapabilitySources {
             adapter_decls: vec![AdapterCapabilityDecl::new(
                 Capability::WebSearch,
@@ -1391,8 +922,8 @@ mod tests {
             adapter_verifies_mcp: false,
             provider: Some(anthropic),
             template_map: None,
-            extensions: ExtensionState::default(),
-            policy: Vec::new(),
+            extensions: &ext,
+            policy: &[],
             harness_version: None,
             harness_label: "partial-h".to_owned(),
         };
@@ -1404,6 +935,7 @@ mod tests {
 
     #[test]
     fn duplicate_adapter_declarations_rejected() {
+        let ext = ExtensionState::default();
         let sources = CapabilitySources {
             adapter_decls: vec![
                 AdapterCapabilityDecl::new(Capability::WebSearch, Support::Native, "a"),
@@ -1412,8 +944,8 @@ mod tests {
             adapter_verifies_mcp: false,
             provider: None,
             template_map: None,
-            extensions: ExtensionState::default(),
-            policy: Vec::new(),
+            extensions: &ext,
+            policy: &[],
             harness_version: None,
             harness_label: "dup-h".to_owned(),
         };
@@ -1512,8 +1044,8 @@ mod tests {
 
     #[test]
     fn instance_query_resolves_each_instance_against_its_own_provider() {
-        // FINDING-1 regression: two same-harness instances with different
-        // providers must resolve differently, never against the first bundled one.
+        // Two same-harness instances with different providers must resolve
+        // differently, never against the first bundled one.
         let tmp = crate::test_util::temp_dir_unique("cap-own-provider");
         let make_instance = |name: &str| Instance {
             id: InstanceId::new(&format!("id-{name}")).unwrap(),
@@ -1692,30 +1224,7 @@ mod tests {
 
     #[test]
     fn matrix_has_native_substituted_absent_with_explanations() {
-        validate_matrix_completeness().unwrap();
-        let mut seen_native = false;
-        let mut seen_substituted = false;
-        let mut seen_absent = false;
-        for entry in MATRIX {
-            assert!(
-                !entry.explanation.trim().is_empty(),
-                "matrix entry harness `{}` provider `{}` cap `{:?}` has empty explanation",
-                entry.harness,
-                entry.provider,
-                entry.capability
-            );
-            match entry.support {
-                Support::Native => seen_native = true,
-                Support::Substituted => seen_substituted = true,
-                Support::Absent => seen_absent = true,
-            }
-        }
-        assert!(seen_native, "matrix must contain at least one native");
-        assert!(
-            seen_substituted,
-            "matrix must contain at least one substituted"
-        );
-        assert!(seen_absent, "matrix must contain at least one absent");
+        let (mut native, mut substituted, mut absent) = (false, false, false);
         for (harness, provider) in ACTIVE_PAIRS {
             let hid_v = HarnessId::new(harness).unwrap();
             let pid_v = ProviderId::new(provider).unwrap();
@@ -1730,12 +1239,23 @@ mod tests {
                     !resolved.explanation.trim().is_empty(),
                     "pair {harness}/{provider} cap {cap:?} has empty explanation"
                 );
+                match resolved.support {
+                    Support::Native => native = true,
+                    Support::Substituted => substituted = true,
+                    Support::Absent => absent = true,
+                }
             }
         }
+        assert!(native, "active pairs must include a native resolution");
+        assert!(
+            substituted,
+            "active pairs must include a substituted resolution"
+        );
+        assert!(absent, "active pairs must include an absent resolution");
     }
 
     #[test]
-    fn add_provider_without_code_change_and_matrix_completeness() {
+    fn add_provider_without_code_change() {
         let dir = crate::test_util::temp_dir_unique("matrix-provider-polish");
         std::fs::create_dir_all(&dir).unwrap();
         let provider_json = r#"{
@@ -1769,70 +1289,6 @@ mod tests {
         assert!(err.contains("do not resolve"), "got: {err}");
 
         drop(std::fs::remove_dir_all(&dir));
-    }
-
-    #[test]
-    fn legacy_matrix_path_still_resolves_explicit_rows() {
-        let synthetic_matrix = [MatrixEntry {
-            harness: "synthetic-harness",
-            provider: "synthetic-matrix-provider",
-            capability: Capability::WebSearch,
-            support: Support::Substituted,
-            source: CapabilitySource::Provider,
-            explanation: "synthetic substituted for test",
-        }];
-        let r = resolve_with_matrix(
-            &hid("synthetic-harness"),
-            &pid("synthetic-matrix-provider"),
-            Capability::WebSearch,
-            &synthetic_matrix,
-        );
-        assert_eq!(r.support, Support::Substituted);
-    }
-
-    #[test]
-    fn duplicate_matrix_detection() {
-        let dup = [
-            MatrixEntry {
-                harness: "a",
-                provider: "b",
-                capability: Capability::WebSearch,
-                support: Support::Native,
-                source: CapabilitySource::Harness,
-                explanation: "first",
-            },
-            MatrixEntry {
-                harness: "a",
-                provider: "b",
-                capability: Capability::WebSearch,
-                support: Support::Native,
-                source: CapabilitySource::Harness,
-                explanation: "dup",
-            },
-        ];
-        validate_matrix_completeness_with(&dup, &[("a", "b")], &[Capability::WebSearch])
-            .unwrap_err();
-    }
-
-    #[test]
-    fn incomplete_matrix_fails() {
-        let incomplete: &[MatrixEntry] = &[];
-        validate_matrix_completeness_with(incomplete, &[("a", "b")], &[Capability::WebSearch])
-            .unwrap_err();
-    }
-
-    #[test]
-    fn substituted_requires_provider_or_template_source() {
-        let bad = [MatrixEntry {
-            harness: "a",
-            provider: "b",
-            capability: Capability::WebSearch,
-            support: Support::Substituted,
-            source: CapabilitySource::Harness,
-            explanation: "bad source",
-        }];
-        validate_matrix_completeness_with(&bad, &[("a", "b")], &[Capability::WebSearch])
-            .unwrap_err();
     }
 
     #[test]

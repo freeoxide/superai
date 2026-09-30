@@ -21,6 +21,15 @@ pub(crate) fn timestamp_millis_now() -> u128 {
         .map_or(0, |d| d.as_millis())
 }
 
+/// Best-effort IO failures go to stderr instead of vanishing; stderr is the
+/// only diagnostic channel this crate has, and silence hides a leaking temp.
+pub(crate) fn warn_io(action: &str, path: &Path, err: impl std::fmt::Display) {
+    eprintln!(
+        "superai-config: {action} failed for {}: {err}",
+        path.display()
+    );
+}
+
 /// Four-hex random suffix from time, pid, and a process-wide counter.
 pub(crate) fn generate_random_suffix(millis: u128) -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -34,11 +43,7 @@ pub(crate) fn generate_random_suffix(millis: u128) -> String {
     format!("{n:04x}")
 }
 
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "kept Result for future fallible name generation"
-)]
-fn generate_temp_path(target: &Path) -> Result<PathBuf> {
+pub(crate) fn generate_temp_path(target: &Path) -> PathBuf {
     let parent = target.parent().unwrap_or_else(|| Path::new("."));
     let file_name = target
         .file_name()
@@ -47,7 +52,14 @@ fn generate_temp_path(target: &Path) -> Result<PathBuf> {
     let millis = timestamp_millis_now();
     let suffix = generate_random_suffix(millis);
     let tmp_name = format!(".tmp.{file_name}.{suffix}.{millis}");
-    Ok(parent.join(tmp_name))
+    parent.join(tmp_name)
+}
+
+/// Abandoned temps are removed best-effort; a failure is logged, not swallowed.
+pub(crate) fn remove_temp(temp_path: &Path) {
+    if let Err(e) = std::fs::remove_file(temp_path) {
+        warn_io("temp cleanup", temp_path, &e);
+    }
 }
 
 /// Permission bits for the replacement: explicit `mode` wins, else the
@@ -124,7 +136,9 @@ pub(crate) fn windows_clear_readonly(path: &Path) {
             reason = "windows-only path; the readonly attribute is the only permission bit"
         )]
         perm.set_readonly(false);
-        drop(std::fs::set_permissions(path, perm));
+        if let Err(e) = std::fs::set_permissions(path, perm) {
+            warn_io("readonly restore", path, &e);
+        }
     }
 }
 
@@ -246,7 +260,7 @@ pub(crate) fn atomic_write_expecting(
     let mut temp_path = PathBuf::new();
     let mut file: Option<std::fs::File> = None;
     for _ in 0..5 {
-        let candidate = generate_temp_path(path)?;
+        let candidate = generate_temp_path(path);
         match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -274,7 +288,7 @@ pub(crate) fn atomic_write_expecting(
     // Owner-only while empty (umask cannot widen it); the fd-based chmod
     // still lands on our inode even if the temp name is swapped.
     if let Err(e) = apply_mode(&file, &temp_path, 0o600) {
-        drop(std::fs::remove_file(&temp_path));
+        remove_temp(&temp_path);
         return Err(e);
     }
 
@@ -292,7 +306,7 @@ pub(crate) fn atomic_write_expecting(
     // Final mode after the bytes are durable but before the rename: the
     // replacement never appears with the interim owner-only mode.
     if let Err(e) = apply_mode(&file, &temp_path, resolve_final_mode(path, mode)) {
-        drop(std::fs::remove_file(&temp_path));
+        remove_temp(&temp_path);
         return Err(e);
     }
     drop(file);
@@ -302,13 +316,13 @@ pub(crate) fn atomic_write_expecting(
     inject(injector, Point::ConflictRecheck)?;
     let current_digest = read_digest_if_exists(path)?;
     if original_digest != current_digest {
-        drop(std::fs::remove_file(&temp_path));
+        remove_temp(&temp_path);
         let expected = original_digest.unwrap_or_default();
         let actual = current_digest.unwrap_or_default();
         return Err(ConfigError::concurrent_modification(path, expected, actual));
     }
     if let Err(e) = expectation.check(path, current_digest.as_deref()) {
-        drop(std::fs::remove_file(&temp_path));
+        remove_temp(&temp_path);
         return Err(e);
     }
 
@@ -328,7 +342,7 @@ pub(crate) fn atomic_write_expecting(
                 std::thread::sleep(std::time::Duration::from_millis(10 * rename_attempts));
             }
             Err(e) => {
-                drop(std::fs::remove_file(&temp_path));
+                remove_temp(&temp_path);
                 return Err(ConfigError::io(path, e));
             }
         }

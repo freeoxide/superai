@@ -1,15 +1,10 @@
 //! Plugin abstraction and lifecycle (EXT-06/07): file/config scope only;
 //! removal keeps a shared dependency until its last consumer is gone.
 
+// Validation and staging branch per declared kind and scope.
 #![expect(
-    clippy::assigning_clones,
-    clippy::collapsible_if,
-    clippy::doc_markdown,
     clippy::excessive_nesting,
-    clippy::manual_let_else,
-    clippy::too_many_lines,
-    clippy::uninlined_format_args,
-    reason = "decl validation keeps collapsible guards and let-else chains"
+    reason = "decl validation branches per kind and scope"
 )]
 
 use std::collections::BTreeMap;
@@ -29,22 +24,10 @@ pub const PLUGIN_SCHEMA_VERSION: u32 = 1;
 /// File name for plugin registry.
 pub const REGISTRY_FILE_NAME: &str = "registry.json";
 
-const SHELL_PATTERNS: &[&str] = &[
-    "`", "$(", "${", "&&", "||", ";", "|", ">", "<", "&", "!", "\"", "'", "\n", "\r",
-];
-
 fn contains_shell_metachars(value: &str) -> bool {
-    for pat in SHELL_PATTERNS {
-        if value.contains(pat) {
-            return true;
-        }
-    }
     // On Windows `\` is the native separator in every absolute locator;
     // elsewhere it is a quoting metachar and stays rejected.
-    if !cfg!(windows) && value.contains('\\') {
-        return true;
-    }
-    false
+    crate::process::contains_shell_metachars(value) || (!cfg!(windows) && value.contains('\\'))
 }
 
 fn validate_plugin_locator(locator: &str, kind: PluginKind) -> Result<()> {
@@ -207,7 +190,7 @@ pub struct PluginRecord {
     /// Optional dependency key (e.g., npm package name) for shared tracking.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dependency_key: Option<String>,
-    /// Files staged into the destination for DirectoryBundle plugins
+    /// Files staged into the destination for `DirectoryBundle` plugins
     /// (EXT-07); removal touches exactly these.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub staged_files: Option<Vec<String>>,
@@ -243,7 +226,7 @@ pub struct PluginRegistry {
     /// Foreign top-level keys preserved from file.
     pub foreign: Map<String, Value>,
     /// Entries that failed to deserialize on load; NOT part of `records`,
-    /// and a store() rewrites the file without them, so report skips first.
+    /// and a `store()` rewrites the file without them, so report skips first.
     pub skipped: Vec<SkippedPluginRecord>,
 }
 
@@ -303,14 +286,11 @@ impl PluginRegistry {
             kind: "json".to_owned(),
             message: format!("plugin registry parse failed: {e}"),
         })?;
-        let obj = match val {
-            Value::Object(m) => m,
-            _ => {
-                return Err(CoreError::SchemaValidation {
-                    path: file,
-                    details: "plugin registry must be an object".to_owned(),
-                });
-            }
+        let Value::Object(obj) = val else {
+            return Err(CoreError::SchemaValidation {
+                path: file,
+                details: "plugin registry must be an object".to_owned(),
+            });
         };
         // Failed deserializations are surfaced, never hidden: the next
         // store() would drop a silently skipped entry for good.
@@ -318,7 +298,8 @@ impl PluginRegistry {
         let mut skipped: Vec<SkippedPluginRecord> = Vec::new();
         if let Some(arr) = obj.get("plugins").and_then(|v| v.as_array()) {
             for (index, v) in arr.iter().enumerate() {
-                match serde_json::from_value::<PluginRecord>(v.clone()) {
+                // Deserialize from the borrowed value; serde needs no owned map.
+                match PluginRecord::deserialize(v) {
                     Ok(rec) => records.push(rec),
                     Err(e) => skipped.push(SkippedPluginRecord {
                         index,
@@ -503,14 +484,13 @@ impl PluginRegistry {
                 reason: preview.conflicts.join("; "),
             });
         }
-        if let Some(ref ex) = preview.existing {
-            if ex.source_locator == source.locator
-                && ex.version == source.version
-                && ex.digest == source.digest
-                && ex.kind == source.kind
-            {
-                return Ok(ex.clone());
-            }
+        if let Some(ref ex) = preview.existing
+            && ex.source_locator == source.locator
+            && ex.version == source.version
+            && ex.digest == source.digest
+            && ex.kind == source.kind
+        {
+            return Ok(ex.clone());
         }
 
         if matches!(source.kind, PluginKind::DirectoryBundle)
@@ -565,21 +545,20 @@ impl PluginRegistry {
     /// Remove an owned plugin entry and report retained shared dependencies
     /// (EXT-06/07: kept until no consumer remains).
     pub fn remove_with_report(&mut self, id: &PluginId) -> Result<Option<PluginRemoval>> {
-        let idx = match self.records.iter().position(|r| &r.id == id) {
-            Some(i) => i,
-            None => return Ok(None),
+        let Some(idx) = self.records.iter().position(|r| &r.id == id) else {
+            return Ok(None);
         };
         let mut retained_shared_deps: Vec<String> = Vec::new();
-        if let Some(r) = self.records.get(idx) {
-            if let Some(k) = r.dependency_key.clone() {
-                let consumers = self
-                    .records
-                    .iter()
-                    .filter(|x| x.dependency_key.as_deref() == Some(k.as_str()) && x.id != r.id)
-                    .count();
-                if consumers > 0 {
-                    retained_shared_deps.push(k);
-                }
+        if let Some(r) = self.records.get(idx)
+            && let Some(k) = r.dependency_key.clone()
+        {
+            let consumers = self
+                .records
+                .iter()
+                .filter(|x| x.dependency_key.as_deref() == Some(k.as_str()) && x.id != r.id)
+                .count();
+            if consumers > 0 {
+                retained_shared_deps.push(k);
             }
         }
         let removed = self.records.remove(idx);
@@ -594,7 +573,7 @@ impl PluginRegistry {
     pub fn enable(&mut self, id: &PluginId) -> Result<PluginRecord> {
         let rec = self.get(id).cloned().ok_or_else(|| CoreError::Validation {
             field: "plugin.id".to_owned(),
-            reason: format!("plugin `{}` not found", id),
+            reason: format!("plugin `{id}` not found"),
         })?;
         if rec.enabled {
             return Ok(rec);
@@ -614,7 +593,7 @@ impl PluginRegistry {
     pub fn disable(&mut self, id: &PluginId) -> Result<PluginRecord> {
         let rec = self.get(id).cloned().ok_or_else(|| CoreError::Validation {
             field: "plugin.id".to_owned(),
-            reason: format!("plugin `{}` not found", id),
+            reason: format!("plugin `{id}` not found"),
         })?;
         if !rec.enabled {
             return Ok(rec);
@@ -783,8 +762,12 @@ fn bundle_digest(files: &[BundleFile]) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// Stage a DirectoryBundle through a compensated transaction (EXT-07):
+/// Stage a `DirectoryBundle` through a compensated transaction (EXT-07):
 /// digest verified, foreign destination refused, staged list persisted.
+#[expect(
+    clippy::too_many_lines,
+    reason = "stage, verify, persist read linearly"
+)]
 pub fn install_directory_bundle(
     registry: &mut PluginRegistry,
     source: &PluginSource,
@@ -988,16 +971,16 @@ pub fn install_directory_bundle(
     let mut record = registry.install(source, Some(decl))?;
     record.digest = Some(digest);
     record.staged_files = Some(staged_rel);
-    if let Some(pos) = registry.records.iter().position(|r| r.id == record.id) {
-        if let Some(slot) = registry.records.get_mut(pos) {
-            *slot = record.clone();
-        }
+    if let Some(pos) = registry.records.iter().position(|r| r.id == record.id)
+        && let Some(slot) = registry.records.get_mut(pos)
+    {
+        *slot = record.clone();
     }
     registry.store()?;
     Ok(record)
 }
 
-/// Remove a staged DirectoryBundle (EXT-07): exactly the recorded owned
+/// Remove a staged `DirectoryBundle` (EXT-07): exactly the recorded owned
 /// files go, owned empty directories are pruned, shared deps reported.
 pub fn remove_directory_bundle(
     registry: &mut PluginRegistry,
@@ -1138,7 +1121,9 @@ pub fn set_plugin_enabled(
             if enabled {
                 // Re-stage from the recorded source locator.
                 let mut restore_source = source.clone();
-                restore_source.locator = record.source_locator.clone();
+                record
+                    .source_locator
+                    .clone_into(&mut restore_source.locator);
                 install_directory_bundle(registry, &restore_source, decl, instance_root)?;
             } else {
                 let mut reg =
@@ -1197,14 +1182,11 @@ fn read_outer_and_inner_json(
         kind: "json".to_owned(),
         message: format!("parse failed: {e}"),
     })?;
-    let outer = match val {
-        Value::Object(m) => m,
-        _ => {
-            return Err(CoreError::SchemaValidation {
-                path: path.to_path_buf(),
-                details: "plugin config must be object".to_owned(),
-            });
-        }
+    let Value::Object(outer) = val else {
+        return Err(CoreError::SchemaValidation {
+            path: path.to_path_buf(),
+            details: "plugin config must be object".to_owned(),
+        });
     };
     let inner = outer
         .get(key)
@@ -1347,8 +1329,11 @@ pub fn remove_config_entry(
 #[cfg(test)]
 #[expect(
     clippy::items_after_statements,
-    clippy::map_unwrap_or,
     reason = "fixtures build records step by step"
+)]
+#[expect(
+    clippy::map_unwrap_or,
+    reason = "the backup probe treats a directory it cannot read as backup-free"
 )]
 mod tests {
     use super::*;

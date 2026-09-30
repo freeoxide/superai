@@ -169,7 +169,15 @@ impl DaemonStartLock {
             return Ok(Self { path });
         }
         if lock_is_stale(&path) {
-            drop(std::fs::remove_file(&path));
+            // NotFound means another acquirer cleared the stale file first.
+            if let Err(e) = std::fs::remove_file(&path)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                return Err(CoreError::Validation {
+                    field: "daemon_start_lock".to_owned(),
+                    reason: format!("cannot remove stale start lock {}: {e}", path.display()),
+                });
+            }
             if Self::try_create(&path, harness)? {
                 return Ok(Self { path });
             }
@@ -225,7 +233,13 @@ impl DaemonStartLock {
 
 impl Drop for DaemonStartLock {
     fn drop(&mut self) {
-        drop(std::fs::remove_file(&self.path));
+        // Drop cannot return the error, so release failures go to stderr.
+        if let Err(e) = std::fs::remove_file(&self.path) {
+            eprintln!(
+                "superai-core: start-lock cleanup failed for {}: {e}",
+                self.path.display()
+            );
+        }
     }
 }
 
@@ -431,14 +445,15 @@ pub fn wait_for_ready(harness: &str, spec: &ReadinessSpec, port: u16) -> Result<
         interval,
     } = &materialized;
     let deadline = Instant::now() + *timeout;
+    // Only the per-attempt timeout varies; build the rest once.
+    let mut opts = ExecuteOpts {
+        timeout: None,
+        env: env.clone(),
+        ..ExecuteOpts::default()
+    };
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let attempt = remaining.min(Duration::from_secs(2));
-        let opts = ExecuteOpts {
-            timeout: Some(attempt),
-            env: env.clone(),
-            ..ExecuteOpts::default()
-        };
+        opts.timeout = Some(remaining.min(Duration::from_secs(2)));
         if let Ok(out) = run_command(executable, args, &opts)
             && out.success
         {
@@ -705,9 +720,19 @@ pub fn start_daemon(config: &DaemonStartConfig, probe: &dyn ProcessProbe) -> Res
     if let Err(e) = wait_for_ready(config.harness.as_str(), &config.readiness, port) {
         // Our own child: kill by handle, never by pid; wait reaps it so the
         // recorded pid is provably gone before we drop the record.
-        drop(handle.kill());
-        drop(handle.wait());
-        drop(std::fs::remove_file(&id_path));
+        if let Err(kill_err) = handle.kill() {
+            return Err(CoreError::BinaryDetection {
+                binary: config.executable.clone(),
+                reason: format!("daemon not ready ({e}) and kill also failed: {kill_err}"),
+            });
+        }
+        handle
+            .wait()
+            .map_err(|wait_err| CoreError::BinaryDetection {
+                binary: config.executable.clone(),
+                reason: format!("daemon not ready ({e}); reaping after kill failed: {wait_err}"),
+            })?;
+        remove_identity_record(&id_path)?;
         return Err(e);
     }
 
@@ -718,7 +743,7 @@ pub fn start_daemon(config: &DaemonStartConfig, probe: &dyn ProcessProbe) -> Res
             binary: config.executable.clone(),
             reason: format!("cannot wait for foreground daemon: {e}"),
         })?;
-        drop(std::fs::remove_file(&id_path));
+        remove_identity_record(&id_path)?;
         return Ok(DaemonLaunch::Foreground {
             pid,
             port,
@@ -859,6 +884,23 @@ pub fn verify_process_identity(id: &DaemonIdentity, probe: &dyn ProcessProbe) ->
     })
 }
 
+/// Remove the identity record once the daemon is provably gone; `NotFound`
+/// means a previous cleanup already won.
+fn remove_identity_record(identity_path: &Path) -> Result<()> {
+    if let Err(e) = std::fs::remove_file(identity_path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(CoreError::Validation {
+            field: "daemon_identity".to_owned(),
+            reason: format!(
+                "cannot remove identity record {}: {e}",
+                identity_path.display()
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Stop a daemon recorded at `identity_path`: fresh-read the identity, refuse
 /// when not provably ours, then graceful command if set, else TERM-then-KILL.
 pub fn stop_daemon(
@@ -868,7 +910,7 @@ pub fn stop_daemon(
 ) -> Result<DaemonStopOutcome> {
     let id = load_identity(identity_path)?;
     if !probe.is_alive(id.pid) {
-        drop(std::fs::remove_file(identity_path));
+        remove_identity_record(identity_path)?;
         return Ok(DaemonStopOutcome::AlreadyStopped {
             pid: id.pid,
             port: id.port,
@@ -895,7 +937,7 @@ pub fn stop_daemon(
             }
         })?;
         if wait_for_exit(id.pid, probe, opts.grace, opts.poll_interval) {
-            drop(std::fs::remove_file(identity_path));
+            remove_identity_record(identity_path)?;
             return Ok(DaemonStopOutcome::Stopped {
                 pid: id.pid,
                 port: id.port,
@@ -905,7 +947,7 @@ pub fn stop_daemon(
 
     send_signal(id.pid, false)?;
     if wait_for_exit(id.pid, probe, opts.grace, opts.poll_interval) {
-        drop(std::fs::remove_file(identity_path));
+        remove_identity_record(identity_path)?;
         return Ok(DaemonStopOutcome::Stopped {
             pid: id.pid,
             port: id.port,
@@ -913,7 +955,7 @@ pub fn stop_daemon(
     }
     send_signal(id.pid, true)?;
     if wait_for_exit(id.pid, probe, opts.grace, opts.poll_interval) {
-        drop(std::fs::remove_file(identity_path));
+        remove_identity_record(identity_path)?;
         return Ok(DaemonStopOutcome::Stopped {
             pid: id.pid,
             port: id.port,

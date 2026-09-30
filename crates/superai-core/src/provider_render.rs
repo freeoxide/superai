@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use serde::Serialize;
 use serde_json::Value;
 
+use superai_config::ConfigError;
 use superai_config::document::{
     DocumentKind as EngineKind, EditOperation, Operation as EngineOperation, Selector,
 };
@@ -532,61 +533,11 @@ fn load_surface_value(path: &std::path::Path, kind: DocumentKind) -> Result<Opti
                     kind: "toml".to_owned(),
                     message: e.to_string(),
                 })?;
-            Some(toml_to_value(&doc))
+            Some(crate::toml_convert::document_to_value(&doc))
         }
         _ => None,
     };
     Ok(parsed)
-}
-
-#[expect(clippy::excessive_nesting, reason = "item/value recursion is per-kind")]
-fn toml_to_value(doc: &toml_edit::DocumentMut) -> Value {
-    fn item_to_value(item: &toml_edit::Item) -> Value {
-        match item {
-            toml_edit::Item::Value(value) => value_to_json(value),
-            toml_edit::Item::Table(table) => {
-                let mut map = serde_json::Map::new();
-                for (key, child) in table {
-                    map.insert(key.to_owned(), item_to_value(child));
-                }
-                Value::Object(map)
-            }
-            toml_edit::Item::ArrayOfTables(arr) => {
-                let mut list = Vec::new();
-                for table in arr {
-                    let mut map = serde_json::Map::new();
-                    for (key, child) in table {
-                        map.insert(key.to_owned(), item_to_value(child));
-                    }
-                    list.push(Value::Object(map));
-                }
-                Value::Array(list)
-            }
-            toml_edit::Item::None => Value::Null,
-        }
-    }
-    fn value_to_json(value: &toml_edit::Value) -> Value {
-        match value {
-            toml_edit::Value::String(s) => Value::String(s.value().to_owned()),
-            toml_edit::Value::Integer(i) => Value::from(*i.value()),
-            toml_edit::Value::Float(f) => Value::from(*f.value()),
-            toml_edit::Value::Boolean(b) => Value::from(*b.value()),
-            toml_edit::Value::Datetime(dt) => Value::String(dt.to_string()),
-            toml_edit::Value::Array(arr) => Value::Array(arr.iter().map(value_to_json).collect()),
-            toml_edit::Value::InlineTable(table) => {
-                let mut map = serde_json::Map::new();
-                for (key, child) in table {
-                    map.insert(key.to_owned(), value_to_json(child));
-                }
-                Value::Object(map)
-            }
-        }
-    }
-    let mut root = serde_json::Map::new();
-    for (key, item) in doc.iter() {
-        root.insert(key.to_owned(), item_to_value(item));
-    }
-    Value::Object(root)
 }
 
 fn normalize_endpoint_for_match(url: &str) -> String {
@@ -1246,37 +1197,6 @@ fn ensure_table<'t>(
 /// preserving decor of untouched keys.
 #[expect(clippy::excessive_nesting, reason = "set/remove navigation branches")]
 fn apply_ops_to_toml(doc: &mut toml_edit::DocumentMut, ops: &[EngineOperation]) -> Result<()> {
-    fn value_to_toml(value: &Value) -> toml_edit::Item {
-        match value {
-            Value::String(s) => toml_edit::value(s.clone()),
-            Value::Number(n) => {
-                if let Some(i) = n.as_i64() {
-                    toml_edit::value(i)
-                } else {
-                    toml_edit::value(n.as_f64().unwrap_or_default())
-                }
-            }
-            Value::Bool(b) => toml_edit::value(*b),
-            Value::Array(arr) => {
-                let items: Vec<toml_edit::Value> = arr
-                    .iter()
-                    .map(|v| match value_to_toml(v) {
-                        toml_edit::Item::Value(value) => value,
-                        _ => toml_edit::Value::from(""),
-                    })
-                    .collect();
-                toml_edit::Item::Value(toml_edit::Value::Array(items.into_iter().collect()))
-            }
-            Value::Object(map) => {
-                let mut table = toml_edit::Table::new();
-                for (key, child) in map {
-                    table.insert(key.as_str(), value_to_toml(child));
-                }
-                toml_edit::Item::Table(table)
-            }
-            Value::Null => toml_edit::Item::None,
-        }
-    }
     for op in ops {
         match &op.kind {
             EditOperation::Set { selector, value } => {
@@ -1295,9 +1215,9 @@ fn apply_ops_to_toml(doc: &mut toml_edit::DocumentMut, ops: &[EngineOperation]) 
                     if table.get(last).is_some() {
                         // Index assignment keeps the existing key's decor
                         // (comments, spacing); `insert` would drop it.
-                        table[last] = value_to_toml(value);
+                        table[last] = crate::toml_convert::json_value_to_toml_lenient(value);
                     } else {
-                        table.insert(last, value_to_toml(value));
+                        table.insert(last, crate::toml_convert::json_value_to_toml_lenient(value));
                     }
                 }
             }
@@ -1343,7 +1263,15 @@ pub fn commit_provider_change(
         });
     }
     let path = instance.config_root.as_path().join(&surface.id);
-    let existing = std::fs::read(&path).ok();
+    // Absent file means a fresh document; a read error must not be
+    // silently rewritten, so it propagates.
+    let existing = match std::fs::read(&path) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            return Err(CoreError::Config(ConfigError::Io { path, source: e }));
+        }
+    };
     let new_bytes = match kind {
         DocumentKind::Toml => {
             let mut doc = match existing.as_deref() {
@@ -1379,12 +1307,10 @@ pub fn commit_provider_change(
                         match serde_json::from_slice::<Value>(bytes) {
                             Ok(value) => value,
                             Err(_) => {
-                                return Err(CoreError::Config(
-                                    superai_config::ConfigError::LossyWrite {
-                                        path: path.clone(),
-                                        format: "jsonc",
-                                    },
-                                ));
+                                return Err(CoreError::Config(ConfigError::LossyWrite {
+                                    path: path.clone(),
+                                    format: "jsonc",
+                                }));
                             }
                         }
                     }

@@ -70,6 +70,19 @@ pub const OWNED_SELECTORS: &[&str] = &[
 /// Constrained note: the server is separate, one per provider.
 pub const CONSTRAINED_NOTE: &str = "client config isolated via LETTA_LOCAL_BACKEND_DIR; separate server per provider state (LETTA_BASE_URL, LETTA_API_KEY, Ollama/vLLM) is separate server and not per-instance mutated: run one server per provider (different ports/volumes at /root/.letta)";
 
+/// Evidence preview for an env value: KEY/TOKEN names redact entirely, so a
+/// long secret cannot ride the 80-char truncation rule into detection output.
+fn env_preview(var: &str, val: &str) -> String {
+    if var.contains("KEY") || var.contains("TOKEN") {
+        "[REDACTED]".to_owned()
+    } else if val.chars().count() > 80 {
+        let truncated: String = val.chars().take(80).collect();
+        format!("{truncated}…")
+    } else {
+        val.to_owned()
+    }
+}
+
 /// Letta Code adapter (`Constrained`): each instance gets its own
 /// `LETTA_LOCAL_BACKEND_DIR`; provider servers stay external to the instance.
 #[derive(Debug, Clone)]
@@ -82,26 +95,6 @@ impl LettaAdapter {
     pub fn new() -> Result<Self, CoreError> {
         let id = HarnessId::new(HARNESS_ID_STR)?;
         Ok(Self { id })
-    }
-
-    /// Borrow the harness id.
-    pub fn harness_id(&self) -> &HarnessId {
-        &self.id
-    }
-
-    /// Executable name for this harness.
-    pub fn executable_name(&self) -> &str {
-        EXECUTABLE
-    }
-
-    /// Local backend env var.
-    pub fn local_backend_env_var(&self) -> &str {
-        LOCAL_BACKEND_ENV_VAR
-    }
-
-    /// Base URL env var.
-    pub fn base_url_env_var(&self) -> &str {
-        BASE_URL_ENV_VAR
     }
 
     fn default_local_backend_dir() -> Option<PathBuf> {
@@ -188,18 +181,7 @@ impl LettaAdapter {
             if let Ok(val) = std::env::var(var)
                 && !val.trim().is_empty()
             {
-                let preview = if val.chars().count() > 80 {
-                    let truncated: String = val.chars().take(80).collect();
-                    format!("{truncated}…")
-                } else {
-                    // Redact API keys/tokens
-                    if var.contains("KEY") || var.contains("TOKEN") {
-                        "[REDACTED]".to_owned()
-                    } else {
-                        val
-                    }
-                };
-                evidence.push(format!("{var} set to {preview}"));
+                evidence.push(format!("{var} set to {}", env_preview(var, &val)));
             } else {
                 evidence.push(format!("{var} not set"));
             }
@@ -215,8 +197,7 @@ impl LettaAdapter {
 
 impl Default for LettaAdapter {
     fn default() -> Self {
-        #[expect(clippy::unwrap_used, reason = "letta-code is static valid HarnessId")]
-        let id = HarnessId::new(HARNESS_ID_STR).unwrap();
+        let id = HarnessId::from_validated_const(HARNESS_ID_STR);
         Self { id }
     }
 }
@@ -498,13 +479,10 @@ impl Adapter for LettaAdapter {
             LOCAL_BACKEND_ENV_VAR.to_owned(),
             instance.config_root.to_string(),
         ));
-        // Deterministic per-instance port hint derived from the name; the
-        // real server url stays external to the instance.
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "name len < 100 truncation intentional"
-        )]
-        let derived_port = 8283u16 + (instance.name.as_str().len() as u16 % 100);
+        // Length-derived port HINT: same-length names collide, so the real
+        // server url stays external to the instance.
+        let name_len = u16::try_from(instance.name.as_str().len()).unwrap_or(u16::MAX);
+        let derived_port = 8283u16 + (name_len % 100);
         let derived_url = format!("http://localhost:{derived_port}");
         plan.env_vars
             .push((BASE_URL_ENV_VAR.to_owned(), derived_url));
@@ -574,9 +552,7 @@ mod tests {
     use std::collections::HashSet;
     use std::path::PathBuf;
 
-    use super::{
-        CONSTRAINED_NOTE, DISPLAY_NAME, EXECUTABLE, HARNESS_ID_STR, LettaAdapter, RESEARCH_DOC,
-    };
+    use super::{CONSTRAINED_NOTE, HARNESS_ID_STR, LettaAdapter, env_preview};
     use crate::adapter::{Adapter, ConfigScope, DocumentKind, ProductStatus, SurfaceOwnership};
     use crate::error::CoreError;
     use crate::ids::{HarnessId, InstanceId, InstanceName};
@@ -608,16 +584,11 @@ mod tests {
     #[test]
     fn adapter_identity() {
         let a = adapter();
+        // Constructor wiring plus catalog registration: an id the catalog
+        // does not know can never reconcile with detection or instances.
         assert_eq!(a.id().as_str(), HARNESS_ID_STR);
-        assert_eq!(a.display_name(), DISPLAY_NAME);
-        assert_eq!(a.executable_name(), EXECUTABLE);
-        assert_eq!(a.local_backend_env_var(), super::LOCAL_BACKEND_ENV_VAR);
-        assert_eq!(a.base_url_env_var(), super::BASE_URL_ENV_VAR);
+        assert!(crate::harness_catalog::find_by_id(HARNESS_ID_STR).is_some());
         assert_eq!(a.product_status(), ProductStatus::Active);
-        assert_eq!(a.research_doc_link(), RESEARCH_DOC);
-        assert!(!a.last_verified_date().is_empty());
-        assert_eq!(a.adapter_revision(), crate::adapter::ADAPTER_REVISION);
-        assert!(CONSTRAINED_NOTE.contains("separate server"));
     }
 
     #[test]
@@ -637,7 +608,6 @@ mod tests {
         let result = a.detection();
         assert!(!result.evidence.is_empty());
         assert!(result.evidence.iter().any(|e| e.contains("constrained")));
-        assert_ne!(result.confidence.to_string(), "");
     }
 
     #[test]
@@ -654,22 +624,6 @@ mod tests {
             assert!(!res.compatible);
         }
         assert!(!res.notes.is_empty());
-    }
-
-    #[test]
-    fn parse_version_output_cases() {
-        let cases = vec![
-            ("letta 0.2.1", Some("0.2.1")),
-            ("letta 0.2.1-beta", Some("0.2.1-beta")),
-            ("0.2.1", Some("0.2.1")),
-            ("v0.2.1", Some("0.2.1")),
-            ("", None),
-            ("not a version", None),
-        ];
-        for (input, expected) in cases {
-            let got = crate::adapters::parse_version_output(input);
-            assert_eq!(got.as_deref(), expected, "input: {input:?}");
-        }
     }
 
     #[test]
@@ -986,7 +940,27 @@ mod tests {
     }
 
     #[test]
-    fn constrained_note_contains_separate_server() {
-        assert!(CONSTRAINED_NOTE.contains("separate server"));
+    fn long_secrets_redact_instead_of_truncate() {
+        // A long KEY/TOKEN-shaped value must never ride the 80-char
+        // truncation rule into detection evidence.
+        let long_secret = format!("sk-{}", "x".repeat(120));
+        assert_eq!(env_preview("LETTA_API_KEY", &long_secret), "[REDACTED]");
+        assert_eq!(
+            env_preview("LETTA_APP_SERVER_TOKEN", &long_secret),
+            "[REDACTED]"
+        );
+        // Non-secret values still truncate past 80 chars.
+        let long_url = format!("http://localhost/{}", "p".repeat(120));
+        let preview = env_preview("LETTA_BASE_URL", &long_url);
+        assert!(preview.chars().count() <= 81, "{preview}");
+        assert_eq!(env_preview("LETTA_BASE_URL", "short"), "short");
+    }
+
+    #[test]
+    fn constrained_note_carries_the_isolation_contract() {
+        // Consumers (plan description, version notes) rely on the note
+        // naming both the isolation mechanism and the external-server rule.
+        assert!(CONSTRAINED_NOTE.contains("LETTA_LOCAL_BACKEND_DIR"));
+        assert!(CONSTRAINED_NOTE.contains("not per-instance mutated"));
     }
 }

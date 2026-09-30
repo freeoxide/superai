@@ -13,10 +13,10 @@ use crate::ids::HarnessId;
 use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence, Isolation};
 
-/// Harness identifier for Conductor.
+/// Harness id this adapter registers under.
 pub const HARNESS_ID_STR: &str = "conductor";
 
-/// Human display name.
+/// Name the adapter's `display_name()` reports.
 pub const DISPLAY_NAME: &str = "Conductor";
 
 /// Primary executable name (desktop launcher + CLI helper).
@@ -25,13 +25,14 @@ pub const EXECUTABLE: &str = "conductor";
 /// Alternative binary name (mac app helper).
 pub const EXECUTABLE_ALT: &str = "conductor-cli";
 
-/// Research document link.
+/// Research source for the declarations in this file; returned by
+/// `research_doc_link()`.
 pub const RESEARCH_DOC: &str = "docs/harness-configs/orchestrators.md";
 
-/// Last verified date.
+/// Date `last_verified_date()` reports.
 pub const LAST_VERIFIED: &str = "2026-08-25";
 
-/// Schema version.
+/// Settings shape version `version_resolution()` maps detected versions to.
 pub const SCHEMA_VERSION_STR: &str = "1";
 
 /// Constrained note: macOS worktrees/profile scoped.
@@ -68,21 +69,6 @@ impl ConductorAdapter {
         Ok(Self { id })
     }
 
-    /// Borrow the harness id.
-    pub fn harness_id(&self) -> &HarnessId {
-        &self.id
-    }
-
-    /// Executable name for this harness.
-    pub fn executable_name(&self) -> &str {
-        EXECUTABLE
-    }
-
-    /// Constrained note.
-    pub fn constrained_note(&self) -> &str {
-        CONSTRAINED_NOTE
-    }
-
     fn default_user_settings() -> Option<PathBuf> {
         let home = std::env::var("HOME")
             .ok()
@@ -100,18 +86,18 @@ impl ConductorAdapter {
     #[expect(clippy::unused_self, reason = "uses adapter constants via Self")]
     fn collect_config_evidence(&self, evidence: &mut Vec<String>) {
         evidence.push(format!("constrained: {CONSTRAINED_NOTE}"));
-        evidence.push(
-            "platform macOS only for harnesses: claude-code, codex, cursor, opencode".to_owned(),
-        );
         match Self::default_user_settings() {
             Some(path) => {
                 if path.exists() {
                     evidence.push(format!("user settings.toml found at {}", path.display()));
-                    if let Ok(text) = std::fs::read_to_string(&path)
-                        && (text.contains("claude_provider") || text.contains("models"))
-                    {
-                        evidence
-                            .push("user settings.toml contains claude_provider/models".to_owned());
+                    match std::fs::read_to_string(&path) {
+                        Ok(text) if text.contains("claude_provider") || text.contains("models") => {
+                            evidence.push(
+                                "user settings.toml contains claude_provider/models".to_owned(),
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => evidence.push(format!("user settings.toml unreadable: {e}")),
                     }
                 } else {
                     evidence.push(format!("user settings.toml missing at {}", path.display()));
@@ -187,8 +173,7 @@ impl ConductorAdapter {
 
 impl Default for ConductorAdapter {
     fn default() -> Self {
-        #[expect(clippy::unwrap_used, reason = "conductor is static valid HarnessId")]
-        let id = HarnessId::new(HARNESS_ID_STR).unwrap();
+        let id = HarnessId::from_validated_const(HARNESS_ID_STR);
         Self { id }
     }
 }
@@ -482,11 +467,13 @@ impl Adapter for ConductorAdapter {
             "CONDUCTOR_ROOT_PATH".to_owned(),
             format!("{}/..", instance.config_root),
         ));
+        // Modulo first: the addend is < 1000, well inside u16, so the cast
+        // cannot truncate no matter how long the instance name is.
         #[expect(
             clippy::cast_possible_truncation,
-            reason = "name len < 1000, truncation intentional for deterministic port"
+            reason = "len % 1000 is at most 999, which u16 represents exactly"
         )]
-        let derived_port = 4000u16 + (instance.name.as_str().len() as u16 % 1000);
+        let derived_port = 4000u16 + (instance.name.as_str().len() % 1000) as u16;
         plan.env_vars
             .push(("CONDUCTOR_PORT".to_owned(), derived_port.to_string()));
         plan.env_vars
@@ -555,10 +542,7 @@ impl Adapter for ConductorAdapter {
 mod tests {
     use std::collections::HashSet;
 
-    use super::{
-        CONSTRAINED_NOTE, ConductorAdapter, DISPLAY_NAME, EXECUTABLE, HARNESS_ID_STR,
-        OWNED_SELECTORS, RESEARCH_DOC,
-    };
+    use super::{CONSTRAINED_NOTE, ConductorAdapter, HARNESS_ID_STR, OWNED_SELECTORS};
     use crate::adapter::{Adapter, ConfigScope, DocumentKind, ProductStatus, SurfaceOwnership};
     use crate::error::CoreError;
     use crate::ids::{HarnessId, InstanceId, InstanceName};
@@ -590,14 +574,13 @@ mod tests {
     #[test]
     fn adapter_identity() {
         let a = adapter();
+        // Constructor wiring plus catalog registration: an id the catalog
+        // does not know can never reconcile with detection or instances.
         assert_eq!(a.id().as_str(), HARNESS_ID_STR);
-        assert_eq!(a.display_name(), DISPLAY_NAME);
-        assert_eq!(a.executable_name(), EXECUTABLE);
+        assert!(crate::harness_catalog::find_by_id(HARNESS_ID_STR).is_some());
         assert_eq!(a.product_status(), ProductStatus::Active);
-        assert_eq!(a.research_doc_link(), RESEARCH_DOC);
-        assert!(!a.last_verified_date().is_empty());
-        assert_eq!(a.adapter_revision(), crate::adapter::ADAPTER_REVISION);
-        assert!(a.constrained_note().contains("macOS"));
+        // The constrained note feeds plan text; it must name the worktree
+        // scoping the plan enforces.
         assert!(CONSTRAINED_NOTE.contains("worktrees"));
     }
 
@@ -626,7 +609,6 @@ mod tests {
             }
             InstallPresence::Broken => assert!(!result.evidence.is_empty()),
         }
-        assert_ne!(result.confidence.to_string(), "");
     }
 
     #[test]
@@ -645,22 +627,6 @@ mod tests {
             assert!(res.schema_version.is_none());
         }
         assert!(!res.notes.is_empty());
-    }
-
-    #[test]
-    fn parse_version_output_cases() {
-        let cases = vec![
-            ("conductor 1.2.3", Some("1.2.3")),
-            ("1.0.0", Some("1.0.0")),
-            ("v1.0.0", Some("1.0.0")),
-            ("Version: 2.0.0", Some("2.0.0")),
-            ("", None),
-            ("not a version", None),
-        ];
-        for (input, expected) in cases {
-            let got = crate::adapters::parse_version_output(input);
-            assert_eq!(got.as_deref(), expected, "input: {input:?}");
-        }
     }
 
     #[test]

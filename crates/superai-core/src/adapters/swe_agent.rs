@@ -2,9 +2,6 @@
 //! `explicit-config`; full for config-run instances.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
 use std::time::Duration;
 
 use crate::adapter::{
@@ -17,34 +14,36 @@ use crate::ids::HarnessId;
 use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence, Isolation};
 
-/// Harness identifier for SWE-agent.
+/// Harness id this adapter registers under; instances and the identity
+/// file carry the same value.
 pub const HARNESS_ID_STR: &str = "swe-agent";
 
-/// Human display name.
+/// Name the adapter's `display_name()` reports.
 pub const DISPLAY_NAME: &str = "SWE-agent";
 
-/// Primary executable name.
+/// Primary executable probed during detection.
 pub const EXECUTABLE: &str = "sweagent";
 
-/// Alternative executable (with dash).
+/// Fallback executable probed when the primary is absent.
 pub const EXECUTABLE_ALT: &str = "swe-agent";
 
-/// Environment variable for config root overlay.
+/// Env override for the relocated config root, probed by detection.
 pub const CONFIG_DIR_ENV_VAR: &str = "SWE_AGENT_CONFIG_DIR";
 
-/// Environment variable for trajectory dir.
+/// Env var receiving the per-instance trajectory dir in wrapper plans.
 pub const TRAJECTORY_ENV_VAR: &str = "SWE_AGENT_TRAJECTORY_DIR";
 
-/// Environment variable for config root (package dir).
+/// Env override checked before `CONFIG_DIR_ENV_VAR` for the package root.
 pub const CONFIG_ROOT_ENV_VAR: &str = "SWE_AGENT_CONFIG_ROOT";
 
-/// Research document link.
+/// Research source for the declarations in this file; returned by
+/// `research_doc_link()`.
 pub const RESEARCH_DOC: &str = "docs/harness-configs/swe-agent.md";
 
-/// Last verified date.
+/// Date `last_verified_date()` reports.
 pub const LAST_VERIFIED: &str = "2026-08-25";
 
-/// Schema version for current config shape.
+/// Config shape version `version_resolution()` maps detected versions to.
 pub const SCHEMA_VERSION_STR: &str = "1";
 
 /// Owned selectors inside SWE-agent YAML config (`agent.model` etc).
@@ -75,60 +74,14 @@ impl SweAgentAdapter {
         Ok(Self { id })
     }
 
-    /// Borrow the harness id.
-    pub fn harness_id(&self) -> &HarnessId {
-        &self.id
-    }
-
-    /// Executable name for this harness.
-    pub fn executable_name(&self) -> &str {
-        EXECUTABLE
-    }
-
-    /// Config dir env var.
-    pub fn config_dir_env_var(&self) -> &str {
-        CONFIG_DIR_ENV_VAR
-    }
-
     fn probe_version(binary: &Path) -> Option<String> {
-        let binary_owned = binary.to_path_buf();
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let output = Command::new(&binary_owned)
-                .arg("--version")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output();
-            let output = if output
-                .as_ref()
-                .is_ok_and(|o| o.status.success() || !o.stdout.is_empty() || !o.stderr.is_empty())
-            {
-                output
-            } else {
-                Command::new(&binary_owned)
-                    .arg("--help")
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .output()
-            };
-            drop(tx.send(output));
-        });
-        let Ok(Ok(output)) = rx.recv_timeout(Duration::from_secs(2)) else {
-            return None;
-        };
-        if !output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
-            return None;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let combined = if stdout.trim().is_empty() {
-            stderr.into_owned()
-        } else if stderr.trim().is_empty() {
-            stdout.into_owned()
-        } else {
-            format!("{stdout} {stderr}")
-        };
-        super::parse_version_output(&combined)
+        // SWE-agent answers --help with its version when --version is unsupported.
+        super::probe_version_with_fallback(
+            binary,
+            &["--version"],
+            &["--help"],
+            Duration::from_secs(2),
+        )
     }
 
     fn default_config_root() -> Option<PathBuf> {
@@ -207,8 +160,7 @@ impl SweAgentAdapter {
 
 impl Default for SweAgentAdapter {
     fn default() -> Self {
-        #[expect(clippy::unwrap_used, reason = "swe-agent is static valid HarnessId")]
-        let id = HarnessId::new(HARNESS_ID_STR).unwrap();
+        let id = HarnessId::from_validated_const(HARNESS_ID_STR);
         Self { id }
     }
 }
@@ -284,16 +236,11 @@ impl Adapter for SweAgentAdapter {
             (None, _) => InstallPresence::Absent,
         };
 
-        // Absent forces High, so the Low "config root exists" arm can never fire.
+        // Absent forces High, so a "config root exists" alone can never
+        // manufacture presence; binary without a version is Medium.
         let confidence = match (&binary_path, &version) {
-            (Some(_), None) => DetectionConfidence::Medium,
             (Some(_), Some(_)) | (None, _) => DetectionConfidence::High,
-        };
-
-        let confidence = if present == InstallPresence::Absent {
-            DetectionConfidence::High
-        } else {
-            confidence
+            (Some(_), None) => DetectionConfidence::Medium,
         };
 
         DetectionResult::new(present, version, evidence, confidence)
@@ -474,7 +421,6 @@ impl Adapter for SweAgentAdapter {
         let config_path = Path::new(&instance.config_root.to_string()).join("config.yaml");
         plan.args.push("--config".to_owned());
         plan.args.push(config_path.display().to_string());
-        // Isolate trajectory dir per instance as well
         plan.env_vars.push((
             TRAJECTORY_ENV_VAR.to_owned(),
             Path::new(&instance.config_root.to_string())
@@ -540,10 +486,7 @@ mod tests {
     use std::collections::HashSet;
     use std::path::PathBuf;
 
-    use super::{
-        DISPLAY_NAME, EXECUTABLE, HARNESS_ID_STR, OWNED_SELECTORS, RESEARCH_DOC, SweAgentAdapter,
-        TRAJECTORY_ENV_VAR,
-    };
+    use super::{HARNESS_ID_STR, OWNED_SELECTORS, SweAgentAdapter, TRAJECTORY_ENV_VAR};
     use crate::adapter::{Adapter, ConfigScope, DocumentKind, ProductStatus, SurfaceOwnership};
     use crate::error::CoreError;
     use crate::ids::{HarnessId, InstanceId, InstanceName};
@@ -575,12 +518,11 @@ mod tests {
     #[test]
     fn adapter_identity() {
         let a = adapter();
+        // Constructor wiring plus catalog registration: an id the catalog
+        // does not know can never reconcile with detection or instances.
         assert_eq!(a.id().as_str(), HARNESS_ID_STR);
-        assert_eq!(a.display_name(), DISPLAY_NAME);
-        assert_eq!(a.executable_name(), EXECUTABLE);
+        assert!(crate::harness_catalog::find_by_id(HARNESS_ID_STR).is_some());
         assert_eq!(a.product_status(), ProductStatus::Active);
-        assert_eq!(a.research_doc_link(), RESEARCH_DOC);
-        assert_eq!(a.adapter_revision(), crate::adapter::ADAPTER_REVISION);
     }
 
     #[test]
@@ -599,7 +541,6 @@ mod tests {
         let a = adapter();
         let result = a.detection();
         assert!(!result.evidence.is_empty());
-        assert_ne!(result.confidence.to_string(), "");
     }
 
     #[test]
@@ -616,21 +557,6 @@ mod tests {
             assert!(!res.compatible);
         }
         assert!(!res.notes.is_empty());
-    }
-
-    #[test]
-    fn parse_version_output_cases() {
-        let cases = vec![
-            ("sweagent 1.0.0", Some("1.0.0")),
-            ("swe-agent 0.5.1", Some("0.5.1")),
-            ("v1.2.3", Some("1.2.3")),
-            ("", None),
-            ("not a version", None),
-        ];
-        for (input, expected) in cases {
-            let got = crate::adapters::parse_version_output(input);
-            assert_eq!(got.as_deref(), expected, "input: {input:?}");
-        }
     }
 
     #[test]
@@ -848,6 +774,13 @@ mod tests {
         let path = fixture_path("overlay.minimal.yaml");
         assert!(path.exists(), "overlay minimal missing: {}", path.display());
         let map = superai_config::yaml::load(&path).unwrap();
-        assert!(map.contains_key("agent") || map.is_empty() || !map.is_empty());
+        // The minimal overlay must surface the agent model the plan relies on.
+        assert!(
+            map.get("agent")
+                .and_then(|a| a.get("model"))
+                .and_then(|m| m.get("name"))
+                .is_some(),
+            "fixture must carry agent.model.name: {map:?}"
+        );
     }
 }

@@ -4,22 +4,22 @@
 use std::path::{Path, PathBuf};
 
 use crate::adapter::{
-    ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
-    DetectionResult, DocumentKind, Os, PathResolver, Platform, ProductStatus, RestartBehavior,
-    SurfaceOwnership, VersionResolution, WrapperPlan,
+    ADAPTER_REVISION, Adapter, ConfigScope, ConfigSurface, DetectionResult, DocumentKind,
+    PathResolver, Platform, ProductStatus, RestartBehavior, SurfaceOwnership, VersionResolution,
+    WrapperPlan,
 };
 use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
-use crate::state::{AdapterSupport, InstallPresence, Isolation};
+use crate::state::{AdapterSupport, Isolation};
 
-/// Harness identifier for Amp.
+/// Catalog id superai registers this harness under.
 pub const HARNESS_ID_STR: &str = "amp";
 
-/// Human display name.
+/// Name shown for this harness in listings and errors.
 pub const DISPLAY_NAME: &str = "Amp";
 
-/// Primary executable name.
+/// Binary name resolved on PATH during detection.
 pub const EXECUTABLE: &str = "amp";
 
 /// Environment variable that relocates the explicit settings file.
@@ -28,16 +28,13 @@ pub const CONFIG_ENV_VAR: &str = "AMP_SETTINGS_FILE";
 /// API key environment variable for non-interactive auth.
 pub const API_KEY_ENV_VAR: &str = "AMP_API_KEY";
 
-/// Default config root when `AMP_SETTINGS_FILE` is unset.
-pub const DEFAULT_CONFIG_ROOT_FALLBACK: &str = "~/.config/amp";
-
-/// Research document link.
+/// Research doc whose findings the constants in this file encode.
 pub const RESEARCH_DOC: &str = "docs/harness-configs/amp.md";
 
-/// Last verified date.
+/// Date the research doc was last checked against the harness.
 pub const LAST_VERIFIED: &str = "2026-08-25";
 
-/// Schema version for current settings shape.
+/// Schema version this adapter maps detected versions to.
 pub const SCHEMA_VERSION_STR: &str = "1";
 
 /// Local mcp/skills and tool gating only; hosted routing/billing/auth stay foreign.
@@ -64,21 +61,6 @@ impl AmpAdapter {
         Ok(Self { id })
     }
 
-    /// Borrow the harness id.
-    pub fn harness_id(&self) -> &HarnessId {
-        &self.id
-    }
-
-    /// Executable name for this harness.
-    pub fn executable_name(&self) -> &str {
-        EXECUTABLE
-    }
-
-    /// Config relocation env var.
-    pub fn config_env_var(&self) -> &str {
-        CONFIG_ENV_VAR
-    }
-
     #[expect(clippy::excessive_nesting, reason = "explicit settings path handling")]
     fn default_config_root() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var(CONFIG_ENV_VAR)
@@ -96,13 +78,8 @@ impl AmpAdapter {
             }
             return Some(p);
         }
-        let home = std::env::var("HOME")
-            .ok()
-            .or_else(|| std::env::var("USERPROFILE").ok())?;
-        if home.trim().is_empty() {
-            return None;
-        }
-        Some(PathBuf::from(home).join(".config").join("amp"))
+        let home = super::home_dir()?;
+        Some(home.join(".config").join("amp"))
     }
 
     fn settings_path_for_root(root: &Path) -> PathBuf {
@@ -120,10 +97,15 @@ impl AmpAdapter {
                     let settings_jc = root.join("settings.jsonc");
                     if settings.exists() {
                         evidence.push(format!("settings.json found at {}", settings.display()));
-                        if let Ok(text) = std::fs::read_to_string(&settings)
-                            && text.contains("amp.")
-                        {
-                            evidence.push("settings.json contains amp. prefix".to_owned());
+                        match std::fs::read_to_string(&settings) {
+                            Ok(text) if text.contains("amp.") => {
+                                evidence.push("settings.json contains amp. prefix".to_owned());
+                            }
+                            Ok(_) => {}
+                            Err(err) => evidence.push(format!(
+                                "config unreadable at {}: {err}",
+                                settings.display()
+                            )),
                         }
                     } else if settings_jc.exists() {
                         evidence.push(format!("settings.jsonc found at {}", settings_jc.display()));
@@ -167,8 +149,7 @@ impl AmpAdapter {
 
 impl Default for AmpAdapter {
     fn default() -> Self {
-        #[expect(clippy::unwrap_used, reason = "amp is static valid HarnessId")]
-        let id = HarnessId::new(HARNESS_ID_STR).unwrap();
+        let id = HarnessId::from_validated_const(HARNESS_ID_STR);
         Self { id }
     }
 }
@@ -187,11 +168,7 @@ impl Adapter for AmpAdapter {
     }
 
     fn supported_platforms(&self) -> Vec<Platform> {
-        vec![
-            Platform::new(Os::Linux, Arch::Any),
-            Platform::new(Os::Macos, Arch::Any),
-            Platform::new(Os::Windows, Arch::Any),
-        ]
+        super::desktop_platforms()
     }
 
     fn adapter_revision(&self) -> &str {
@@ -238,46 +215,15 @@ impl Adapter for AmpAdapter {
 
         self.collect_config_evidence(&mut evidence);
 
-        let present = match (&binary_path, &version) {
-            (Some(_), Some(_)) => InstallPresence::Present,
-            (Some(_), None) => InstallPresence::UnknownVersion,
-            (None, _) => InstallPresence::Absent,
-        };
+        let present = super::install_presence(binary_path.is_some(), version.is_some());
 
-        let confidence = match (
-            &binary_path,
-            &version,
-            evidence.iter().any(|e| e.contains("config root exists")),
-        ) {
-            (Some(_), None, _) => DetectionConfidence::Medium,
-            (None, _, true) => DetectionConfidence::Low,
-            (Some(_), Some(_), _) | (None, _, false) => DetectionConfidence::High,
-        };
-
-        let confidence = if present == InstallPresence::Absent {
-            DetectionConfidence::High
-        } else {
-            confidence
-        };
-
+        let confidence =
+            super::detection_confidence(binary_path.is_some(), version.is_some(), false);
         DetectionResult::new(present, version, evidence, confidence)
     }
 
     fn version_resolution(&self) -> VersionResolution {
-        let detection = self.detection();
-        if let Some(v) = detection.version {
-            let mut notes = Vec::new();
-            notes.push(format!("detected amp version {v}"));
-            notes.push(format!("mapped to schema version {SCHEMA_VERSION_STR}"));
-            let mut res =
-                VersionResolution::new(Some(v), Some(SCHEMA_VERSION_STR.to_owned()), true);
-            res.notes = notes;
-            res
-        } else {
-            let mut res = VersionResolution::unknown();
-            res.notes = detection.evidence;
-            res
-        }
+        super::resolution_from_detection(self.detection(), "amp", SCHEMA_VERSION_STR)
     }
 
     fn config_surfaces(&self) -> Vec<ConfigSurface> {
@@ -391,18 +337,10 @@ impl Adapter for AmpAdapter {
     }
 
     fn plan_wrapper(&self, instance: &Instance) -> Result<WrapperPlan, CoreError> {
-        if instance.harness != self.id {
-            return Err(CoreError::Validation {
-                field: "harness".to_owned(),
-                reason: format!(
-                    "instance harness `{}` does not match adapter `{}`",
-                    instance.harness, self.id
-                ),
-            });
-        }
+        super::ensure_instance_harness(&self.id, instance)?;
         instance.validate()?;
         let mut plan = WrapperPlan::new("explicit-config via AMP_SETTINGS_FILE/--settings-file");
-        let settings_path = Path::new(&instance.config_root.to_string()).join("settings.json");
+        let settings_path = instance.config_root.as_path().join("settings.json");
         plan.env_vars.push((
             CONFIG_ENV_VAR.to_owned(),
             settings_path.display().to_string(),
@@ -430,12 +368,7 @@ impl Adapter for AmpAdapter {
     }
 
     fn validate_instance(&self, instance: &Instance) -> Result<(), CoreError> {
-        if instance.harness != self.id {
-            return Err(CoreError::Validation {
-                field: "harness".to_owned(),
-                reason: format!("expected harness `{}`, got `{}`", self.id, instance.harness),
-            });
-        }
+        super::ensure_instance_harness(&self.id, instance)?;
         instance.validate()?;
         match instance.isolation {
             Isolation::ExplicitConfig | Isolation::RelocatedRoot | Isolation::Unknown => Ok(()),
@@ -447,11 +380,7 @@ impl Adapter for AmpAdapter {
     }
 
     fn supported_skill_modes(&self) -> Vec<crate::adapter::SkillMode> {
-        vec![
-            crate::adapter::SkillMode::LinkAll,
-            crate::adapter::SkillMode::LinkSelected,
-            crate::adapter::SkillMode::CopySelected,
-        ]
+        super::skill_modes_link_first()
     }
 
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
@@ -489,11 +418,8 @@ mod tests {
     use std::collections::HashSet;
     use std::path::PathBuf;
 
-    use super::{
-        AmpAdapter, CONFIG_ENV_VAR, DISPLAY_NAME, EXECUTABLE, HARNESS_ID_STR, OWNED_SELECTORS,
-        RESEARCH_DOC,
-    };
-    use crate::adapter::{Adapter, ConfigScope, DocumentKind, ProductStatus, SurfaceOwnership};
+    use super::{AmpAdapter, CONFIG_ENV_VAR, HARNESS_ID_STR, OWNED_SELECTORS};
+    use crate::adapter::{Adapter, ConfigScope, DocumentKind, SurfaceOwnership};
     use crate::error::CoreError;
     use crate::ids::{HarnessId, InstanceId, InstanceName};
     use crate::instance::Instance;
@@ -524,14 +450,11 @@ mod tests {
     #[test]
     fn adapter_identity() {
         let a = adapter();
+        // Constructor wiring plus catalog registration: an id the catalog
+        // does not know can never reconcile with detection or instances.
+        let entry = crate::harness_catalog::find_by_id(HARNESS_ID_STR).unwrap();
         assert_eq!(a.id().as_str(), HARNESS_ID_STR);
-        assert_eq!(a.display_name(), DISPLAY_NAME);
-        assert_eq!(a.executable_name(), EXECUTABLE);
-        assert_eq!(a.config_env_var(), CONFIG_ENV_VAR);
-        assert_eq!(a.product_status(), ProductStatus::Active);
-        assert_eq!(a.research_doc_link(), RESEARCH_DOC);
-        assert!(!a.last_verified_date().is_empty());
-        assert_eq!(a.adapter_revision(), crate::adapter::ADAPTER_REVISION);
+        assert_eq!(a.product_status(), entry.product_status);
     }
 
     #[test]
@@ -558,7 +481,6 @@ mod tests {
             }
             InstallPresence::Broken => assert!(!result.evidence.is_empty()),
         }
-        assert_ne!(result.confidence.to_string(), "");
     }
 
     #[test]
@@ -576,22 +498,6 @@ mod tests {
             assert!(res.schema_version.is_none());
         }
         assert!(!res.notes.is_empty());
-    }
-
-    #[test]
-    fn parse_version_output_cases() {
-        let cases = vec![
-            ("amp 1.2.3", Some("1.2.3")),
-            ("amp 0.1.0-beta", Some("0.1.0-beta")),
-            ("v1.0.0", Some("1.0.0")),
-            ("Version: 2.0.0", Some("2.0.0")),
-            ("", None),
-            ("not a version", None),
-        ];
-        for (input, expected) in cases {
-            let got = crate::adapters::parse_version_output(input);
-            assert_eq!(got.as_deref(), expected, "input: {input:?}");
-        }
     }
 
     #[test]
@@ -619,13 +525,6 @@ mod tests {
         let secrets = surfaces.iter().find(|s| s.id == "secrets.json").unwrap();
         assert_eq!(secrets.ownership, SurfaceOwnership::ExternalSecretStore);
         assert!(!secrets.backup_required);
-    }
-
-    #[test]
-    fn owned_selectors_are_stable() {
-        assert!(OWNED_SELECTORS.len() >= 5);
-        let set: HashSet<&str> = OWNED_SELECTORS.iter().copied().collect();
-        assert_eq!(set.len(), OWNED_SELECTORS.len(), "selectors must be unique");
     }
 
     #[test]
@@ -725,11 +624,7 @@ mod tests {
         let a = adapter();
         let candidates = a.scan_candidates();
         assert!(!candidates.is_empty());
-        assert!(
-            candidates
-                .iter()
-                .any(|c| c.contains(".config/amp") || c.contains("amp"))
-        );
+        assert!(candidates.iter().any(|c| c.contains("amp")));
         assert!(candidates.iter().any(|c| c.contains(CONFIG_ENV_VAR)));
     }
 

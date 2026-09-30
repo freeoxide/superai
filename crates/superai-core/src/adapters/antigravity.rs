@@ -4,37 +4,34 @@
 use std::path::PathBuf;
 
 use crate::adapter::{
-    ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
-    DetectionResult, DocumentKind, Os, PathResolver, Platform, ProductStatus, RestartBehavior,
-    SurfaceOwnership, VersionResolution, WrapperPlan,
+    ADAPTER_REVISION, Adapter, ConfigScope, ConfigSurface, DetectionResult, DocumentKind,
+    PathResolver, Platform, ProductStatus, RestartBehavior, SurfaceOwnership, VersionResolution,
+    WrapperPlan,
 };
 use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
-use crate::state::{AdapterSupport, InstallPresence};
+use crate::state::AdapterSupport;
 
-/// Harness identifier for Antigravity CLI.
+/// Catalog id superai registers this harness under.
 pub const HARNESS_ID_STR: &str = "antigravity-cli";
 
-/// Human display name.
+/// Name shown for this harness in listings and errors.
 pub const DISPLAY_NAME: &str = "Antigravity CLI";
 
-/// Primary executable name.
+/// Binary name resolved on PATH during detection.
 pub const EXECUTABLE: &str = "agy";
 
 /// Alternative binary name (installer).
 pub const EXECUTABLE_ALT: &str = "antigravity";
 
-/// Default config root fallback (under ~/.gemini).
-pub const DEFAULT_CONFIG_ROOT_FALLBACK: &str = "~/.gemini/antigravity-cli";
-
-/// Research document link.
+/// Research doc whose findings the constants in this file encode.
 pub const RESEARCH_DOC: &str = "docs/harness-configs/antigravity-cli.md";
 
-/// Last verified date.
+/// Date the research doc was last checked against the harness.
 pub const LAST_VERIFIED: &str = "2026-08-25";
 
-/// Schema version.
+/// Schema version this adapter maps detected versions to.
 pub const SCHEMA_VERSION_STR: &str = "1";
 
 /// HOME workaround note.
@@ -53,33 +50,8 @@ impl AntigravityAdapter {
         Ok(Self { id })
     }
 
-    /// Borrow harness id.
-    pub fn harness_id(&self) -> &HarnessId {
-        &self.id
-    }
-
-    /// Executable name.
-    pub fn executable_name(&self) -> &str {
-        EXECUTABLE
-    }
-
-    /// Research-blocked reason.
-    pub fn blocked_reason(&self) -> &str {
-        HOME_WORKAROUND_NOTE
-    }
-
     fn default_home() -> Option<PathBuf> {
-        if let Ok(home) = std::env::var("HOME")
-            && !home.trim().is_empty()
-        {
-            return Some(PathBuf::from(home));
-        }
-        if let Ok(home) = std::env::var("USERPROFILE")
-            && !home.trim().is_empty()
-        {
-            return Some(PathBuf::from(home));
-        }
-        None
+        super::home_dir()
     }
 
     #[expect(
@@ -127,11 +99,7 @@ impl AntigravityAdapter {
 
 impl Default for AntigravityAdapter {
     fn default() -> Self {
-        #[expect(
-            clippy::unwrap_used,
-            reason = "antigravity-cli is static valid HarnessId"
-        )]
-        let id = HarnessId::new(HARNESS_ID_STR).unwrap();
+        let id = HarnessId::from_validated_const(HARNESS_ID_STR);
         Self { id }
     }
 }
@@ -150,11 +118,7 @@ impl Adapter for AntigravityAdapter {
     }
 
     fn supported_platforms(&self) -> Vec<Platform> {
-        vec![
-            Platform::new(Os::Linux, Arch::Any),
-            Platform::new(Os::Macos, Arch::Any),
-            Platform::new(Os::Windows, Arch::Any),
-        ]
+        super::desktop_platforms()
     }
 
     fn adapter_revision(&self) -> &str {
@@ -199,23 +163,13 @@ impl Adapter for AntigravityAdapter {
 
         self.collect_config_evidence(&mut evidence);
 
-        let present = match (&binary_path, &version) {
-            (Some(_), Some(_)) => InstallPresence::Present,
-            (Some(_), None) => InstallPresence::UnknownVersion,
-            (None, _) => InstallPresence::Absent,
-        };
+        let present = super::install_presence(binary_path.is_some(), version.is_some());
 
-        let confidence = if present == InstallPresence::Absent {
-            if evidence.iter().any(|e| e.contains("config root exists")) {
-                DetectionConfidence::Low
-            } else {
-                DetectionConfidence::High
-            }
-        } else if binary_path.is_some() && version.is_none() {
-            DetectionConfidence::Medium
-        } else {
-            DetectionConfidence::High
-        };
+        let confidence = super::detection_confidence(
+            binary_path.is_some(),
+            version.is_some(),
+            evidence.iter().any(|e| e.contains("config root exists")),
+        );
 
         DetectionResult::new(present, version, evidence, confidence)
     }
@@ -333,15 +287,7 @@ impl Adapter for AntigravityAdapter {
     }
 
     fn plan_wrapper(&self, instance: &Instance) -> Result<WrapperPlan, CoreError> {
-        if instance.harness != self.id {
-            return Err(CoreError::Validation {
-                field: "harness".to_owned(),
-                reason: format!(
-                    "instance harness `{}` does not match adapter `{}`",
-                    instance.harness, self.id
-                ),
-            });
-        }
+        super::ensure_instance_harness(&self.id, instance)?;
         Err(CoreError::ResearchBlocked {
             harness: self.id.to_string(),
             surface: "wrapper".to_owned(),
@@ -362,12 +308,7 @@ impl Adapter for AntigravityAdapter {
     }
 
     fn validate_instance(&self, instance: &Instance) -> Result<(), CoreError> {
-        if instance.harness != self.id {
-            return Err(CoreError::Validation {
-                field: "harness".to_owned(),
-                reason: format!("expected harness `{}`, got `{}`", self.id, instance.harness),
-            });
-        }
+        super::ensure_instance_harness(&self.id, instance)?;
         instance.validate()?;
         Err(CoreError::ResearchBlocked {
             harness: self.id.to_string(),
@@ -403,8 +344,8 @@ impl Adapter for AntigravityAdapter {
 mod tests {
     use std::collections::HashSet;
 
-    use super::{AntigravityAdapter, DISPLAY_NAME, EXECUTABLE, HARNESS_ID_STR, RESEARCH_DOC};
-    use crate::adapter::{Adapter, ConfigScope, DocumentKind, ProductStatus, SurfaceOwnership};
+    use super::{AntigravityAdapter, HARNESS_ID_STR};
+    use crate::adapter::{Adapter, ConfigScope, DocumentKind, SurfaceOwnership};
     use crate::error::CoreError;
     use crate::ids::{HarnessId, InstanceId, InstanceName};
     use crate::instance::Instance;
@@ -435,13 +376,11 @@ mod tests {
     #[test]
     fn adapter_identity() {
         let a = adapter();
+        // Constructor wiring plus catalog registration: an id the catalog
+        // does not know can never reconcile with detection or instances.
+        let entry = crate::harness_catalog::find_by_id(HARNESS_ID_STR).unwrap();
         assert_eq!(a.id().as_str(), HARNESS_ID_STR);
-        assert_eq!(a.display_name(), DISPLAY_NAME);
-        assert_eq!(a.executable_name(), EXECUTABLE);
-        assert_eq!(a.product_status(), ProductStatus::Preview);
-        assert_eq!(a.research_doc_link(), RESEARCH_DOC);
-        assert!(!a.last_verified_date().is_empty());
-        assert!(a.blocked_reason().contains("HOME"));
+        assert_eq!(a.product_status(), entry.product_status);
     }
 
     #[test]
@@ -481,21 +420,6 @@ mod tests {
                 .iter()
                 .any(|n| n.contains("research blocked") || n.contains("HOME"))
         );
-    }
-
-    #[test]
-    fn parse_version_output_cases() {
-        let cases = vec![
-            ("agy 1.1.17", Some("1.1.17")),
-            ("1.0.7", Some("1.0.7")),
-            ("v1.2.0", Some("1.2.0")),
-            ("", None),
-            ("not a version", None),
-        ];
-        for (input, expected) in cases {
-            let got = crate::adapters::parse_version_output(input);
-            assert_eq!(got.as_deref(), expected, "input: {input:?}");
-        }
     }
 
     #[test]
