@@ -127,12 +127,22 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # Pinned to the version the cache and local baselines were built with; an unpinned install drifts (cargo-shear broke this way).
       - run: cargo install cargo-mutants --version 27.1.0 --locked
-      - name: Mutation tests (scoped baseline)
-        run: cargo mutants --output mutants.out --jobs 4 --no-times
+      - name: Diff against master (PRs)
+        if: github.event_name == 'pull_request'
+        run: git diff origin/master...HEAD > pr.diff
+      - name: Mutation tests (PR-scoped)
+        if: github.event_name == 'pull_request'
+        run: cargo mutants --output mutants.out --jobs 4 --no-times --baseline=skip --in-diff pr.diff
+      # Master pushes keep the full set as the score's baseline trend.
+      - name: Mutation tests (full set)
+        if: github.event_name != 'pull_request'
+        run: cargo mutants --output mutants.out --jobs 4 --no-times --baseline=skip
       - name: Mutation score summary
         if: always()
         run: |
