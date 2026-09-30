@@ -727,6 +727,22 @@ mod tests {
     use super::*;
     use crate::document::strip_jsonc_comments;
 
+    #[test]
+    fn backup_id_string_conversions_preserve_the_recorded_text() {
+        assert_eq!(
+            BackupId::new("1700000000000-ab12cd34").into_string(),
+            "1700000000000-ab12cd34"
+        );
+        assert_eq!(
+            String::from(BackupId::new("1700000000000-ab12cd34")),
+            "1700000000000-ab12cd34"
+        );
+        assert_eq!(
+            BackupId::new("1700000000000-ab12cd34").as_str(),
+            "1700000000000-ab12cd34"
+        );
+    }
+
     fn scratch(name: &str) -> PathBuf {
         let dir = crate::test_util::temp_dir_unique("config-backup");
         std::fs::create_dir_all(&dir).unwrap();
