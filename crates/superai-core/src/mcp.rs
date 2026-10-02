@@ -708,6 +708,41 @@ fn inner_entries(outer: &Value, decl: &McpAdapterDecl) -> BTreeMap<String, Value
     out
 }
 
+fn owned_entry<'a>(outer: &'a Value, decl: &McpAdapterDecl, id: &str) -> Option<&'a Value> {
+    let container = navigate_dotted(outer, &decl.dest_key)?;
+    match &decl.shape {
+        crate::adapter::McpDestShape::NameMap => container.as_object().and_then(|m| m.get(id)),
+        crate::adapter::McpDestShape::IdentityList { key } => container.as_array().and_then(|a| {
+            a.iter()
+                .find(|item| item.get(key).and_then(Value::as_str) == Some(id))
+        }),
+    }
+}
+
+fn inner_keys<'a>(outer: &'a Value, decl: &McpAdapterDecl) -> std::collections::BTreeSet<&'a str> {
+    let mut out = std::collections::BTreeSet::new();
+    let Some(container) = navigate_dotted(outer, &decl.dest_key) else {
+        return out;
+    };
+    match &decl.shape {
+        crate::adapter::McpDestShape::NameMap => {
+            if let Some(map) = container.as_object() {
+                out.extend(map.keys().map(String::as_str));
+            }
+        }
+        crate::adapter::McpDestShape::IdentityList { key } => {
+            if let Some(arr) = container.as_array() {
+                for item in arr {
+                    if let Some(id) = item.get(key).and_then(Value::as_str) {
+                        out.insert(id);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 /// A single owned-server mutation to stage (EXT-09 per-entry writes keep
 /// foreign servers and their lexical presentation untouched).
 #[derive(Debug, Clone, PartialEq)]
@@ -716,16 +751,12 @@ enum ServerWrite {
     Remove,
 }
 
-/// Commit `bytes` through the compensated transaction: backup, atomic
-/// write, read-back parse verification (EXT-07/EXT-10).
-fn commit_document(path: &Path, kind: DocumentKind, bytes: Vec<u8>) -> Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut steps: Vec<superai_config::transaction::FileAction> = Vec::new();
-    if !parent.as_os_str().is_empty() && !parent.exists() {
-        steps.push(superai_config::transaction::FileAction::CreateDir {
-            path: parent.to_path_buf(),
-        });
-    }
+fn commit_document(
+    path: &Path,
+    kind: DocumentKind,
+    bytes: &[u8],
+    expected: &superai_config::snapshot::Snapshot,
+) -> Result<()> {
     let engine_kind = match kind {
         DocumentKind::Json => superai_config::document::DocumentKind::StrictJson,
         DocumentKind::Jsonc => superai_config::document::DocumentKind::JsonC,
@@ -739,12 +770,13 @@ fn commit_document(path: &Path, kind: DocumentKind, bytes: Vec<u8>) -> Result<()
             });
         }
     };
-    steps.push(superai_config::transaction::FileAction::Write {
-        path: path.to_path_buf(),
-        content: bytes,
-        kind: engine_kind,
-    });
-    let snap_before = superai_config::snapshot::snapshot(path);
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    if !parent.as_os_str().is_empty() && !parent.exists() {
+        std::fs::create_dir_all(parent).map_err(|e| CoreError::Commit {
+            path: path.to_path_buf(),
+            reason: format!("create parent {}: {e}", parent.display()),
+        })?;
+    }
     let file_label = path
         .file_name()
         .map_or_else(|| "config".to_owned(), |n| n.to_string_lossy().to_string());
@@ -755,37 +787,32 @@ fn commit_document(path: &Path, kind: DocumentKind, bytes: Vec<u8>) -> Result<()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_millis())
     );
-    let op_id = superai_config::transaction::OperationId::new(&op_id_str).map_err(|e| {
-        CoreError::Validation {
-            field: "operation_id".to_owned(),
-            reason: format!("invalid operation id: {e}"),
-        }
-    })?;
-    let mut txn = superai_config::transaction::Transaction::new(op_id, steps);
-    txn.validate_plan().map_err(|e| CoreError::Validation {
-        field: "mcp_transaction".to_owned(),
-        reason: format!("transaction plan invalid: {e}"),
-    })?;
-    let outcome = txn.execute().map_err(|e| CoreError::Commit {
-        path: path.to_path_buf(),
-        reason: format!("transaction failed: {e}"),
-    })?;
-    if !outcome.success {
-        let diag = outcome.diagnostics_redacted.join("; ");
-        if diag.contains("modified") || diag.contains("concurrent") {
-            let snap_after = superai_config::snapshot::snapshot(path);
-            let exp = snap_before.digest.unwrap_or_else(|| "missing".to_owned());
-            let act = snap_after.digest.unwrap_or_else(|| "missing".to_owned());
+    let commit = superai_config::transaction::commit_file_expecting(
+        &op_id_str,
+        path,
+        bytes,
+        engine_kind,
+        Some(expected),
+    );
+    match commit {
+        Ok(_) => {}
+        Err(superai_config::ConfigError::ConcurrentModification {
+            path,
+            expected,
+            actual,
+        }) => {
             return Err(CoreError::ConcurrentModification {
-                path: path.to_path_buf(),
-                expected: exp,
-                actual: act,
+                path,
+                expected,
+                actual,
             });
         }
-        return Err(CoreError::Commit {
-            path: path.to_path_buf(),
-            reason: format!("mcp commit failed: {diag}"),
-        });
+        Err(e) => {
+            return Err(CoreError::Commit {
+                path: path.to_path_buf(),
+                reason: format!("transaction failed: {e}"),
+            });
+        }
     }
     read_outer_value(path, kind).map_err(|e| CoreError::Verification {
         path: path.to_path_buf(),
@@ -795,13 +822,25 @@ fn commit_document(path: &Path, kind: DocumentKind, bytes: Vec<u8>) -> Result<()
     Ok(())
 }
 
-/// Write one owned server entry, preserving every other key, server, and
-/// (for TOML) comment/decor in the destination (EXT-09).
+struct DestRead {
+    outer: Value,
+    snap: superai_config::snapshot::Snapshot,
+}
+
+fn read_dest(path: &Path, decl: &McpAdapterDecl) -> Result<DestRead> {
+    // The snapshot must precede the parse: swapped, a change landing between
+    // the two would pass the token check while the write base predates it.
+    let snap = superai_config::snapshot::snapshot(path);
+    let outer = read_outer_value(path, decl.kind)?;
+    Ok(DestRead { outer, snap })
+}
+
 fn write_server_entry(
     path: &Path,
     decl: &McpAdapterDecl,
     id: &str,
     write: &ServerWrite,
+    base: Option<&DestRead>,
 ) -> Result<()> {
     if let Some(reason) = &decl.read_only {
         return Err(CoreError::UnsupportedOperation {
@@ -824,8 +863,22 @@ fn write_server_entry(
         }));
     }
     match (decl.kind, &decl.shape) {
-        (DocumentKind::Json, shape) => write_json_server(path, decl, id, write, shape),
-        (DocumentKind::Toml, shape) => write_toml_server(path, decl, id, write, shape),
+        (DocumentKind::Json, shape) => {
+            let base = if let Some(base) = base {
+                base
+            } else {
+                &read_dest(path, decl)?
+            };
+            write_json_server(path, decl, id, write, shape, base)
+        }
+        (DocumentKind::Toml, shape) => {
+            let snap = if let Some(base) = base {
+                base.snap.clone()
+            } else {
+                superai_config::snapshot::snapshot(path)
+            };
+            write_toml_server(path, decl, id, write, shape, &snap)
+        }
         (other, _) => Err(CoreError::UnsupportedOperation {
             harness: "mcp".to_owned(),
             operation: format!("write `{}` entry `{id}`", decl.dest_key),
@@ -935,21 +988,21 @@ fn apply_json_server_write(
     Ok(())
 }
 
-/// Write one server entry into a JSON destination (foreign keys preserved).
 fn write_json_server(
     path: &Path,
     decl: &McpAdapterDecl,
     id: &str,
     write: &ServerWrite,
     shape: &crate::adapter::McpDestShape,
+    base: &DestRead,
 ) -> Result<()> {
-    let mut outer = read_outer_value(path, decl.kind)?;
+    let mut outer = base.outer.clone();
     apply_json_server_write(&mut outer, decl, id, write, shape)?;
     let bytes = serde_json::to_vec_pretty(&outer).map_err(|e| CoreError::Validation {
         field: "mcp_config".to_owned(),
         reason: format!("serialize failed: {e}"),
     })?;
-    commit_document(path, decl.kind, bytes)
+    commit_document(path, decl.kind, &bytes, &base.snap)
 }
 
 /// Convert a server entry to a TOML table; sub-tables become
@@ -1016,6 +1069,7 @@ fn write_toml_server(
     id: &str,
     write: &ServerWrite,
     shape: &crate::adapter::McpDestShape,
+    expected: &superai_config::snapshot::Snapshot,
 ) -> Result<()> {
     let mut doc = superai_config::toml_file::load(path)?;
     let schema_err = |msg: String| CoreError::SchemaValidation {
@@ -1087,7 +1141,8 @@ fn write_toml_server(
             }
         }
     }
-    commit_document(path, decl.kind, doc.to_string().into_bytes())
+    let bytes = doc.to_string().into_bytes();
+    commit_document(path, decl.kind, &bytes, expected)
 }
 
 /// One destination scan: parseable servers keyed by id, plus `(key, reason)`
@@ -1149,21 +1204,21 @@ pub fn preview_install(
     server: &McpServerDef,
 ) -> Result<McpInstallPreview> {
     server.validate()?;
-    let (_outer, inner) = read_outer_and_inner(path, decl)?;
-    preview_from_inner(server, &inner)
+    let outer = read_outer_value(path, decl.kind)?;
+    preview_from_base(server, &outer, decl)
 }
 
-fn preview_from_inner(
+fn preview_from_base(
     server: &McpServerDef,
-    inner: &BTreeMap<String, Value>,
+    outer: &Value,
+    decl: &McpAdapterDecl,
 ) -> Result<McpInstallPreview> {
-    let existing = inner
-        .get(server.id.as_str())
+    let existing = owned_entry(outer, decl, server.id.as_str())
         .map(|v| from_native_value(server.id.as_str(), v))
         .transpose()?;
     let is_update = existing.is_some();
     let mut conflicts: Vec<String> = Vec::new();
-    for existing_key in inner.keys() {
+    for existing_key in inner_keys(outer, decl) {
         if existing_key.to_lowercase() == server.id.as_str().to_lowercase()
             && existing_key != server.id.as_str()
         {
@@ -1223,8 +1278,8 @@ pub fn install_mcp_server(
     server: &McpServerDef,
 ) -> Result<McpServerDef> {
     server.validate()?;
-    let (_outer, inner) = read_outer_and_inner(path, decl)?;
-    let preview = preview_from_inner(server, &inner)?;
+    let dest = read_dest(path, decl)?;
+    let preview = preview_from_base(server, &dest.outer, decl)?;
     if !preview.can_auto_apply {
         return Err(CoreError::NameCollision {
             kind: "McpServerId".to_owned(),
@@ -1237,9 +1292,15 @@ pub fn install_mcp_server(
     {
         return Ok(server.clone());
     }
-    let existing_native = inner.get(server.id.as_str());
+    let existing_native = owned_entry(&dest.outer, decl, server.id.as_str());
     let merged = merge_server_native(existing_native, &to_native_value(server));
-    write_server_entry(path, decl, server.id.as_str(), &ServerWrite::Upsert(merged))?;
+    write_server_entry(
+        path,
+        decl,
+        server.id.as_str(),
+        &ServerWrite::Upsert(merged),
+        Some(&dest),
+    )?;
     Ok(server.clone())
 }
 
@@ -1250,9 +1311,8 @@ pub fn set_mcp_enabled(
     id: &McpServerId,
     enabled: bool,
 ) -> Result<McpServerDef> {
-    let (_outer, inner) = read_outer_and_inner(path, decl)?;
-    let val = inner
-        .get(id.as_str())
+    let dest = read_dest(path, decl)?;
+    let val = owned_entry(&dest.outer, decl, id.as_str())
         .cloned()
         .ok_or_else(|| CoreError::Validation {
             field: "mcp.id".to_owned(),
@@ -1261,8 +1321,17 @@ pub fn set_mcp_enabled(
     let mut def = from_native_value(id.as_str(), &val)?;
     def.disabled = !enabled;
     def.validate()?;
-    let merged = merge_server_native(inner.get(id.as_str()), &to_native_value(&def));
-    write_server_entry(path, decl, id.as_str(), &ServerWrite::Upsert(merged))?;
+    let merged = merge_server_native(
+        owned_entry(&dest.outer, decl, id.as_str()),
+        &to_native_value(&def),
+    );
+    write_server_entry(
+        path,
+        decl,
+        id.as_str(),
+        &ServerWrite::Upsert(merged),
+        Some(&dest),
+    )?;
     Ok(def)
 }
 
@@ -1273,13 +1342,13 @@ pub fn remove_mcp_server(
     decl: &McpAdapterDecl,
     id: &McpServerId,
 ) -> Result<Option<McpServerDef>> {
-    let (_outer, inner) = read_outer_and_inner(path, decl)?;
-    let existing_val = match inner.get(id.as_str()) {
+    let dest = read_dest(path, decl)?;
+    let existing_val = match owned_entry(&dest.outer, decl, id.as_str()) {
         Some(v) => v.clone(),
         None => return Ok(None),
     };
     let def = from_native_value(id.as_str(), &existing_val)?;
-    write_server_entry(path, decl, id.as_str(), &ServerWrite::Remove)?;
+    write_server_entry(path, decl, id.as_str(), &ServerWrite::Remove, Some(&dest))?;
     Ok(Some(def))
 }
 
@@ -1355,10 +1424,9 @@ pub fn preview_scope_transfer(
     id: &McpServerId,
     action: ScopeTransfer,
 ) -> Result<McpScopeTransferPreview> {
-    let (_src_outer, src_inner) = read_outer_and_inner(source_path, source_decl)?;
-    let source_val = src_inner
-        .get(id.as_str())
-        .ok_or_else(|| CoreError::Validation {
+    let src_outer = read_outer_value(source_path, source_decl.kind)?;
+    let source_val =
+        owned_entry(&src_outer, source_decl, id.as_str()).ok_or_else(|| CoreError::Validation {
             field: "mcp.id".to_owned(),
             reason: format!(
                 "mcp server `{id}` not found at source {}",
@@ -1366,9 +1434,8 @@ pub fn preview_scope_transfer(
             ),
         })?;
     let source_existing = from_native_value(id.as_str(), source_val)?;
-    let (_dst_outer, dst_inner) = read_outer_and_inner(dest_path, dest_decl)?;
-    let dest_existing = dst_inner
-        .get(id.as_str())
+    let dst_outer = read_outer_value(dest_path, dest_decl.kind)?;
+    let dest_existing = owned_entry(&dst_outer, dest_decl, id.as_str())
         .map(|v| from_native_value(id.as_str(), v))
         .transpose()?;
 
@@ -1425,7 +1492,13 @@ pub fn transfer_between_scopes(
         && *dest == preview.source_existing
     {
         if action == ScopeTransfer::Move {
-            write_server_entry(source_path, source_decl, id.as_str(), &ServerWrite::Remove)?;
+            write_server_entry(
+                source_path,
+                source_decl,
+                id.as_str(),
+                &ServerWrite::Remove,
+                None,
+            )?;
         }
         return Ok(Some(preview.source_existing));
     }
@@ -1435,9 +1508,16 @@ pub fn transfer_between_scopes(
         dest_decl,
         id.as_str(),
         &ServerWrite::Upsert(merged),
+        None,
     )?;
     if action == ScopeTransfer::Move {
-        write_server_entry(source_path, source_decl, id.as_str(), &ServerWrite::Remove)?;
+        write_server_entry(
+            source_path,
+            source_decl,
+            id.as_str(),
+            &ServerWrite::Remove,
+            None,
+        )?;
     }
     Ok(Some(preview.source_existing))
 }
@@ -1574,10 +1654,12 @@ pub fn bulk_plan(targets: &[BulkTarget], action: &BulkAction) -> BulkPlan {
         let mut expected = None;
         if unsupported_reason.is_none() {
             if dest_path.exists() {
-                expected = Some(superai_config::snapshot::snapshot(&dest_path));
-                match read_outer_and_inner(&dest_path, &decl) {
-                    Ok((_outer, inner)) => {
-                        if let Some(v) = inner.get(action.server_id().as_str()) {
+                match read_dest(&dest_path, &decl) {
+                    Ok(dest) => {
+                        expected = Some(dest.snap);
+                        if let Some(v) =
+                            owned_entry(&dest.outer, &decl, action.server_id().as_str())
+                        {
                             match from_native_value(action.server_id().as_str(), v) {
                                 Ok(def) => existing = Some(def),
                                 Err(e) => conflicts.push(format!(
@@ -1593,7 +1675,7 @@ pub fn bulk_plan(targets: &[BulkTarget], action: &BulkAction) -> BulkPlan {
                             ));
                         }
                         if let BulkAction::InstallMcpServer { server } = action {
-                            for key in inner.keys() {
+                            for key in inner_keys(&dest.outer, &decl) {
                                 if key.to_lowercase() == server.id.as_str().to_lowercase()
                                     && key != server.id.as_str()
                                 {
@@ -2073,7 +2155,6 @@ mod tests {
             server.validate().is_err(),
             "shell in args should be rejected"
         );
-        // disabled round-trip
         server.args = vec!["good".to_owned()];
         server.disabled = true;
         server.validate().unwrap();
