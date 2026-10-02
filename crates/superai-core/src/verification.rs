@@ -1272,16 +1272,12 @@ mod tests {
         };
         let r = superai_config::quarantine::validate_quarantine_target(&fs_root);
         assert!(r.is_err(), "broad root {fs_root:?} should be rejected");
-        // home dir must be rejected
         if let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
             && home.is_absolute()
         {
-            // only test if path exists or not, validate checks equality before existence for home
             let r = superai_config::quarantine::validate_quarantine_target(&home);
-            // home may not exist in temp HOME override, but still should be rejected as broad root/home
             assert!(r.is_err(), "home {} should be rejected", home.display());
         }
-        // globs must be rejected before existence check
         let tmp = crate::test_util::tmp_abs("mutant-glob");
         for p in [
             tmp.join("*.json"),
@@ -1292,7 +1288,6 @@ mod tests {
             let r = superai_config::quarantine::validate_quarantine_target(&p);
             assert!(r.is_err(), "glob {p:?} should be rejected");
         }
-        // unresolved variables must be rejected
         for p in [
             tmp.join("$HOME/foo"),
             tmp.join("%USERPROFILE%/bar"),
@@ -1301,7 +1296,6 @@ mod tests {
             let r = superai_config::quarantine::validate_quarantine_target(&p);
             assert!(r.is_err(), "var {p:?} should be rejected");
         }
-        // relative and traversal must be rejected
         assert!(
             superai_config::quarantine::validate_quarantine_target(Path::new("relative/path"))
                 .is_err(),

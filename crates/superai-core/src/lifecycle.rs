@@ -1,8 +1,6 @@
 //! Instance lifecycle orchestration (INS-01..09): inspect, create, rename,
 //! reconfigure, detach, remove, repair; the registry record commits last.
 
-// Preview and commit arms mirror each other per action kind, so the nested
-// guards are deliberate; flattening would interleave unrelated branches.
 #![expect(
     clippy::excessive_nesting,
     reason = "preview and commit arms mirror each other per action kind"
@@ -1619,7 +1617,6 @@ fn preflight_create(
         }
     }
 
-    // Source must exist and be readable.
     let src_snapshot = snapshot(source_root);
     preconditions.push(Precondition {
         kind: PreconditionKind::Exists,
@@ -1645,7 +1642,6 @@ fn preflight_create(
         });
     }
 
-    // Target must be absent, or empty, or already owned.
     let tgt_snapshot = snapshot(target_root);
     if tgt_snapshot.exists {
         let is_empty = if tgt_snapshot.is_dir {
