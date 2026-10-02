@@ -485,7 +485,9 @@ fn formatting_change_warnings(
     .collect()
 }
 
-fn lexical_diff(old: &[u8], new: &[u8]) -> String {
+/// Unified-diff preview of two buffers, capped at 8 KiB of output; binary
+/// input yields a size/digest summary instead of content.
+pub fn lexical_diff(old: &[u8], new: &[u8]) -> String {
     if old == new {
         return String::new();
     }

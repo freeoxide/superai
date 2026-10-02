@@ -11,6 +11,11 @@ publish = false
 repository.workspace = true
 description = "Layer 1: per-harness config files — read fresh, edit, back up, write back preserving unmodelled keys."
 
+# cargo bench must run only the criterion target; the lib's unittest
+# harness would otherwise receive criterion-only flags like --save-baseline.
+[lib]
+bench = false
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -18,5 +23,12 @@ toml_edit = { workspace = true }
 thiserror = { workspace = true }
 yaml-serde = { workspace = true }
 
+[dev-dependencies]
+criterion = { workspace = true }
+
 [lints]
 workspace = true
+
+[[bench]]
+name = "hot_lanes"
+harness = false

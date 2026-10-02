@@ -760,11 +760,7 @@ pub(crate) fn resolve_dotted<'a>(value: &'a Value, path: &str) -> Option<&'a Val
 
 /// Parse-check `bytes` as `kind` (staging and restore verification);
 /// env lines must be blank, comments, or `KEY=VALUE`.
-pub(crate) fn validate_bytes_for_kind(
-    content: &[u8],
-    kind: DocumentKind,
-    path: &Path,
-) -> Result<()> {
+pub fn validate_bytes_for_kind(content: &[u8], kind: DocumentKind, path: &Path) -> Result<()> {
     match kind {
         DocumentKind::StrictJson => {
             std::str::from_utf8(content).map_err(|_err| {
@@ -928,6 +924,32 @@ mod tests {
             .join(name)
             .to_string_lossy()
             .into_owned()
+    }
+
+    #[test]
+    fn strip_jsonc_comments_pins_line_comment_cr_bytes() {
+        // The line-comment loop breaks only on '\n', so the CR of a CRLF
+        // inside a comment is swallowed while the LF survives; a lone CR is
+        // eaten as comment bytes too.
+        assert_eq!(
+            strip_jsonc_comments("{\r\n  // note\r\n  \"a\": 1\r\n}\r\n"),
+            "{\r\n  \n  \"a\": 1\r\n}\r\n"
+        );
+        assert_eq!(
+            strip_jsonc_comments("{\"a\": 1 // tail\r\n}"),
+            "{\"a\": 1 \n}"
+        );
+        assert_eq!(strip_jsonc_comments("// a\rb\nz"), "\nz");
+    }
+
+    #[test]
+    fn strip_jsonc_comments_pins_block_comment_deletion_bytes() {
+        // Block comments are deleted with no replacement byte.
+        assert_eq!(strip_jsonc_comments("{\"a\"/* gone */: 1}"), "{\"a\": 1}");
+        assert_eq!(
+            strip_jsonc_comments("[ 1, /* multi\nline */ 2 ]"),
+            "[ 1,  2 ]"
+        );
     }
 
     #[test]

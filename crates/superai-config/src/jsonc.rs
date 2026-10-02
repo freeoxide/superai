@@ -49,7 +49,7 @@ fn strip_trailing_commas(input: &str) -> String {
 }
 
 /// Strip JSONC extensions (comments + trailing commas) to produce strict JSON.
-pub(crate) fn strip_jsonc(input: &str) -> String {
+pub fn strip_jsonc(input: &str) -> String {
     strip_trailing_commas(&crate::document::strip_jsonc_comments(input))
 }
 
