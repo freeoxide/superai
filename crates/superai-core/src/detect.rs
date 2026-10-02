@@ -254,33 +254,14 @@ pub fn detect_all_for_entry(entry: &InstallCatalogEntry, opts: &DetectOptions) -
     let path_dirs = opts.resolve_path_dirs();
     let home = opts.resolve_home();
 
-    let (configured, path_hits, mise_shims, mise_managed, brew, npm, cargo, pipx, uv, system, apps) =
-        std::thread::scope(|scope| {
-            let configured = scope.spawn(|| configured_binary_detections(entry, opts));
-            let path_hits = scope.spawn(|| path_detections(entry, &path_dirs, opts, home.as_ref()));
-            let mise_shims = scope.spawn(|| mise_shim_detections(entry, home.as_ref(), opts));
-            let mise_managed = scope.spawn(|| mise_managed_detections(entry, home.as_ref(), opts));
-            let brew = scope.spawn(|| brew_detections(entry, opts));
-            let npm = scope.spawn(|| npm_detections(entry, opts));
-            let cargo = scope.spawn(|| cargo_detections(entry, opts));
-            let pipx = scope.spawn(|| pipx_detections(entry, opts));
-            let uv = scope.spawn(|| uv_detections(entry, opts));
-            let system = scope.spawn(|| system_detections(entry, opts));
-            let apps = scope.spawn(|| app_detections(entry, opts));
-            (
-                join_probe(configured),
-                join_probe(path_hits),
-                join_probe(mise_shims),
-                join_probe(mise_managed),
-                join_probe(brew),
-                join_probe(npm),
-                join_probe(cargo),
-                join_probe(pipx),
-                join_probe(uv),
-                join_probe(system),
-                join_probe(apps),
-            )
-        });
+    // Wave 1: configured binary and PATH hits run concurrently; their canonical
+    // paths seed `seen_paths`, which the mise-shim probes must consult to skip
+    // already-found installs exactly as the sequential order did.
+    let (configured, path_hits) = std::thread::scope(|scope| {
+        let configured = scope.spawn(|| configured_binary_detections(entry, opts));
+        let path_hits = scope.spawn(|| path_detections(entry, &path_dirs, opts, home.as_ref()));
+        (join_probe(configured), join_probe(path_hits))
+    });
 
     let mut detections: Vec<Detection> = Vec::new();
     let mut seen_paths: HashSet<PathBuf> = HashSet::new();
@@ -296,6 +277,34 @@ pub fn detect_all_for_entry(entry: &InstallCatalogEntry, opts: &DetectOptions) -
         seen_paths.insert(canonical_or_clone(&d.path));
         detections.push(d);
     }
+
+    // Wave 2: every package-manager and app probe runs concurrently; merge
+    // order below replays the original sequential insertion order.
+    let (mise_shims, mise_managed, brew, npm, cargo, pipx, uv, system, apps) =
+        std::thread::scope(|scope| {
+            let mise_shims =
+                scope.spawn(|| mise_shim_detections(entry, home.as_ref(), opts, &seen_paths));
+            let mise_managed = scope.spawn(|| mise_managed_detections(entry, home.as_ref(), opts));
+            let brew = scope.spawn(|| brew_detections(entry, opts));
+            let npm = scope.spawn(|| npm_detections(entry, opts));
+            let cargo = scope.spawn(|| cargo_detections(entry, home.as_deref(), opts));
+            let pipx = scope.spawn(|| pipx_detections(entry, &path_dirs, home.as_deref(), opts));
+            let uv = scope.spawn(|| uv_detections(entry, &path_dirs, home.as_deref(), opts));
+            let system =
+                scope.spawn(|| system_detections(entry, &path_dirs, home.as_deref(), opts));
+            let apps = scope.spawn(|| app_detections(entry, opts));
+            (
+                join_probe(mise_shims),
+                join_probe(mise_managed),
+                join_probe(brew),
+                join_probe(npm),
+                join_probe(cargo),
+                join_probe(pipx),
+                join_probe(uv),
+                join_probe(system),
+                join_probe(apps),
+            )
+        });
 
     for (canon, d) in mise_shims {
         if !seen_paths.contains(&canon) {
@@ -408,24 +417,30 @@ fn path_detections(
     opts: &DetectOptions,
     home: Option<&PathBuf>,
 ) -> Vec<Detection> {
+    const MAX_CONCURRENT_HIT_PROBES: usize = 4;
     let mut detections: Vec<Detection> = Vec::new();
     for exe in &entry.executables {
         let hits = scan_path_for_executable(exe, path_dirs);
-        let probes: Vec<(Option<String>, bool)> = std::thread::scope(|scope| {
-            let handles: Vec<_> = hits
-                .iter()
-                .map(|path| {
-                    let version = scope.spawn(move || probe_version_for_path(path, entry, opts));
-                    let arch = scope.spawn(move || probe_arch_mismatch(path, opts));
-                    (version, arch)
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|(version, arch)| (join_probe(version), join_probe(arch)))
-                .collect()
-        });
-        for (rank, (path, (version, arch_mismatch))) in hits.iter().zip(probes).enumerate() {
+        let mut all_probes: Vec<(Option<String>, bool)> = Vec::with_capacity(hits.len());
+        for chunk in hits.chunks(MAX_CONCURRENT_HIT_PROBES) {
+            let probes: Vec<(Option<String>, bool)> = std::thread::scope(|scope| {
+                let handles: Vec<_> = chunk
+                    .iter()
+                    .map(|path| {
+                        let version =
+                            scope.spawn(move || probe_version_for_path(path, entry, opts));
+                        let arch = scope.spawn(move || probe_arch_mismatch(path, opts));
+                        (version, arch)
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|(version, arch)| (join_probe(version), join_probe(arch)))
+                    .collect()
+            });
+            all_probes.extend(probes);
+        }
+        for (rank, (path, (version, arch_mismatch))) in hits.iter().zip(all_probes).enumerate() {
             let mut d = Detection::new(
                 &entry.harness,
                 exe,
@@ -463,6 +478,7 @@ fn mise_shim_detections(
     entry: &InstallCatalogEntry,
     home: Option<&PathBuf>,
     opts: &DetectOptions,
+    seen_paths: &HashSet<PathBuf>,
 ) -> Vec<(PathBuf, Detection)> {
     let mut out = Vec::new();
     if !opts.probe_mise {
@@ -474,7 +490,7 @@ fn mise_shim_detections(
     for exe in &entry.executables {
         let shim = home.join(".local/share/mise/shims").join(exe);
         let canon = canonical_or_clone(&shim);
-        if shim.exists() {
+        if shim.exists() && !seen_paths.contains(&canon) {
             let mut d = Detection::new(
                 &entry.harness,
                 exe,
@@ -545,7 +561,11 @@ fn npm_detections(entry: &InstallCatalogEntry, opts: &DetectOptions) -> Vec<Dete
     out
 }
 
-fn cargo_detections(entry: &InstallCatalogEntry, opts: &DetectOptions) -> Vec<Detection> {
+fn cargo_detections(
+    entry: &InstallCatalogEntry,
+    home: Option<&Path>,
+    opts: &DetectOptions,
+) -> Vec<Detection> {
     let mut out = Vec::new();
     if !opts.probe_cargo {
         return out;
@@ -555,14 +575,19 @@ fn cargo_detections(entry: &InstallCatalogEntry, opts: &DetectOptions) -> Vec<De
         .iter()
         .filter(|m| matches!(m.kind, crate::install_catalog::InstallMethodKind::Cargo))
     {
-        if let Some(ds) = probe_cargo(&method.package_name, entry, opts) {
+        if let Some(ds) = probe_cargo(&method.package_name, entry, home, opts) {
             out.extend(ds);
         }
     }
     out
 }
 
-fn pipx_detections(entry: &InstallCatalogEntry, opts: &DetectOptions) -> Vec<Detection> {
+fn pipx_detections(
+    entry: &InstallCatalogEntry,
+    path_dirs: &[PathBuf],
+    home: Option<&Path>,
+    opts: &DetectOptions,
+) -> Vec<Detection> {
     let mut out = Vec::new();
     if !opts.probe_pipx {
         return out;
@@ -572,14 +597,19 @@ fn pipx_detections(entry: &InstallCatalogEntry, opts: &DetectOptions) -> Vec<Det
         .iter()
         .filter(|m| matches!(m.kind, crate::install_catalog::InstallMethodKind::Pipx))
     {
-        if let Some(ds) = probe_pipx(&method.package_name, entry, opts) {
+        if let Some(ds) = probe_pipx(&method.package_name, entry, path_dirs, home, opts) {
             out.extend(ds);
         }
     }
     out
 }
 
-fn uv_detections(entry: &InstallCatalogEntry, opts: &DetectOptions) -> Vec<Detection> {
+fn uv_detections(
+    entry: &InstallCatalogEntry,
+    path_dirs: &[PathBuf],
+    home: Option<&Path>,
+    opts: &DetectOptions,
+) -> Vec<Detection> {
     let mut out = Vec::new();
     if !opts.probe_uv {
         return out;
@@ -589,14 +619,19 @@ fn uv_detections(entry: &InstallCatalogEntry, opts: &DetectOptions) -> Vec<Detec
         .iter()
         .filter(|m| matches!(m.kind, crate::install_catalog::InstallMethodKind::Uv))
     {
-        if let Some(ds) = probe_uv(&method.package_name, entry, opts) {
+        if let Some(ds) = probe_uv(&method.package_name, entry, path_dirs, home, opts) {
             out.extend(ds);
         }
     }
     out
 }
 
-fn system_detections(entry: &InstallCatalogEntry, opts: &DetectOptions) -> Vec<Detection> {
+fn system_detections(
+    entry: &InstallCatalogEntry,
+    path_dirs: &[PathBuf],
+    home: Option<&Path>,
+    opts: &DetectOptions,
+) -> Vec<Detection> {
     let mut out = Vec::new();
     if !opts.probe_system {
         return out;
@@ -606,7 +641,7 @@ fn system_detections(entry: &InstallCatalogEntry, opts: &DetectOptions) -> Vec<D
         .iter()
         .filter(|m| m.kind == crate::install_catalog::InstallMethodKind::Direct)
     {
-        if let Some(d) = probe_system_package(&method.package_name, entry, opts) {
+        if let Some(d) = probe_system_package(&method.package_name, entry, path_dirs, home, opts) {
             out.push(d);
         }
     }
@@ -1022,6 +1057,7 @@ fn extract_npm_version(json: &str, package: &str) -> Option<String> {
 fn probe_cargo(
     package: &str,
     entry: &InstallCatalogEntry,
+    home: Option<&Path>,
     opts: &DetectOptions,
 ) -> Option<Vec<Detection>> {
     let exec_opts = ExecuteOpts {
@@ -1078,7 +1114,6 @@ fn probe_cargo(
                     exe_candidate
                 };
                 if entry.executables.contains(&exe_name) || package.contains(&exe_name) {
-                    let home = opts.resolve_home();
                     let bin_path = home.map_or_else(
                         // Temp-dir anchor keeps the path absolute on Windows.
                         || std::env::temp_dir().join(format!(".cargo/bin/{exe_name}")),
@@ -1111,9 +1146,9 @@ fn probe_cargo(
 }
 
 /// Exec opts for package-manager probes, scoped to the injected environment.
-fn package_probe_opts(opts: &DetectOptions) -> ExecuteOpts {
+fn package_probe_opts(opts: &DetectOptions, home: Option<&Path>) -> ExecuteOpts {
     let mut env = Vec::new();
-    if let Some(home) = opts.resolve_home() {
+    if let Some(home) = home {
         env.push(("HOME".to_owned(), home.to_string_lossy().into_owned()));
     }
     ExecuteOpts {
@@ -1173,16 +1208,18 @@ fn extract_pipx_version(json_text: &str, package: &str) -> Option<String> {
 fn probe_pipx(
     package: &str,
     entry: &InstallCatalogEntry,
+    path_dirs: &[PathBuf],
+    home: Option<&Path>,
     opts: &DetectOptions,
 ) -> Option<Vec<Detection>> {
-    let exec_opts = package_probe_opts(opts);
-    let pipx = resolve_manager(&opts.resolve_path_dirs(), "pipx");
+    let exec_opts = package_probe_opts(opts, home);
+    let pipx = resolve_manager(path_dirs, "pipx");
     let out = run_command(&pipx, &["list".to_owned(), "--json".to_owned()], &exec_opts).ok()?;
     if !out.success {
         return None;
     }
     let version = extract_pipx_version(&out.stdout, package)?;
-    let home = opts.resolve_home()?;
+    let home = home?;
     let exe = entry.executables.first().map_or(package, String::as_str);
     let bin_path = home
         .join(".local/pipx/venvs")
@@ -1226,16 +1263,18 @@ fn extract_uv_version(text: &str, package: &str) -> Option<String> {
 fn probe_uv(
     package: &str,
     entry: &InstallCatalogEntry,
+    path_dirs: &[PathBuf],
+    home: Option<&Path>,
     opts: &DetectOptions,
 ) -> Option<Vec<Detection>> {
-    let exec_opts = package_probe_opts(opts);
-    let uv = resolve_manager(&opts.resolve_path_dirs(), "uv");
+    let exec_opts = package_probe_opts(opts, home);
+    let uv = resolve_manager(path_dirs, "uv");
     let out = run_command(&uv, &["tool".to_owned(), "list".to_owned()], &exec_opts).ok()?;
     if !out.success {
         return None;
     }
     let version = extract_uv_version(&out.stdout, package)?;
-    let home = opts.resolve_home()?;
+    let home = home?;
     let exe = entry.executables.first().map_or(package, String::as_str);
     let bin_path = home.join(".local/bin").join(exe);
     let mut d = Detection::new(
@@ -1258,10 +1297,12 @@ fn probe_uv(
 fn probe_system_package(
     package: &str,
     entry: &InstallCatalogEntry,
+    path_dirs: &[PathBuf],
+    home: Option<&Path>,
     opts: &DetectOptions,
 ) -> Option<Detection> {
-    let exec_opts = package_probe_opts(opts);
-    let dpkg = resolve_manager(&opts.resolve_path_dirs(), "dpkg");
+    let exec_opts = package_probe_opts(opts, home);
+    let dpkg = resolve_manager(path_dirs, "dpkg");
     let out = run_command(&dpkg, &["-s".to_owned(), package.to_owned()], &exec_opts).ok()?;
     if !out.success {
         return None;
@@ -1526,6 +1567,16 @@ mod tests {
     }
 
     #[test]
+    fn extract_npm_version_absent_package_falls_back_to_first_dependency() {
+        let json =
+            r#"{"dependencies":{"renamed-tool":{"version":"9.9.9"},"other":{"version":"1.0.0"}}}"#;
+        assert_eq!(
+            extract_npm_version(json, "absent-pkg").as_deref(),
+            Some("9.9.9")
+        );
+    }
+
+    #[test]
     fn scan_path_preserves_order() {
         let d1 = PathBuf::from("/a/b");
         let d2 = PathBuf::from("/c/d");
@@ -1691,6 +1742,88 @@ mod tests {
             hits.iter()
                 .all(|d| d.source != DetectionSource::SystemPackage),
             "no manager present must yield no system-package hits: {hits:?}"
+        );
+        drop(fs::remove_dir_all(&bin_dir));
+        drop(fs::remove_dir_all(&home));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mise_shim_already_on_path_is_not_reported_twice() {
+        let home = make_temp_dir("home-shim-on-path");
+        let shim_dir = home.join(".local/share/mise/shims");
+        fs::create_dir_all(&shim_dir).unwrap();
+        write_fake_exe(&shim_dir, "claude", "3.1.0");
+
+        let catalog = InstallCatalog::embedded().unwrap();
+        let entry = catalog.get_str("claude-code").unwrap().clone();
+
+        let opts = DetectOptions {
+            path_dirs: Some(vec![shim_dir]),
+            home_dir: Some(home.clone()),
+            probe_mise: true,
+            probe_brew: false,
+            probe_npm: false,
+            probe_cargo: false,
+            probe_apps: false,
+            ..Default::default()
+        };
+        let hits = detect_all_for_entry(&entry, &opts);
+        assert_eq!(
+            hits.iter()
+                .filter(|d| d.source == DetectionSource::Path)
+                .count(),
+            1,
+            "{hits:?}"
+        );
+        assert_eq!(
+            hits.iter()
+                .filter(|d| d.source == DetectionSource::MiseShim)
+                .count(),
+            0,
+            "a shim already reported as a PATH hit must not be re-reported: {hits:?}"
+        );
+        drop(fs::remove_dir_all(&home));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_hits_precede_package_probes_in_insertion_order() {
+        let bin_dir = make_temp_dir("order-bins");
+        let home = make_temp_dir("order-home");
+        write_fake_exe(&bin_dir, "my-exe", "9.9.9");
+        write_fake_manager(
+            &bin_dir,
+            "dpkg",
+            "#!/bin/sh\nprintf 'Package: my-pkg\\nStatus: install ok installed\\nVersion: 1.4.2\\n'\n",
+        );
+
+        let entry = pythonish_entry();
+        let opts = DetectOptions {
+            path_dirs: Some(vec![bin_dir.clone()]),
+            home_dir: Some(home.clone()),
+            probe_mise: false,
+            probe_brew: false,
+            probe_npm: false,
+            probe_cargo: false,
+            probe_pipx: false,
+            probe_uv: false,
+            probe_system: true,
+            probe_apps: false,
+            ..Default::default()
+        };
+        let hits = detect_all_for_entry(&entry, &opts);
+        let last_path = hits
+            .iter()
+            .rposition(|d| d.source == DetectionSource::Path)
+            .unwrap_or_else(|| panic!("no PATH hit: {hits:?}"));
+        let first_pkg = hits
+            .iter()
+            .position(|d| d.source == DetectionSource::SystemPackage)
+            .unwrap_or_else(|| panic!("no system-package hit: {hits:?}"));
+        assert!(
+            last_path < first_pkg,
+            "PATH hits must precede package probes: {hits:?}"
         );
         drop(fs::remove_dir_all(&bin_dir));
         drop(fs::remove_dir_all(&home));

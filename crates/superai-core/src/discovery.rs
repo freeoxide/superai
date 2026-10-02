@@ -369,7 +369,6 @@ fn fingerprint_candidate_with_path_cache(
         .to_owned();
     let name_lower = name.to_lowercase();
 
-    // Path pattern evidence (low confidence baseline)
     let mut pattern_hint: Option<&str> = None;
     if name_lower.starts_with(".claude") || name_lower.contains("claude") {
         pattern_hint = Some("claude-code");
@@ -395,14 +394,12 @@ fn fingerprint_candidate_with_path_cache(
     let mut harness_found: Option<&str> = None;
     let mut confidence = Confidence::None;
 
-    // Claude: settings.json
     let candidate_settings = path.join("settings.json");
     if candidate_settings.is_file() {
         evidence.push(format!(
             "canonical file settings.json present at {}",
             candidate_settings.display()
         ));
-        // Try to read a small bounded slice and look for schema markers without parsing secrets.
         if let Ok(text) = read_bounded(&candidate_settings, 64 * 1024) {
             if text.contains("\"model\"")
                 || text.contains("\"permissions\"")
@@ -412,7 +409,6 @@ fn fingerprint_candidate_with_path_cache(
                 harness_found = Some("claude-code");
                 confidence = Confidence::High;
             } else {
-                // File exists but not clearly Claude; keep medium
                 if harness_found.is_none() {
                     harness_found = Some("claude-code");
                     confidence = Confidence::Medium;
@@ -422,7 +418,6 @@ fn fingerprint_candidate_with_path_cache(
         }
     }
 
-    // Codex: config.toml
     let codex_toml = path.join("config.toml");
     if codex_toml.is_file() {
         evidence.push(format!(
@@ -441,7 +436,6 @@ fn fingerprint_candidate_with_path_cache(
         }
     }
 
-    // Opencode: opencode.json / opencode.jsonc
     for fname in ["opencode.json", "opencode.jsonc"] {
         let p = path.join(fname);
         if p.is_file() {
@@ -460,7 +454,6 @@ fn fingerprint_candidate_with_path_cache(
         }
     }
 
-    // Aider: .aider.conf.yml, aider.conf.yml, .aider.*
     for fname in [
         ".aider.conf.yml",
         "aider.conf.yml",
@@ -478,18 +471,15 @@ fn fingerprint_candidate_with_path_cache(
         }
     }
 
-    // Cline: settings.json + cline specific marker
     if harness_found.is_none()
         && path.to_string_lossy().contains("cline")
         && candidate_settings.is_file()
     {
-        // Already covered, but add cline hint
         harness_found = Some("cline");
         confidence = Confidence::Medium;
         evidence.push("cline settings.json candidate".to_owned());
     }
 
-    // If no canonical file but path pattern exists, keep Low.
     if harness_found.is_none() {
         if let Some(hit) = pattern_hint {
             harness_found = Some(hit);
@@ -504,7 +494,6 @@ fn fingerprint_candidate_with_path_cache(
         }
     }
 
-    // Adjacent state layout as supporting evidence (non-secret)
     let creds = path.join(".credentials.json");
     if creds.is_file() {
         evidence.push(format!(
@@ -564,16 +553,12 @@ fn fingerprint_candidate_with_path_cache(
 }
 
 fn read_bounded(path: &Path, max_bytes: usize) -> std::io::Result<String> {
-    let data = std::fs::read(path)?;
-    let len = std::cmp::min(data.len(), max_bytes);
-    let Some(slice) = data.get(..len) else {
-        return Ok(String::new());
-    };
-    let valid_len = match std::str::from_utf8(slice) {
-        Ok(_) => slice.len(),
+    let data = crate::wrapper::read_up_to(path, u64::try_from(max_bytes).unwrap_or(u64::MAX))?;
+    let valid_len = match std::str::from_utf8(&data) {
+        Ok(_) => data.len(),
         Err(err) => err.valid_up_to(),
     };
-    let text = String::from_utf8_lossy(slice.get(..valid_len).unwrap_or_default()).into_owned();
+    let text = String::from_utf8_lossy(data.get(..valid_len).unwrap_or_default()).into_owned();
     Ok(text)
 }
 
@@ -592,13 +577,10 @@ const ORCHESTRATOR_WORKSPACE_MARKERS: &[(&str, &str)] = &[
 ];
 
 struct ForeignHomeFiles {
-    conductor_settings: PathBuf,
-    conductor_text: HomeFileText,
-    sculptor_env: PathBuf,
-    sculptor_text: HomeFileText,
-    multi_config: PathBuf,
-    multi_text: HomeFileText,
-    multi_dir: Option<PathBuf>,
+    home: Option<PathBuf>,
+    conductor_text: Option<HomeFileText>,
+    sculptor_text: Option<HomeFileText>,
+    multi_state: Option<(HomeFileText, Option<PathBuf>)>,
 }
 
 enum HomeFileText {
@@ -608,40 +590,57 @@ enum HomeFileText {
 }
 
 impl ForeignHomeFiles {
-    fn load(home: &Path) -> Self {
-        let conductor_settings = home.join(".conductor").join("settings.toml");
-        let conductor_text = home_file_text(&conductor_settings, 256 * 1024);
-        let sculptor_env = home.join(".sculptor").join(".env");
-        let sculptor_text = home_file_text(&sculptor_env, 64 * 1024);
-        let multi_config = home.join(".claude-multi").join("config.json");
-        let multi_text = home_file_text(&multi_config, 256 * 1024);
-        let multi_dir = if matches!(multi_text, HomeFileText::Absent) {
-            let dir = home.join(".claude-multi");
-            dir.is_dir().then_some(dir)
-        } else {
-            None
-        };
+    fn new(home: Option<&Path>) -> Self {
         Self {
-            conductor_settings,
-            conductor_text,
-            sculptor_env,
-            sculptor_text,
-            multi_config,
-            multi_text,
-            multi_dir,
+            home: home.map(Path::to_path_buf),
+            conductor_text: None,
+            sculptor_text: None,
+            multi_state: None,
         }
     }
 
-    fn empty() -> Self {
-        Self {
-            conductor_settings: PathBuf::new(),
-            conductor_text: HomeFileText::Absent,
-            sculptor_env: PathBuf::new(),
-            sculptor_text: HomeFileText::Absent,
-            multi_config: PathBuf::new(),
-            multi_text: HomeFileText::Absent,
-            multi_dir: None,
-        }
+    fn conductor_path(&self) -> PathBuf {
+        self.home.clone().map_or_else(PathBuf::new, |home| {
+            home.join(".conductor").join("settings.toml")
+        })
+    }
+
+    fn sculptor_path(&self) -> PathBuf {
+        self.home
+            .clone()
+            .map_or_else(PathBuf::new, |home| home.join(".sculptor").join(".env"))
+    }
+
+    fn conductor_text(&mut self) -> &HomeFileText {
+        self.conductor_text.get_or_insert_with(|| {
+            self.home.as_ref().map_or(HomeFileText::Absent, |home| {
+                home_file_text(&home.join(".conductor").join("settings.toml"), 256 * 1024)
+            })
+        })
+    }
+
+    fn sculptor_text(&mut self) -> &HomeFileText {
+        self.sculptor_text.get_or_insert_with(|| {
+            self.home.as_ref().map_or(HomeFileText::Absent, |home| {
+                home_file_text(&home.join(".sculptor").join(".env"), 64 * 1024)
+            })
+        })
+    }
+
+    fn multi_state(&mut self) -> &(HomeFileText, Option<PathBuf>) {
+        self.multi_state.get_or_insert_with(|| {
+            let Some(home) = self.home.as_ref() else {
+                return (HomeFileText::Absent, None);
+            };
+            let text = home_file_text(&home.join(".claude-multi").join("config.json"), 256 * 1024);
+            let dir = if matches!(text, HomeFileText::Absent) {
+                let dir = home.join(".claude-multi");
+                dir.is_dir().then_some(dir)
+            } else {
+                None
+            };
+            (text, dir)
+        })
     }
 }
 
@@ -659,7 +658,7 @@ fn home_file_text(path: &Path, cap: usize) -> HomeFileText {
 /// (DRF-04). Evidence is structural and local only; nothing is executed.
 fn detect_orchestrator_manager(
     path: &Path,
-    files: &ForeignHomeFiles,
+    files: &mut ForeignHomeFiles,
 ) -> Option<(&'static str, String)> {
     let normalized = path.to_string_lossy().replace('\\', "/");
     let lowered = normalized.to_ascii_lowercase();
@@ -674,27 +673,31 @@ fn detect_orchestrator_manager(
             ));
         }
     }
-    if let HomeFileText::Text(text) = &files.conductor_text
-        && text.contains(path.to_string_lossy().as_ref())
-    {
+    let conductor_hit = match files.conductor_text() {
+        HomeFileText::Text(text) => text.contains(path.to_string_lossy().as_ref()),
+        HomeFileText::Unreadable | HomeFileText::Absent => false,
+    };
+    if conductor_hit {
         return Some((
             "conductor",
             format!(
                 "candidate {} referenced in {}",
                 path.display(),
-                files.conductor_settings.display()
+                files.conductor_path().display()
             ),
         ));
     }
-    if let HomeFileText::Text(text) = &files.sculptor_text
-        && text.contains(path.to_string_lossy().as_ref())
-    {
+    let sculptor_hit = match files.sculptor_text() {
+        HomeFileText::Text(text) => text.contains(path.to_string_lossy().as_ref()),
+        HomeFileText::Unreadable | HomeFileText::Absent => false,
+    };
+    if sculptor_hit {
         return Some((
             "sculptor",
             format!(
                 "candidate {} referenced in {}",
                 path.display(),
-                files.sculptor_env.display()
+                files.sculptor_path().display()
             ),
         ));
     }
@@ -704,72 +707,77 @@ fn detect_orchestrator_manager(
 /// Detect whether `path` is owned by a foreign manager (marker files,
 /// claude-multi config references, orchestrator roots). Bounded reads only.
 pub fn is_foreign_managed(path: &Path, home: Option<&Path>) -> ForeignCheck {
-    let files = home.map_or_else(ForeignHomeFiles::empty, ForeignHomeFiles::load);
-    is_foreign_managed_with_files(path, home, &files)
+    let mut files = ForeignHomeFiles::new(home);
+    is_foreign_managed_with_files(path, home, &mut files)
 }
 
-fn is_foreign_managed_with_files(
-    path: &Path,
-    home: Option<&Path>,
-    files: &ForeignHomeFiles,
-) -> ForeignCheck {
-    let mut evidence: Vec<String> = Vec::new();
-    let mut ambiguous = false;
-
+fn early_foreign_check(path: &Path, files: &mut ForeignHomeFiles) -> Option<ForeignCheck> {
     for marker in [".foreign-managed", ".superai-foreign", ".owned-by-foreign"] {
         let candidate = path.join(marker);
         if candidate.is_file() {
-            evidence.push(format!("marker {marker} found at {}", candidate.display()));
-            return ForeignCheck {
+            return Some(ForeignCheck {
                 is_foreign: true,
                 owner: Some("generic-marker".to_owned()),
-                evidence,
+                evidence: vec![format!("marker {marker} found at {}", candidate.display())],
                 ambiguous: false,
-            };
+            });
         }
     }
 
     // Orchestrator-managed workspaces (DRF-04): structural evidence first so
     // such a workspace is never adoptable regardless of other markers.
     if let Some((owner, reason)) = detect_orchestrator_manager(path, files) {
-        evidence.push(reason);
-        return ForeignCheck {
+        return Some(ForeignCheck {
             is_foreign: true,
             owner: Some(owner.to_owned()),
-            evidence,
+            evidence: vec![reason],
             ambiguous: false,
-        };
+        });
     }
 
     // .claude-multi marker file inside candidate
     let multi_in_candidate = path.join(".claude-multi");
     if multi_in_candidate.exists() {
-        evidence.push(format!(
-            "marker .claude-multi found at {}",
-            multi_in_candidate.display()
-        ));
-        return ForeignCheck {
+        return Some(ForeignCheck {
             is_foreign: true,
             owner: Some("claude-multi".to_owned()),
-            evidence,
+            evidence: vec![format!(
+                "marker .claude-multi found at {}",
+                multi_in_candidate.display()
+            )],
             ambiguous: false,
-        };
+        });
+    }
+    None
+}
+
+fn is_foreign_managed_with_files(
+    path: &Path,
+    home: Option<&Path>,
+    files: &mut ForeignHomeFiles,
+) -> ForeignCheck {
+    let mut evidence: Vec<String> = Vec::new();
+    let mut ambiguous = false;
+
+    if let Some(check) = early_foreign_check(path, files) {
+        return check;
     }
 
-    if home.is_some() {
-        match &files.multi_text {
+    if let Some(home_path) = home {
+        let multi_config = home_path.join(".claude-multi").join("config.json");
+        let (multi_text, multi_dir) = files.multi_state();
+        match multi_text {
             HomeFileText::Text(text) => {
                 evidence.push(format!(
                     "checking foreign manager config at {}",
-                    files.multi_config.display()
+                    multi_config.display()
                 ));
                 let path_str = path.to_string_lossy();
-                let candidate_str = path_str.as_ref();
-                if text.contains(candidate_str) {
+                if text.contains(path_str.as_ref()) {
                     evidence.push(format!(
                         "candidate {} referenced in {}",
                         path.display(),
-                        files.multi_config.display()
+                        multi_config.display()
                     ));
                     return ForeignCheck {
                         is_foreign: true,
@@ -781,17 +789,21 @@ fn is_foreign_managed_with_files(
                 evidence.push(format!(
                     "candidate {} not referenced in {}",
                     path.display(),
-                    files.multi_config.display()
+                    multi_config.display()
                 ));
             }
             HomeFileText::Unreadable => {
                 evidence.push(format!(
+                    "checking foreign manager config at {}",
+                    multi_config.display()
+                ));
+                evidence.push(format!(
                     "could not read {} (permission or io)",
-                    files.multi_config.display()
+                    multi_config.display()
                 ));
             }
             HomeFileText::Absent => {
-                if let Some(multi_dir) = &files.multi_dir {
+                if let Some(multi_dir) = multi_dir.as_ref() {
                     evidence.push(format!(
                         "foreign manager directory .claude-multi exists at {} but does not link {}",
                         multi_dir.display(),
@@ -884,7 +896,7 @@ fn binary_on_path_from_env(name: &str) -> Option<PathBuf> {
 /// Detect whether `path` is a package-manager shim rather than an instance
 /// wrapper (DRF-04): mise/asdf shims are NEVER a superai wrapper or config root.
 pub fn detect_shim_manager(path: &Path) -> Option<&'static str> {
-    shim_manager_from_bytes(&std::fs::read(path).ok()?)
+    shim_manager_from_bytes(&crate::wrapper::read_up_to(path, 16 * 1024 + 1).ok()?)
 }
 
 fn shim_manager_from_bytes(data: &[u8]) -> Option<&'static str> {
@@ -1342,7 +1354,8 @@ pub fn scan_wrapper_dirs(dirs: &[PathBuf], registry: &Registry) -> Vec<WrapperFi
             if !meta.is_file() {
                 continue;
             }
-            let data = match std::fs::read(&path) {
+            let total_len = meta.len();
+            let data = match crate::wrapper::read_up_to(&path, 32 * 1024 + 1) {
                 Ok(d) => d,
                 Err(e) => {
                     findings.push(WrapperFinding {
@@ -1373,7 +1386,7 @@ pub fn scan_wrapper_dirs(dirs: &[PathBuf], registry: &Registry) -> Vec<WrapperFi
                 });
                 continue;
             }
-            match crate::wrapper::wrapper_kind_from_bytes(&data) {
+            match crate::wrapper::wrapper_kind_from_bytes(&data, total_len) {
                 crate::wrapper::WrapperKind::SuperaiOwned {
                     digest,
                     instance_id,
@@ -1542,9 +1555,11 @@ pub fn reconcile(
 }
 
 fn wrapper_text(path: &Path) -> Option<String> {
-    std::fs::read(path)
-        .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
+    let bytes = crate::wrapper::read_up_to(path, 32 * 1024 + 1).ok()?;
+    if bytes.len() > 32 * 1024 {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
 }
 
 struct RecordedCandidate<'a> {
@@ -1941,7 +1956,7 @@ pub fn drift_report_with_options(
         .iter()
         .map(|(root, inst)| (root.clone(), inst.ownership))
         .collect();
-    let foreign_files = ForeignHomeFiles::load(home);
+    let mut foreign_files = ForeignHomeFiles::new(Some(home));
     let mut path_hits: std::collections::HashMap<String, Option<PathBuf>> =
         std::collections::HashMap::new();
     let normalized_candidates: Vec<PathBuf> =
@@ -1949,7 +1964,7 @@ pub fn drift_report_with_options(
     let mut findings: Vec<DriftFinding> = Vec::new();
     for cand in &candidates {
         let fingerprint = fingerprint_candidate_with_path_cache(cand, &mut path_hits);
-        let foreign = is_foreign_managed_with_files(cand, Some(home), &foreign_files);
+        let foreign = is_foreign_managed_with_files(cand, Some(home), &mut foreign_files);
         let ownership = classify_ownership_with_foreign(cand, &inst_owners, &foreign);
         let cand_root = normalize_absolute(cand);
         let matched_inst = inst_index
@@ -2532,6 +2547,59 @@ mod tests {
         );
         let content = std::fs::read_to_string(&settings).unwrap();
         assert_eq!(content, r#"{"model":"sonnet"}"#);
+    }
+
+    #[test]
+    fn read_bounded_truncates_at_first_invalid_byte() {
+        let dir = tmp_home("read_bounded_utf8");
+        let file = dir.join("blob");
+        std::fs::write(&file, b"abc\xFFdef").unwrap();
+        assert_eq!(read_bounded(&file, 64).unwrap(), "abc");
+    }
+
+    #[test]
+    fn read_bounded_cap_cuts_at_char_boundary() {
+        let dir = tmp_home("read_bounded_cap");
+        let file = dir.join("blob");
+        std::fs::write(&file, "é".repeat(1024).as_bytes()).unwrap();
+        assert_eq!(read_bounded(&file, 5).unwrap(), "éé");
+    }
+
+    #[test]
+    fn read_bounded_reports_unreadable_file() {
+        let dir = tmp_home("read_bounded_missing");
+        let missing = dir.join("nope");
+        if let Ok(text) = read_bounded(&missing, 8) {
+            panic!("missing file must not read as {text:?}");
+        }
+    }
+
+    #[test]
+    fn shim_detection_ignores_oversized_files() {
+        let dir = tmp_home("shim_oversize");
+        let big = dir.join("shim");
+        std::fs::write(&big, "mise x --".repeat(2048).as_bytes()).unwrap();
+        assert!(big.metadata().unwrap().len() > 16 * 1024);
+        assert_eq!(detect_shim_manager(&big), None);
+        let small = dir.join("small");
+        std::fs::write(&small, "#!/bin/sh\nexec mise x -- claude \"$@\"\n").unwrap();
+        assert_eq!(detect_shim_manager(&small), Some("mise"));
+    }
+
+    #[test]
+    fn scan_wrapper_dirs_marks_oversized_files_opaque() {
+        let dir = tmp_home("wrapper_oversize");
+        let big = dir.join("big");
+        std::fs::write(&big, vec![b'a'; 40 * 1024]).unwrap();
+        let reg = Registry::default();
+        let findings = scan_wrapper_dirs(std::slice::from_ref(&dir), &reg);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        match &findings[0].kind {
+            WrapperFindingKind::Opaque { reason } => {
+                assert!(reason.contains("too large (40960 bytes"), "{reason}");
+            }
+            other => panic!("expected Opaque, got {other:?}"),
+        }
     }
 
     /// Every catalog harness must resolve to its concrete adapter and every
