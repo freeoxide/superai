@@ -362,7 +362,17 @@ pub fn is_owned_wrapper(path: &Path, expected_digest: Option<&str>) -> bool {
     let Ok(content) = std::fs::read_to_string(path) else {
         return false;
     };
-    let Some(parsed) = parse_wrapper_content(&content) else {
+    owned_wrapper_from_content(Some(content.as_str()), expected_digest)
+}
+
+pub(crate) fn owned_wrapper_from_content(
+    content: Option<&str>,
+    expected_digest: Option<&str>,
+) -> bool {
+    let Some(content) = content else {
+        return false;
+    };
+    let Some(parsed) = parse_wrapper_content(content) else {
         return false;
     };
     let Some(marker) = parsed.marker.as_deref() else {
@@ -518,6 +528,10 @@ pub fn detect_wrapper_kind(path: &Path) -> WrapperKind {
             };
         }
     };
+    wrapper_kind_from_bytes(&data)
+}
+
+pub(crate) fn wrapper_kind_from_bytes(data: &[u8]) -> WrapperKind {
     if data.len() > MAX_WRAPPER_BYTES {
         return WrapperKind::Opaque {
             reason: format!(
@@ -527,7 +541,7 @@ pub fn detect_wrapper_kind(path: &Path) -> WrapperKind {
             ),
         };
     }
-    let content = String::from_utf8_lossy(&data);
+    let content = String::from_utf8_lossy(data);
     detect_wrapper_kind_from_content(&content)
 }
 
