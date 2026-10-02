@@ -966,7 +966,7 @@ impl Template {
 
 /// True when `full` equals `prefix` plus one or more dot-separated levels
 /// under it (allocation-free `starts_with(prefix + ".")`).
-fn extends_by_dot(prefix: &str, full: &str) -> bool {
+pub(crate) fn extends_by_dot(prefix: &str, full: &str) -> bool {
     full.len() > prefix.len()
         && full.starts_with(prefix)
         && full.as_bytes().get(prefix.len()) == Some(&b'.')
@@ -995,13 +995,22 @@ impl Template {
         for (op, _support) in adapter.supported_operations() {
             owned.insert(op);
         }
+        let mut owned_plain_keys: HashSet<String> = HashSet::new();
+        for entry in &owned {
+            if let Ok(superai_config::document::Selector::Key(k)) =
+                superai_config::document::Selector::parse(entry)
+            {
+                owned_plain_keys.insert(k);
+            }
+        }
 
         for patch in &self.patches {
             let selector = patch.selector.trim();
             if owned.contains(selector) {
                 continue;
             }
-            let canonical = match superai_config::document::Selector::parse(selector) {
+            let parsed = superai_config::document::Selector::parse(selector);
+            let canonical = match &parsed {
                 Ok(s) => s.to_typed_string(),
                 Err(_) => selector.to_owned(),
             };
@@ -1009,26 +1018,19 @@ impl Template {
                 continue;
             }
             let mut matched = false;
-            if let Ok(superai_config::document::Selector::Key(k)) =
-                superai_config::document::Selector::parse(selector)
-            {
-                if owned.contains(&k) {
+            if let Ok(superai_config::document::Selector::Key(k)) = &parsed {
+                if owned.contains(k) {
                     matched = true;
                 }
-                if !matched {
-                    for o in &owned {
-                        if extends_by_dot(o, &k) || extends_by_dot(&k, o) {
-                            matched = true;
-                            break;
-                        }
-                        if let Ok(superai_config::document::Selector::Key(ok)) =
-                            superai_config::document::Selector::parse(o)
-                            && ok == k
-                        {
-                            matched = true;
-                            break;
-                        }
-                    }
+                if !matched
+                    && owned
+                        .iter()
+                        .any(|o| extends_by_dot(o, k) || extends_by_dot(k, o))
+                {
+                    matched = true;
+                }
+                if !matched && owned_plain_keys.contains(k) {
+                    matched = true;
                 }
             }
             if matched {

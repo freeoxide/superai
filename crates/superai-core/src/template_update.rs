@@ -61,21 +61,12 @@ fn selector_to_path(selector: &str) -> Option<Vec<String>> {
 
 fn get_local_value(local: &Map<String, Value>, selector: &str) -> Option<Value> {
     let path = selector_to_path(selector)?;
-    if path.is_empty() {
-        return None;
-    }
     let first = path.first()?;
-    let mut current = local.get(first)?.clone();
+    let mut current: &Value = local.get(first)?;
     for segment in path.iter().skip(1) {
-        match current {
-            Value::Object(ref map) => {
-                let next = map.get(segment)?.clone();
-                current = next;
-            }
-            _ => return None,
-        }
+        current = current.as_object().and_then(|map| map.get(segment))?;
     }
-    Some(current)
+    Some(current.clone())
 }
 
 /// Engine operation for one edit: three-way edits route through the

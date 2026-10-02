@@ -16,7 +16,7 @@ use crate::adapter::{Adapter, ConfigSurface, DocumentKind};
 use crate::error::{CoreError, Result};
 use crate::ids::ProviderId;
 use crate::instance::Instance;
-use crate::provider::{ApiKeySink, Protocol, ProviderDefinition, resolve_api_key_sink};
+use crate::provider::{ApiKeySink, Protocol, ProviderDefinition};
 use crate::template::Template;
 
 /// A successful render: typed engine operations against one surface, plus
@@ -180,12 +180,28 @@ fn auth_env_var(provider: &ProviderDefinition, warnings: &mut Vec<String>) -> St
 
 /// Render a provider into typed adapter mutations (PRV-03): pure, nothing
 /// is written; auth appears as a sink/variable name only, never a secret.
-#[expect(clippy::too_many_lines, reason = "strategy table is deliberate")]
 pub fn render_provider_into_adapter(
     provider: &ProviderDefinition,
     template: Option<&Template>,
     adapter: &dyn Adapter,
     instance: &Instance,
+) -> RenderOutcome {
+    render_provider_with_surfaces(
+        provider,
+        template,
+        adapter,
+        instance,
+        &adapter.config_surfaces(),
+    )
+}
+
+#[expect(clippy::too_many_lines, reason = "strategy table is deliberate")]
+fn render_provider_with_surfaces(
+    provider: &ProviderDefinition,
+    template: Option<&Template>,
+    adapter: &dyn Adapter,
+    instance: &Instance,
+    surfaces: &[ConfigSurface],
 ) -> RenderOutcome {
     let mut warnings: Vec<String> = Vec::new();
     if !instance.harness.eq_case_fold(&adapter.id()) {
@@ -204,7 +220,6 @@ pub fn render_provider_into_adapter(
     }
     // Render to the FIRST writable surface in declaration order; per-profile
     // override layers are user-created and must not be hijacked.
-    let surfaces = adapter.config_surfaces();
     let Some((surface, strategy)) = surfaces
         .iter()
         .find_map(|surface| strategy_for(surface).map(|strategy| (surface, strategy)))
@@ -397,7 +412,7 @@ pub fn render_provider_into_adapter(
         }
     }
 
-    let auth_sink = resolve_api_key_sink(adapter).ok();
+    let auth_sink = crate::provider::resolve_api_key_sink_in(surfaces, &adapter.id()).ok();
     if auth_sink.is_none() {
         warnings.push(format!(
             "harness `{}` declares no config/env key sink; auth placement may require external login",
@@ -533,7 +548,7 @@ fn load_surface_value(path: &std::path::Path, kind: DocumentKind) -> Result<Opti
                     kind: "toml".to_owned(),
                     message: e.to_string(),
                 })?;
-            Some(crate::toml_convert::document_to_value(&doc))
+            Some(crate::toml_convert::document_into_value(doc))
         }
         _ => None,
     };
@@ -690,7 +705,7 @@ pub fn inspect_effective_provider(
                 if surface
                     .owned_selectors
                     .iter()
-                    .any(|s| s.eq_ignore_ascii_case(key) || s.starts_with(&format!("{key}.")))
+                    .any(|s| s.eq_ignore_ascii_case(key) || crate::template::extends_by_dot(key, s))
                 {
                     continue;
                 }
@@ -806,13 +821,15 @@ pub struct ProviderChangeOutcome {
 }
 
 /// The surface a change targets, resolved from the render strategy.
-fn target_surface(adapter: &dyn Adapter) -> Result<(ConfigSurface, RenderStrategy)> {
-    adapter
-        .config_surfaces()
-        .into_iter()
-        .find_map(|surface| strategy_for(&surface).map(|strategy| (surface, strategy)))
+fn target_surface(
+    surfaces: &[ConfigSurface],
+    harness: &str,
+) -> Result<(ConfigSurface, RenderStrategy)> {
+    surfaces
+        .iter()
+        .find_map(|surface| strategy_for(surface).map(|strategy| (surface.clone(), strategy)))
         .ok_or_else(|| CoreError::UnsupportedOperation {
-            harness: adapter.id().to_string(),
+            harness: harness.to_owned(),
             operation: "provider_lifecycle".to_owned(),
             reason: "harness declares no writable provider-owned selectors (managed backend)"
                 .to_owned(),
@@ -867,6 +884,7 @@ fn plan_change(
     instance: &Instance,
     adapter: &dyn Adapter,
     change: &ProviderChange<'_>,
+    surfaces: &[ConfigSurface],
 ) -> Result<(
     Vec<EngineOperation>,
     Vec<String>,
@@ -874,7 +892,7 @@ fn plan_change(
     DocumentKind,
     ConfigSurface,
 )> {
-    let (surface, strategy) = target_surface(adapter)?;
+    let (surface, strategy) = target_surface(surfaces, &adapter.id())?;
     let owned_keys = surface.owned_selectors.clone();
     let owned = |needle: &str| {
         surface
@@ -912,7 +930,8 @@ fn plan_change(
 
     match change {
         ProviderChange::AddOrUpdate { provider } => {
-            let outcome = render_provider_into_adapter(provider, None, adapter, instance);
+            let outcome =
+                render_provider_with_surfaces(provider, None, adapter, instance, surfaces);
             match outcome {
                 RenderOutcome::Supported(render) => {
                     if render.surface_id != surface.id {
@@ -1112,11 +1131,12 @@ pub fn preview_provider_change(
     adapter: &dyn Adapter,
     change: &ProviderChange<'_>,
 ) -> ProviderChangePreview {
-    let surface_id = target_surface(adapter).map(|(s, _)| s.id);
+    let surfaces = adapter.config_surfaces();
+    let surface_id = target_surface(&surfaces, &adapter.id()).map(|(s, _)| s.id);
     match surface_id {
         Ok(surface_id) => {
             let path = instance.config_root.as_path().join(&surface_id);
-            match plan_change(instance, adapter, change) {
+            match plan_change(instance, adapter, change, &surfaces) {
                 Ok((_, edits, warnings, _, _)) => ProviderChangePreview {
                     surface_id,
                     path,
@@ -1255,7 +1275,8 @@ pub fn commit_provider_change(
     change: &ProviderChange<'_>,
     options: &ProviderChangeOptions,
 ) -> Result<ProviderChangeOutcome> {
-    let (ops, edits, warnings, kind, surface) = plan_change(instance, adapter, change)?;
+    let (ops, edits, warnings, kind, surface) =
+        plan_change(instance, adapter, change, &adapter.config_surfaces())?;
     if ops.is_empty() {
         return Err(CoreError::Validation {
             field: "provider_change".to_owned(),

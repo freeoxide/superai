@@ -3,11 +3,12 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::adapter::{Adapter, DocumentKind, SurfaceOwnership};
+use crate::adapter::{Adapter, ConfigSurface, DocumentKind, SurfaceOwnership};
 use crate::capability::{Capability, Support};
 use crate::error::{CoreError, RedactedString, Result};
 use crate::ids::ProviderId;
@@ -1048,8 +1049,13 @@ fn is_valid_base_url(url: &str) -> (bool, String) {
 pub const BUNDLED_PROVIDERS_JSON: &str = include_str!("../assets/providers.json");
 
 /// Load providers from the bundled `assets/providers.json`, validating
-/// each definition and rejecting duplicates.
+/// each definition and rejecting duplicates. The asset is a compile-time
+/// constant, so the validated list is cached after the first call.
 pub fn load_bundled_providers() -> Result<Vec<ProviderDefinition>> {
+    static CACHED: OnceLock<Vec<ProviderDefinition>> = OnceLock::new();
+    if let Some(providers) = CACHED.get() {
+        return Ok(providers.clone());
+    }
     let providers: Vec<ProviderDefinition> =
         serde_json::from_str(BUNDLED_PROVIDERS_JSON).map_err(|source| CoreError::Parse {
             path: PathBuf::from("assets/providers.json"),
@@ -1060,7 +1066,7 @@ pub fn load_bundled_providers() -> Result<Vec<ProviderDefinition>> {
         p.validate()?;
     }
     validate_no_duplicates(&providers)?;
-    Ok(providers)
+    Ok(CACHED.get_or_init(|| providers).clone())
 }
 
 /// Result of a health probe; `base_url` and `reason` are redacted and
@@ -1203,9 +1209,17 @@ pub fn validate_api_key_value(provider: &ProviderDefinition, key: &str) -> Resul
 /// Resolve the harness-supported api-key sink: a writable surface with an
 /// api-key-shaped selector, else an env file; never registry/logs/keychain.
 pub fn resolve_api_key_sink(adapter: &dyn Adapter) -> Result<ApiKeySink> {
-    let surfaces = adapter.config_surfaces();
+    resolve_api_key_sink_in(&adapter.config_surfaces(), &adapter.id())
+}
+
+/// [`resolve_api_key_sink`] over a surface list the caller already built,
+/// so one flow does not rebuild the adapter's surfaces per step.
+pub(crate) fn resolve_api_key_sink_in(
+    surfaces: &[ConfigSurface],
+    harness: &str,
+) -> Result<ApiKeySink> {
     // Prefer a writable document surface with an api-key-shaped owned selector.
-    for surface in &surfaces {
+    for surface in surfaces {
         if surface.ownership == SurfaceOwnership::ExternalSecretStore {
             continue;
         }
@@ -1245,7 +1259,7 @@ pub fn resolve_api_key_sink(adapter: &dyn Adapter) -> Result<ApiKeySink> {
         }
     }
     // Second, an env file under the isolated root.
-    for surface in &surfaces {
+    for surface in surfaces {
         if surface.kind == DocumentKind::Env
             && matches!(
                 surface.ownership,
@@ -1272,7 +1286,7 @@ pub fn resolve_api_key_sink(adapter: &dyn Adapter) -> Result<ApiKeySink> {
     // No generic wrapper literal sink is invented: without a declared
     // config/env sink the placement is Unsupported.
     Err(CoreError::UnsupportedOperation {
-        harness: adapter.id().to_string(),
+        harness: harness.to_owned(),
         operation: "place_api_key".to_owned(),
         reason: "harness declares no writable config or env sink for api key".to_owned(),
     })
