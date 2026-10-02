@@ -511,17 +511,20 @@ pub fn lexical_diff(old: &[u8], new: &[u8]) -> String {
         return String::new();
     }
 
-    let old_lines: Vec<&str> = old_str.lines().collect();
-    let new_lines: Vec<&str> = new_str.lines().collect();
+    let mut old_lines = old_str.lines();
+    let mut new_lines = new_str.lines();
+    let mut lower_scratch = String::new();
 
     let mut out = String::new();
     out.push_str("--- old\n");
     out.push_str("+++ new\n");
 
-    let max = usize::max(old_lines.len(), new_lines.len());
-    for idx in 0..max {
-        let old_line = old_lines.get(idx).copied();
-        let new_line = new_lines.get(idx).copied();
+    loop {
+        let old_line = old_lines.next();
+        let new_line = new_lines.next();
+        if old_line.is_none() && new_line.is_none() {
+            break;
+        }
         match (old_line, new_line) {
             (Some(a), Some(b)) if a == b => {
                 out.push(' ');
@@ -530,20 +533,20 @@ pub fn lexical_diff(old: &[u8], new: &[u8]) -> String {
             }
             (Some(a), Some(b)) => {
                 out.push_str("- ");
-                out.push_str(&redact_line_for_preview(a));
+                out.push_str(&redact_line_for_preview(a, &mut lower_scratch));
                 out.push('\n');
                 out.push_str("+ ");
-                out.push_str(&redact_line_for_preview(b));
+                out.push_str(&redact_line_for_preview(b, &mut lower_scratch));
                 out.push('\n');
             }
             (Some(a), None) => {
                 out.push_str("- ");
-                out.push_str(&redact_line_for_preview(a));
+                out.push_str(&redact_line_for_preview(a, &mut lower_scratch));
                 out.push('\n');
             }
             (None, Some(b)) => {
                 out.push_str("+ ");
-                out.push_str(&redact_line_for_preview(b));
+                out.push_str(&redact_line_for_preview(b, &mut lower_scratch));
                 out.push('\n');
             }
             (None, None) => {}
@@ -557,8 +560,11 @@ pub fn lexical_diff(old: &[u8], new: &[u8]) -> String {
     out
 }
 
-fn redact_line_for_preview(line: &str) -> String {
-    if !contains_secret_marker(&line.to_ascii_lowercase()) {
+fn redact_line_for_preview(line: &str, lower: &mut String) -> String {
+    lower.clear();
+    lower.push_str(line);
+    lower.make_ascii_lowercase();
+    if !contains_secret_marker(lower) {
         return line.to_owned();
     }
     if let Some(pos) = line.find(':') {
@@ -929,13 +935,17 @@ pub fn find_redaction_spans(content: &[u8], _kind: DocumentKind) -> Vec<Redactio
 
 fn find_redaction_spans_str(text: &str) -> Vec<RedactionSpan> {
     let mut spans = Vec::new();
+    let mut lower = String::new();
     let mut offset = 0usize;
     for line_with_nl in text.split_inclusive('\n') {
         let line = line_with_nl
             .strip_suffix('\n')
             .and_then(|l| l.strip_suffix('\r'))
             .unwrap_or(line_with_nl.trim_end_matches('\n'));
-        if let Some(span) = redaction_span_for_line(line, offset) {
+        lower.clear();
+        lower.push_str(line);
+        lower.make_ascii_lowercase();
+        if let Some(span) = redaction_span_for_line(line, &lower, offset) {
             spans.push(span);
         }
         offset = offset.saturating_add(line_with_nl.len());
@@ -943,13 +953,11 @@ fn find_redaction_spans_str(text: &str) -> Vec<RedactionSpan> {
     spans
 }
 
-fn redaction_span_for_line(line: &str, line_offset: usize) -> Option<RedactionSpan> {
-    let lower = line.to_ascii_lowercase();
-    if !contains_secret_marker(&lower) && !lower.contains("auth") {
+fn redaction_span_for_line(line: &str, lower: &str, line_offset: usize) -> Option<RedactionSpan> {
+    if !contains_secret_marker(lower) && !lower.contains("auth") {
         return None;
     }
     let Some(pos) = line.find(':').or_else(|| line.find('=')) else {
-        // No separator to anchor on: redact the whole line.
         return Some(RedactionSpan {
             start: line_offset,
             end: line_offset.saturating_add(line.len()),
@@ -1169,29 +1177,13 @@ fn enforce_span_only_change(path: &Path, new_content: &[u8]) -> Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(e) => return Err(ConfigError::io(path, e)),
     };
-    let to_text = |bytes: &[u8], label: &str| -> Result<String> {
-        std::str::from_utf8(bytes)
-            .map(str::to_owned)
-            .map_err(|err| {
-                ConfigError::io(
-                    path,
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("{label} content is not valid utf-8: {err}"),
-                    ),
-                )
-            })
-    };
-    let old_text = to_text(&old_bytes, "current")?;
-    let new_text = to_text(new_content, "new")?;
+    let old_text = commit_text(path, &old_bytes, "current")?;
+    let new_text = commit_text(path, new_content, "new")?;
     let codec = crate::span_codec::SpanCodec::default();
-    let old_outside = codec
-        .outside_span_bytes(&old_text)
+    let outside_equal = codec
+        .outside_span_bytes_equal(old_text, new_text)
         .map_err(|e| e.into_config_error(path))?;
-    let new_outside = codec
-        .outside_span_bytes(&new_text)
-        .map_err(|e| e.into_config_error(path))?;
-    if old_outside == new_outside {
+    if outside_equal {
         return Ok(());
     }
     Err(ConfigError::unmanaged_span_write(
@@ -1200,6 +1192,18 @@ fn enforce_span_only_change(path: &Path, new_content: &[u8]) -> Result<()> {
          opaque/read-only (DOC-08)"
             .to_owned(),
     ))
+}
+
+fn commit_text<'a>(path: &Path, bytes: &'a [u8], label: &str) -> Result<&'a str> {
+    std::str::from_utf8(bytes).map_err(|err| {
+        ConfigError::io(
+            path,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{label} content is not valid utf-8: {err}"),
+            ),
+        )
+    })
 }
 
 fn validate_for_commit(path: &Path, content: &[u8], kind: DocumentKind) -> Result<()> {
@@ -1273,7 +1277,6 @@ fn validate_for_commit(path: &Path, content: &[u8], kind: DocumentKind) -> Resul
     }
 }
 
-#[expect(clippy::too_many_lines, reason = "commit steps are sequential")]
 fn commit_inner(
     path: &Path,
     new_content: &[u8],
@@ -1376,19 +1379,6 @@ fn commit_inner(
         }
         return Err(e);
     }
-
-    let read_back = std::fs::read(path).map_err(|e| ConfigError::io(path, e))?;
-    let expected_digest_new = compute_digest(new_content);
-    let actual_digest = compute_digest(&read_back);
-    if expected_digest_new != actual_digest {
-        return Err(ConfigError::verification(
-            path,
-            format!(
-                "digest mismatch after commit: expected {expected_digest_new}, got {actual_digest}"
-            ),
-        ));
-    }
-    validate_for_commit(path, &read_back, kind)?;
 
     let new_snapshot = snapshot(path);
     let new_digest = new_snapshot

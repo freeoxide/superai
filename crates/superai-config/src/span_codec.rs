@@ -95,19 +95,14 @@ impl SpanCodec {
         let mut begins: Vec<(&str, usize, usize)> = Vec::new(); // (name, line, offset)
         let mut ends: Vec<(&str, usize, usize, usize)> = Vec::new(); // (name, line, offset, line_end)
 
-        let begin_marker = format!("{}superai:begin:", prefix_with_space(self));
-        let end_marker = format!("{}superai:end:", prefix_with_space(self));
-
         let mut offset = 0usize;
         for (idx, line) in text.split_inclusive('\n').enumerate() {
             let line_no = idx.saturating_add(1);
-            // Sentinels must start at column 0 so span math stays exact;
-            // trailing whitespace and the line terminator trim from the name.
-            if let Some(rest) = line.strip_prefix(&begin_marker) {
+            if let Some(rest) = strip_sentinel(line, &self.comment_prefix, "superai:begin:") {
                 let name = rest.trim_end();
                 Self::validate_name(name).map_err(|e| SpanError::new(line_no, e.reason))?;
                 begins.push((name, line_no, offset));
-            } else if let Some(rest) = line.strip_prefix(&end_marker) {
+            } else if let Some(rest) = strip_sentinel(line, &self.comment_prefix, "superai:end:") {
                 let name = rest.trim_end();
                 Self::validate_name(name).map_err(|e| SpanError::new(line_no, e.reason))?;
                 ends.push((name, line_no, offset, offset.saturating_add(line.len())));
@@ -115,26 +110,22 @@ impl SpanCodec {
             offset = offset.saturating_add(line.len());
         }
 
-        // Pair begins with ends, fail closed on every anomaly.
-        let mut ends_by_name: HashMap<&str, Vec<(usize, usize, usize)>> = HashMap::new();
-        for (name, line_no, offset, line_end) in &ends {
-            ends_by_name
-                .entry(name)
-                .or_default()
-                .push((*line_no, *offset, *line_end));
-        }
-        let mut begin_counts: HashMap<&str, usize> = HashMap::new();
-        for (name, _, _) in &begins {
-            *begin_counts.entry(name).or_default() += 1;
-        }
+        let (begin_pairs, end_counts) = pair_sentinels(&begins, &ends);
 
         let mut ranges = Vec::new();
-        for (name, line_no, begin_offset) in &begins {
-            let matching = ends_by_name.get(*name).map_or(&[][..], Vec::as_slice);
-            ranges.push(pair_single_span(name, *line_no, *begin_offset, matching)?);
+        for (idx, (name, line_no, begin_offset)) in begins.iter().enumerate() {
+            let (end_count, single) = begin_pairs.get(idx).copied().unwrap_or((0, None));
+            ranges.push(pair_single_span(
+                name,
+                *line_no,
+                *begin_offset,
+                end_count,
+                single,
+            )?);
         }
-        for (name, line_no, _, _) in &ends {
-            match begin_counts.get(*name).copied().unwrap_or(0) {
+        for (idx, (name, line_no, _, _)) in ends.iter().enumerate() {
+            let begin_count = end_counts.get(idx).copied().unwrap_or(0);
+            match begin_count {
                 0 => {
                     return Err(SpanError::new(
                         *line_no,
@@ -289,29 +280,175 @@ impl SpanCodec {
         out.push_str(text.get(cursor..).unwrap_or_default());
         Ok(out)
     }
+
+    /// Whether `a` and `b` carry byte-identical content outside all spans
+    /// (span bodies may differ); `a` is validated before `b`, so its failure
+    /// surfaces first.
+    pub fn outside_span_bytes_equal(
+        &self,
+        a: &str,
+        b: &str,
+    ) -> std::result::Result<bool, SpanError> {
+        let ranges_a = self.validate(a)?;
+        let ranges_b = self.validate(b)?;
+        Ok(gaps_equal(Gaps::new(a, &ranges_a), Gaps::new(b, &ranges_b)))
+    }
 }
 
-/// `prefix` plus one space: `"#"` yields `"# superai:begin:"`.
-fn prefix_with_space(codec: &SpanCodec) -> String {
-    format!("{} ", codec.comment_prefix)
+struct Gaps<'t> {
+    text: &'t str,
+    ranges: std::slice::Iter<'t, SpanRange>,
+    cursor: usize,
 }
 
-/// Pair one begin with its end, failing closed on duplicates, missing
-/// ends, and mis-ordered sentinels.
+impl<'t> Gaps<'t> {
+    fn new(text: &'t str, ranges: &'t [SpanRange]) -> Self {
+        Self {
+            text,
+            ranges: ranges.iter(),
+            cursor: 0,
+        }
+    }
+}
+
+impl<'t> Iterator for Gaps<'t> {
+    type Item = &'t str;
+
+    fn next(&mut self) -> Option<&'t str> {
+        match self.ranges.next() {
+            Some(range) => {
+                let gap = self.text.get(self.cursor..range.begin).unwrap_or_default();
+                self.cursor = range.end;
+                Some(gap)
+            }
+            None if self.cursor < self.text.len() => {
+                let gap = self.text.get(self.cursor..).unwrap_or_default();
+                self.cursor = self.text.len();
+                Some(gap)
+            }
+            None => None,
+        }
+    }
+}
+
+fn gaps_equal(mut ga: Gaps<'_>, mut gb: Gaps<'_>) -> bool {
+    let mut chunk_a: &[u8] = &[];
+    let mut chunk_b: &[u8] = &[];
+    loop {
+        while chunk_a.is_empty()
+            && let Some(gap) = ga.next()
+        {
+            chunk_a = gap.as_bytes();
+        }
+        while chunk_b.is_empty()
+            && let Some(gap) = gb.next()
+        {
+            chunk_b = gap.as_bytes();
+        }
+        if chunk_a.is_empty() || chunk_b.is_empty() {
+            return chunk_a.is_empty() && chunk_b.is_empty();
+        }
+        let n = usize::min(chunk_a.len(), chunk_b.len());
+        let (head_a, tail_a) = chunk_a.split_at(n);
+        let (head_b, tail_b) = chunk_b.split_at(n);
+        if head_a != head_b {
+            return false;
+        }
+        chunk_a = tail_a;
+        chunk_b = tail_b;
+    }
+}
+
+const LINEAR_PAIRING_SENTINEL_LIMIT: usize = 64;
+
+fn pair_sentinels(
+    begins: &[(&str, usize, usize)],
+    ends: &[(&str, usize, usize, usize)],
+) -> (Vec<(usize, Option<(usize, usize, usize)>)>, Vec<usize>) {
+    if begins.len().saturating_add(ends.len()) <= LINEAR_PAIRING_SENTINEL_LIMIT {
+        let begin_pairs = begins
+            .iter()
+            .map(|(name, _, _)| scan_end_match(ends, name))
+            .collect();
+        let end_counts = ends
+            .iter()
+            .map(|(name, _, _, _)| scan_begin_count(begins, name))
+            .collect();
+        return (begin_pairs, end_counts);
+    }
+    let mut ends_by_name: HashMap<&str, Vec<(usize, usize, usize)>> = HashMap::new();
+    for (name, line_no, offset, line_end) in ends {
+        ends_by_name
+            .entry(name)
+            .or_default()
+            .push((*line_no, *offset, *line_end));
+    }
+    let mut begin_counts: HashMap<&str, usize> = HashMap::new();
+    for (name, _, _) in begins {
+        *begin_counts.entry(name).or_default() += 1;
+    }
+    let mut begin_pairs = Vec::with_capacity(begins.len());
+    for (name, _, _) in begins {
+        let matching = ends_by_name.get(*name).map_or(&[][..], Vec::as_slice);
+        match matching.len() {
+            0 => begin_pairs.push((0, None)),
+            1 => {
+                let one = matching.first().copied();
+                begin_pairs.push((1, one));
+            }
+            _ => begin_pairs.push((matching.len(), None)),
+        }
+    }
+    let end_counts = ends
+        .iter()
+        .map(|(name, _, _, _)| begin_counts.get(*name).copied().unwrap_or(0))
+        .collect();
+    (begin_pairs, end_counts)
+}
+
+fn strip_sentinel<'a>(line: &'a str, comment_prefix: &str, directive: &str) -> Option<&'a str> {
+    line.strip_prefix(comment_prefix)?
+        .strip_prefix(' ')?
+        .strip_prefix(directive)
+}
+
+fn scan_end_match(
+    ends: &[(&str, usize, usize, usize)],
+    name: &str,
+) -> (usize, Option<(usize, usize, usize)>) {
+    let mut count = 0usize;
+    let mut single = None;
+    for (end_name, line_no, offset, line_end) in ends {
+        if *end_name == name {
+            count = count.saturating_add(1);
+            single = Some((*line_no, *offset, *line_end));
+        }
+    }
+    (count, single)
+}
+
+fn scan_begin_count(begins: &[(&str, usize, usize)], name: &str) -> usize {
+    begins
+        .iter()
+        .filter(|(begin_name, _, _)| *begin_name == name)
+        .count()
+}
+
 fn pair_single_span(
     name: &str,
     line_no: usize,
     begin_offset: usize,
-    ends: &[(usize, usize, usize)],
+    end_count: usize,
+    single: Option<(usize, usize, usize)>,
 ) -> std::result::Result<SpanRange, SpanError> {
-    let one = match ends {
-        [] => {
+    let one = match (end_count, single) {
+        (0, _) => {
             return Err(SpanError::new(
                 line_no,
                 format!("unbalanced span `{name}`: begin sentinel has no end sentinel"),
             ));
         }
-        [one] => one,
+        (1, Some(one)) => one,
         _ => {
             return Err(SpanError::new(
                 line_no,
