@@ -177,7 +177,6 @@ pub(crate) fn run_capturing(binary: &Path, args: &[&str], budget: Duration) -> O
     rx.recv_timeout(budget).unwrap_or_default()
 }
 
-/// Drain `pipe` into `buf`; a read error is logged, not silently dropped.
 fn drain_pipe(pipe: Option<impl Read>, buf: &mut Vec<u8>, binary: &Path, side: &str) {
     let Some(mut pipe) = pipe else {
         return;
@@ -190,8 +189,30 @@ fn drain_pipe(pipe: Option<impl Read>, buf: &mut Vec<u8>, binary: &Path, side: &
     }
 }
 
-/// Spawn, kill at the deadline, reap, and merge the captured output; `None`
-/// on spawn failure, timeout, or a failing probe with no output.
+fn drain_pipe_concurrently(
+    pipe: Option<impl Read + Send + 'static>,
+    binary: &Path,
+    side: &'static str,
+) -> thread::JoinHandle<Vec<u8>> {
+    let binary = binary.to_path_buf();
+    thread::spawn(move || {
+        let mut buf = Vec::new();
+        drain_pipe(pipe, &mut buf, &binary, side);
+        buf
+    })
+}
+
+fn join_pipe_reader(handle: thread::JoinHandle<Vec<u8>>, binary: &Path) -> Vec<u8> {
+    if let Ok(buf) = handle.join() {
+        return buf;
+    }
+    eprintln!(
+        "superai-core: probe reader for {} failed before EOF",
+        binary.display()
+    );
+    Vec::new()
+}
+
 fn run_probe(binary: &Path, args: &[String], budget: Duration) -> Option<String> {
     let spawned = Command::new(binary)
         .args(args)
@@ -209,6 +230,9 @@ fn run_probe(binary: &Path, args: &[String], budget: Duration) -> Option<String>
         }
     };
     let deadline = Instant::now() + budget;
+    let stdout = drain_pipe_concurrently(child.stdout.take(), binary, "stdout");
+    let stderr = drain_pipe_concurrently(child.stderr.take(), binary, "stderr");
+    let mut poll = Duration::from_micros(500);
     let status: ExitStatus = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -230,7 +254,10 @@ fn run_probe(binary: &Path, args: &[String], budget: Duration) -> Option<String>
                     }
                 };
             }
-            Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                thread::sleep(poll);
+                poll = (poll * 2).min(Duration::from_millis(10));
+            }
             Err(err) => {
                 eprintln!(
                     "superai-core: probe of {} wait failed: {err}",
@@ -240,10 +267,8 @@ fn run_probe(binary: &Path, args: &[String], budget: Duration) -> Option<String>
             }
         }
     };
-    let mut out = Vec::new();
-    let mut err = Vec::new();
-    drain_pipe(child.stdout.take(), &mut out, binary, "stdout");
-    drain_pipe(child.stderr.take(), &mut err, binary, "stderr");
+    let out = join_pipe_reader(stdout, binary);
+    let err = join_pipe_reader(stderr, binary);
     if !status.success() && out.is_empty() && err.is_empty() {
         return None;
     }
@@ -484,7 +509,8 @@ mod decl_tests {
     }
 
     /// A probe past its budget returns None and the child is killed, not left
-    /// running: the /proc sweep fails while the bare `sleep` victim survives.
+    /// running. The sweep matches only our own child: this sandbox's worker
+    /// keeps an ambient `sleep 30` alive forever (distinct parent pid).
     #[test]
     #[cfg(unix)]
     fn run_capturing_kills_a_hung_child() {
@@ -505,18 +531,67 @@ mod decl_tests {
         }
     }
 
+    /// A probe whose output passes the OS pipe capacity must finish inside
+    /// its budget and still parse the version at the end of the stream.
+    #[test]
+    #[cfg(unix)]
+    fn probe_drains_output_past_pipe_capacity() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_util::temp_dir_unique("probe-chatty");
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("chatty");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s 9.9.9\\n' '{}'\n",
+                "x".repeat(96 * 1024)
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let started = std::time::Instant::now();
+        let version = super::probe_version(&script);
+        assert_eq!(
+            version.as_deref(),
+            Some("9.9.9"),
+            "version past the pipe capacity was lost"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "chatty probe paid the kill budget: {:?}",
+            started.elapsed()
+        );
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
     /// Whether any live process's argv is exactly `wanted`; /proc entries
     /// that vanish mid-scan or have unreadable cmdlines never match.
     #[cfg(all(test, unix))]
     fn argv_alive(wanted: &[&str]) -> bool {
-        let cmdline_matches = |entry: std::fs::DirEntry| {
-            std::fs::read_to_string(entry.path().join("cmdline")).is_ok_and(|cmd| {
-                cmd.split('\0')
-                    .filter(|a| !a.is_empty())
-                    .eq(wanted.iter().copied())
-            })
+        let parent = std::process::id();
+        std::fs::read_dir("/proc").is_ok_and(|entries| {
+            entries
+                .flatten()
+                .any(|entry| argv_entry_is_our_child(&entry, wanted, parent))
+        })
+    }
+
+    fn argv_entry_is_our_child(entry: &std::fs::DirEntry, wanted: &[&str], parent: u32) -> bool {
+        let Ok(cmd) = std::fs::read_to_string(entry.path().join("cmdline")) else {
+            return false;
         };
-        std::fs::read_dir("/proc").is_ok_and(|entries| entries.flatten().any(cmdline_matches))
+        if !cmd
+            .split('\0')
+            .filter(|a| !a.is_empty())
+            .eq(wanted.iter().copied())
+        {
+            return false;
+        }
+        let Ok(status) = std::fs::read_to_string(entry.path().join("status")) else {
+            return false;
+        };
+        let ppid = format!("PPid:\t{parent}");
+        status.lines().any(|line| line == ppid)
     }
 
     /// Runtime backstop for `from_validated_const`: every adapter literal,

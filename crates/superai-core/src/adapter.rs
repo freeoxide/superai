@@ -625,14 +625,29 @@ pub fn validate_surface_content(
     kind: superai_config::document::DocumentKind,
 ) -> Vec<Diagnostic> {
     let schema = adapter.surface_schema(surface_id);
-    let diagnostics = match &schema {
+    validate_content_with_schema(
+        adapter.id().as_ref(),
+        surface_id,
+        schema.as_ref(),
+        content,
+        kind,
+    )
+}
+
+fn validate_content_with_schema(
+    harness: &str,
+    surface_id: &str,
+    schema: Option<&SurfaceSchema>,
+    content: &[u8],
+    kind: superai_config::document::DocumentKind,
+) -> Vec<Diagnostic> {
+    let diagnostics = match schema {
         Some(schema) => {
             let engine = schema.semantic_schema();
             superai_config::raw_editor::validate_with_schema(content, kind, Some(&engine))
         }
         None => superai_config::raw_editor::validate(content, kind),
     };
-    let harness = adapter.id().to_string();
     diagnostics
         .into_iter()
         .map(|d| Diagnostic {
@@ -647,8 +662,10 @@ pub fn validate_surface_content(
 /// Validate on-disk surface content under `root` against declared schemas
 /// (HAD-03); missing files skip, error diagnostics fail, deprecations do not.
 pub fn validate_instance_surfaces(adapter: &dyn Adapter, root: &Path) -> Result<(), CoreError> {
+    let harness = adapter.id().to_string();
     for surface in adapter.config_surfaces() {
-        if adapter.surface_schema(&surface.id).is_none() {
+        let schema = adapter.surface_schema(&surface.id);
+        if schema.is_none() {
             continue;
         }
         let path = root.join(&surface.id);
@@ -656,11 +673,12 @@ pub fn validate_instance_surfaces(adapter: &dyn Adapter, root: &Path) -> Result<
             continue;
         };
         let kind = superai_config::document::DocumentKind::from(surface.kind);
-        let errors: Vec<String> = validate_surface_content(adapter, &surface.id, &content, kind)
-            .into_iter()
-            .filter(|d| d.severity == superai_config::document::DiagnosticSeverity::Error)
-            .map(|d| d.message)
-            .collect();
+        let errors: Vec<String> =
+            validate_content_with_schema(&harness, &surface.id, schema.as_ref(), &content, kind)
+                .into_iter()
+                .filter(|d| d.severity == superai_config::document::DiagnosticSeverity::Error)
+                .map(|d| d.message)
+                .collect();
         if !errors.is_empty() {
             return Err(CoreError::SchemaValidation {
                 path,
