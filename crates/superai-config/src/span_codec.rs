@@ -651,6 +651,116 @@ mod tests {
     }
 
     #[test]
+    fn outside_span_bytes_equal_agrees_with_concatenated_outside_bytes() {
+        let codec = SpanCodec::default();
+        let mut rng = Rng(0x5eed_1234);
+        for case in 0..400u32 {
+            let mut text = random_prelude(&mut rng, case);
+            let span_count = rng.below(5);
+            for i in 0..span_count {
+                let name = format!("s{case}_{i}");
+                let body = random_body(&mut rng);
+                text = codec.insert_span(&text, &name, &body).unwrap();
+            }
+            if rng.below(4) == 0 {
+                text = text.replace('\n', "\r\n");
+            }
+            let variant = random_variant(&codec, &mut rng, &text);
+            let expected = match codec.outside_span_bytes(&text) {
+                Err(e) => Err(e),
+                Ok(a_outside) => match codec.outside_span_bytes(&variant) {
+                    Err(e) => Err(e),
+                    Ok(b_outside) => Ok(a_outside == b_outside),
+                },
+            };
+            let got = codec.outside_span_bytes_equal(&text, &variant);
+            assert_eq!(
+                got, expected,
+                "case {case}: streaming gate diverged from the scalar oracle\ntext: {text:?}\nvariant: {variant:?}"
+            );
+        }
+    }
+
+    fn random_variant(codec: &SpanCodec, rng: &mut Rng, text: &str) -> String {
+        let ranges = codec.validate(text).expect("fixture must validate");
+        let pick = rng.below(4);
+        if pick == 0 || ranges.is_empty() {
+            let mut edit = text.to_owned();
+            if rng.below(2) == 0 {
+                edit.push_str("outside junk\n");
+            } else {
+                edit.insert_str(0, "junk outside\n");
+            }
+            return edit;
+        }
+        let name = ranges
+            .get(rng.below(ranges.len()))
+            .map(|r| r.name.as_str())
+            .unwrap_or_default()
+            .to_owned();
+        match pick {
+            1 => codec
+                .replace_span(text, &name, &random_body(rng))
+                .unwrap_or_else(|_| text.to_owned()),
+            2 => {
+                let removed = codec
+                    .remove_span(text, &name)
+                    .unwrap_or_else(|_| text.to_owned());
+                codec
+                    .insert_span(&removed, &name, &random_body(rng))
+                    .unwrap_or(removed)
+            }
+            _ => {
+                let mut smuggled = text.to_owned();
+                smuggled.push_str("# superai:begin:");
+                smuggled.push_str(&name);
+                smuggled.push('\n');
+                smuggled
+            }
+        }
+    }
+
+    fn random_prelude(rng: &mut Rng, salt: u32) -> String {
+        let mut text = String::new();
+        for line in 0..rng.below(4) {
+            text.push_str("prelude ");
+            text.push_str(&salt.to_string());
+            text.push(' ');
+            text.push_str(&(line * 7).to_string());
+            text.push('\n');
+        }
+        text
+    }
+
+    fn random_body(rng: &mut Rng) -> String {
+        let mut body = String::new();
+        for _ in 0..rng.below(4) {
+            for _ in 0..rng.below(12) {
+                body.push(['a', 'b', 'c', ' ', '=', '9'][rng.below(6)]);
+            }
+            body.push('\n');
+        }
+        body
+    }
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            usize::try_from(self.next() % (n.max(1) as u64)).unwrap_or(0)
+        }
+    }
+
+    #[test]
     fn custom_comment_prefix_and_crlf_tolerant_names() {
         let codec = SpanCodec::new("//");
         let text = codec.insert_span("js\n", "cfg", "v=1").unwrap();

@@ -520,12 +520,8 @@ pub fn lexical_diff(old: &[u8], new: &[u8]) -> String {
     out.push_str("+++ new\n");
 
     loop {
-        let old_line = old_lines.next();
-        let new_line = new_lines.next();
-        if old_line.is_none() && new_line.is_none() {
-            break;
-        }
-        match (old_line, new_line) {
+        match (old_lines.next(), new_lines.next()) {
+            (None, None) => break,
             (Some(a), Some(b)) if a == b => {
                 out.push(' ');
                 out.push_str(a);
@@ -549,7 +545,6 @@ pub fn lexical_diff(old: &[u8], new: &[u8]) -> String {
                 out.push_str(&redact_line_for_preview(b, &mut lower_scratch));
                 out.push('\n');
             }
-            (None, None) => {}
         }
         if out.len() > 8192 {
             out.push_str("... truncated\n");
@@ -1041,7 +1036,7 @@ pub fn create_file_with_injector(
     // RAW-05 empty-buffer rule and, for fragments, the span-only gate).
     validate_for_commit(path, new_content, kind)?;
     if kind == DocumentKind::TextFragment {
-        enforce_span_only_change(path, new_content)?;
+        enforce_span_only_change(path, new_content, None)?;
     }
     // The caller expects a missing target; an existing file is a conflict.
     if path.exists() {
@@ -1156,7 +1151,7 @@ pub fn commit(
     new_content: &[u8],
     expected_digest: Option<&str>,
 ) -> Result<CommitReport> {
-    commit_inner(path, new_content, expected_digest, None)
+    commit_inner(path, new_content, expected_digest, None, None)
 }
 
 /// Commit with an explicit [`Snapshot`] conflict token.
@@ -1166,18 +1161,40 @@ pub fn commit_with_snapshot(
     expected: Option<&Snapshot>,
 ) -> Result<CommitReport> {
     let digest_opt = expected.and_then(|s| s.digest.as_deref());
-    commit_inner(path, new_content, digest_opt, expected)
+    commit_inner(path, new_content, digest_opt, expected, None)
+}
+
+/// [`commit_with_snapshot`] for text fragments where the caller holds the
+/// bytes it just read from `path` this operation: the span gate compares
+/// against `base` instead of re-reading. The snapshot token is still
+/// re-checked fresh, so a file that changed since `base` was read aborts
+/// before any disk mutation.
+pub fn commit_with_snapshot_and_base(
+    path: &Path,
+    new_content: &[u8],
+    expected: Option<&Snapshot>,
+    base: &[u8],
+) -> Result<CommitReport> {
+    let digest_opt = expected.and_then(|s| s.digest.as_deref());
+    commit_inner(path, new_content, digest_opt, expected, Some(base))
 }
 
 /// DOC-08 gate: both sides need well-formed sentinels and identical bytes
 /// outside all spans, else the write is refused (missing file = empty).
-fn enforce_span_only_change(path: &Path, new_content: &[u8]) -> Result<()> {
-    let old_bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(e) => return Err(ConfigError::io(path, e)),
+/// `base` supplies the caller's fresh bytes when it holds them.
+fn enforce_span_only_change(path: &Path, new_content: &[u8], base: Option<&[u8]>) -> Result<()> {
+    let read;
+    let old_bytes: &[u8] = if let Some(bytes) = base {
+        bytes
+    } else {
+        read = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(ConfigError::io(path, e)),
+        };
+        &read
     };
-    let old_text = commit_text(path, &old_bytes, "current")?;
+    let old_text = commit_text(path, old_bytes, "current")?;
     let new_text = commit_text(path, new_content, "new")?;
     let codec = crate::span_codec::SpanCodec::default();
     let outside_equal = codec
@@ -1282,6 +1299,7 @@ fn commit_inner(
     new_content: &[u8],
     expected_digest: Option<&str>,
     expected_snapshot: Option<&Snapshot>,
+    base: Option<&[u8]>,
 ) -> Result<CommitReport> {
     let kind = DocumentKind::from_path(path);
 
@@ -1300,7 +1318,7 @@ fn commit_inner(
 
     // DOC-08: fragments accept span-only edits; whole-file rewrites stay read-only.
     if kind == DocumentKind::TextFragment {
-        enforce_span_only_change(path, new_content)?;
+        enforce_span_only_change(path, new_content, base)?;
     }
 
     let current_snapshot = snapshot(path);
