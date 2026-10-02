@@ -254,7 +254,6 @@ impl Adapter for OpenClawAdapter {
             "models.providers".to_owned(),
         ];
         config_surface.backup_required = true;
-        // JSON5 allows comments; must be format-preserving, but we model as Json for now.
         config_surface.restart_behavior = RestartBehavior::Restart;
         surfaces.push(config_surface);
 

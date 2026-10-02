@@ -70,8 +70,6 @@ pub const OWNED_SELECTORS: &[&str] = &[
 /// Constrained note: the server is separate, one per provider.
 pub const CONSTRAINED_NOTE: &str = "client config isolated via LETTA_LOCAL_BACKEND_DIR; separate server per provider state (LETTA_BASE_URL, LETTA_API_KEY, Ollama/vLLM) is separate server and not per-instance mutated: run one server per provider (different ports/volumes at /root/.letta)";
 
-/// Evidence preview for an env value: KEY/TOKEN names redact entirely, so a
-/// long secret cannot ride the 80-char truncation rule into detection output.
 fn env_preview(var: &str, val: &str) -> String {
     if var.contains("KEY") || var.contains("TOKEN") {
         "[REDACTED]".to_owned()

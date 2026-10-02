@@ -415,7 +415,6 @@ impl Adapter for PlandexAdapter {
         instance.validate()?;
         let mut plan =
             WrapperPlan::new("env_only via PLANDEX_API_HOST + provider keys, server per-deploy");
-        // A name-derived localhost port keeps wrapper plans deterministic.
         #[expect(
             clippy::cast_possible_truncation,
             reason = "name len < 100, truncation intentional for deterministic port"
@@ -426,7 +425,6 @@ impl Adapter for PlandexAdapter {
             .push((API_HOST_ENV_VAR.to_owned(), derived_host));
         plan.env_vars
             .push((ENV_ENV_VAR.to_owned(), "production".to_owned()));
-        // Provider keys are template/secrets driven; wrapper sets host + env marker.
         plan.description = format!(
             " Wrapper sets {API_HOST_ENV_VAR}=http://localhost:{derived_port} {ENV_ENV_VAR}=production and HOME={} (provider keys via template, custom models JSON at <home>/.plandex-home-v2/custom-models.json, server PLANDEX_BASE_DIR/DATABASE_URL per-deploy, {CONSTRAINED_NOTE})",
             instance.config_root

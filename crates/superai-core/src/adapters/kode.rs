@@ -107,19 +107,15 @@ impl KodeAdapter {
                             Err(err) => evidence
                                 .push(format!("config unreadable at {}: {err}", cfg.display())),
                         }
-                    } else {
-                        // Legacy flat-file location, pre-relocation installs.
-                        if let Some(home) = super::home_dir() {
-                            let legacy = home.join(".kode.json");
-                            if legacy.exists() {
-                                evidence
-                                    .push(format!("legacy config found at {}", legacy.display()));
-                            } else {
-                                evidence.push(format!("config.json missing at {}", cfg.display()));
-                            }
+                    } else if let Some(home) = super::home_dir() {
+                        let legacy = home.join(".kode.json");
+                        if legacy.exists() {
+                            evidence.push(format!("legacy config found at {}", legacy.display()));
                         } else {
                             evidence.push(format!("config.json missing at {}", cfg.display()));
                         }
+                    } else {
+                        evidence.push(format!("config.json missing at {}", cfg.display()));
                     }
                     let settings = Path::new(".kode").join("settings.json");
                     if settings.exists() {

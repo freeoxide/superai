@@ -468,8 +468,6 @@ impl Adapter for OpenCodeAdapter {
             | Isolation::ExplicitConfig
             | Isolation::EnvOnly
             | Isolation::Unknown => {
-                // Surface content under the instance root must satisfy the
-                // declared root shapes and owned-key rules.
                 crate::adapter::validate_instance_surfaces(self, instance.config_root.as_path())
             }
             other => Err(CoreError::Validation {

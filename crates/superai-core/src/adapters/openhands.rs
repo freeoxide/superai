@@ -88,8 +88,6 @@ impl OpenHandsAdapter {
         Some(home.join(".openhands"))
     }
 
-    /// Evidence line for a readable config carrying any marker, or for the
-    /// read failure itself; a readable file without markers stays silent.
     fn probe_config_markers(
         path: &Path,
         markers: &[&str],
@@ -282,7 +280,6 @@ impl Adapter for OpenHandsAdapter {
 
         let present = super::install_presence(binary_path.is_some(), version.is_some());
 
-        // never survive.
         let confidence =
             super::detection_confidence(binary_path.is_some(), version.is_some(), false);
         DetectionResult::new(present, version, evidence, confidence)
@@ -511,8 +508,6 @@ impl Adapter for OpenHandsAdapter {
             PERSISTENCE_ENV_VAR.to_owned(),
             instance.config_root.to_string(),
         ));
-        // V1 env overrides are session-inline and only apply behind
-        // --override-with-envs; persistence is what the wrapper pins.
         plan.env_vars
             .push(("RUNTIME".to_owned(), "docker".to_owned()));
         let runtime_image = "ghcr.io/openhands/agent-server:1.26.0-python";
