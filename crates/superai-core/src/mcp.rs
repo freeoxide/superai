@@ -1,8 +1,6 @@
 //! MCP canonical definition and lifecycle (EXT-08..10): per-entry merges
 //! keep foreign servers and unmodelled keys; JSONC/YAML refuse writes.
 
-// The per-format (JSON/TOML/YAML) walkers branch per node kind, so deep
-// nesting is intrinsic to the serialization dispatch.
 #![expect(
     clippy::excessive_nesting,
     reason = "per-format walkers branch per node kind"
@@ -789,7 +787,6 @@ fn commit_document(path: &Path, kind: DocumentKind, bytes: Vec<u8>) -> Result<()
             reason: format!("mcp commit failed: {diag}"),
         });
     }
-    // The written bytes must parse under the same codec.
     read_outer_value(path, kind).map_err(|e| CoreError::Verification {
         path: path.to_path_buf(),
         kind: "parse".to_owned(),
@@ -1153,12 +1150,17 @@ pub fn preview_install(
 ) -> Result<McpInstallPreview> {
     server.validate()?;
     let (_outer, inner) = read_outer_and_inner(path, decl)?;
-    let existing_val = inner.get(server.id.as_str()).cloned();
-    let existing = if let Some(v) = existing_val {
-        Some(from_native_value(server.id.as_str(), &v)?)
-    } else {
-        None
-    };
+    preview_from_inner(server, &inner)
+}
+
+fn preview_from_inner(
+    server: &McpServerDef,
+    inner: &BTreeMap<String, Value>,
+) -> Result<McpInstallPreview> {
+    let existing = inner
+        .get(server.id.as_str())
+        .map(|v| from_native_value(server.id.as_str(), v))
+        .transpose()?;
     let is_update = existing.is_some();
     let mut conflicts: Vec<String> = Vec::new();
     for existing_key in inner.keys() {
@@ -1221,7 +1223,8 @@ pub fn install_mcp_server(
     server: &McpServerDef,
 ) -> Result<McpServerDef> {
     server.validate()?;
-    let preview = preview_install(path, decl, server)?;
+    let (_outer, inner) = read_outer_and_inner(path, decl)?;
+    let preview = preview_from_inner(server, &inner)?;
     if !preview.can_auto_apply {
         return Err(CoreError::NameCollision {
             kind: "McpServerId".to_owned(),
@@ -1234,8 +1237,6 @@ pub fn install_mcp_server(
     {
         return Ok(server.clone());
     }
-    // Read fresh for the merge; disk is truth.
-    let (_outer, inner) = read_outer_and_inner(path, decl)?;
     let existing_native = inner.get(server.id.as_str());
     let merged = merge_server_native(existing_native, &to_native_value(server));
     write_server_entry(path, decl, server.id.as_str(), &ServerWrite::Upsert(merged))?;
@@ -1428,7 +1429,6 @@ pub fn transfer_between_scopes(
         }
         return Ok(Some(preview.source_existing));
     }
-    // Destination write first (additive, foreign preserved).
     let merged = merge_server_native(None, &to_native_value(&preview.source_existing));
     write_server_entry(
         dest_path,

@@ -229,6 +229,24 @@ fn compose_child_env(opts: &ExecuteOpts) -> BTreeMap<OsString, OsString> {
     env
 }
 
+fn child_path_var(opts: &ExecuteOpts) -> Option<OsString> {
+    let path_key = env_map_key(OsStr::new("PATH"));
+    let removed = opts
+        .env_remove
+        .iter()
+        .any(|key| env_map_key(OsStr::new(key)) == path_key);
+    if !removed
+        && let Some((_, value)) = opts
+            .env
+            .iter()
+            .rev()
+            .find(|(key, _)| env_map_key(OsStr::new(key)) == path_key)
+    {
+        return Some(OsString::from(value));
+    }
+    std::env::var_os("PATH")
+}
+
 /// Whether `path` names an executable file (unix demands the execute bit;
 /// Windows tests existence only, matching the adapter PATH helpers).
 fn is_executable_file(path: &Path) -> bool {
@@ -265,12 +283,7 @@ fn first_path_match(path_var: &OsStr, name: &str) -> Option<PathBuf> {
     None
 }
 
-/// Resolve `executable` to what will be spawned: bare names take the first
-/// PATH match from the child's composed PATH; `.`/`..` is refused.
-fn resolve_executable(
-    executable: &str,
-    child_env: &BTreeMap<OsString, OsString>,
-) -> Result<PathBuf, CoreError> {
+fn resolve_executable(executable: &str, path_var: Option<&OsStr>) -> Result<PathBuf, CoreError> {
     let path = Path::new(executable);
     if path
         .components()
@@ -290,15 +303,11 @@ fn resolve_executable(
     if executable.contains('/') {
         return Ok(path.to_path_buf());
     }
-    let path_var = child_env
-        .get(&env_map_key(OsStr::new("PATH")))
-        .cloned()
-        .or_else(|| std::env::var_os("PATH"))
-        .ok_or_else(|| CoreError::BinaryDetection {
-            binary: executable.to_owned(),
-            reason: "PATH is not set; refusing to guess a search path for a bare name".to_owned(),
-        })?;
-    first_path_match(&path_var, executable).ok_or_else(|| CoreError::BinaryDetection {
+    let path_var = path_var.ok_or_else(|| CoreError::BinaryDetection {
+        binary: executable.to_owned(),
+        reason: "PATH is not set; refusing to guess a search path for a bare name".to_owned(),
+    })?;
+    first_path_match(path_var, executable).ok_or_else(|| CoreError::BinaryDetection {
         binary: executable.to_owned(),
         reason: format!(
             "`{executable}` not found on PATH (first match; the working directory is never searched)"
@@ -334,9 +343,10 @@ pub fn run_command(
         }
     }
 
-    // Compose the env first: bare names resolve against the child's PATH.
-    let child_env = compose_child_env(opts);
-    let resolved = resolve_executable(executable, &child_env)?;
+    // Bare names resolve against the child's PATH, which only differs from
+    // the ambient one when the opts touch it.
+    let path_var = child_path_var(opts);
+    let resolved = resolve_executable(executable, path_var.as_deref())?;
 
     let mut cmd = duct::cmd(resolved.as_os_str(), args);
 
@@ -346,7 +356,9 @@ pub fn run_command(
 
     // Duct's env wraps apply in reverse build order; one composed map is
     // its only env input so compose_child_env decides precedence.
-    cmd = cmd.full_env(child_env);
+    if opts.clear_env || !opts.env.is_empty() || !opts.env_remove.is_empty() {
+        cmd = cmd.full_env(compose_child_env(opts));
+    }
 
     cmd = cmd.stdout_capture().stderr_capture();
 

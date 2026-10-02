@@ -379,9 +379,7 @@ fn gather_default_sources<'a>(
     provider_id: &ProviderId,
     providers: &'a [ProviderDefinition],
 ) -> CapabilitySources<'a> {
-    let adapter = crate::harness_catalog::all_adapters()
-        .into_iter()
-        .find(|a| a.id().eq_case_fold(harness));
+    let adapter = crate::harness_catalog::adapter_for_id_fold(harness.as_str());
     let provider = providers.iter().find(|p| p.id.eq_case_fold(provider_id));
     match adapter {
         Some(adapter) => CapabilitySources::for_adapter(&*adapter, provider, None),

@@ -941,25 +941,37 @@ pub(crate) fn concrete_adapter_for(id: &str) -> Option<Box<dyn Adapter>> {
 pub fn all_adapters() -> Vec<Box<dyn Adapter>> {
     let mut out = Vec::with_capacity(ENTRIES.len());
     for entry in ENTRIES {
-        if let Some(adapter) = concrete_adapter_for(entry.id) {
+        if let Some(adapter) = adapter_for_entry(entry) {
             out.push(adapter);
-            continue;
-        }
-        if let Ok(harness_id) = HarnessId::new(entry.id) {
-            let adapter = GenericAdapter::new(
-                harness_id,
-                entry.display_name,
-                entry.product_status,
-                entry.research_doc,
-                entry.last_verified,
-                entry.support,
-                entry.reason,
-                entry.source,
-            );
-            out.push(Box::new(adapter) as Box<dyn Adapter>);
         }
     }
     out
+}
+
+pub(crate) fn adapter_for_id_fold(id: &str) -> Option<Box<dyn Adapter>> {
+    let lowered = id.to_lowercase();
+    let entry = ENTRIES
+        .iter()
+        .find(|entry| entry.id.to_lowercase() == lowered)?;
+    adapter_for_entry(entry)
+}
+
+fn adapter_for_entry(entry: &CatalogEntry) -> Option<Box<dyn Adapter>> {
+    if let Some(adapter) = concrete_adapter_for(entry.id) {
+        return Some(adapter);
+    }
+    let harness_id = HarnessId::new(entry.id).ok()?;
+    let adapter = GenericAdapter::new(
+        harness_id,
+        entry.display_name,
+        entry.product_status,
+        entry.research_doc,
+        entry.last_verified,
+        entry.support,
+        entry.reason,
+        entry.source,
+    );
+    Some(Box::new(adapter) as Box<dyn Adapter>)
 }
 
 /// Convenience: adapter ids as strings.
