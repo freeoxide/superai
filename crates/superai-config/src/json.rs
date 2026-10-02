@@ -1,12 +1,11 @@
 use std::path::Path;
 
 use serde::de::{self, Deserialize, MapAccess, SeqAccess, Visitor};
+use serde_json::map::Entry;
 use serde_json::{Map, Number, Value};
 
 use crate::error::{ConfigError, Result};
 
-/// Deserializes any JSON value but rejects duplicate keys; `Number` keeps
-/// i64/u64/f64 distinct so `1` and `1.0` stay different (DOC-03).
 struct StrictValue(Value);
 
 impl<'de> Deserialize<'de> for StrictValue {
@@ -108,10 +107,17 @@ impl<'de> Deserialize<'de> for StrictValue {
             {
                 let mut m = Map::new();
                 while let Some((key, value)) = map.next_entry::<String, StrictValue>()? {
-                    if m.contains_key(&key) {
-                        return Err(de::Error::custom(format!("duplicate key `{key}`")));
+                    match m.entry(key) {
+                        Entry::Occupied(existing) => {
+                            return Err(de::Error::custom(format!(
+                                "duplicate key `{}`",
+                                existing.key()
+                            )));
+                        }
+                        Entry::Vacant(slot) => {
+                            slot.insert(value.0);
+                        }
                     }
-                    m.insert(key, value.0);
                 }
                 Ok(StrictValue(Value::Object(m)))
             }
@@ -121,7 +127,6 @@ impl<'de> Deserialize<'de> for StrictValue {
     }
 }
 
-/// Strict parse: duplicates rejected, number types preserved, no trailing content.
 pub(crate) fn parse_strict_raw(text: &str) -> std::result::Result<Value, serde_json::Error> {
     let mut de = serde_json::Deserializer::from_str(text);
     let v = StrictValue::deserialize(&mut de)?;

@@ -1,14 +1,13 @@
 //! JSONC reads strip comments/trailing commas before the strict parse;
 //! changing writes on files carrying that material are refused (DOC-05).
 
+use std::borrow::Cow;
 use std::path::Path;
 
 use serde_json::{Map, Value};
 
 use crate::error::{ConfigError, Result};
 
-/// Strip commas followed only by whitespace and `}`/`]`, string-aware;
-/// JSON structure chars are ASCII so a byte scan never splits UTF-8.
 fn strip_trailing_commas(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut output = String::with_capacity(input.len());
@@ -53,6 +52,16 @@ pub fn strip_jsonc(input: &str) -> String {
     strip_trailing_commas(&crate::document::strip_jsonc_comments(input))
 }
 
+fn strip_jsonc_cow(text: &str) -> Cow<'_, str> {
+    if !text.contains('/') && !text.contains(',') {
+        return Cow::Borrowed(text);
+    }
+    if !text.contains('/') {
+        return Cow::Owned(strip_trailing_commas(text));
+    }
+    Cow::Owned(strip_jsonc(text))
+}
+
 /// Read fresh; comments and trailing commas accepted, duplicates rejected.
 /// The root must be an object; use [`load_value`] for arbitrary roots.
 pub fn load(path: &Path) -> Result<Map<String, Value>> {
@@ -66,7 +75,7 @@ pub fn load(path: &Path) -> Result<Map<String, Value>> {
         return Ok(Map::new());
     }
 
-    let value = crate::json::parse_strict(&strip_jsonc(&text), path)?;
+    let value = crate::json::parse_strict(&strip_jsonc_cow(&text), path)?;
     match value {
         Value::Object(map) => Ok(map),
         _ => Err(ConfigError::NotAnObject {
@@ -87,14 +96,14 @@ pub fn load_value(path: &Path) -> Result<Value> {
         return Ok(Value::Object(Map::new()));
     }
 
-    crate::json::parse_strict(&strip_jsonc(&text), path)
+    crate::json::parse_strict(&strip_jsonc_cow(&text), path)
 }
 
-/// Refuse writes that would destroy JSONC lexical material: only files whose
-/// bytes equal their stripped form (or are missing) are writable.
 fn ensure_lossless_write(path: &Path) -> Result<()> {
     match std::fs::read_to_string(path) {
-        Ok(text) if strip_jsonc(&text) != text => Err(ConfigError::lossy_write(path, "jsonc")),
+        Ok(text) if strip_jsonc_cow(&text).as_ref() != text => {
+            Err(ConfigError::lossy_write(path, "jsonc"))
+        }
         Ok(_) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(ConfigError::io(path, e)),
@@ -167,7 +176,7 @@ where
 /// DOC-10 disclosure; files carrying JSONC material never reformat (their
 /// writes are refused), extension-free files warn when not normalized.
 pub fn formatting_change_warning(text: &str) -> Option<&'static str> {
-    if text.trim().is_empty() || strip_jsonc(text) != text {
+    if text.trim().is_empty() || strip_jsonc_cow(text).as_ref() != text {
         return None;
     }
     crate::json::formatting_change_warning(text).map(|_| {

@@ -4,11 +4,11 @@
 use std::path::Path;
 
 use serde::de::{self, Deserialize, MapAccess, SeqAccess, Visitor};
+use serde_json::map::Entry;
 use serde_json::{Map, Number, Value};
 
 use crate::error::{ConfigError, Result};
 
-/// Wrapper that deserializes any YAML value but rejects duplicate object keys.
 struct StrictValue(Value);
 
 impl<'de> Deserialize<'de> for StrictValue {
@@ -110,10 +110,17 @@ impl<'de> Deserialize<'de> for StrictValue {
             {
                 let mut m = Map::new();
                 while let Some((key, value)) = map.next_entry::<String, StrictValue>()? {
-                    if m.contains_key(&key) {
-                        return Err(de::Error::custom(format!("duplicate key `{key}`")));
+                    match m.entry(key) {
+                        Entry::Occupied(existing) => {
+                            return Err(de::Error::custom(format!(
+                                "duplicate key `{}`",
+                                existing.key()
+                            )));
+                        }
+                        Entry::Vacant(slot) => {
+                            slot.insert(value.0);
+                        }
                     }
-                    m.insert(key, value.0);
                 }
                 Ok(StrictValue(Value::Object(m)))
             }
@@ -123,23 +130,18 @@ impl<'de> Deserialize<'de> for StrictValue {
     }
 }
 
-/// Strip a leading UTF-8 BOM if present.
 fn strip_bom(text: &str) -> &str {
     text.strip_prefix('\u{FEFF}').unwrap_or(text)
 }
 
-/// Existing YAML is read-only (DOC-06): the writer drops comments, anchors,
-/// tags, scalar style, and markers, and lexical detection cannot be hole-free.
 fn ensure_lossless_write(path: &Path) -> Result<()> {
-    match std::fs::read_to_string(path) {
+    match std::fs::metadata(path) {
         Ok(_) => Err(ConfigError::lossy_write(path, "yaml")),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(ConfigError::io(path, e)),
     }
 }
 
-/// Strict parse: duplicate keys rejected; multiple documents and
-/// non-`Value`-mappable tags are errors.
 pub(crate) fn parse_strict_raw(text: &str) -> std::result::Result<Value, yaml_serde::Error> {
     yaml_serde::from_str::<StrictValue>(strip_bom(text)).map(|v| v.0)
 }
