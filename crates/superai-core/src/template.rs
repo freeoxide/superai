@@ -982,26 +982,25 @@ impl Template {
     pub fn validate_against_adapter(&self, adapter: &dyn Adapter) -> Result<()> {
         let surfaces = adapter.config_surfaces();
         let mut owned: HashSet<String> = HashSet::new();
-        for surface in &surfaces {
-            for sel in &surface.owned_selectors {
-                owned.insert(sel.clone());
+        let mut owned_plain_keys: HashSet<String> = HashSet::new();
+        let mut admit = |entry: &str| {
+            owned.insert(entry.to_owned());
+            if let Ok(parsed) = superai_config::document::Selector::parse(entry) {
                 // Also insert the typed-string form so both `model` and
                 // `key:model` are recognised.
-                if let Ok(parsed) = superai_config::document::Selector::parse(sel) {
-                    owned.insert(parsed.to_typed_string());
+                owned.insert(parsed.to_typed_string());
+                if let superai_config::document::Selector::Key(k) = &parsed {
+                    owned_plain_keys.insert(k.clone());
                 }
+            }
+        };
+        for surface in &surfaces {
+            for sel in &surface.owned_selectors {
+                admit(sel);
             }
         }
         for (op, _support) in adapter.supported_operations() {
-            owned.insert(op);
-        }
-        let mut owned_plain_keys: HashSet<String> = HashSet::new();
-        for entry in &owned {
-            if let Ok(superai_config::document::Selector::Key(k)) =
-                superai_config::document::Selector::parse(entry)
-            {
-                owned_plain_keys.insert(k);
-            }
+            admit(&op);
         }
 
         for patch in &self.patches {
@@ -1221,20 +1220,30 @@ pub fn check_update(instance: &Instance, repo: &TemplateRepoConfig) -> UpdateSta
                 Err(reason) => UpdateStatus::Incompatible { reason },
             }
         }
-        Err(e) => {
-            let msg = format!("{e}");
-            if msg.contains("not found") || msg.contains("NotFound") {
-                UpdateStatus::CurrentMissing
-            } else if msg.contains("digest") || msg.contains("DigestMismatch") {
-                UpdateStatus::Incompatible {
-                    reason: format!("latest template digest mismatch: {msg}"),
-                }
-            } else {
-                UpdateStatus::Incompatible {
-                    reason: format!("cannot fetch latest template `{latest_str}`: {msg}"),
-                }
-            }
-        }
+        Err(e) => match classify_template_fetch_error(&e) {
+            FetchErrorClass::Missing => UpdateStatus::CurrentMissing,
+            FetchErrorClass::DigestMismatch => UpdateStatus::Incompatible {
+                reason: format!("latest template digest mismatch: {e}"),
+            },
+            FetchErrorClass::Other => UpdateStatus::Incompatible {
+                reason: format!("cannot fetch latest template `{latest_str}`: {e}"),
+            },
+        },
+    }
+}
+
+enum FetchErrorClass {
+    Missing,
+    DigestMismatch,
+    Other,
+}
+
+fn classify_template_fetch_error(e: &crate::template_fetch::TemplateFetchError) -> FetchErrorClass {
+    use crate::template_fetch::TemplateFetchError as E;
+    match e {
+        E::NotFound { .. } => FetchErrorClass::Missing,
+        E::DigestMismatch { .. } => FetchErrorClass::DigestMismatch,
+        _ => FetchErrorClass::Other,
     }
 }
 
@@ -2684,6 +2693,36 @@ mod tests {
         assert_eq!(
             diff.harness_version_req_changed,
             Some((Some(">=1.0.0".to_owned()), Some(">=2.0.0".to_owned())))
+        );
+    }
+    #[test]
+    fn template_fetch_errors_classify_by_variant_not_text() {
+        use crate::template_fetch::TemplateFetchError as E;
+        assert!(matches!(
+            classify_template_fetch_error(&E::NotFound {
+                template: "t".to_owned(),
+                reason: "gone".to_owned()
+            }),
+            FetchErrorClass::Missing
+        ));
+        assert!(matches!(
+            classify_template_fetch_error(&E::DigestMismatch {
+                template: "t".to_owned(),
+                expected: "a".to_owned(),
+                actual: "b".to_owned()
+            }),
+            FetchErrorClass::DigestMismatch
+        ));
+        let network = E::Network {
+            template: "t".to_owned(),
+            reason: "dns lookup said not found".to_owned(),
+        };
+        assert!(
+            matches!(
+                classify_template_fetch_error(&network),
+                FetchErrorClass::Other
+            ),
+            "text mentioning 'not found' must not classify as Missing"
         );
     }
 }

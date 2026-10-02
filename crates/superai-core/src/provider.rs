@@ -1052,9 +1052,15 @@ pub const BUNDLED_PROVIDERS_JSON: &str = include_str!("../assets/providers.json"
 /// each definition and rejecting duplicates. The asset is a compile-time
 /// constant, so the validated list is cached after the first call.
 pub fn load_bundled_providers() -> Result<Vec<ProviderDefinition>> {
+    Ok(bundled_providers()?.to_vec())
+}
+
+/// The validated bundled providers as a static slice: same validation and
+/// caching as [`load_bundled_providers`] without the per-call copy.
+pub(crate) fn bundled_providers() -> Result<&'static [ProviderDefinition]> {
     static CACHED: OnceLock<Vec<ProviderDefinition>> = OnceLock::new();
     if let Some(providers) = CACHED.get() {
-        return Ok(providers.clone());
+        return Ok(providers);
     }
     let providers: Vec<ProviderDefinition> =
         serde_json::from_str(BUNDLED_PROVIDERS_JSON).map_err(|source| CoreError::Parse {
@@ -1066,7 +1072,7 @@ pub fn load_bundled_providers() -> Result<Vec<ProviderDefinition>> {
         p.validate()?;
     }
     validate_no_duplicates(&providers)?;
-    Ok(CACHED.get_or_init(|| providers).clone())
+    Ok(CACHED.get_or_init(|| providers))
 }
 
 /// Result of a health probe; `base_url` and `reason` are redacted and
@@ -1420,12 +1426,9 @@ fn write_config_field(
         field: "selector".to_owned(),
         reason: format!("selector `{selector}` does not address an object"),
     };
-    // Selectors may carry a "key:" or "env." prefix; strip both when present.
-    let sel = selector
-        .strip_prefix("key:")
-        .unwrap_or(selector)
-        .strip_prefix("env.")
-        .unwrap_or(selector);
+    // Selectors may carry a "key:" or "env." prefix; strip each when present.
+    let after_key = selector.strip_prefix("key:").unwrap_or(selector);
+    let sel = after_key.strip_prefix("env.").unwrap_or(after_key);
     let (target_obj, leaf_key) = if selector.contains("env.") {
         if !root.is_object() {
             root = Value::Object(serde_json::Map::new());
@@ -1443,9 +1446,9 @@ fn write_config_field(
             env_entry,
             sel.split('.').next_back().unwrap_or(sel).to_owned(),
         )
-    } else if selector.contains('.') {
-        let parts: Vec<&str> = selector.split('.').collect();
-        let leaf = parts.last().copied().unwrap_or(selector).to_owned();
+    } else if sel.contains('.') {
+        let parts: Vec<&str> = sel.split('.').collect();
+        let leaf = parts.last().copied().unwrap_or(sel).to_owned();
         let mut cur = &mut root;
         for part in parts.iter().take(parts.len().saturating_sub(1)) {
             if !cur.is_object() {
@@ -2802,5 +2805,34 @@ status: active
         assert!(sonnet.supports_tools);
         assert!(sonnet.input_modalities.contains(&Modality::Image));
         assert!(!anthropic.capabilities.is_empty());
+    }
+    #[test]
+    fn write_config_field_splits_typed_dotted_selector_after_prefix() {
+        let dir = tmp_dir("typed-selector");
+        let bin_dir = dir.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let fake_claude = write_fake_claude(&bin_dir);
+        let adapter =
+            crate::adapters::claude_code::ClaudeCodeAdapter::with_configured_binary(fake_claude)
+                .unwrap();
+        let dest = dir.join("settings.json");
+        write_config_field(
+            &dest,
+            "key:providers.glm.apiKey",
+            "sk-typed-0123456789abcdef",
+            &adapter,
+        )
+        .unwrap();
+        let value: Value = serde_json::from_str(&std::fs::read_to_string(&dest).unwrap()).unwrap();
+        assert_eq!(
+            value["providers"]["glm"]["apiKey"].as_str(),
+            Some("sk-typed-0123456789abcdef"),
+            "got: {value}"
+        );
+        assert!(
+            value.get("key:providers").is_none(),
+            "raw prefix must not become an object: {value}"
+        );
+        drop(std::fs::remove_dir_all(&dir));
     }
 }

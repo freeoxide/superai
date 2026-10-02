@@ -399,8 +399,8 @@ fn gather_default_sources<'a>(
 /// Resolve a single capability for a harness/provider pair from default
 /// sources (fresh adapter + bundled providers); never compile-time tables.
 pub fn resolve(harness: &HarnessId, provider: &ProviderId, cap: Capability) -> ResolvedCapability {
-    let bundled = crate::provider::load_bundled_providers().unwrap_or_default();
-    let sources = gather_default_sources(harness, provider, &bundled);
+    let bundled = crate::provider::bundled_providers().unwrap_or_default();
+    let sources = gather_default_sources(harness, provider, bundled);
     resolve_with_sources(harness, provider, cap, &sources)
 }
 
@@ -409,8 +409,8 @@ pub fn resolve_all(
     harness: &HarnessId,
     provider: &ProviderId,
 ) -> Vec<(Capability, ResolvedCapability)> {
-    let bundled = crate::provider::load_bundled_providers().unwrap_or_default();
-    let sources = gather_default_sources(harness, provider, &bundled);
+    let bundled = crate::provider::bundled_providers().unwrap_or_default();
+    let sources = gather_default_sources(harness, provider, bundled);
     resolve_all_with_sources(harness, provider, &sources)
 }
 
@@ -456,14 +456,18 @@ pub fn resolve_for_instance(
     instance: &Instance,
     sources: &InstanceCapabilitySources<'_>,
 ) -> Vec<(Capability, ResolvedCapability)> {
-    let bundled = crate::provider::load_bundled_providers().unwrap_or_default();
+    let bundled = crate::provider::bundled_providers().unwrap_or_default();
     let effective: &[ProviderDefinition] = if sources.providers.is_empty() {
-        &bundled
+        bundled
     } else {
         sources.providers
     };
-    let adapters = crate::harness_catalog::all_adapters();
-    resolve_for_instance_with(instance, sources, effective, &adapters)
+    let adapter = crate::harness_catalog::adapter_for_id_fold(instance.harness.as_str());
+    let adapters = match &adapter {
+        Some(one) => std::slice::from_ref(one),
+        None => &[],
+    };
+    resolve_for_instance_with(instance, sources, effective, adapters)
 }
 
 /// The per-instance body of [`resolve_for_instance`], with the provider list
@@ -530,9 +534,9 @@ pub fn filter_instances_by_capability(
 ) -> Vec<(InstanceId, ResolvedCapability)> {
     // Parse the provider bundle and adapter catalog once for the whole batch;
     // per-instance state is still read fresh inside each resolution.
-    let bundled = crate::provider::load_bundled_providers().unwrap_or_default();
+    let bundled = crate::provider::bundled_providers().unwrap_or_default();
     let effective: &[ProviderDefinition] = if sources.providers.is_empty() {
-        &bundled
+        bundled
     } else {
         sources.providers
     };

@@ -114,20 +114,42 @@ fn rollback_logged(transaction: &mut Transaction, op_id: &str) {
 }
 
 fn resolve_config_path(instance: &Instance, adapter: &dyn Adapter) -> PathBuf {
-    for surface in adapter.config_surfaces() {
-        if surface.id.contains("settings") {
-            // The surface's fallback basename (settings.json and friends)
-            // resolves inside the instance's relocated root.
-            if let Some(name) = Path::new(&surface.path_resolver.fallback)
-                .file_name()
-                .and_then(|n| n.to_str())
-                && name.to_ascii_lowercase().contains("settings.json")
-            {
-                return instance.config_root.as_path().join(name);
-            }
+    let surfaces = adapter.config_surfaces();
+    for surface in &surfaces {
+        if surface.id.contains("settings")
+            && let Some(name) = basename_if_settings_json(&surface.path_resolver.fallback)
+        {
+            return instance.config_root.as_path().join(name);
+        }
+    }
+    // Harnesses whose primary document is not settings.json (codex's
+    // config.toml) resolve their first writable document surface instead.
+    for surface in &surfaces {
+        if matches!(
+            surface.kind,
+            crate::adapter::DocumentKind::Json
+                | crate::adapter::DocumentKind::Jsonc
+                | crate::adapter::DocumentKind::Toml
+                | crate::adapter::DocumentKind::Yaml
+        ) && matches!(
+            surface.ownership,
+            crate::adapter::SurfaceOwnership::UserEditable
+                | crate::adapter::SurfaceOwnership::SuperaiCreated
+        ) && let Some(name) = Path::new(&surface.path_resolver.fallback)
+            .file_name()
+            .and_then(|n| n.to_str())
+        {
+            return instance.config_root.as_path().join(name);
         }
     }
     instance.config_root.as_path().join("settings.json")
+}
+
+fn basename_if_settings_json(fallback: &str) -> Option<&str> {
+    let name = Path::new(fallback).file_name().and_then(|n| n.to_str())?;
+    name.to_ascii_lowercase()
+        .contains("settings.json")
+        .then_some(name)
 }
 
 /// Load the local map for a three-way merge, or refuse honestly (DOC-05):
@@ -148,7 +170,10 @@ fn load_local_map(path: &Path) -> Result<Map<String, Value>> {
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Map::new()),
-        Err(_) => Ok(Map::new()),
+        Err(e) => Err(CoreError::Config(superai_config::ConfigError::Io {
+            path: path.to_path_buf(),
+            source: e,
+        })),
     }
 }
 
@@ -1918,5 +1943,49 @@ mod tests {
         );
 
         drop(std::fs::remove_dir_all(&tmp));
+    }
+    #[test]
+    #[cfg(unix)]
+    fn load_local_map_propagates_unreadable_local_config() {
+        let dir = crate::test_util::temp_dir_unique("load-local-map-eacces");
+        let path = dir.join("settings.json");
+        std::fs::write(&path, b"{\"a\":1}").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        assert!(
+            load_local_map(&path).is_err(),
+            "an unreadable local config must not become an empty merge base"
+        );
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn resolve_config_path_uses_the_toml_surface_for_codex() {
+        let dir = crate::test_util::temp_dir_unique("resolve-codex-path");
+        let adapter = crate::adapters::codex_cli::CodexCliAdapter::new().unwrap();
+        let config_root = dir.join("codex");
+        std::fs::create_dir_all(&config_root).unwrap();
+        let instance = Instance {
+            id: crate::ids::InstanceId::new("codex-path-001").unwrap(),
+            name: crate::ids::InstanceName::new("codex-path").unwrap(),
+            harness: HarnessId::new("codex-cli").unwrap(),
+            config_root: AbsolutePath::from_path(&config_root).unwrap(),
+            binary: None,
+            wrapper: None,
+            isolation: Isolation::RelocatedRoot,
+            origin: InstanceOrigin::Created,
+            ownership: Ownership::SuperaiCreated,
+            template: None,
+            created_at: "2026-08-26T00:00:00Z".to_owned(),
+            adapter_revision: "0.1.0".to_owned(),
+        };
+        assert_eq!(
+            resolve_config_path(&instance, &adapter),
+            config_root.join("config.toml"),
+            "a TOML harness must not resolve a settings.json it never reads"
+        );
+        drop(std::fs::remove_dir_all(&dir));
     }
 }

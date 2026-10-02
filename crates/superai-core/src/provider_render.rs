@@ -537,8 +537,31 @@ fn load_surface_value(path: &std::path::Path, kind: DocumentKind) -> Result<Opti
                 })?,
             )
         }
-        DocumentKind::Jsonc => serde_json::from_slice::<Value>(&bytes).ok(),
-        DocumentKind::Yaml => yaml_serde::from_slice::<Value>(&bytes).ok(),
+        DocumentKind::Jsonc => {
+            let text = std::str::from_utf8(&bytes).map_err(|e| CoreError::Parse {
+                path: path.to_path_buf(),
+                kind: "jsonc".to_owned(),
+                message: format!("invalid utf-8: {e}"),
+            })?;
+            Some(
+                serde_json::from_str::<Value>(&superai_config::jsonc::strip_jsonc(text)).map_err(
+                    |e| CoreError::Parse {
+                        path: path.to_path_buf(),
+                        kind: "jsonc".to_owned(),
+                        message: e.to_string(),
+                    },
+                )?,
+            )
+        }
+        DocumentKind::Yaml => {
+            Some(
+                yaml_serde::from_slice::<Value>(&bytes).map_err(|e| CoreError::Parse {
+                    path: path.to_path_buf(),
+                    kind: "yaml".to_owned(),
+                    message: e.to_string(),
+                })?,
+            )
+        }
         DocumentKind::Toml => {
             let text = String::from_utf8_lossy(&bytes);
             let doc = text
@@ -578,9 +601,9 @@ pub fn inspect_effective_provider(
     let mut unknown_fields: Vec<String> = Vec::new();
     let mut winning_precedence: Option<u8> = None;
 
-    let mut surfaces: Vec<ConfigSurface> = adapter
-        .config_surfaces()
-        .into_iter()
+    let all_surfaces = adapter.config_surfaces();
+    let mut surfaces: Vec<&ConfigSurface> = all_surfaces
+        .iter()
         .filter(|s| {
             writable_surface_kinds(s.kind)
                 && !matches!(
@@ -735,7 +758,13 @@ pub fn inspect_effective_provider(
                 .find(|p| Some(p.id.to_string()) == found.id);
             match matched {
                 Some(provider) => {
-                    let outcome = render_provider_into_adapter(provider, None, adapter, instance);
+                    let outcome = render_provider_with_surfaces(
+                        provider,
+                        None,
+                        adapter,
+                        instance,
+                        &all_surfaces,
+                    );
                     match outcome {
                         RenderOutcome::Supported(_) => CompatVerdict::Compatible,
                         RenderOutcome::Unsupported(reason) => CompatVerdict::Incompatible {
@@ -1215,7 +1244,6 @@ fn ensure_table<'t>(
 
 /// Apply engine Set/Remove operations to a TOML document in place,
 /// preserving decor of untouched keys.
-#[expect(clippy::excessive_nesting, reason = "set/remove navigation branches")]
 fn apply_ops_to_toml(doc: &mut toml_edit::DocumentMut, ops: &[EngineOperation]) -> Result<()> {
     for op in ops {
         match &op.kind {
@@ -1231,14 +1259,21 @@ fn apply_ops_to_toml(doc: &mut toml_edit::DocumentMut, ops: &[EngineOperation]) 
                 let Some((last, parents)) = segments.split_last() else {
                     continue;
                 };
-                if let Some(table) = ensure_table(doc.as_table_mut(), parents) {
-                    if table.get(last).is_some() {
-                        // Index assignment keeps the existing key's decor
-                        // (comments, spacing); `insert` would drop it.
-                        table[last] = crate::toml_convert::json_value_to_toml_lenient(value);
-                    } else {
-                        table.insert(last, crate::toml_convert::json_value_to_toml_lenient(value));
-                    }
+                let Some(table) = ensure_table(doc.as_table_mut(), parents) else {
+                    return Err(CoreError::UnsupportedOperation {
+                        harness: "toml".to_owned(),
+                        operation: "provider_render".to_owned(),
+                        reason: format!(
+                            "dotted key `{key}` crosses a non-table value; refusing the write"
+                        ),
+                    });
+                };
+                if table.get(last).is_some() {
+                    // Index assignment keeps the existing key's decor
+                    // (comments, spacing); `insert` would drop it.
+                    table[last] = crate::toml_convert::json_value_to_toml_lenient(value);
+                } else {
+                    table.insert(last, crate::toml_convert::json_value_to_toml_lenient(value));
                 }
             }
             EditOperation::Remove { selector } => {
@@ -1249,9 +1284,16 @@ fn apply_ops_to_toml(doc: &mut toml_edit::DocumentMut, ops: &[EngineOperation]) 
                 let Some((last, parents)) = segments.split_last() else {
                     continue;
                 };
-                if let Some(table) = ensure_table(doc.as_table_mut(), parents) {
-                    table.remove(last);
-                }
+                let Some(table) = ensure_table(doc.as_table_mut(), parents) else {
+                    return Err(CoreError::UnsupportedOperation {
+                        harness: "toml".to_owned(),
+                        operation: "provider_render".to_owned(),
+                        reason: format!(
+                            "dotted key `{key}` crosses a non-table value; refusing the removal"
+                        ),
+                    });
+                };
+                table.remove(last);
             }
             _ => {
                 return Err(CoreError::UnsupportedOperation {
@@ -1336,11 +1378,29 @@ pub fn commit_provider_change(
                         }
                     }
                 }
-                _ => yaml_serde::from_slice::<Value>(existing.as_deref().unwrap_or_default())
-                    .unwrap_or(Value::Object(serde_json::Map::new())),
+                _ => {
+                    let bytes = existing.as_deref().unwrap_or_default();
+                    if bytes.is_empty() || bytes.iter().all(u8::is_ascii_whitespace) {
+                        Value::Object(serde_json::Map::new())
+                    } else {
+                        yaml_serde::from_slice::<Value>(bytes).map_err(|e| CoreError::Parse {
+                            path: path.clone(),
+                            kind: "yaml".to_owned(),
+                            message: e.to_string(),
+                        })?
+                    }
+                }
             };
             if !value.is_object() {
-                value = Value::Object(serde_json::Map::new());
+                return Err(CoreError::Parse {
+                    path: path.clone(),
+                    kind: match kind {
+                        DocumentKind::Yaml => "yaml".to_owned(),
+                        DocumentKind::Jsonc => "jsonc".to_owned(),
+                        _ => "json".to_owned(),
+                    },
+                    message: "document root is not an object; refusing the rewrite".to_owned(),
+                });
             }
             for op in &ops {
                 superai_config::executor::apply_to_value(&path, &mut value, op)
@@ -1929,6 +1989,152 @@ mod tests {
             std::fs::read_to_string(&config).unwrap(),
             "model = \"old-model\"\n",
             "preview must not write"
+        );
+        drop(std::fs::remove_dir_all(&dir));
+    }
+    #[test]
+    fn apply_ops_to_toml_refuses_ops_through_scalar_parents() {
+        let mut doc = "a = 1\n".parse::<toml_edit::DocumentMut>().unwrap();
+        let ops = vec![set_op("a.b", Value::Bool(true), Vec::new())];
+        let err = apply_ops_to_toml(&mut doc, &ops).unwrap_err();
+        assert!(
+            err.to_string().contains("crosses a non-table value"),
+            "got: {err}"
+        );
+        assert_eq!(doc.to_string(), "a = 1\n");
+
+        let mut doc = "a = 1\n".parse::<toml_edit::DocumentMut>().unwrap();
+        let ops = vec![remove_op("a.b", Vec::new())];
+        let err = apply_ops_to_toml(&mut doc, &ops).unwrap_err();
+        assert!(
+            err.to_string().contains("crosses a non-table value"),
+            "got: {err}"
+        );
+        assert_eq!(doc.to_string(), "a = 1\n");
+    }
+
+    #[test]
+    fn commit_refuses_unparseable_yaml_instead_of_resetting() {
+        let dir = tmp_dir("yaml-unparseable");
+        let adapter = crate::adapters::continue_dev::ContinueDevAdapter::new().unwrap();
+        let instance = instance_in(&dir, "continue", "yaml-bad");
+        let config = instance.config_root.as_path().join("config.yaml");
+        let original = b"{ [ this is not yaml";
+        std::fs::write(&config, original).unwrap();
+        let provider = universal_provider("yaml-bad-prov");
+        let err = commit_provider_change(
+            &instance,
+            &adapter,
+            &ProviderChange::AddOrUpdate {
+                provider: &provider,
+            },
+            &ProviderChangeOptions::default(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("yaml"), "got: {err}");
+        assert_eq!(std::fs::read(&config).unwrap(), original.to_vec());
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn commit_refuses_yaml_sequence_root_instead_of_resetting() {
+        let dir = tmp_dir("yaml-sequence");
+        let adapter = crate::adapters::continue_dev::ContinueDevAdapter::new().unwrap();
+        let instance = instance_in(&dir, "continue", "yaml-seq");
+        let config = instance.config_root.as_path().join("config.yaml");
+        let original = b"- a\n- b\n";
+        std::fs::write(&config, original).unwrap();
+        let provider = universal_provider("yaml-seq-prov");
+        let err = commit_provider_change(
+            &instance,
+            &adapter,
+            &ProviderChange::AddOrUpdate {
+                provider: &provider,
+            },
+            &ProviderChangeOptions::default(),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("root is not an object"),
+            "got: {err}"
+        );
+        assert_eq!(std::fs::read(&config).unwrap(), original.to_vec());
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn inspect_reads_jsonc_comments_and_refuses_broken_jsonc() {
+        let dir = tmp_dir("jsonc-inspect");
+        let adapter = crate::adapters::claude_code::ClaudeCodeAdapter::new().unwrap();
+        let instance = instance_in(&dir, "claude-code", "jsonc-inspect");
+        let settings = instance.config_root.as_path().join("settings.json");
+        std::fs::write(
+            &settings,
+            b"{\n  // user comment\n  \"env\": {\"ANTHROPIC_BASE_URL\": \"https://api.anthropic.com\"}\n}\n",
+        )
+        .unwrap();
+        let providers = crate::provider::bundled_providers().unwrap();
+        let report = inspect_effective_provider(&instance, &adapter, providers).unwrap();
+        let detected = report
+            .detected_provider
+            .expect("endpoint visible through comments");
+        assert!(detected.endpoint.contains("anthropic"));
+
+        std::fs::write(&settings, b"{ broken").unwrap();
+        let err = inspect_effective_provider(&instance, &adapter, providers).unwrap_err();
+        assert!(err.to_string().contains("jsonc"), "got: {err}");
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn commit_json_yaml_and_toml_output_bytes_are_pinned() {
+        let dir = tmp_dir("byte-pins");
+        let cc = crate::adapters::claude_code::ClaudeCodeAdapter::new().unwrap();
+        let inst = instance_in(&dir, "claude-code", "pin-json");
+        commit_provider_change(
+            &inst,
+            &cc,
+            &ProviderChange::AddOrUpdate {
+                provider: &universal_provider("pin-prov"),
+            },
+            &ProviderChangeOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(inst.config_root.as_path().join("settings.json")).unwrap(),
+            "{\n  \"env\": {\n    \"ANTHROPIC_BASE_URL\": \"https://api.example.com/anthropic\"\n  },\n  \"model\": \"model-a\"\n}\n"
+        );
+
+        let cd = crate::adapters::continue_dev::ContinueDevAdapter::new().unwrap();
+        let inst = instance_in(&dir, "continue", "pin-yaml");
+        commit_provider_change(
+            &inst,
+            &cd,
+            &ProviderChange::AddOrUpdate {
+                provider: &universal_provider("pin-prov"),
+            },
+            &ProviderChangeOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(inst.config_root.as_path().join("config.yaml")).unwrap(),
+            "provider:\n  pin-prov:\n    options:\n      baseUrl: https://api.example.com/v1\n    apiKey: '{env:UNIVERSAL_API_KEY}'\nmodel: pin-prov/model-a\n"
+        );
+
+        let cx = crate::adapters::codex_cli::CodexCliAdapter::new().unwrap();
+        let inst = instance_in(&dir, "codex-cli", "pin-toml");
+        commit_provider_change(
+            &inst,
+            &cx,
+            &ProviderChange::AddOrUpdate {
+                provider: &universal_provider("pin-prov"),
+            },
+            &ProviderChangeOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(inst.config_root.as_path().join("config.toml")).unwrap(),
+            "model_provider = \"pin-prov\"\nmodel = \"model-a\"\n\n[model_providers]\n\n[model_providers.pin-prov]\nname = \"Universal\"\nbase_url = \"https://api.example.com/v1\"\nenv_key = \"UNIVERSAL_API_KEY\"\nwire_api = \"chat\"\n"
         );
         drop(std::fs::remove_dir_all(&dir));
     }
