@@ -303,11 +303,9 @@ impl Adapter for ZcodeAdapter {
     fn plan_wrapper(&self, instance: &Instance) -> Result<WrapperPlan, CoreError> {
         super::ensure_instance_harness(&self.id, instance)?;
         instance.validate()?;
-        // Fixed path: no relocation; wrapper is identity (single instance).
         let mut plan = WrapperPlan::new(
             "fixed path single instance: no isolation, writes to ~/.zcode/v2/config.json in place",
         );
-        // No env vars; the harness always reads the fixed path.
         plan.description = format!(
             " single instance at {FIXED_CONFIG_PATH}; wrapper is no-op (config_root {} is informative, not used for isolation)",
             instance.config_root
@@ -324,8 +322,6 @@ impl Adapter for ZcodeAdapter {
         instance.validate()?;
         match instance.isolation {
             Isolation::FixedPathSingle | Isolation::Unknown | Isolation::RelocatedRoot => {
-                // Config content under the root must satisfy the declared
-                // root shape (full schema still research-gated).
                 crate::adapter::validate_instance_surfaces(self, instance.config_root.as_path())
             }
             other => Err(CoreError::Validation {
