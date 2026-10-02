@@ -825,6 +825,7 @@ name = "superai-config"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "memchr",
  "serde",
  "serde_json",
  "thiserror",
@@ -836,6 +837,7 @@ dependencies = [
 name = "superai-core"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "duct",
  "hex",
  "semver",

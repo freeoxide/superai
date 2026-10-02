@@ -24,5 +24,20 @@ hex = { version = "0.4" }
 ureq = { version = "3", default-features = false, features = ["rustls", "gzip"] }
 duct = { version = "1", features = ["timeout"] }
 
+[dev-dependencies]
+criterion = { workspace = true }
+
 [lints]
 workspace = true
+
+[[bench]]
+name = "drift_lanes"
+harness = false
+
+[[bench]]
+name = "render_lanes"
+harness = false
+
+[[bench]]
+name = "mcp_lanes"
+harness = false
