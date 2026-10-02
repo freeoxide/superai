@@ -401,7 +401,6 @@ impl Adapter for AmpAdapter {
         ))
     }
 
-    /// `amp.skills.*` lives in the JSONC settings file, so writes hit the lossy-write gate.
     fn skill_config_decl(&self) -> Option<crate::adapter::SkillConfigDecl> {
         Some(
             crate::adapter::SkillConfigDecl::new("settings.json")

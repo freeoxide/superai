@@ -343,8 +343,6 @@ impl Adapter for ClaudeCodeAdapter {
         ]
     }
 
-    /// The harness reads skills from `$CLAUDE_CONFIG_DIR/skills`; superai
-    /// manages them by symlinking (`LinkAll`), so a mirror links, not copies.
     fn mirror_link_paths(&self) -> Vec<String> {
         vec!["skills".to_owned()]
     }
@@ -455,7 +453,6 @@ impl Adapter for ClaudeCodeAdapter {
         super::skill_modes_link_first()
     }
 
-    /// Only the project `.mcp.json` is declared; the user-scope `~/.claude.json` store stays harness-managed.
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(crate::adapter::McpAdapterDecl::new(
             ".mcp.json",

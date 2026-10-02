@@ -73,8 +73,6 @@ impl ChatGptDesktopAdapter {
         Some(home.join(".codex"))
     }
 
-    /// The GUI binary name is unverified, so evidence keys on the shared
-    /// store and must say the files may equally be a codex-cli install.
     #[expect(clippy::excessive_nesting, reason = "evidence branches explicit")]
     fn collect_config_evidence(evidence: &mut Vec<String>) {
         evidence.push(format!(
@@ -290,8 +288,6 @@ impl Adapter for ChatGptDesktopAdapter {
         ]
     }
 
-    /// Setting `CODEX_HOME` here would fabricate undocumented GUI relocation;
-    /// the empty env set is what the alias core refuses on (alias codex-cli).
     fn plan_wrapper(&self, instance: &Instance) -> Result<WrapperPlan, CoreError> {
         super::ensure_instance_harness(&self.id, instance)?;
         instance.validate()?;

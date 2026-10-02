@@ -508,7 +508,6 @@ pub fn profile_era_conflict(version: &str, content: &[u8]) -> Option<String> {
 }
 
 fn is_profile_era(version: &str) -> bool {
-    // Unparseable versions count as legacy (fail-safe).
     let mut parts = version.split('.');
     let major = parts
         .next()

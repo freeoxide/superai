@@ -126,7 +126,6 @@ impl GrokBuildAdapter {
                 // GROK_CONFIG is an inline JSON overlay that can carry provider
                 // keys; only the path variable is safe to quote.
                 let preview = if var == CONFIG_PATH_ENV_VAR {
-                    // Chars, not bytes, so the cut cannot split UTF-8.
                     let truncated: String = val.chars().take(80).collect();
                     format!("{truncated}…")
                 } else {
@@ -440,7 +439,6 @@ impl Adapter for GrokBuildAdapter {
         ))
     }
 
-    /// Plugins install as directories: `~/.grok/plugins/` (user) or `.grok/plugins/` (project).
     fn plugin_decl(&self) -> Option<crate::adapter::PluginAdapterDecl> {
         Some(crate::adapter::PluginAdapterDecl::directory_bundle(
             "plugins",

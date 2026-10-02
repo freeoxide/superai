@@ -372,7 +372,6 @@ impl Adapter for GeminiCliAdapter {
         Vec::new()
     }
 
-    /// Server address precedence inside a `mcpServers` entry: `httpUrl` > `url` > `command`.
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(
             crate::adapter::McpAdapterDecl::new(

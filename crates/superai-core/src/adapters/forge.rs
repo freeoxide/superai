@@ -410,7 +410,6 @@ impl Adapter for ForgeAdapter {
         super::skill_modes_link_first()
     }
 
-    /// `disable: true` toggles a server without deleting it; `FORGE_CONFIG` relocates the user scope.
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(crate::adapter::McpAdapterDecl::new(
             ".mcp.json",

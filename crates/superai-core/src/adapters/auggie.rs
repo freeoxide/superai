@@ -454,7 +454,6 @@ impl Adapter for AuggieAdapter {
         super::skill_modes_link_first()
     }
 
-    /// Tiers replace `mcpServers` whole; settings tiers never deep-merge.
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(crate::adapter::McpAdapterDecl::new(
             "settings.json",

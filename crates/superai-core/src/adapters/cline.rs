@@ -73,7 +73,6 @@ impl ClineAdapter {
         Ok(Self { id })
     }
 
-    /// Cline first; a lone VS Code binary still counts as install evidence.
     fn find_binary_in_path() -> Option<PathBuf> {
         super::find_in_path(&[EXECUTABLE]).or_else(|| super::find_in_path(&[VSCODE_EXECUTABLE]))
     }
@@ -101,7 +100,6 @@ impl ClineAdapter {
                     .join("settings"),
             )
         } else if cfg!(windows) {
-            // Approximate via APPDATA.
             if let Ok(appdata) = std::env::var("APPDATA")
                 && !appdata.trim().is_empty()
             {

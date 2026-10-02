@@ -390,7 +390,6 @@ impl Adapter for GooseAdapter {
         super::skill_modes_link_first()
     }
 
-    /// `extensions:` maps name to stdio/remote config; `enabled_extensions` lists the bundled ones.
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(crate::adapter::McpAdapterDecl::new(
             "config.yaml",

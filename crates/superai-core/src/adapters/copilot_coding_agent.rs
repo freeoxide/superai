@@ -88,7 +88,6 @@ impl CopilotCodingAgentAdapter {
             "no MCP local, no skills local, no API key local: org policy + repo settings govern"
                 .to_owned(),
         );
-        // GH token env (but don't leak)
         if let Ok(val) = std::env::var("GH_TOKEN")
             && !val.trim().is_empty()
         {
@@ -155,7 +154,6 @@ impl Adapter for CopilotCodingAgentAdapter {
                 EXECUTABLE,
                 path.display()
             ));
-            // The gh version is evidence, never claimed as coding-agent version.
             match super::probe_version(path) {
                 Some(v) => {
                     evidence.push(format!(
@@ -179,7 +177,6 @@ impl Adapter for CopilotCodingAgentAdapter {
 
         self.collect_config_evidence(&mut evidence);
 
-        // The agent is cloud-owned, so local presence is always Absent.
         let present = InstallPresence::Absent;
         let confidence = DetectionConfidence::High;
 
@@ -199,7 +196,6 @@ impl Adapter for CopilotCodingAgentAdapter {
     }
 
     fn config_surfaces(&self) -> Vec<ConfigSurface> {
-        // Cloud-owned surfaces are exposed as Opaque for documentation.
         let mut surfaces = Vec::new();
 
         let cloud_instructions_resolver = PathResolver::fallback_only(

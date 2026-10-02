@@ -83,7 +83,6 @@ impl ClaudeDesktopAdapter {
         )?)
     }
 
-    /// Per-OS default root; the app has no relocation env var, so this is the only root.
     fn default_config_root() -> Option<PathBuf> {
         let home = super::home_dir()?;
         if cfg!(target_os = "macos") {
@@ -381,8 +380,6 @@ impl Adapter for ClaudeDesktopAdapter {
         ]
     }
 
-    /// The app reads one hardcoded per-OS path; no env var points elsewhere.
-    /// The alias core refuses aliasing on exactly this empty env set.
     fn plan_wrapper(&self, instance: &Instance) -> Result<WrapperPlan, CoreError> {
         super::ensure_instance_harness(&self.id, instance)?;
         instance.validate()?;
@@ -456,7 +453,6 @@ impl Adapter for ClaudeDesktopAdapter {
         ]
     }
 
-    /// Remote connectors are UI-managed and intentionally not modeled here.
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(crate::adapter::McpAdapterDecl::new(
             CONFIG_FILE,

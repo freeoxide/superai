@@ -467,8 +467,6 @@ impl Adapter for ConductorAdapter {
             "CONDUCTOR_ROOT_PATH".to_owned(),
             format!("{}/..", instance.config_root),
         ));
-        // Modulo first: the addend is < 1000, well inside u16, so the cast
-        // cannot truncate no matter how long the instance name is.
         #[expect(
             clippy::cast_possible_truncation,
             reason = "len % 1000 is at most 999, which u16 represents exactly"

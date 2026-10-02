@@ -94,8 +94,6 @@ impl CursorAdapter {
         Some(home.join(".cursor"))
     }
 
-    /// The agent reads user MCP only from `$HOME/.cursor/mcp.json` and
-    /// ignores env relocation (probe-verified 2026-09-18).
     fn mcp_read_path() -> Option<PathBuf> {
         let home = super::home_dir()?;
         Some(home.join(".cursor").join("mcp.json"))
@@ -491,7 +489,6 @@ impl Adapter for CursorAdapter {
         super::skill_modes_link_first()
     }
 
-    /// The agent never reads `$CURSOR_CONFIG_DIR/mcp.json` (probe 2026-09-18).
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(crate::adapter::McpAdapterDecl::new(
             "mcp.json",

@@ -392,8 +392,6 @@ impl Adapter for FactoryDroidAdapter {
         super::skill_modes_link_first()
     }
 
-    /// `droid mcp add` writes top-level `mcpServers` to `$HOME/.factory/mcp.json`
-    /// only (live-verified droid 0.222.0); under HOME relocation the dest must nest.
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(crate::adapter::McpAdapterDecl::new(
             ".factory/mcp.json",
