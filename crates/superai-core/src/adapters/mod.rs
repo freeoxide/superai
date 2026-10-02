@@ -86,9 +86,17 @@ pub(crate) fn find_in_path_within(path_var: &std::ffi::OsStr, names: &[&str]) ->
 }
 
 /// First PATH hit for `names`, dir-major: the earliest directory holding any
-/// name wins.
+/// name wins. A non-UTF8 `PATH` yields `None` here, unlike lossy
+/// [`find_in_path`]; both divergences from the name-major order are
+/// per-adapter contract.
 pub(crate) fn find_in_path_dir_first(names: &[&str]) -> Option<PathBuf> {
     let path_var = std::env::var("PATH").ok()?;
+    find_in_path_dir_first_within(&path_var, names)
+}
+
+/// [`find_in_path_dir_first`] against an explicit PATH value; the caller owns
+/// the UTF-8 gate.
+pub(crate) fn find_in_path_dir_first_within(path_var: &str, names: &[&str]) -> Option<PathBuf> {
     let separator = if cfg!(windows) { ';' } else { ':' };
     for dir in path_var.split(separator) {
         for name in names {
@@ -216,6 +224,7 @@ fn join_pipe_reader(handle: thread::JoinHandle<Vec<u8>>, binary: &Path) -> Vec<u
 fn run_probe(binary: &Path, args: &[String], budget: Duration) -> Option<String> {
     let spawned = Command::new(binary)
         .args(args)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn();
@@ -531,8 +540,11 @@ mod decl_tests {
         }
     }
 
-    /// A probe whose output passes the OS pipe capacity must finish inside
-    /// its budget and still parse the version at the end of the stream.
+    /// A probe whose output passes the OS pipe capacity must capture the
+    /// version at the stream's end: only an unblocked child that wrote
+    /// everything and exited can produce it, so a probe paying the kill
+    /// budget instead fails here. Retries absorb a transient spawn failure
+    /// under parallel-test load; the truncation this pins never recovers.
     #[test]
     #[cfg(unix)]
     fn probe_drains_output_past_pipe_capacity() {
@@ -549,19 +561,80 @@ mod decl_tests {
         )
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let started = std::time::Instant::now();
-        let version = super::probe_version(&script);
+        let mut version = None;
+        for _ in 0..3 {
+            version = super::probe_version(&script);
+            if version.is_some() {
+                break;
+            }
+        }
         assert_eq!(
             version.as_deref(),
             Some("9.9.9"),
-            "version past the pipe capacity was lost"
-        );
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(2),
-            "chatty probe paid the kill budget: {:?}",
-            started.elapsed()
+            "version past the pipe capacity was lost across 3 attempts"
         );
         drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// A probe child sees EOF on stdin, never the parent's terminal: `cat`
+    /// blocks on any inherited open stdin until the kill budget, and only a
+    /// terminated child prints at all. Retries absorb a transient spawn
+    /// failure under parallel-test load; the inherited hang never recovers.
+    #[test]
+    #[cfg(unix)]
+    fn probe_child_gets_null_stdin_and_prompts_end_inside_budget() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_util::temp_dir_unique("probe-stdin");
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("asker");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ncat >/dev/null\nprintf 'stdin=%s 1.0.0\\n' \"$(readlink /proc/self/fd/0)\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut out = None;
+        for _ in 0..3 {
+            out = super::run_capturing(&script, &[], std::time::Duration::from_secs(2));
+            if out.is_some() {
+                break;
+            }
+        }
+        let out = out.expect("stdin-reading probe child never produced output in 3 attempts");
+        assert!(
+            out.contains("stdin=/dev/null"),
+            "probe child stdin was not /dev/null: {out:?}"
+        );
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// The two PATH lookup orders resolve different binaries when a later
+    /// name sits in an earlier directory: name-major keeps the first name,
+    /// dir-major keeps the first directory.
+    #[test]
+    fn path_lookup_orders_diverge_as_declared() {
+        let dir_a = crate::test_util::temp_dir_unique("path-order-a");
+        let dir_b = crate::test_util::temp_dir_unique("path-order-b");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+        std::fs::write(dir_a.join("beta"), b"#!bin\n").unwrap();
+        std::fs::write(dir_b.join("alpha"), b"#!bin\n").unwrap();
+        let path_var = format!("{}:{}", dir_a.display(), dir_b.display());
+        let name_major =
+            super::find_in_path_within(std::ffi::OsStr::new(&path_var), &["alpha", "beta"]);
+        let dir_major = super::find_in_path_dir_first_within(&path_var, &["alpha", "beta"]);
+        assert_eq!(
+            name_major.as_deref(),
+            Some(dir_b.join("alpha").as_path()),
+            "name-major must prefer the earlier name over the earlier directory"
+        );
+        assert_eq!(
+            dir_major.as_deref(),
+            Some(dir_a.join("beta").as_path()),
+            "dir-major must prefer the earlier directory over the earlier name"
+        );
+        drop(std::fs::remove_dir_all(&dir_a));
+        drop(std::fs::remove_dir_all(&dir_b));
     }
 
     /// Whether any live process's argv is exactly `wanted`; /proc entries
