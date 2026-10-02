@@ -451,6 +451,32 @@ mod tests {
     }
 
     #[test]
+    fn store_refuses_non_utf8_target_with_lossy_write() {
+        let path = scratch("non_utf8.yaml");
+        std::fs::write(&path, [0xFF, 0xFE, b'a']).unwrap();
+        let mut map = Map::new();
+        map.insert("a".into(), Value::Number(2.into()));
+        match store(&path, &map) {
+            Err(ConfigError::LossyWrite { format, .. }) => assert_eq!(format, "yaml"),
+            other => panic!("expected LossyWrite, got {other:?}"),
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), vec![0xFF, 0xFE, b'a']);
+    }
+
+    #[test]
+    fn store_refuses_directory_target_with_lossy_write() {
+        let path = scratch("as_dir.yaml");
+        std::fs::create_dir_all(&path).unwrap();
+        let mut map = Map::new();
+        map.insert("a".into(), Value::Number(2.into()));
+        match store(&path, &map) {
+            Err(ConfigError::LossyWrite { format, .. }) => assert_eq!(format, "yaml"),
+            other => panic!("expected LossyWrite, got {other:?}"),
+        }
+        assert!(path.is_dir());
+    }
+
+    #[test]
     fn lone_cr_comment_file_refuses_changing_edit() {
         // libyaml accepts lone CR as a line break, so this file loads fine;
         // the edit must still refuse rather than destroy the comment.
