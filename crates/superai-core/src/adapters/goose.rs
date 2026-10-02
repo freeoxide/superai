@@ -637,10 +637,11 @@ mod tests {
         assert!(candidates.iter().any(|c| c.contains(CONFIG_ENV_VAR)));
     }
 
-    /// Real goose nests `config/` inside `$GOOSE_PATH_ROOT` (live 1.51.0: a
-    /// flat config.yaml there is ignored); hints must carry the segment.
     #[test]
     fn env_relocated_surface_hints_nest_config_segment() {
+        // Live goose 1.51.0 ignores a flat config.yaml in $GOOSE_PATH_ROOT;
+        // it only reads the nested config/ segment.
+
         let a = adapter();
         let env_prefix = format!("{ISOLATED_CONFIG_ROOT_HINT}/");
         let win_prefix = "%GOOSE_PATH_ROOT%\\config\\";
