@@ -599,10 +599,9 @@ pub struct FileCommitReport {
 
 /// Detect a case-insensitive sibling (QAL-09): on such filesystems the write
 /// would silently land over the sibling, so the risk surfaces everywhere.
-pub(crate) fn case_fold_collision_in_dir(target: &Path) -> Option<PathBuf> {
+pub fn case_fold_collision_in_dir(target: &Path) -> Option<PathBuf> {
     let dir = target.parent()?;
     let target_name = target.file_name()?.to_string_lossy().into_owned();
-    let wanted = target_name.to_ascii_lowercase();
     let entries = std::fs::read_dir(dir).ok()?;
     let mut best: Option<PathBuf> = None;
     for entry in entries.flatten() {
@@ -611,7 +610,7 @@ pub(crate) fn case_fold_collision_in_dir(target: &Path) -> Option<PathBuf> {
         if name_str == target_name {
             continue;
         }
-        if name_str.to_ascii_lowercase() == wanted {
+        if name_str.eq_ignore_ascii_case(&target_name) {
             let variant = dir.join(&name);
             match &best {
                 Some(current) if current <= &variant => {}
@@ -1485,7 +1484,6 @@ impl Transaction {
             self.expected_states.insert(path, snap);
         }
 
-        // Every staged temp must still carry exactly its planned bytes.
         let planned: HashMap<&Path, &Vec<u8>> = self
             .steps
             .iter()
@@ -1498,10 +1496,8 @@ impl Transaction {
             let Some(content) = planned.get(target.as_path()) else {
                 continue;
             };
-            let expected = compute_digest(content);
             let staged_bytes = std::fs::read(&temp).map_err(|e| ConfigError::io(&temp, e))?;
-            let actual = compute_digest(&staged_bytes);
-            if expected != actual {
+            if staged_bytes != content.as_slice() {
                 return Err(ConfigError::verification(
                     &target,
                     format!("staged digest mismatch for {}", target.display()),
@@ -1599,10 +1595,6 @@ impl Transaction {
                 self.inject(Point::ParseStaged)?;
                 validate_bytes_for_kind(content, *kind, path)?;
                 let temp_path = self.stage_write(path, content)?;
-                // The staged file itself must parse (read fresh).
-                let staged_bytes =
-                    std::fs::read(&temp_path).map_err(|e| ConfigError::io(&temp_path, e))?;
-                validate_bytes_for_kind(&staged_bytes, *kind, &temp_path)?;
                 staged.push(temp_path.clone());
                 staged_map.push((path.clone(), temp_path));
             }
@@ -1987,7 +1979,7 @@ impl Transaction {
                 let expected_digest = compute_digest(content);
                 let actual_digest = compute_digest(&bytes);
                 let digest_ok = expected_digest == actual_digest;
-                let parse_ok = validate_bytes_for_kind(&bytes, *kind, path).is_ok();
+                let parse_ok = digest_ok || validate_bytes_for_kind(&bytes, *kind, path).is_ok();
                 let message = if digest_ok && parse_ok {
                     "verified".to_owned()
                 } else if !digest_ok {
