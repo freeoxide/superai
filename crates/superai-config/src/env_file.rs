@@ -552,10 +552,10 @@ pub(crate) fn commit_delta(
         newline,
         lexical,
     } = fresh;
+    if map == *final_map {
+        return Ok(());
+    }
     if !lexical {
-        if final_map.is_empty() {
-            return Ok(());
-        }
         return store(path, final_map);
     }
     apply_lexical(path, &mut lines, &map, final_map, newline)
@@ -660,9 +660,6 @@ where
     }
     let mut final_map = fresh.map.clone();
     edit_fn(&mut final_map);
-    if final_map == fresh.map {
-        return Ok(());
-    }
     commit_delta(path, fresh, &final_map)
 }
 

@@ -268,6 +268,28 @@ fn backup_inner(
     injector: Option<&dyn Injector>,
 ) -> Result<Option<BackupEntry>> {
     inject(injector, Point::BackupOpen)?;
+    let Some(meta) = backup_source_meta(path)? else {
+        return Ok(None);
+    };
+    let original_bytes = std::fs::read(path).map_err(|e| ConfigError::io(path, e))?;
+    backup_from_meta(path, operation_id, reason, injector, &meta, &original_bytes)
+}
+
+pub(crate) fn backup_bytes_with_injector(
+    path: &Path,
+    operation_id: Option<&str>,
+    reason: &str,
+    injector: Option<&dyn Injector>,
+    original_bytes: &[u8],
+) -> Result<Option<BackupEntry>> {
+    inject(injector, Point::BackupOpen)?;
+    let Some(meta) = backup_source_meta(path)? else {
+        return Ok(None);
+    };
+    backup_from_meta(path, operation_id, reason, injector, &meta, original_bytes)
+}
+
+fn backup_source_meta(path: &Path) -> Result<Option<std::fs::Metadata>> {
     let meta = match std::fs::symlink_metadata(path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -298,17 +320,26 @@ fn backup_inner(
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file"),
         ));
     }
+    Ok(Some(meta))
+}
 
-    let original_bytes = std::fs::read(path).map_err(|e| ConfigError::io(path, e))?;
-    let digest = compute_digest(&original_bytes);
+fn backup_from_meta(
+    path: &Path,
+    operation_id: Option<&str>,
+    reason: &str,
+    injector: Option<&dyn Injector>,
+    meta: &std::fs::Metadata,
+    original_bytes: &[u8],
+) -> Result<Option<BackupEntry>> {
+    let digest = compute_digest(original_bytes);
     let size = original_bytes.len() as u64;
-    let permissions = get_permissions_u32(&meta);
+    let permissions = get_permissions_u32(meta);
 
     inject(injector, Point::BackupWrite)?;
     // Unix exclusive-creates the backup: a symlink planted at the name is
     // refused, never followed. Windows fs::copy leaves a probe-to-copy race.
     #[cfg(unix)]
-    let (target, millis, suffix) = write_backup_bytes(path, &original_bytes, permissions)?;
+    let (target, millis, suffix) = write_backup_bytes(path, original_bytes, permissions)?;
     #[cfg(not(unix))]
     let (target, millis, suffix) = {
         let picked = pick_backup_path(path, Path::exists);
@@ -328,21 +359,11 @@ fn backup_inner(
 
     inject(injector, Point::BackupVerify)?;
     let backup_bytes = std::fs::read(&target).map_err(|e| ConfigError::io(&target, e))?;
-    let backup_digest = compute_digest(&backup_bytes);
-    if backup_digest != digest {
+    if backup_bytes != original_bytes {
+        let backup_digest = compute_digest(&backup_bytes);
         return Err(ConfigError::backup_verification(
             &target,
             format!("digest mismatch after copy: expected {digest}, got {backup_digest}"),
-        ));
-    }
-
-    if (backup_bytes.len() as u64) != size {
-        return Err(ConfigError::backup_verification(
-            &target,
-            format!(
-                "size mismatch after copy: expected {size}, got {}",
-                backup_bytes.len()
-            ),
         ));
     }
 
@@ -471,27 +492,29 @@ pub fn list_backups(original_path: &Path) -> Result<Vec<BackupEntry>> {
     Ok(entries)
 }
 
+/// Whether already-read bytes match the entry's recorded digest and size.
+fn verify_backup_bytes(entry: &BackupEntry, bytes: &[u8]) -> bool {
+    compute_digest(bytes) == entry.digest && bytes.len() as u64 == entry.size
+}
+
 /// Whether the backup file matches its entry: `Ok(false)` on mismatch.
 pub fn verify_backup(entry: &BackupEntry) -> Result<bool> {
     let bytes =
         std::fs::read(&entry.backup_path).map_err(|e| ConfigError::io(&entry.backup_path, e))?;
-    let digest = compute_digest(&bytes);
-    let size = bytes.len() as u64;
-    Ok(digest == entry.digest && size == entry.size)
+    Ok(verify_backup_bytes(entry, &bytes))
 }
 
-/// Whether the entry belongs to `target`: same original path and a properly
-/// named sibling backup, so restores cannot cross identities (MUT-07).
-pub fn verify_backup_relation(entry: &BackupEntry, target: &Path) -> Result<bool> {
+/// Path-only half of the relation check (MUT-07); reads no contents.
+fn backup_relation_holds(entry: &BackupEntry, target: &Path) -> bool {
     if entry.original_path != target {
-        return Ok(false);
+        return false;
     }
     let Some(parent) = target.parent() else {
-        return Ok(false);
+        return false;
     };
     let backup_parent = entry.backup_path.parent().unwrap_or_else(|| Path::new("."));
     if backup_parent != parent && !parent.as_os_str().is_empty() {
-        return Ok(false);
+        return false;
     }
     let file_name = target
         .file_name()
@@ -502,10 +525,13 @@ pub fn verify_backup_relation(entry: &BackupEntry, target: &Path) -> Result<bool
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or_default();
-    if !backup_name.starts_with(file_name) {
-        return Ok(false);
-    }
-    if !backup_name.contains(".bak.") {
+    backup_name.starts_with(file_name) && backup_name.contains(".bak.")
+}
+
+/// Whether the entry belongs to `target`: same original path and a properly
+/// named sibling backup, so restores cannot cross identities (MUT-07).
+pub fn verify_backup_relation(entry: &BackupEntry, target: &Path) -> Result<bool> {
+    if !backup_relation_holds(entry, target) {
         return Ok(false);
     }
     verify_backup(entry)
@@ -626,15 +652,17 @@ pub struct RestoreReport {
 /// Verify digest and relation, back up the current bytes, replace atomically,
 /// verify the read-back (MUT-07).
 pub fn restore_verified(entry: &BackupEntry) -> Result<RestoreReport> {
-    let digest_ok = verify_backup(entry)?;
-    if !digest_ok {
+    // One read serves the digest gate, the relation gate, and the restore
+    // bytes; nothing writes between them.
+    let backup_bytes =
+        std::fs::read(&entry.backup_path).map_err(|e| ConfigError::io(&entry.backup_path, e))?;
+    if !verify_backup_bytes(entry, &backup_bytes) {
         return Err(ConfigError::backup_verification(
             &entry.backup_path,
             "backup digest does not match entry",
         ));
     }
-    let relation_ok = verify_backup_relation(entry, &entry.original_path)?;
-    if !relation_ok {
+    if !backup_relation_holds(entry, &entry.original_path) {
         return Err(ConfigError::backup_verification(
             &entry.original_path,
             "backup relation mismatch: entry does not belong to target",
@@ -647,8 +675,6 @@ pub fn restore_verified(entry: &BackupEntry) -> Result<RestoreReport> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(ConfigError::io(&entry.original_path, e)),
     };
-    let backup_bytes =
-        std::fs::read(&entry.backup_path).map_err(|e| ConfigError::io(&entry.backup_path, e))?;
     let preview_redacted =
         redacted_diff_preview(current_bytes.as_deref().unwrap_or_default(), &backup_bytes);
     let backup_before = if current_bytes.is_some() {
@@ -676,14 +702,15 @@ pub fn restore_verified(entry: &BackupEntry) -> Result<RestoreReport> {
     )?;
     let restored_bytes = std::fs::read(&entry.original_path)
         .map_err(|e| ConfigError::io(&entry.original_path, e))?;
-    let restored_digest = compute_digest(&restored_bytes);
-    let backup_digest = compute_digest(&backup_bytes);
-    let verification_passed =
-        restored_digest == backup_digest && restored_bytes.len() == backup_bytes.len();
+    let verification_passed = restored_bytes == backup_bytes;
     if !verification_passed {
+        let restored_digest = compute_digest(&restored_bytes);
         return Err(ConfigError::verification(
             &entry.original_path,
-            format!("restore verification failed: expected {backup_digest}, got {restored_digest}"),
+            format!(
+                "restore verification failed: expected {}, got {restored_digest}",
+                entry.digest
+            ),
         ));
     }
     // Best-effort parse check; a failure never fails the restore itself.

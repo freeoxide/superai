@@ -13,13 +13,13 @@ use std::sync::Arc;
 use crate::atomic::{
     apply_mode, compute_digest, generate_temp_path, remove_temp, resolve_final_mode, sync_parent,
 };
-use crate::backup::{BackupEntry, backup_with_injector, verify_backup};
+use crate::backup::{BackupEntry, backup_bytes_with_injector, backup_with_injector, verify_backup};
 use crate::document::{DocumentKind, validate_bytes_for_kind};
 use crate::error::{ConfigError, Result};
 use crate::injector::{Injector, Point};
 use crate::journal::{CrashJournal, JournalBackup, JournalPhase};
 use crate::safe_paths::home_dir;
-use crate::snapshot::{Snapshot, is_modified, snapshot};
+use crate::snapshot::{Snapshot, is_modified, snapshot, snapshot_with_bytes};
 
 /// Stable operation identifier for quarantine and backup linkage.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -505,7 +505,6 @@ pub fn commit_staged_file(
 ) -> Result<()> {
     validate_path_safety(target)?;
     let staged_bytes = std::fs::read(staged).map_err(|e| ConfigError::io(staged, e))?;
-    let expected_digest = compute_digest(&staged_bytes);
 
     if let Some(parent) = target.parent()
         && !parent.as_os_str().is_empty()
@@ -568,21 +567,12 @@ pub fn commit_staged_file(
         injector.inject(Point::ReadBackVerify)?;
     }
     let read_back = std::fs::read(target).map_err(|e| ConfigError::io(target, e))?;
-    let actual = compute_digest(&read_back);
-    if expected_digest != actual {
+    if read_back != staged_bytes {
+        let expected_digest = compute_digest(&staged_bytes);
+        let actual = compute_digest(&read_back);
         return Err(ConfigError::verification(
             target,
             format!("digest mismatch after commit: expected {expected_digest}, got {actual}"),
-        ));
-    }
-    if read_back.len() != staged_bytes.len() {
-        return Err(ConfigError::verification(
-            target,
-            format!(
-                "size mismatch after commit: expected {}, got {}",
-                staged_bytes.len(),
-                read_back.len(),
-            ),
         ));
     }
     Ok(())
@@ -1500,7 +1490,7 @@ impl Transaction {
             if staged_bytes != content.as_slice() {
                 return Err(ConfigError::verification(
                     &target,
-                    format!("staged digest mismatch for {}", target.display()),
+                    format!("staged bytes mismatch for {}", target.display()),
                 ));
             }
         }
@@ -1557,7 +1547,17 @@ impl Transaction {
             if !(snap.exists && snap.is_file) {
                 continue;
             }
-            let current = snapshot(p);
+            // One fresh read serves both the recheck token and the backup
+            // bytes; both consumers live inside this prepare pass.
+            let read = match std::fs::read(p) {
+                Ok(bytes) => Some(bytes),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => return Err(ConfigError::io(p, e)),
+            };
+            let current = match &read {
+                Some(bytes) => snapshot_with_bytes(p, bytes),
+                None => snapshot(p),
+            };
             if is_modified(snap, &current) {
                 return Err(ConfigError::concurrent_modification(
                     p,
@@ -1565,12 +1565,21 @@ impl Transaction {
                     current.digest.unwrap_or_default(),
                 ));
             }
-            let entry = backup_with_injector(
-                p,
-                Some(self.id.as_str()),
-                "transaction prepare",
-                self.injector.as_deref(),
-            )?;
+            let entry = match read {
+                Some(bytes) => backup_bytes_with_injector(
+                    p,
+                    Some(self.id.as_str()),
+                    "transaction prepare",
+                    self.injector.as_deref(),
+                    &bytes,
+                )?,
+                None => backup_with_injector(
+                    p,
+                    Some(self.id.as_str()),
+                    "transaction prepare",
+                    self.injector.as_deref(),
+                )?,
+            };
             if let Some(entry) = entry {
                 self.backups.push(entry);
             }
@@ -1950,7 +1959,9 @@ impl Transaction {
         Ok(())
     }
 
-    /// Fresh read plus parse per Write step.
+    /// Fresh read per Write step; a commit whose bytes equal the staged
+    /// content is verified without a re-parse (those bytes already passed
+    /// the stage-time parse gate).
     #[expect(
         clippy::excessive_nesting,
         reason = "verify checks digest and parse per file"
@@ -1979,7 +1990,8 @@ impl Transaction {
                 let expected_digest = compute_digest(content);
                 let actual_digest = compute_digest(&bytes);
                 let digest_ok = expected_digest == actual_digest;
-                let parse_ok = digest_ok || validate_bytes_for_kind(&bytes, *kind, path).is_ok();
+                let parse_ok = bytes.as_slice() == content.as_slice()
+                    || validate_bytes_for_kind(&bytes, *kind, path).is_ok();
                 let message = if digest_ok && parse_ok {
                     "verified".to_owned()
                 } else if !digest_ok {
@@ -2991,7 +3003,7 @@ mod tests {
             .prepare()
             .expect_err("tampered staged bytes must abort prepare");
         assert!(
-            err.to_string().contains("staged digest mismatch"),
+            err.to_string().contains("staged bytes mismatch"),
             "unexpected error: {err}"
         );
         drop(std::fs::remove_dir_all(&root));

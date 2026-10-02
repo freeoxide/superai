@@ -848,7 +848,9 @@ fn apply_json_family(path: &Path, op: &Operation, family: JsonFamily) -> Result<
     let old_text = read_text_or_empty(path)?;
     let mut value = match family {
         JsonFamily::Strict => text_value(&old_text, path, crate::json::parse_strict)?,
-        JsonFamily::JsonC => crate::jsonc::load_value(path)?,
+        JsonFamily::JsonC => text_value(&old_text, path, |text, path| {
+            crate::json::parse_strict(&crate::jsonc::strip_jsonc_cow(text), path)
+        })?,
         JsonFamily::Yaml => text_value(&old_text, path, |text, path| {
             crate::yaml::parse_strict_raw(text).map_err(|source| ConfigError::Yaml {
                 path: path.to_path_buf(),
@@ -1178,11 +1180,17 @@ fn value_to_env_map(
 fn apply_env(path: &Path, op: &Operation) -> Result<OperationOutcome> {
     let fresh = crate::env_file::read_fresh(path)?;
     let mut view = env_map_to_value(fresh.effective_map());
-    let outcome = apply_to_value(path, &mut view, op)?;
+    let mut outcome = apply_to_value(path, &mut view, op)?;
     if !outcome.changed {
         return Ok(outcome);
     }
     let new_vars = value_to_env_map(&view, path, op)?;
+    if new_vars == *fresh.effective_map() {
+        // The env rendering cannot carry the type change (e.g. Bool over
+        // "true"); identical effective map means no write is warranted.
+        outcome.changed = false;
+        return Ok(outcome);
+    }
     crate::env_file::commit_delta(path, fresh, &new_vars)?;
     Ok(outcome)
 }
@@ -1953,6 +1961,25 @@ mod tests {
         assert!(after.contains("# top comment"), "{after}");
         assert!(after.contains("MODEL=sonnet"));
         assert!(after.contains("OTHER=1"));
+        drop(std::fs::remove_file(&path));
+    }
+
+    #[test]
+    fn file_apply_env_typed_noop_writes_nothing() {
+        let path = scratch("apply-env-noop", ".env");
+        let before = b"# keep\nA=true\nN=42\n";
+        std::fs::write(&path, before).unwrap();
+
+        for (selector, value, key) in [("key:A", Value::Bool(true), "A"), ("key:N", json!(42), "N")]
+        {
+            let op = set_op(selector, value).with_owned_keys(vec![key.into()]);
+            let outcome = apply(&path, DocumentKind::Env, &op).unwrap();
+            assert!(!outcome.changed, "env rendering is unchanged: {outcome:?}");
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let dir = path.parent().unwrap();
+        let siblings = std::fs::read_dir(dir).unwrap().flatten().count();
+        assert_eq!(siblings, 1, "a no-op must not leave a backup sibling");
         drop(std::fs::remove_file(&path));
     }
 

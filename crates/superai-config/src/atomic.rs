@@ -353,22 +353,12 @@ pub(crate) fn atomic_write_expecting(
 
     inject(injector, Point::ReadBackVerify)?;
     let read_back = std::fs::read(path).map_err(|e| ConfigError::io(path, e))?;
-    let expected = compute_digest(bytes);
-    let actual = compute_digest(&read_back);
-    if expected != actual {
+    if read_back.as_slice() != bytes {
+        let expected = compute_digest(bytes);
+        let actual = compute_digest(&read_back);
         return Err(ConfigError::verification(
             path,
             format!("digest mismatch after atomic write: expected {expected}, got {actual}"),
-        ));
-    }
-    if read_back.len() != bytes.len() {
-        return Err(ConfigError::verification(
-            path,
-            format!(
-                "size mismatch after atomic write: expected {}, got {}",
-                bytes.len(),
-                read_back.len()
-            ),
         ));
     }
 
