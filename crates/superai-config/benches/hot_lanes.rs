@@ -3,6 +3,7 @@
 
 // The lib's regular deps ride along as externs of this target; none are
 // referenced directly, so mark them used for `unused_crate_dependencies`.
+use memchr as _;
 use serde as _;
 use thiserror as _;
 use toml_edit as _;

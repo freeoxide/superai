@@ -782,8 +782,14 @@ pub fn validate_bytes_for_kind(content: &[u8], kind: DocumentKind, path: &Path) 
                     std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid utf8 in jsonc"),
                 )
             })?;
-            let stripped = strip_jsonc_comments(text);
-            serde_json::from_str::<Value>(&stripped).map_err(|source| ConfigError::Json {
+            let stripped;
+            let parse_input = if text.contains('/') {
+                stripped = strip_jsonc_comments(text);
+                stripped.as_str()
+            } else {
+                text
+            };
+            serde_json::from_str::<Value>(parse_input).map_err(|source| ConfigError::Json {
                 path: path.to_path_buf(),
                 source,
             })?;

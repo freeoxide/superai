@@ -4,10 +4,12 @@
 use std::borrow::Cow;
 use std::path::Path;
 
+use memchr::{memchr, memchr2_iter, memchr3_iter};
 use serde_json::{Map, Value};
 
 use crate::error::{ConfigError, Result};
 
+#[cfg(test)]
 fn strip_trailing_commas(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut output = String::with_capacity(input.len());
@@ -49,17 +51,141 @@ fn strip_trailing_commas(input: &str) -> String {
 
 /// Strip JSONC extensions (comments + trailing commas) to produce strict JSON.
 pub fn strip_jsonc(input: &str) -> String {
-    strip_trailing_commas(&crate::document::strip_jsonc_comments(input))
+    strip_jsonc_cow(input).into_owned()
 }
 
-fn strip_jsonc_cow(text: &str) -> Cow<'_, str> {
-    if !text.contains('/') && !text.contains(',') {
+pub(crate) fn strip_jsonc_cow(text: &str) -> Cow<'_, str> {
+    let bytes = text.as_bytes();
+    match (memchr(b'/', bytes).is_some(), memchr(b',', bytes).is_some()) {
+        (false, false) => Cow::Borrowed(text),
+        (false, true) => strip_trailing_commas_cow(text),
+        (true, _) => strip_fused_cow(text),
+    }
+}
+
+fn span(text: &str, start: usize, end: usize) -> &str {
+    text.get(start..end).unwrap_or_default()
+}
+
+fn escaped_at(bytes: &[u8], quote: usize) -> bool {
+    let mut i = quote;
+    let mut backslashes = 0u64;
+    while i > 0 && bytes.get(i - 1) == Some(&b'\\') {
+        backslashes += 1;
+        i -= 1;
+    }
+    backslashes % 2 == 1
+}
+
+fn block_comment_end(bytes: &[u8], from: usize) -> Option<usize> {
+    let mut i = from;
+    while let Some(rel) = memchr(b'*', bytes.get(i..).unwrap_or_default()) {
+        let star = i + rel;
+        if bytes.get(star + 1) == Some(&b'/') {
+            return Some(star + 2);
+        }
+        i = star + 1;
+    }
+    None
+}
+
+fn comment_end_at(bytes: &[u8], slash: usize) -> usize {
+    match bytes.get(slash + 1) {
+        Some(b'/') => memchr(b'\n', bytes.get(slash + 2..).unwrap_or_default())
+            .map_or(bytes.len(), |rel| slash + 2 + rel),
+        _ => block_comment_end(bytes, slash + 2).unwrap_or(bytes.len()),
+    }
+}
+
+fn comment_pair_at(bytes: &[u8], at: usize) -> bool {
+    bytes.get(at) == Some(&b'/') && matches!(bytes.get(at + 1), Some(b'/' | b'*'))
+}
+
+fn strip_fused_cow(text: &str) -> Cow<'_, str> {
+    let bytes = text.as_bytes();
+    let mut out = String::new();
+    let mut run = 0usize;
+    let mut in_string = false;
+    let mut skip_until = 0usize;
+    for p in memchr3_iter(b'"', b'/', b',', bytes) {
+        if p < skip_until {
+            continue;
+        }
+        if in_string {
+            if bytes.get(p) == Some(&b'"') && !escaped_at(bytes, p) {
+                in_string = false;
+            }
+            continue;
+        }
+        if bytes.get(p) == Some(&b'"') {
+            in_string = true;
+            continue;
+        }
+        if comment_pair_at(bytes, p) {
+            out.push_str(span(text, run, p));
+            let end = comment_end_at(bytes, p);
+            skip_until = end;
+            run = end;
+            continue;
+        }
+        if bytes.get(p) != Some(&b',') {
+            continue;
+        }
+        let mut look = p + 1;
+        loop {
+            match bytes.get(look) {
+                Some(b' ' | b'\t' | b'\n' | b'\r') => look += 1,
+                Some(b'/') if comment_pair_at(bytes, look) => {
+                    look = comment_end_at(bytes, look);
+                }
+                _ => break,
+            }
+        }
+        if matches!(bytes.get(look), Some(b'}' | b']')) {
+            out.push_str(span(text, run, p));
+            run = p + 1;
+        }
+    }
+    if out.is_empty() && run == 0 {
         return Cow::Borrowed(text);
     }
-    if !text.contains('/') {
-        return Cow::Owned(strip_trailing_commas(text));
+    out.push_str(span(text, run, bytes.len()));
+    Cow::Owned(out)
+}
+
+fn strip_trailing_commas_cow(text: &str) -> Cow<'_, str> {
+    let bytes = text.as_bytes();
+    if memchr(b',', bytes).is_none() {
+        return Cow::Borrowed(text);
     }
-    Cow::Owned(strip_jsonc(text))
+    let mut out = String::new();
+    let mut run = 0usize;
+    let mut in_string = false;
+    for p in memchr2_iter(b',', b'"', bytes) {
+        if in_string {
+            if bytes.get(p) == Some(&b'"') && !escaped_at(bytes, p) {
+                in_string = false;
+            }
+            continue;
+        }
+        if bytes.get(p) == Some(&b'"') {
+            in_string = true;
+            continue;
+        }
+        let mut look = p + 1;
+        while matches!(bytes.get(look), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+            look += 1;
+        }
+        if matches!(bytes.get(look), Some(b'}' | b']')) {
+            out.push_str(span(text, run, p));
+            run = p + 1;
+        }
+    }
+    if out.is_empty() && run == 0 {
+        return Cow::Borrowed(text);
+    }
+    out.push_str(span(text, run, bytes.len()));
+    Cow::Owned(out)
 }
 
 /// Read fresh; comments and trailing commas accepted, duplicates rejected.
@@ -193,6 +319,109 @@ mod tests {
         let dir = crate::test_util::temp_dir_unique("config-jsonc");
         std::fs::create_dir_all(&dir).unwrap();
         dir.join(name)
+    }
+
+    fn scalar_strip_jsonc(text: &str) -> String {
+        strip_trailing_commas(&crate::document::strip_jsonc_comments(text))
+    }
+
+    #[test]
+    fn fast_strip_matches_scalar_on_fixed_corpus() {
+        let cases = [
+            "",
+            "/",
+            "//",
+            "/*",
+            "/**",
+            "/**/",
+            "/***/",
+            "/*/",
+            "{}",
+            "{,}",
+            "{\"a\":1,}",
+            "[1,2,]",
+            "[1,/*c*/2,]",
+            "{\"u\":\"a\\\"/*b*/\",}",
+            "{\"url\":\"http://x/y\",}",
+            "a // c\r\nb\n",
+            "// only comment, no newline",
+            "/* unterminated {\"a\":1,}",
+            "{\"k\":\"// not comment\", \"j\":/*c*/\"v\",}",
+            "{\"é\":1/*中文*/,}",
+            "{\"emoji\":\"\u{1F600}\",}",
+            "{\"a\": [1, 2 /* x */, ] }",
+            "{\"a\":1,,}",
+            "[,]",
+            "{\"a\":\"b\\\\\",}",
+            "{\"a\":\"b\\\"\",}",
+            "\r\n{\"a\":1,}\r\n",
+            "{\"a\" : 1 , }",
+            "\"\\uD83D\\uDE00\"",
+            "{\"a\":\"\\u0061\",}",
+        ];
+        for case in cases {
+            assert_eq!(strip_jsonc(case), scalar_strip_jsonc(case), "case {case:?}");
+            assert_eq!(
+                strip_jsonc_cow(case).as_ref(),
+                scalar_strip_jsonc(case),
+                "cow case {case:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fast_strip_matches_scalar_on_generated_inputs() {
+        fn xorshift(state: &mut u64) -> u64 {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            *state
+        }
+        let tokens = [
+            "{",
+            "}",
+            "[",
+            "]",
+            ",",
+            ":",
+            "\"",
+            "\\",
+            "//c\n",
+            "/*c*/",
+            "/",
+            "x",
+            " ",
+            "\r\n",
+            "\"s\"",
+            "1",
+            "é",
+            "\u{1F600}",
+            "\"a\\\"b\"",
+            "\"/*n*/\"",
+            "//",
+            "*/",
+            "/*",
+        ];
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        for _ in 0..2000 {
+            let count = usize::try_from(xorshift(&mut state) % 12).unwrap() + 1;
+            let mut input = String::new();
+            for _ in 0..count {
+                let idx = usize::try_from(xorshift(&mut state) % tokens.len() as u64).unwrap();
+                input.push_str(tokens[idx]);
+            }
+            assert_eq!(
+                strip_jsonc_cow(&input).as_ref(),
+                scalar_strip_jsonc(&input),
+                "input {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn line_comment_swallows_the_cr_of_crlf() {
+        let input = "{\"a\":1, // c\r\n\"b\":2}\n";
+        assert_eq!(strip_jsonc(input), "{\"a\":1, \n\"b\":2}\n");
     }
 
     #[test]

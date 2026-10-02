@@ -251,15 +251,44 @@ pub fn formatting_change_warning(text: &str) -> Option<&'static str> {
         return None;
     }
     let value = serde_json::from_str::<Value>(text).ok()?;
-    let mut normalized = serde_json::to_string_pretty(&value).ok()?;
-    normalized.push('\n');
-    if normalized == text {
+    let bytes = text.as_bytes();
+    let mut canonical = CanonicalPretty {
+        expected: bytes,
+        pos: 0,
+    };
+    let matches = serde_json::to_writer_pretty(&mut canonical, &value).is_ok()
+        && canonical.pos + 1 == bytes.len()
+        && bytes.last() == Some(&b'\n');
+    if matches {
         None
     } else {
         Some(
             "strict json codec normalizes whitespace and indentation on changing writes; \
              surrounding formatting will change even where semantics do not",
         )
+    }
+}
+
+struct CanonicalPretty<'a> {
+    expected: &'a [u8],
+    pos: usize,
+}
+
+impl std::io::Write for CanonicalPretty<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let end = self.pos + buf.len();
+        if self.expected.get(self.pos..end) != Some(buf) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "not canonical pretty json",
+            ));
+        }
+        self.pos = end;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 

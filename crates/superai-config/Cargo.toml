@@ -17,6 +17,7 @@ description = "Layer 1: per-harness config files — read fresh, edit, back up, 
 bench = false
 
 [dependencies]
+memchr = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml_edit = { workspace = true }
