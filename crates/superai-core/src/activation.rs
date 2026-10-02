@@ -25,16 +25,12 @@ pub fn default_store_root(home: &Path) -> PathBuf {
     home.join(".superai").join("fixed-path-profiles")
 }
 
-/// Lockfile name inside the per-harness store directory.
 const LOCK_FILE_NAME: &str = "activation.lock";
 
-/// Metadata file suffix for a stored profile.
 const PROFILE_META_SUFFIX: &str = ".profile.json";
 
-/// Raw content file suffix for a stored profile.
 const PROFILE_CONTENT_SUFFIX: &str = ".profile.content";
 
-/// Active-identity record name inside the per-harness store directory.
 const ACTIVE_FILE_NAME: &str = "active.json";
 
 /// Metadata for one saved profile.
@@ -236,7 +232,6 @@ impl ActivationLock {
             reason: format!("cannot create {}: {e}", dir.display()),
         })?;
         let path = dir.join(LOCK_FILE_NAME);
-        // One stale-recovery retry, then a typed conflict.
         if Self::try_create(&path, harness)? {
             return Ok(Self { path });
         }
@@ -261,8 +256,6 @@ impl ActivationLock {
         Err(CoreError::ActivationLockHeld { path, holder_pid })
     }
 
-    /// Create the lockfile with create-new semantics: `Ok(true)` acquired,
-    /// `Ok(false)` a live or unrecoverable holder, `Err` an I/O failure.
     fn try_create(path: &Path, harness: &str) -> Result<bool> {
         let mut file = match OpenOptions::new()
             .read(true)
@@ -298,7 +291,6 @@ impl ActivationLock {
 
 impl Drop for ActivationLock {
     fn drop(&mut self) {
-        // Drop cannot return the error, so release failures go to stderr.
         if let Err(e) = std::fs::remove_file(&self.path) {
             eprintln!(
                 "superai-core: lockfile cleanup failed for {}: {e}",
@@ -308,7 +300,6 @@ impl Drop for ActivationLock {
     }
 }
 
-/// Whether the lockfile at `path` is provably stale.
 fn lock_is_stale(path: &Path) -> bool {
     let Ok(bytes) = std::fs::read(path) else {
         return true;
@@ -374,7 +365,6 @@ impl FixedPathProfileStore {
         self.harness_dir().join(ACTIVE_FILE_NAME)
     }
 
-    /// Validate that `fixed_path` is a file path inside the harness tree.
     fn require_fixed_path(&self, fixed_path: &Path) -> Result<()> {
         if !fixed_path.is_absolute() || !fixed_path.starts_with(&self.harness_root) {
             return Err(CoreError::Validation {
@@ -414,7 +404,6 @@ impl FixedPathProfileStore {
         self.write_profile(name, fixed_path, &content)
     }
 
-    /// Write profile content + metadata into the superai-owned store.
     fn write_profile(
         &self,
         name: &InstanceName,
@@ -433,8 +422,6 @@ impl FixedPathProfileStore {
             saved_at: now_iso8601(),
             fixed_path: fixed_path.display().to_string(),
         };
-        // Content stays opaque; metadata is parse-validated JSON. Both go
-        // through the one mutation boundary.
         commit_file(
             "profile-content",
             &self.content_path(name),
@@ -456,7 +443,6 @@ impl FixedPathProfileStore {
         Ok(summary)
     }
 
-    /// Load a stored profile (metadata + content), digest-verified.
     fn load_profile(&self, name: &InstanceName) -> Result<(ProfileSummary, Vec<u8>)> {
         let meta_bytes =
             std::fs::read(self.meta_path(name)).map_err(|e| CoreError::Validation {
@@ -597,8 +583,6 @@ impl FixedPathProfileStore {
         self.require_fixed_path(fixed_path)?;
         let _lock = ActivationLock::acquire(&self.harness_dir(), self.harness.as_str())?;
 
-        // WRP-06: the app was launched against the active content and is not
-        // confirmed stopped, so refuse until the caller clears the flag.
         let active = self.active_identity()?;
         if let Some(active) = active.filter(|a| a.app_may_write) {
             return Err(CoreError::AppMayStillWrite {
@@ -613,14 +597,10 @@ impl FixedPathProfileStore {
 
         let (summary, content) = self.load_profile(name)?;
 
-        // Fresh-read the current fixed-path state (disk is truth), then
-        // reconcile an external edit vs the last-activated snapshot.
         let current = std::fs::read(fixed_path).ok();
         let captured =
             self.reconcile_external_edit(name, fixed_path, choice, current.as_deref())?;
 
-        // Transactional apply: backup of the existing foreign file, atomic
-        // replace, fresh-snapshot conflict recheck, read-back verify.
         let op_id =
             TxOperationId::new(&format!("activate-{}-{}", self.harness, name)).map_err(|e| {
                 CoreError::Validation {
@@ -660,8 +640,6 @@ impl FixedPathProfileStore {
             .map(|c| c.backups.into_iter().map(|b| b.backup_path).collect())
             .unwrap_or_default();
 
-        // Verify the applied content by digest (content/provenance-derived
-        // identity, not an assumed flag).
         let applied = std::fs::read(fixed_path).map_err(|e| CoreError::Verification {
             path: fixed_path.to_path_buf(),
             kind: "digest".to_owned(),
@@ -692,8 +670,6 @@ impl FixedPathProfileStore {
                 field: "active_identity".to_owned(),
                 reason: format!("cannot serialize active identity: {e}"),
             })?;
-        // The identity record persists through the one mutation boundary
-        // (pretty JSON, staged parse-validation included).
         commit_file(
             "active-identity",
             &self.active_path(),
@@ -748,8 +724,6 @@ impl FixedPathProfileStore {
         Ok(identity)
     }
 
-    /// Reconcile a fixed-path file changed since the last activation
-    /// (WRP-06): abort, capture, or discard; never a silent overwrite.
     fn reconcile_external_edit(
         &self,
         name: &InstanceName,

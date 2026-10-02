@@ -26,8 +26,6 @@ pub const DEFAULT_PORT_RANGE_START: u16 = 49152;
 /// Inclusive end of the default port range.
 pub const DEFAULT_PORT_RANGE_END: u16 = 65535;
 
-/// Upper bound on bind probes per allocation attempt (keeps worst-case
-/// allocation bounded even over the full ephemeral range).
 const MAX_PORT_PROBES: usize = 512;
 
 /// Evidence source for the liveness and identity of an OS process.
@@ -85,7 +83,6 @@ pub fn pid_is_alive(pid: u32) -> bool {
     }
 }
 
-/// Process state character from `/proc/<pid>/stat` on Linux (e.g. `R`, `Z`).
 #[cfg(target_os = "linux")]
 #[must_use]
 fn proc_state(pid: u32) -> Option<char> {
@@ -147,8 +144,6 @@ pub fn identity_path(root: &Path, harness: &str, instance: &str) -> PathBuf {
     root.join(format!("{harness}-{instance}.identity.json"))
 }
 
-/// Start-lock body: the holder identity, for staleness recovery and conflict
-/// diagnostics.
 #[derive(Serialize, Deserialize)]
 struct StartLockFile {
     pid: u32,
@@ -156,8 +151,6 @@ struct StartLockFile {
     acquired_at: String,
 }
 
-/// Exclusive start lock serializing daemon starts per harness/instance, so
-/// the exists-check, spawn, and identity write act as one step.
 struct DaemonStartLock {
     path: PathBuf,
 }
@@ -196,7 +189,6 @@ impl DaemonStartLock {
         })
     }
 
-    /// `Ok(true)` = created (acquired); `Ok(false)` = held; `Err` = I/O.
     fn try_create(path: &Path, harness: &str) -> Result<bool> {
         use std::io::Write;
         let mut file = match std::fs::OpenOptions::new()
@@ -233,7 +225,6 @@ impl DaemonStartLock {
 
 impl Drop for DaemonStartLock {
     fn drop(&mut self) {
-        // Drop cannot return the error, so release failures go to stderr.
         if let Err(e) = std::fs::remove_file(&self.path) {
             eprintln!(
                 "superai-core: start-lock cleanup failed for {}: {e}",
@@ -243,8 +234,6 @@ impl Drop for DaemonStartLock {
     }
 }
 
-/// Whether the start lock at `path` is provably stale (dead holder or
-/// unparsable body sitting in the superai-owned root).
 fn lock_is_stale(path: &Path) -> bool {
     let Ok(bytes) = std::fs::read(path) else {
         return true;
@@ -320,7 +309,6 @@ pub fn port_is_free(addr: IpAddr, port: u16) -> bool {
     TcpListener::bind((addr, port)).is_ok()
 }
 
-/// Ports currently claimed by recorded daemon identities whose pid is alive.
 fn held_ports(root: &Path, probe: &dyn ProcessProbe) -> HashSet<u16> {
     read_identities(root)
         .into_iter()
@@ -410,7 +398,6 @@ pub enum ReadinessSpec {
 }
 
 impl ReadinessSpec {
-    /// Materialize the probe against a resolved port (replaces `{port}`).
     #[must_use]
     fn for_port(&self, port: u16) -> Self {
         match self {
@@ -445,7 +432,6 @@ pub fn wait_for_ready(harness: &str, spec: &ReadinessSpec, port: u16) -> Result<
         interval,
     } = &materialized;
     let deadline = Instant::now() + *timeout;
-    // Only the per-attempt timeout varies; build the rest once.
     let mut opts = ExecuteOpts {
         timeout: None,
         env: env.clone(),
@@ -524,7 +510,6 @@ pub struct ShutdownCommand {
 }
 
 impl ShutdownCommand {
-    /// Materialize the argv against a resolved port (replaces `{port}`).
     #[must_use]
     fn for_port(&self, port: u16) -> Vec<String> {
         self.args
@@ -706,8 +691,6 @@ pub fn start_daemon(config: &DaemonStartConfig, probe: &dyn ProcessProbe) -> Res
             field: "daemon_identity".to_owned(),
             reason: format!("cannot serialize daemon identity: {e}"),
         })?;
-        // Plan-02 fold: the identity record persists through the config crate's
-        // ONE mutation boundary (pretty JSON, staged parse-validation included).
         commit_file(
             "daemon-identity",
             &id_path,
@@ -737,8 +720,6 @@ pub fn start_daemon(config: &DaemonStartConfig, probe: &dyn ProcessProbe) -> Res
     }
 
     if config.foreground {
-        // WRP-07 foreground: block until the daemon exits, then clean the
-        // identity; the exit status reaches the caller, nothing is signaled.
         let status = handle.wait().map_err(|e| CoreError::BinaryDetection {
             binary: config.executable.clone(),
             reason: format!("cannot wait for foreground daemon: {e}"),
@@ -758,8 +739,6 @@ pub fn start_daemon(config: &DaemonStartConfig, probe: &dyn ProcessProbe) -> Res
     }))
 }
 
-/// Spawn the daemon (no capture, no shell) with the resolved port substituted
-/// into args/env; foreground inherits stdio, background detaches with nulled stdio.
 fn spawn_daemon_process(config: &DaemonStartConfig, port: u16) -> Result<(duct::Handle, u32)> {
     let mut args: Vec<String> = config
         .args
@@ -806,8 +785,6 @@ fn spawn_daemon_process(config: &DaemonStartConfig, port: u16) -> Result<(duct::
     Ok((handle, pid))
 }
 
-/// Signal a process via the platform binary (argv tokens, no shell, no
-/// unsafe). `force` escalates to a hard kill.
 fn send_signal(pid: u32, force: bool) -> Result<()> {
     #[cfg(unix)]
     let (binary, args) = (
@@ -884,8 +861,6 @@ pub fn verify_process_identity(id: &DaemonIdentity, probe: &dyn ProcessProbe) ->
     })
 }
 
-/// Remove the identity record once the daemon is provably gone; `NotFound`
-/// means a previous cleanup already won.
 fn remove_identity_record(identity_path: &Path) -> Result<()> {
     if let Err(e) = std::fs::remove_file(identity_path)
         && e.kind() != std::io::ErrorKind::NotFound
@@ -970,7 +945,6 @@ pub fn stop_daemon(
     })
 }
 
-/// Poll for process death within `grace`.
 fn wait_for_exit(pid: u32, probe: &dyn ProcessProbe, grace: Duration, interval: Duration) -> bool {
     let deadline = Instant::now() + grace;
     while Instant::now() < deadline {

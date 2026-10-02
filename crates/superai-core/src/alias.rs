@@ -30,8 +30,6 @@ pub const ALIAS_MARKER_FILE: &str = ".superai-alias";
 /// Manifest file under the alias base directory listing every alias.
 pub const ALIAS_MANIFEST_FILE: &str = "aliases.json";
 
-/// Directory under an alias root holding superai's own per-alias state (the
-/// plugin registry). Dot-prefixed so harnesses ignore it.
 const ALIAS_STATE_DIR: &str = ".superai";
 
 const MANIFEST_SCHEMA_KEY: &str = "schema_version";
@@ -50,8 +48,6 @@ pub const ALIAS_PROVIDER_REF_SCHEMA_VERSION: u32 = 1;
 /// virtualized `HOME` (live evidence); every other harness keeps the guard.
 pub const HOME_VIRT_HARNESSES: &[&str] = &["claude-desktop", "chatgpt-desktop"];
 
-/// HOME-virt MCP destination overrides: the seeded file must land where the
-/// HOME-relocated binary actually reads it (relative to the alias root).
 const HOME_VIRT_MCP_DESTS: &[(&str, &str)] = &[(
     "claude-desktop",
     // XDG_CONFIG_HOME=<root>/.config + Electron appData appname "Claude".
@@ -66,8 +62,6 @@ const CLAUDE_CODE_API_KEY_VAR: &str = "ANTHROPIC_API_KEY";
 const CLAUDE_CODE_MODEL_VAR: &str = "ANTHROPIC_MODEL";
 const CLAUDE_CODE_HAIKU_VAR: &str = "ANTHROPIC_DEFAULT_HAIKU_MODEL";
 
-/// Deterministic instance id for an alias: stable across recreation of the
-/// same (harness, name, root) triple.
 fn derive_alias_instance_id(
     harness: &HarnessId,
     name: &InstanceName,
@@ -92,14 +86,9 @@ fn transaction_operation_id(prefix: &str) -> Result<superai_config::transaction:
     })
 }
 
-/// How a harness carries a third-party provider override.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProviderCarriage {
-    /// The binary reads gateway endpoint/model/auth from its environment
-    /// (claude-code: `ANTHROPIC_*`); nothing is written to the config.
     EnvCarried,
-    /// The binary reads a provider table from its config file (codex family:
-    /// `$CODEX_HOME/config.toml`). Only the `env_key` NAME is written; the token rides the launch env.
     ConfigCarried,
 }
 
@@ -119,8 +108,6 @@ fn provider_carriage(harness: &HarnessId) -> Result<ProviderCarriage> {
     }
 }
 
-/// Whether `name` is a syntactically valid environment variable name
-/// (identifier, never PATH).
 fn valid_env_var_name(name: &str) -> bool {
     !name.is_empty()
         && name != "PATH"
@@ -204,8 +191,6 @@ impl ProviderProfile {
         self
     }
 
-    /// Validate the profile against the harness's modeled provider surface
-    /// (researcher-exact semantics; refusals cite them).
     fn validate_for(&self, harness: &HarnessId, home_virt: bool) -> Result<()> {
         if !valid_env_var_name(&self.auth_env_var) {
             return Err(CoreError::Validation {
@@ -281,8 +266,6 @@ impl ProviderProfile {
         Ok(())
     }
 
-    /// The `ProviderDefinition` rendered from this profile (auth as a NAME
-    /// only; the definition never sees a secret).
     fn to_definition(&self) -> ProviderDefinition {
         let mut def = ProviderDefinition::new(self.provider_id.clone(), self.base_url.clone());
         def.display_name = self.provider_id.to_string();
@@ -294,8 +277,6 @@ impl ProviderProfile {
     }
 }
 
-/// The persisted provider reference under the alias root: names, URL, and
-/// model pinning only, never a secret value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ProviderRef {
     schema_version: u32,
@@ -314,8 +295,6 @@ fn provider_ref_path(root: &AbsolutePath) -> Result<AbsolutePath> {
     root.join(ALIAS_PROVIDER_REF_FILE)
 }
 
-/// Load the per-alias provider reference, fresh from disk (`Ok(None)` when
-/// absent); malformed state is a typed schema error, never silently ignored.
 fn load_provider_ref(root: &AbsolutePath) -> Result<Option<ProviderRef>> {
     let path = provider_ref_path(root)?;
     match std::fs::read(path.as_path()) {
@@ -345,8 +324,6 @@ fn load_provider_ref(root: &AbsolutePath) -> Result<Option<ProviderRef>> {
     }
 }
 
-/// Persist the provider reference through the config crate's mutation
-/// boundary (backup + atomic replace; the file is superai-created).
 fn store_provider_ref(root: &AbsolutePath, profile: &ProviderProfile) -> Result<()> {
     let reference = ProviderRef {
         schema_version: ALIAS_PROVIDER_REF_SCHEMA_VERSION,
@@ -492,8 +469,6 @@ pub struct AliasRecord {
 }
 
 impl AliasRecord {
-    /// Rebuild the adapter-facing [`Instance`] for this record. The id is
-    /// re-derived deterministically, so planning is stable across processes.
     fn to_instance(&self) -> Result<Instance> {
         let id = derive_alias_instance_id(&self.harness, &self.name, &self.root)?;
         Ok(Instance {
@@ -547,8 +522,6 @@ fn manifest_entry_matches(entry: &Value, harness: &HarnessId, name: &str) -> boo
         && entry_name.is_some_and(|n| n.eq_ignore_ascii_case(name))
 }
 
-/// Insert a record into the manifest through the config mutation boundary
-/// (foreign keys preserved; existing content backed up before replace).
 fn insert_manifest_record(base_dir: &Path, record: &AliasRecord) -> Result<()> {
     let path = manifest_path(base_dir);
     let encoded = serde_json::to_value(record).map_err(CoreError::Records)?;
@@ -571,8 +544,6 @@ fn insert_manifest_record(base_dir: &Path, record: &AliasRecord) -> Result<()> {
     Ok(())
 }
 
-/// Remove an alias's entry from the manifest, leaving foreign keys and other
-/// records untouched.
 fn remove_manifest_record(base_dir: &Path, harness: &HarnessId, name: &str) -> Result<()> {
     let path = manifest_path(base_dir);
     superai_config::json::edit(&path, |map| {
@@ -590,7 +561,6 @@ fn remove_manifest_record(base_dir: &Path, harness: &HarnessId, name: &str) -> R
     Ok(())
 }
 
-/// The adapter's MCP declaration, refusing absence and read-only dests.
 fn writable_mcp_decl(harness: &HarnessId, adapter: &dyn Adapter) -> Result<McpAdapterDecl> {
     let Some(decl) = adapter.mcp_decl() else {
         let reason = adapter
@@ -612,8 +582,6 @@ fn writable_mcp_decl(harness: &HarnessId, adapter: &dyn Adapter) -> Result<McpAd
     Ok(decl)
 }
 
-/// The adapter's plugin declaration, refusing absent and execution-requiring
-/// mechanisms (alias creation stages files; it never runs harness commands).
 fn stageable_plugin_decl(harness: &HarnessId, adapter: &dyn Adapter) -> Result<PluginAdapterDecl> {
     let Some(decl) = adapter.plugin_decl() else {
         let reason = adapter
@@ -639,8 +607,6 @@ fn stageable_plugin_decl(harness: &HarnessId, adapter: &dyn Adapter) -> Result<P
     Ok(decl)
 }
 
-/// Build the HOME-virtualization launch plan: `HOME=<alias-root>` plus
-/// `XDG_CONFIG_HOME=<alias-root>/.config`; never sets `PATH`.
 fn home_virt_wrapper_plan(root: &AbsolutePath) -> Result<WrapperPlan> {
     let config_root = root.join(".config")?;
     let mut plan = WrapperPlan::new(
@@ -664,8 +630,6 @@ fn home_virt_wrapper_plan(root: &AbsolutePath) -> Result<WrapperPlan> {
     Ok(plan)
 }
 
-/// Plan the alias launch through the adapter's own `plan_wrapper`, refusing
-/// plans without relocation vars or that override `PATH`.
 fn wrapper_plan_for_alias(
     adapter: &dyn Adapter,
     instance: &Instance,
@@ -821,8 +785,6 @@ pub fn create_alias(
     }
 }
 
-/// Undo a partially created alias: root to quarantine, this run's wrapper
-/// restored; the original error survives a clean rollback.
 fn rollback_partial_alias(
     base_dir: &Path,
     root: &Path,
@@ -865,8 +827,6 @@ fn rollback_partial_alias(
     }
 }
 
-/// Return the wrapper path to its pre-create state. Only bytes provably
-/// this run's wrapper are touched; foreign launchers are left alone.
 fn rollback_wrapper_file(
     path: &Path,
     wrapper_content: &[u8],
@@ -882,8 +842,6 @@ fn rollback_wrapper_file(
         }
         Err(_) => return Ok(format!("wrapper {} already absent", path.display())),
     }
-    // The backup from this run is the pre-create state; if backups cannot
-    // be listed that state is unknown, so the wrapper stays in place.
     let ours = match superai_config::backup::list_backups(path) {
         Ok(mut all) => {
             all.retain(|b| b.timestamp_millis >= started_millis);
@@ -924,8 +882,6 @@ fn rollback_wrapper_file(
     }
 }
 
-/// Create the alias root directory plus the ownership marker via a
-/// compensated transaction (no raw `mkdir`/file writes).
 fn create_alias_root(root: &AbsolutePath, harness: &HarnessId, name: &InstanceName) -> Result<()> {
     let marker = format!("{}\n{}\n", harness.as_str(), name.as_str());
     let steps = vec![
@@ -950,8 +906,6 @@ fn create_alias_root(root: &AbsolutePath, harness: &HarnessId, name: &InstanceNa
     Ok(())
 }
 
-/// The MCP destination relative to the alias root: under HOME-virt the file
-/// must land where the HOME-relocated binary reads it.
 fn alias_mcp_dest(harness: &HarnessId, decl_dest: &str, home_virt: bool) -> String {
     if home_virt
         && let Some((_, overridden)) = HOME_VIRT_MCP_DESTS
@@ -963,8 +917,6 @@ fn alias_mcp_dest(harness: &HarnessId, decl_dest: &str, home_virt: bool) -> Stri
     decl_dest.to_owned()
 }
 
-/// Seed the MCP set through the existing `mcp` write path at the
-/// adapter-declared destination under the alias root.
 fn seed_mcp_set(
     root: &AbsolutePath,
     harness: &HarnessId,
@@ -983,8 +935,6 @@ fn seed_mcp_set(
     Ok(())
 }
 
-/// Stage the plugin set through the existing `plugin` machinery, with the
-/// plugin registry colocated under the alias root.
 fn seed_plugin_set(
     root: &AbsolutePath,
     harness: &HarnessId,
@@ -1003,8 +953,6 @@ fn seed_plugin_set(
     Ok(())
 }
 
-/// Seed the alias's third-party provider: env-carried composes at launch,
-/// config-carried seeds the codex `CODEX_HOME` table; the reference carries names only.
 fn seed_provider_profile(root: &AbsolutePath, spec: &AliasSpec) -> Result<()> {
     let Some(profile) = &spec.provider else {
         return Ok(());
@@ -1054,8 +1002,6 @@ fn seed_provider_profile(root: &AbsolutePath, spec: &AliasSpec) -> Result<()> {
     store_provider_ref(root, profile)
 }
 
-/// Compose the provider's launch env from the persisted reference and the
-/// caller's secrets; a missing secret warns (both families validate lazily).
 fn compose_provider_env(
     harness: &HarnessId,
     root: &AbsolutePath,
@@ -1098,8 +1044,6 @@ fn compose_provider_env(
     Ok((overlay, secret_entries))
 }
 
-/// Overlay env entries onto a base set: overlay values WIN on key conflict
-/// (explicit provider-vs-plan precedence), new keys are appended in order.
 fn overlay_env(
     mut env: Vec<(String, String)>,
     overlay: Vec<(String, String)>,
@@ -1113,7 +1057,6 @@ fn overlay_env(
     env
 }
 
-/// Guard the composed environment: PATH is never set.
 fn refuse_path_override(env: &[(String, String)]) -> Result<()> {
     if env.iter().any(|(key, _)| key == "PATH") {
         return Err(CoreError::Validation {
@@ -1124,8 +1067,6 @@ fn refuse_path_override(env: &[(String, String)]) -> Result<()> {
     Ok(())
 }
 
-/// Generate and write the alias wrapper through the existing generator and
-/// write path (foreign-ownership refusal included).
 fn generate_alias_wrapper(
     instance: &Instance,
     plan: &WrapperPlan,
@@ -1144,8 +1085,6 @@ fn generate_alias_wrapper(
     }))
 }
 
-/// Quarantine a half-created alias root. Recovery state stays under the
-/// alias base (`<base>/.superai/quarantine/...`), never the user's home.
 fn quarantine_alias_root(base_dir: &Path, root: &Path) -> std::result::Result<PathBuf, CoreError> {
     let op = crate::registry::unique_operation_string("alias-failure");
     superai_config::quarantine::move_to_quarantine_under(base_dir, root, &op)
@@ -1258,13 +1197,10 @@ pub fn launch_composition(
     })
 }
 
-/// Whether `path` is `base` itself or nested under it (component-wise).
 fn path_is_under(path: &Path, base: &Path) -> bool {
     path.starts_with(base)
 }
 
-/// Verify the alias marker names this harness and alias (case-folded on the
-/// name). A missing or mismatched marker means the root must not be touched.
 fn verify_alias_marker(root: &Path, harness: &HarnessId, name: &str) -> Result<()> {
     let marker_path = root.join(ALIAS_MARKER_FILE);
     let text = std::fs::read_to_string(&marker_path).map_err(|e| CoreError::ForeignOwnership {
@@ -1304,7 +1240,6 @@ pub fn remove_alias(base_dir: &Path, harness: &HarnessId, name: &str) -> Result<
         )?;
     }
     if record.root.as_path().exists() {
-        // Recovery state stays under the alias base, never the user's home.
         let op = crate::registry::unique_operation_string("alias-remove");
         superai_config::quarantine::move_to_quarantine_under(
             base.as_path(),
