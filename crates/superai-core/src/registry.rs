@@ -468,7 +468,6 @@ impl Registry {
                     reg.validate()?;
                     Ok(reg)
                 } else if let Some(instances_raw) = map.get(INSTANCES_KEY) {
-                    // Files written without schema_version: try the v1 shape, fall back to legacy migration.
                     let try_new: std::result::Result<Vec<Instance>, _> =
                         serde_json::from_value(instances_raw.clone());
                     if let Ok(instances) = try_new {
@@ -661,7 +660,6 @@ impl Registry {
             }
         }
 
-        // Cross-check wrapper commands vs instance names (different instances).
         for inst in &self.instances {
             if let Some(wrapper) = &inst.wrapper
                 && let Some(other) = names.get(&wrapper.command_name.normalized())
@@ -788,7 +786,6 @@ impl Registry {
         }
 
         if let Err(e) = self.validate() {
-            // Roll back the name and any wrapper command the rename touched.
             let Some(inst) = self.instances.get_mut(idx) else {
                 return Err(CoreError::Validation {
                     field: "name".to_owned(),

@@ -1,7 +1,6 @@
 //! Plugin abstraction and lifecycle (EXT-06/07): file/config scope only;
 //! removal keeps a shared dependency until its last consumer is gone.
 
-// Validation and staging branch per declared kind and scope.
 #![expect(
     clippy::excessive_nesting,
     reason = "decl validation branches per kind and scope"
@@ -298,7 +297,6 @@ impl PluginRegistry {
         let mut skipped: Vec<SkippedPluginRecord> = Vec::new();
         if let Some(arr) = obj.get("plugins").and_then(|v| v.as_array()) {
             for (index, v) in arr.iter().enumerate() {
-                // Deserialize from the borrowed value; serde needs no owned map.
                 match PluginRecord::deserialize(v) {
                     Ok(rec) => records.push(rec),
                     Err(e) => skipped.push(SkippedPluginRecord {
@@ -929,7 +927,6 @@ pub fn install_directory_bundle(
         });
     }
 
-    // Read-back verify one file's bytes (staging discipline).
     if let Some(first) = staged_rel.first() {
         let target = instance_root.join(first);
         let read_back = std::fs::read(&target).map_err(|e| CoreError::Verification {
@@ -1119,7 +1116,6 @@ pub fn set_plugin_enabled(
         PluginKind::DirectoryBundle => {
             let instance_root = dest_path.parent().unwrap_or_else(|| Path::new("."));
             if enabled {
-                // Re-stage from the recorded source locator.
                 let mut restore_source = source.clone();
                 record
                     .source_locator

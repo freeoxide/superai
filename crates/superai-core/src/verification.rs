@@ -54,8 +54,6 @@ pub fn contains_real_secret(content: &[u8], kind: DocumentKind) -> bool {
         if trimmed.len() >= 4 && !is_obviously_fake(trimmed) {
             return true;
         }
-        // Short non-fake values can still be real; only the placeholder form
-        // is excused.
         if !trimmed.eq_ignore_ascii_case("[REDACTED]") && trimmed.len() > 2 {
             return true;
         }
