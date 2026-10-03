@@ -1954,6 +1954,10 @@ mod tests {
             use std::os::unix::fs::PermissionsExt as _;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
         }
+        if std::fs::read(&path).is_ok() {
+            drop(std::fs::remove_dir_all(&dir));
+            return;
+        }
         assert!(
             load_local_map(&path).is_err(),
             "an unreadable local config must not become an empty merge base"

@@ -543,15 +543,18 @@ fn load_surface_value(path: &std::path::Path, kind: DocumentKind) -> Result<Opti
                 kind: "jsonc".to_owned(),
                 message: format!("invalid utf-8: {e}"),
             })?;
-            Some(
-                serde_json::from_str::<Value>(&superai_config::jsonc::strip_jsonc(text)).map_err(
-                    |e| CoreError::Parse {
+            let stripped = superai_config::jsonc::strip_jsonc(text);
+            if stripped.trim().is_empty() {
+                None
+            } else {
+                Some(
+                    serde_json::from_str::<Value>(&stripped).map_err(|e| CoreError::Parse {
                         path: path.to_path_buf(),
                         kind: "jsonc".to_owned(),
                         message: e.to_string(),
-                    },
-                )?,
-            )
+                    })?,
+                )
+            }
         }
         DocumentKind::Yaml => {
             Some(
@@ -2083,6 +2086,14 @@ mod tests {
         std::fs::write(&settings, b"{ broken").unwrap();
         let err = inspect_effective_provider(&instance, &adapter, providers).unwrap_err();
         assert!(err.to_string().contains("jsonc"), "got: {err}");
+
+        std::fs::write(&settings, b"// only a comment\n/* and a block */\n").unwrap();
+        let report = inspect_effective_provider(&instance, &adapter, providers)
+            .expect("comments-only jsonc is content-free, not an error");
+        assert!(
+            report.detected_provider.is_none(),
+            "no provider can be detected from comments alone"
+        );
         drop(std::fs::remove_dir_all(&dir));
     }
 

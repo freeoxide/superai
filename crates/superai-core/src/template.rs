@@ -1225,6 +1225,7 @@ pub fn check_update(instance: &Instance, repo: &TemplateRepoConfig) -> UpdateSta
             FetchErrorClass::DigestMismatch => UpdateStatus::Incompatible {
                 reason: format!("latest template digest mismatch: {e}"),
             },
+            FetchErrorClass::Offline => UpdateStatus::Offline,
             FetchErrorClass::Other => UpdateStatus::Incompatible {
                 reason: format!("cannot fetch latest template `{latest_str}`: {e}"),
             },
@@ -1235,6 +1236,7 @@ pub fn check_update(instance: &Instance, repo: &TemplateRepoConfig) -> UpdateSta
 enum FetchErrorClass {
     Missing,
     DigestMismatch,
+    Offline,
     Other,
 }
 
@@ -1243,6 +1245,7 @@ fn classify_template_fetch_error(e: &crate::template_fetch::TemplateFetchError) 
     match e {
         E::NotFound { .. } => FetchErrorClass::Missing,
         E::DigestMismatch { .. } => FetchErrorClass::DigestMismatch,
+        E::Network { .. } => FetchErrorClass::Offline,
         _ => FetchErrorClass::Other,
     }
 }
@@ -2720,9 +2723,9 @@ mod tests {
         assert!(
             matches!(
                 classify_template_fetch_error(&network),
-                FetchErrorClass::Other
+                FetchErrorClass::Offline
             ),
-            "text mentioning 'not found' must not classify as Missing"
+            "a network failure is Offline, and its text mentioning 'not found' must not classify as Missing"
         );
     }
 }

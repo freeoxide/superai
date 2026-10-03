@@ -179,10 +179,77 @@ fn bench_validate_against_adapter(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_capability_resolver(c: &mut Criterion) {
+    let harness = HarnessId::new("codex-cli").expect("bench harness id is valid");
+    let provider = ProviderId::new("glm").expect("bench provider id is valid");
+    let mut group = c.benchmark_group("capability_resolver");
+    group.measurement_time(Duration::from_secs(3));
+    group.bench_function("resolve_all_bundled_slice", |b| {
+        b.iter(|| superai_core::capability_resolver::resolve_all(&harness, &provider).len());
+    });
+
+    let scratch = Scratch::new("resolve-instance");
+    let instance = scratch.instance("resolve");
+    let sources = superai_core::capability_resolver::InstanceCapabilitySources::default();
+    group.bench_function("resolve_for_instance_single_adapter", |b| {
+        b.iter(|| {
+            superai_core::capability_resolver::resolve_for_instance(&instance, &sources).len()
+        });
+    });
+    group.finish();
+}
+
+fn bench_preview_three_way(c: &mut Criterion) {
+    let template = |version: &str, model: &str| Template {
+        schema_version: TEMPLATE_SCHEMA_VERSION,
+        id: TemplateId::new("codex-glm").expect("bench template id is valid"),
+        version: version.to_owned(),
+        harness: HarnessId::new("codex-cli").expect("bench harness id is valid"),
+        provider: ProviderId::new("glm").expect("bench provider id is valid"),
+        label: "Codex on GLM".to_owned(),
+        status: TemplateStatus::Active,
+        inputs: Vec::new(),
+        patches: (0..6)
+            .map(|i| OwnedPatch {
+                selector: format!("model_providers.glm.field_{i}"),
+                value: serde_json::json!(format!("{model}-{i}")),
+            })
+            .collect(),
+        wrapper_env: BTreeMap::new(),
+        wrapper_args: Vec::new(),
+        assets: Vec::new(),
+        capability_map: BTreeMap::new(),
+        migration_notes: Vec::new(),
+        digest: "a".repeat(64),
+        harness_version_req: None,
+        provider_protocol: None,
+        replacement: None,
+    };
+    let base = template("1.0.0", "old");
+    let new = template("1.1.0", "new");
+    let mut local = serde_json::Map::new();
+    local.insert(
+        "model_providers".to_owned(),
+        serde_json::json!({"glm": {"name": "GLM", "field_0": "old-0", "field_1": "local-1"}}),
+    );
+    let mut group = c.benchmark_group("template_update");
+    group.measurement_time(Duration::from_secs(3));
+    group.bench_function("preview_three_way_6_patches", |b| {
+        b.iter(|| {
+            superai_core::template_update::preview_three_way(&base, &new, &local)
+                .auto_applicable
+                .len()
+        });
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_bundled_providers,
     bench_inspect_codex_toml,
     bench_validate_against_adapter,
+    bench_capability_resolver,
+    bench_preview_three_way,
 );
 criterion_main!(benches);
