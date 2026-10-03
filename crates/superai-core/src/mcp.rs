@@ -457,7 +457,6 @@ pub fn from_native_value(id: &str, value: &Value) -> Result<McpServerDef> {
             .filter_map(|v| v.as_str().map(ToOwned::to_owned))
             .collect::<Vec<_>>()
     } else if let Some(parts) = obj.get("command").and_then(Value::as_array) {
-        // Kilo argv arrays: everything after the first element is args.
         parts
             .iter()
             .skip(1)
@@ -793,25 +792,8 @@ fn commit_document(
         engine_kind,
         Some(expected),
     );
-    match commit {
-        Ok(_) => {}
-        Err(superai_config::ConfigError::ConcurrentModification {
-            path,
-            expected,
-            actual,
-        }) => {
-            return Err(CoreError::ConcurrentModification {
-                path,
-                expected,
-                actual,
-            });
-        }
-        Err(e) => {
-            return Err(CoreError::Commit {
-                path: path.to_path_buf(),
-                reason: format!("transaction failed: {e}"),
-            });
-        }
+    if let Err(e) = commit {
+        return Err(map_transaction_error(path, e));
     }
     verify_written_parses(path, kind)
 }
@@ -865,38 +847,46 @@ fn commit_document_creating_dir(
         field: "mcp_transaction".to_owned(),
         reason: format!("transaction plan invalid: {e}"),
     })?;
-    txn.prepare().map_err(|e| CoreError::Commit {
-        path: path.to_path_buf(),
-        reason: format!("transaction failed: {e}"),
-    })?;
+    txn.prepare().map_err(|e| map_transaction_error(path, e))?;
     if let Err(e) = txn.commit() {
-        return Err(match e {
-            superai_config::ConfigError::ConcurrentModification {
-                path,
-                expected,
-                actual,
-            } => CoreError::ConcurrentModification {
-                path,
-                expected,
-                actual,
-            },
-            e => CoreError::Commit {
-                path: path.to_path_buf(),
-                reason: format!("transaction failed: {e}"),
-            },
-        });
+        return Err(map_transaction_error(path, e));
     }
-    if let Err(e) = txn.verify() {
+    // verify() reports digest/parse failures as outcome flags, never as Err;
+    // inspect them exactly as the engine's execute() does.
+    let verification = txn.verify().map_err(|e| CoreError::Verification {
+        path: path.to_path_buf(),
+        kind: "verify".to_owned(),
+        reason: format!("post-commit verification read failed: {e}"),
+    })?;
+    if let Some(failed) = verification.iter().find(|v| !v.digest_ok || !v.parse_ok) {
         if let Err(rollback_err) = txn.rollback() {
             eprintln!("superai-core: mcp rollback after verify failure failed: {rollback_err}");
         }
         return Err(CoreError::Verification {
             path: path.to_path_buf(),
             kind: "verify".to_owned(),
-            reason: format!("post-commit verification failed: {e}"),
+            reason: failed.message.clone(),
         });
     }
     verify_written_parses(path, kind)
+}
+
+fn map_transaction_error(path: &Path, e: superai_config::ConfigError) -> CoreError {
+    match e {
+        superai_config::ConfigError::ConcurrentModification {
+            path,
+            expected,
+            actual,
+        } => CoreError::ConcurrentModification {
+            path,
+            expected,
+            actual,
+        },
+        e => CoreError::Commit {
+            path: path.to_path_buf(),
+            reason: format!("transaction failed: {e}"),
+        },
+    }
 }
 
 fn verify_written_parses(path: &Path, kind: DocumentKind) -> Result<()> {
