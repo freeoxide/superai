@@ -577,7 +577,7 @@ mod tests {
 
     #[test]
     fn platform_gate_unsupported_when_not_in_list() {
-        // Pick a platform that is not current: if current is Linux, use Windows
+        // Pick a platform that is not the current one.
         let current = current_platform();
         let other_os = match current.os {
             Os::Linux => Os::Windows,
@@ -976,7 +976,6 @@ mod tests {
         for f in fixtures {
             let via = harness.version_for(&f.name);
             if f.is_timeout || f.is_huge || f.exit_code.is_some_and(|c| c != 0) {
-                // These should not parse as success
                 if f.is_timeout || f.is_huge {
                     assert!(
                         via.is_none(),
@@ -1053,7 +1052,6 @@ mod tests {
         let dir = crate::test_util::temp_dir_unique("mutant-backup");
         std::fs::create_dir_all(&dir).unwrap();
 
-        // happy: regular file backup succeeds and verifies
         let file = dir.join("config.json");
         std::fs::write(&file, br#"{"a":1}"#).unwrap();
         let entry = superai_config::backup::backup(&file)

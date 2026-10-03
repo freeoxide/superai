@@ -1426,7 +1426,6 @@ fn write_config_field(
         field: "selector".to_owned(),
         reason: format!("selector `{selector}` does not address an object"),
     };
-    // Selectors may carry a "key:" or "env." prefix; strip each when present.
     let after_key = selector.strip_prefix("key:").unwrap_or(selector);
     let sel = after_key.strip_prefix("env.").unwrap_or(after_key);
     let (target_obj, leaf_key) = if selector.contains("env.") {

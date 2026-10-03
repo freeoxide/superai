@@ -2243,7 +2243,6 @@ mod tests {
         let cfg_file = config_root.join("settings.json");
         fs::write(&cfg_file, r#"{"model":"test"}"#).unwrap();
 
-        // Build a registry with an instance pointing at that config root
         let reg_path = tmp.join("registry.json");
         let instance_json = serde_json::json!([{
             "id": "test-id-1",
@@ -2305,7 +2304,6 @@ mod tests {
         echo_plan.blocked_reason = None;
         let out = execute_uninstall(&echo_plan, true, false).unwrap();
         assert!(out.success);
-        // Verify config file still exists (uninstall preserves config)
         assert!(
             cfg_file.exists(),
             "config must be preserved after uninstall"
