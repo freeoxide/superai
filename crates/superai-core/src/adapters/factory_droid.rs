@@ -207,7 +207,11 @@ impl Adapter for FactoryDroidAdapter {
     }
 
     fn version_resolution(&self) -> VersionResolution {
-        super::resolution_from_detection(self.detection(), "factory-droid", SCHEMA_VERSION_STR)
+        self.version_resolution_from(&self.detection())
+    }
+
+    fn version_resolution_from(&self, detection: &DetectionResult) -> VersionResolution {
+        super::resolution_from_detection(detection.clone(), "factory-droid", SCHEMA_VERSION_STR)
     }
 
     fn config_surfaces(&self) -> Vec<ConfigSurface> {

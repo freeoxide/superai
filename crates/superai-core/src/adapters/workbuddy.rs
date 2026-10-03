@@ -333,10 +333,13 @@ impl Adapter for WorkBuddyAdapter {
     }
 
     fn version_resolution(&self) -> VersionResolution {
-        let detection = self.detection();
-        let Some(v) = detection.version else {
+        self.version_resolution_from(&self.detection())
+    }
+
+    fn version_resolution_from(&self, detection: &DetectionResult) -> VersionResolution {
+        let Some(v) = detection.version.clone() else {
             let mut res = VersionResolution::unknown();
-            res.notes = detection.evidence;
+            res.notes.clone_from(&detection.evidence);
             return res;
         };
         let era = if Self::is_auto_compact_window_era(&v) {

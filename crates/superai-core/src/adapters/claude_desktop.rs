@@ -253,8 +253,11 @@ impl Adapter for ClaudeDesktopAdapter {
     }
 
     fn version_resolution(&self) -> VersionResolution {
-        let detection = self.detection();
-        if let Some(v) = detection.version {
+        self.version_resolution_from(&self.detection())
+    }
+
+    fn version_resolution_from(&self, detection: &DetectionResult) -> VersionResolution {
+        if let Some(v) = detection.version.clone() {
             let notes = vec![
                 format!("detected claude-desktop version {v} (date-stamped build scheme)"),
                 format!("mapped to schema version {SCHEMA_VERSION_STR}"),
@@ -265,14 +268,14 @@ impl Adapter for ClaudeDesktopAdapter {
             res
         } else if detection.present == InstallPresence::Present {
             let mut res = VersionResolution::new(None, Some(SCHEMA_VERSION_STR.to_owned()), true);
-            res.notes = detection.evidence;
+            res.notes.clone_from(&detection.evidence);
             res.notes.push(format!(
                 "config-present detection; schema {SCHEMA_VERSION_STR} is the documented mcpServers shape"
             ));
             res
         } else {
             let mut res = VersionResolution::unknown();
-            res.notes = detection.evidence;
+            res.notes.clone_from(&detection.evidence);
             res
         }
     }

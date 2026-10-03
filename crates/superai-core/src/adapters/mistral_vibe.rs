@@ -219,7 +219,11 @@ impl Adapter for MistralVibeAdapter {
     }
 
     fn version_resolution(&self) -> VersionResolution {
-        super::resolution_from_detection(self.detection(), "mistral-vibe", SCHEMA_VERSION_STR)
+        self.version_resolution_from(&self.detection())
+    }
+
+    fn version_resolution_from(&self, detection: &DetectionResult) -> VersionResolution {
+        super::resolution_from_detection(detection.clone(), "mistral-vibe", SCHEMA_VERSION_STR)
     }
 
     #[expect(clippy::too_many_lines, reason = "surfaces are declarative")]

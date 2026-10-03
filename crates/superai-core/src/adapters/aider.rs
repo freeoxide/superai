@@ -189,7 +189,11 @@ impl Adapter for AiderAdapter {
     }
 
     fn version_resolution(&self) -> VersionResolution {
-        super::resolution_from_detection(self.detection(), "aider", SCHEMA_VERSION_STR)
+        self.version_resolution_from(&self.detection())
+    }
+
+    fn version_resolution_from(&self, detection: &DetectionResult) -> VersionResolution {
+        super::resolution_from_detection(detection.clone(), "aider", SCHEMA_VERSION_STR)
     }
 
     fn config_surfaces(&self) -> Vec<ConfigSurface> {

@@ -175,9 +175,12 @@ impl Adapter for ChatGptDesktopAdapter {
     }
 
     fn version_resolution(&self) -> VersionResolution {
-        let detection = self.detection();
+        self.version_resolution_from(&self.detection())
+    }
+
+    fn version_resolution_from(&self, detection: &DetectionResult) -> VersionResolution {
         let mut res = VersionResolution::new(None, Some(SCHEMA_VERSION_STR.to_owned()), false);
-        res.notes = detection.evidence;
+        res.notes.clone_from(&detection.evidence);
         res.notes.push(
             "desktop app versioning is CalVer (e.g. 26.812.10818) with no documented \
              --version probe; writes are codex-cli's business, not this adapter's"

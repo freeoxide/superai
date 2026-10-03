@@ -238,8 +238,11 @@ impl Adapter for SculptorAdapter {
     }
 
     fn version_resolution(&self) -> VersionResolution {
-        let detection = self.detection();
-        if let Some(v) = detection.version {
+        self.version_resolution_from(&self.detection())
+    }
+
+    fn version_resolution_from(&self, detection: &DetectionResult) -> VersionResolution {
+        if let Some(v) = detection.version.clone() {
             let mut notes = Vec::new();
             notes.push(format!("detected sculptor version {v}"));
             notes.push(format!("mapped to schema version {SCHEMA_VERSION_STR}"));
@@ -250,7 +253,7 @@ impl Adapter for SculptorAdapter {
             res
         } else {
             let mut res = VersionResolution::unknown();
-            res.notes = detection.evidence;
+            res.notes.clone_from(&detection.evidence);
             res
         }
     }

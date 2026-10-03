@@ -1271,6 +1271,13 @@ pub trait Adapter: Send + Sync + fmt::Debug {
     /// Map the detected harness version to a config schema.
     fn version_resolution(&self) -> VersionResolution;
 
+    /// [`Adapter::version_resolution`] over an already-taken detection, equal
+    /// to it for the same machine state; callers holding a fresh detection
+    /// must prefer this over the re-probing path.
+    fn version_resolution_from(&self, _detection: &DetectionResult) -> VersionResolution {
+        self.version_resolution()
+    }
+
     /// All config surfaces for this harness.
     fn config_surfaces(&self) -> Vec<ConfigSurface>;
 

@@ -219,7 +219,11 @@ impl Adapter for KimiCodeAdapter {
     }
 
     fn version_resolution(&self) -> VersionResolution {
-        super::resolution_from_detection(self.detection(), "kimi-code", SCHEMA_VERSION_STR)
+        self.version_resolution_from(&self.detection())
+    }
+
+    fn version_resolution_from(&self, detection: &DetectionResult) -> VersionResolution {
+        super::resolution_from_detection(detection.clone(), "kimi-code", SCHEMA_VERSION_STR)
     }
 
     #[expect(clippy::too_many_lines, reason = "surfaces are declarative")]

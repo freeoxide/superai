@@ -175,8 +175,11 @@ impl Adapter for AntigravityAdapter {
     }
 
     fn version_resolution(&self) -> VersionResolution {
-        let detection = self.detection();
-        if let Some(v) = detection.version {
+        self.version_resolution_from(&self.detection())
+    }
+
+    fn version_resolution_from(&self, detection: &DetectionResult) -> VersionResolution {
+        if let Some(v) = detection.version.clone() {
             let mut notes = Vec::new();
             notes.push(format!("detected antigravity-cli version {v}"));
             notes.push(format!("research blocked: {HOME_WORKAROUND_NOTE}"));
@@ -185,7 +188,7 @@ impl Adapter for AntigravityAdapter {
             res
         } else {
             let mut res = VersionResolution::unknown();
-            res.notes = detection.evidence;
+            res.notes.clone_from(&detection.evidence);
             res.notes
                 .push(format!("research blocked: {HOME_WORKAROUND_NOTE}"));
             res

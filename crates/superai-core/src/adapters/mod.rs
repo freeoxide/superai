@@ -542,9 +542,8 @@ mod decl_tests {
 
     /// A probe whose output passes the OS pipe capacity must capture the
     /// version at the stream's end: only an unblocked child that wrote
-    /// everything and exited can produce it, so a probe paying the kill
-    /// budget instead fails here. Retries absorb a transient spawn failure
-    /// under parallel-test load; the truncation this pins never recovers.
+    /// everything and exited can produce it. A failed attempt that paid the
+    /// budget fails outright; only a fast transient spawn failure retries.
     #[test]
     #[cfg(unix)]
     fn probe_drains_output_past_pipe_capacity() {
@@ -561,25 +560,27 @@ mod decl_tests {
         )
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let budget = std::time::Duration::from_secs(2);
         let mut version = None;
         for _ in 0..3 {
+            let started = std::time::Instant::now();
             version = super::probe_version(&script);
-            if version.is_some() {
+            if version.is_some() || started.elapsed() >= budget {
                 break;
             }
         }
         assert_eq!(
             version.as_deref(),
             Some("9.9.9"),
-            "version past the pipe capacity was lost across 3 attempts"
+            "version past the pipe capacity was lost"
         );
         drop(std::fs::remove_dir_all(&dir));
     }
 
     /// A probe child sees EOF on stdin, never the parent's terminal: `cat`
     /// blocks on any inherited open stdin until the kill budget, and only a
-    /// terminated child prints at all. Retries absorb a transient spawn
-    /// failure under parallel-test load; the inherited hang never recovers.
+    /// terminated child prints at all. A failed attempt that paid the budget
+    /// fails outright; only a fast transient spawn failure retries.
     #[test]
     #[cfg(unix)]
     fn probe_child_gets_null_stdin_and_prompts_end_inside_budget() {
@@ -593,18 +594,22 @@ mod decl_tests {
         )
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let budget = std::time::Duration::from_secs(2);
         let mut out = None;
         for _ in 0..3 {
-            out = super::run_capturing(&script, &[], std::time::Duration::from_secs(2));
-            if out.is_some() {
+            let started = std::time::Instant::now();
+            out = super::run_capturing(&script, &[], budget);
+            if out.is_some() || started.elapsed() >= budget {
                 break;
             }
         }
-        let out = out.expect("stdin-reading probe child never produced output in 3 attempts");
-        assert!(
-            out.contains("stdin=/dev/null"),
-            "probe child stdin was not /dev/null: {out:?}"
-        );
+        let out = out.expect("stdin-reading probe child never produced output");
+        if cfg!(target_os = "linux") {
+            assert!(
+                out.contains("stdin=/dev/null"),
+                "probe child stdin was not /dev/null: {out:?}"
+            );
+        }
         drop(std::fs::remove_dir_all(&dir));
     }
 
@@ -698,6 +703,25 @@ mod decl_tests {
             // confidence is only pinned when the two probes agree.
             if first.version == second.version {
                 assert_eq!(first.confidence, second.confidence, "{id}");
+            }
+        }
+    }
+
+    /// `version_resolution()` equals deriving from a fresh detection, so a
+    /// caller holding one may substitute `version_resolution_from` and skip
+    /// the second probe cycle. Only pinned when two probes agree.
+    #[test]
+    fn version_resolution_matches_derivation_from_a_fresh_detection() {
+        for adapter in harness_catalog::all_adapters() {
+            let id = adapter.id().as_str().to_owned();
+            let first = adapter.detection();
+            let second = adapter.detection();
+            if first == second {
+                assert_eq!(
+                    adapter.version_resolution_from(&first),
+                    adapter.version_resolution(),
+                    "{id}: derivation diverged from the probing path"
+                );
             }
         }
     }

@@ -214,7 +214,10 @@ impl Adapter for ZcodeAdapter {
     }
 
     fn version_resolution(&self) -> VersionResolution {
-        let detection = self.detection();
+        self.version_resolution_from(&self.detection())
+    }
+
+    fn version_resolution_from(&self, detection: &DetectionResult) -> VersionResolution {
         if let Some(v) = detection.version.clone() {
             let mut notes = Vec::new();
             notes.push(format!("detected zcode version {v}"));
@@ -228,14 +231,14 @@ impl Adapter for ZcodeAdapter {
         } else if detection.present == InstallPresence::Present {
             // Config exists with version unknown: still compatible via fixed-path schema.
             let mut res = VersionResolution::new(None, Some(SCHEMA_VERSION_STR.to_owned()), true);
-            res.notes = detection.evidence;
+            res.notes.clone_from(&detection.evidence);
             res.notes.push(format!(
                 "fixed path {FIXED_CONFIG_PATH} schema {SCHEMA_VERSION_STR}"
             ));
             res
         } else {
             let mut res = VersionResolution::unknown();
-            res.notes = detection.evidence;
+            res.notes.clone_from(&detection.evidence);
             res
         }
     }

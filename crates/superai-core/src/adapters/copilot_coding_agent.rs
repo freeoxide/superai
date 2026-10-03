@@ -184,9 +184,12 @@ impl Adapter for CopilotCodingAgentAdapter {
     }
 
     fn version_resolution(&self) -> VersionResolution {
-        let detection = self.detection();
+        self.version_resolution_from(&self.detection())
+    }
+
+    fn version_resolution_from(&self, detection: &DetectionResult) -> VersionResolution {
         let mut res = VersionResolution::unknown();
-        res.notes = detection.evidence;
+        res.notes.clone_from(&detection.evidence);
         res.notes.push(format!("unsupported: {UNSUPPORTED_REASON}"));
         res.notes.push(format!(
             "schema version {SCHEMA_VERSION_STR} is placeholder, no local config schema"
