@@ -1960,9 +1960,9 @@ impl Transaction {
         Ok(())
     }
 
-    /// Fresh read per Write step; a commit whose bytes equal the staged
-    /// content is verified without a re-parse (those bytes already passed
-    /// the stage-time parse gate).
+    /// Fresh read per Write step; bytes equal to the staged content skip
+    /// the re-parse. Never errors on verification failure: each outcome
+    /// carries `digest_ok`/`parse_ok` and rollback is caller-driven.
     #[expect(
         clippy::excessive_nesting,
         reason = "verify checks digest and parse per file"
@@ -2924,6 +2924,62 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    #[derive(Clone, Debug)]
+    struct SharedRecorder(Arc<Mutex<Vec<Point>>>);
+    impl Injector for SharedRecorder {
+        fn inject(&self, point: Point) -> Result<()> {
+            if let Ok(mut points) = self.0.lock() {
+                points.push(point);
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn full_transaction_backs_up_before_staging_before_commit() {
+        let root = tmp_root();
+        let target = root.join("full-order.json");
+        std::fs::write(&target, b"pre-existing").unwrap();
+        let id = OperationId::new("op-durability-order").unwrap();
+        let recorder = SharedRecorder(Arc::new(Mutex::new(Vec::new())));
+        let mut txn = Transaction::new(
+            id,
+            vec![FileAction::Write {
+                path: target,
+                content: b"replacement".to_vec(),
+                kind: DocumentKind::TextFragment,
+            }],
+        )
+        .with_injector(Arc::new(recorder.clone()));
+        txn.prepare().unwrap();
+        txn.commit().unwrap();
+        let expected = [
+            Point::BackupOpen,
+            Point::BackupWrite,
+            Point::BackupFlush,
+            Point::BackupVerify,
+            Point::ParseStaged,
+            Point::TempCreate,
+            Point::TempWrite,
+            Point::TempFlush,
+            Point::ConflictRecheck,
+            Point::AtomicReplace,
+            Point::ParentSync,
+            Point::ReadBackVerify,
+        ];
+        let seen = recorder.0.lock().unwrap();
+        let observed: Vec<Point> = seen
+            .iter()
+            .copied()
+            .filter(|p| expected.contains(p))
+            .collect();
+        assert_eq!(
+            observed, expected,
+            "a foreign-target commit must back up and flush before staging, and stage-fsync before the rename chain"
+        );
+        drop(std::fs::remove_dir_all(&root));
     }
 
     #[test]
