@@ -1268,14 +1268,20 @@ pub trait Adapter: Send + Sync + fmt::Debug {
     /// Detect whether the harness is installed and which version.
     fn detection(&self) -> DetectionResult;
 
-    /// Map the detected harness version to a config schema.
-    fn version_resolution(&self) -> VersionResolution;
+    /// Map the detected harness version to a config schema. Provided as
+    /// [`Adapter::version_resolution_from`] over a fresh [`Adapter::detection`];
+    /// overriding it re-introduces the probe cycle the split exists to skip.
+    fn version_resolution(&self) -> VersionResolution {
+        self.version_resolution_from(&self.detection())
+    }
 
-    /// [`Adapter::version_resolution`] over an already-taken detection, equal
-    /// to it for the same machine state; callers holding a fresh detection
-    /// must prefer this over the re-probing path.
-    fn version_resolution_from(&self, _detection: &DetectionResult) -> VersionResolution {
-        self.version_resolution()
+    /// Derive the resolution from a caller-held detection; overrides derive
+    /// from `detection` and never re-probe. The default is `unknown()`, so an
+    /// adapter that forgets the override refuses writes instead of guessing.
+    fn version_resolution_from(&self, detection: &DetectionResult) -> VersionResolution {
+        let mut res = VersionResolution::unknown();
+        res.notes.clone_from(&detection.evidence);
+        res
     }
 
     /// All config surfaces for this harness.

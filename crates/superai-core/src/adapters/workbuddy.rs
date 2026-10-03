@@ -332,10 +332,6 @@ impl Adapter for WorkBuddyAdapter {
         DetectionResult::new(present, version, evidence, confidence)
     }
 
-    fn version_resolution(&self) -> VersionResolution {
-        self.version_resolution_from(&self.detection())
-    }
-
     fn version_resolution_from(&self, detection: &DetectionResult) -> VersionResolution {
         let Some(v) = detection.version.clone() else {
             let mut res = VersionResolution::unknown();
@@ -679,7 +675,6 @@ impl Adapter for WorkBuddyAdapter {
         Self::models_era_conflict(&version, content)
     }
 
-    // LinkAll first: relink_skills takes the first supported mode.
     fn supported_skill_modes(&self) -> Vec<crate::adapter::SkillMode> {
         vec![
             crate::adapter::SkillMode::LinkAll,

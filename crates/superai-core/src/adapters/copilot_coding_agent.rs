@@ -183,10 +183,6 @@ impl Adapter for CopilotCodingAgentAdapter {
         DetectionResult::new(present, version, evidence, confidence)
     }
 
-    fn version_resolution(&self) -> VersionResolution {
-        self.version_resolution_from(&self.detection())
-    }
-
     fn version_resolution_from(&self, detection: &DetectionResult) -> VersionResolution {
         let mut res = VersionResolution::unknown();
         res.notes.clone_from(&detection.evidence);

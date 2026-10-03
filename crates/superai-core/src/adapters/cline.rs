@@ -362,12 +362,8 @@ impl Adapter for ClineAdapter {
         DetectionResult::new(present, version, evidence, confidence)
     }
 
-    fn version_resolution(&self) -> VersionResolution {
-        self.version_resolution_from(&self.detection())
-    }
-
     fn version_resolution_from(&self, detection: &DetectionResult) -> VersionResolution {
-        super::resolution_from_detection(detection.clone(), "cline", SCHEMA_VERSION_STR)
+        super::resolution_from_detection(detection, "cline", SCHEMA_VERSION_STR)
     }
 
     #[expect(clippy::too_many_lines, reason = "surfaces are declarative")]

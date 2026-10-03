@@ -225,12 +225,8 @@ impl Adapter for ClaudeCodeAdapter {
         DetectionResult::new(present, version, evidence, confidence)
     }
 
-    fn version_resolution(&self) -> VersionResolution {
-        self.version_resolution_from(&self.detection())
-    }
-
     fn version_resolution_from(&self, detection: &DetectionResult) -> VersionResolution {
-        super::resolution_from_detection(detection.clone(), "claude", SCHEMA_VERSION_STR)
+        super::resolution_from_detection(detection, "claude", SCHEMA_VERSION_STR)
     }
 
     fn config_surfaces(&self) -> Vec<ConfigSurface> {

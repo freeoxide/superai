@@ -174,10 +174,6 @@ impl Adapter for ChatGptDesktopAdapter {
         DetectionResult::new(present, None, evidence, confidence)
     }
 
-    fn version_resolution(&self) -> VersionResolution {
-        self.version_resolution_from(&self.detection())
-    }
-
     fn version_resolution_from(&self, detection: &DetectionResult) -> VersionResolution {
         let mut res = VersionResolution::new(None, Some(SCHEMA_VERSION_STR.to_owned()), false);
         res.notes.clone_from(&detection.evidence);

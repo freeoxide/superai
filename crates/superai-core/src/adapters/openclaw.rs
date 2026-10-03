@@ -212,10 +212,6 @@ impl Adapter for OpenClawAdapter {
         DetectionResult::new(present, version, evidence, confidence)
     }
 
-    fn version_resolution(&self) -> VersionResolution {
-        self.version_resolution_from(&self.detection())
-    }
-
     fn version_resolution_from(&self, detection: &DetectionResult) -> VersionResolution {
         if let Some(v) = detection.version.clone() {
             let mut notes = Vec::new();

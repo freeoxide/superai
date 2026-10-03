@@ -421,13 +421,13 @@ pub(crate) fn detection_confidence(
 
 /// Map a probe outcome onto the resolution, naming `harness` in the notes.
 pub(crate) fn resolution_from_detection(
-    detection: crate::adapter::DetectionResult,
+    detection: &crate::adapter::DetectionResult,
     harness: &str,
     schema_version: &str,
 ) -> crate::adapter::VersionResolution {
-    let Some(version) = detection.version else {
+    let Some(version) = detection.version.clone() else {
         let mut res = crate::adapter::VersionResolution::unknown();
-        res.notes = detection.evidence;
+        res.notes.clone_from(&detection.evidence);
         return res;
     };
     let notes = vec![
@@ -542,8 +542,8 @@ mod decl_tests {
 
     /// A probe whose output passes the OS pipe capacity must capture the
     /// version at the stream's end: only an unblocked child that wrote
-    /// everything and exited can produce it. A failed attempt that paid the
-    /// budget fails outright; only a fast transient spawn failure retries.
+    /// everything and exited can produce it; budget-paying failures do not
+    /// retry, only fast transient spawn failures do.
     #[test]
     #[cfg(unix)]
     fn probe_drains_output_past_pipe_capacity() {
@@ -579,8 +579,7 @@ mod decl_tests {
 
     /// A probe child sees EOF on stdin, never the parent's terminal: `cat`
     /// blocks on any inherited open stdin until the kill budget, and only a
-    /// terminated child prints at all. A failed attempt that paid the budget
-    /// fails outright; only a fast transient spawn failure retries.
+    /// terminated child prints at all; budget-paying failures do not retry.
     #[test]
     #[cfg(unix)]
     fn probe_child_gets_null_stdin_and_prompts_end_inside_budget() {
@@ -724,6 +723,168 @@ mod decl_tests {
                 );
             }
         }
+    }
+
+    /// An adapter overriding neither resolution method terminates in the
+    /// fail-safe `unknown()` refusal with the detection's evidence, never in
+    /// mutual recursion between the provided pair.
+    #[test]
+    fn unoverridden_resolution_methods_do_not_recurse() {
+        use crate::adapter::Adapter as _;
+        #[derive(Debug)]
+        struct BareAdapter;
+        impl crate::adapter::Adapter for BareAdapter {
+            fn id(&self) -> crate::ids::HarnessId {
+                crate::ids::HarnessId::new("bare-probe").unwrap()
+            }
+            fn display_name(&self) -> &'static str {
+                "bare"
+            }
+            fn product_status(&self) -> crate::adapter::ProductStatus {
+                crate::adapter::ProductStatus::Unknown
+            }
+            fn supported_platforms(&self) -> Vec<crate::adapter::Platform> {
+                Vec::new()
+            }
+            fn adapter_revision(&self) -> &'static str {
+                "0"
+            }
+            fn research_doc_link(&self) -> &'static str {
+                "about:blank"
+            }
+            fn last_verified_date(&self) -> &'static str {
+                "1970-01-01"
+            }
+            fn detection(&self) -> crate::adapter::DetectionResult {
+                crate::adapter::DetectionResult::new(
+                    crate::state::InstallPresence::UnknownVersion,
+                    None,
+                    vec!["bare evidence".to_owned()],
+                    crate::adapter::DetectionConfidence::Low,
+                )
+            }
+            fn config_surfaces(&self) -> Vec<crate::adapter::ConfigSurface> {
+                Vec::new()
+            }
+            fn supported_operations(&self) -> Vec<(String, crate::state::AdapterSupport)> {
+                Vec::new()
+            }
+            fn plan_mirror_exclusions(&self) -> Vec<String> {
+                Vec::new()
+            }
+            fn plan_wrapper(
+                &self,
+                _instance: &crate::instance::Instance,
+            ) -> Result<crate::adapter::WrapperPlan, crate::error::CoreError> {
+                Ok(crate::adapter::WrapperPlan::new("bare"))
+            }
+            fn scan_candidates(&self) -> Vec<String> {
+                Vec::new()
+            }
+            fn validate_instance(
+                &self,
+                _instance: &crate::instance::Instance,
+            ) -> Result<(), crate::error::CoreError> {
+                Ok(())
+            }
+        }
+        let adapter = BareAdapter;
+        let detection = adapter.detection();
+        let via_hook = adapter.version_resolution_from(&detection);
+        assert!(!via_hook.compatible, "default must refuse writes");
+        assert_eq!(via_hook.notes, detection.evidence);
+        let via_composition = adapter.version_resolution();
+        assert_eq!(
+            via_composition, via_hook,
+            "provided composition must terminate on the fail-safe default"
+        );
+    }
+
+    /// `version_resolution_from` never probes, and the provided
+    /// `version_resolution()` composition probes exactly once — pinned by a
+    /// counting detection, immune to probe flapping.
+    #[test]
+    fn version_resolution_from_never_probes() {
+        use crate::adapter::Adapter as _;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        #[derive(Debug)]
+        struct CountingAdapter {
+            probes: AtomicU32,
+        }
+        impl crate::adapter::Adapter for CountingAdapter {
+            fn id(&self) -> crate::ids::HarnessId {
+                crate::ids::HarnessId::new("counting-probe").unwrap()
+            }
+            fn display_name(&self) -> &'static str {
+                "counting"
+            }
+            fn product_status(&self) -> crate::adapter::ProductStatus {
+                crate::adapter::ProductStatus::Unknown
+            }
+            fn supported_platforms(&self) -> Vec<crate::adapter::Platform> {
+                Vec::new()
+            }
+            fn adapter_revision(&self) -> &'static str {
+                "0"
+            }
+            fn research_doc_link(&self) -> &'static str {
+                "about:blank"
+            }
+            fn last_verified_date(&self) -> &'static str {
+                "1970-01-01"
+            }
+            fn detection(&self) -> crate::adapter::DetectionResult {
+                self.probes.fetch_add(1, Ordering::SeqCst);
+                crate::adapter::DetectionResult::new(
+                    crate::state::InstallPresence::Present,
+                    Some("1.0.0".to_owned()),
+                    Vec::new(),
+                    crate::adapter::DetectionConfidence::High,
+                )
+            }
+            fn version_resolution_from(
+                &self,
+                detection: &crate::adapter::DetectionResult,
+            ) -> crate::adapter::VersionResolution {
+                super::resolution_from_detection(detection, "counting", "1")
+            }
+            fn config_surfaces(&self) -> Vec<crate::adapter::ConfigSurface> {
+                Vec::new()
+            }
+            fn supported_operations(&self) -> Vec<(String, crate::state::AdapterSupport)> {
+                Vec::new()
+            }
+            fn plan_mirror_exclusions(&self) -> Vec<String> {
+                Vec::new()
+            }
+            fn plan_wrapper(
+                &self,
+                _instance: &crate::instance::Instance,
+            ) -> Result<crate::adapter::WrapperPlan, crate::error::CoreError> {
+                Ok(crate::adapter::WrapperPlan::new("counting"))
+            }
+            fn scan_candidates(&self) -> Vec<String> {
+                Vec::new()
+            }
+            fn validate_instance(
+                &self,
+                _instance: &crate::instance::Instance,
+            ) -> Result<(), crate::error::CoreError> {
+                Ok(())
+            }
+        }
+        let adapter = CountingAdapter {
+            probes: AtomicU32::new(0),
+        };
+        let detection = adapter.detection();
+        assert_eq!(adapter.probes.load(Ordering::SeqCst), 1);
+        let derived = adapter.version_resolution_from(&detection);
+        let rederived = adapter.version_resolution_from(&detection);
+        assert_eq!(adapter.probes.load(Ordering::SeqCst), 1);
+        assert!(derived.compatible && rederived.compatible);
+        let via_composition = adapter.version_resolution();
+        assert_eq!(adapter.probes.load(Ordering::SeqCst), 2);
+        assert_eq!(via_composition, derived);
     }
 
     /// (harness id, expected dest file, expected dest key) for every adapter
