@@ -528,6 +528,48 @@ mod tests {
     }
 
     #[test]
+    fn staging_gate_refuses_bom_jsonc_bytes() {
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(b"{\"a\": 1}");
+        let verdict = crate::document::validate_bytes_for_kind(
+            &bytes,
+            crate::document::DocumentKind::JsonC,
+            Path::new("bom.jsonc"),
+        );
+        assert!(verdict.is_err(), "staging gate must refuse BOM'd jsonc");
+    }
+
+    #[test]
+    fn staging_gate_strips_comments_but_not_trailing_commas() {
+        let trailing = "{\"a\": 1,}".as_bytes();
+        let editor_parse = serde_json::from_str::<Value>(&strip_jsonc("{\"a\": 1,}"));
+        assert!(
+            editor_parse.is_ok(),
+            "editor chain must strip trailing commas"
+        );
+        let verdict = crate::document::validate_bytes_for_kind(
+            trailing,
+            crate::document::DocumentKind::JsonC,
+            Path::new("trailing.jsonc"),
+        );
+        assert!(
+            verdict.is_err(),
+            "staging gate must refuse trailing commas it cannot strip"
+        );
+
+        let commented = "{\n  // c\n  \"a\": 1\n}".as_bytes();
+        let commented_verdict = crate::document::validate_bytes_for_kind(
+            commented,
+            crate::document::DocumentKind::JsonC,
+            Path::new("commented.jsonc"),
+        );
+        assert!(
+            commented_verdict.is_ok(),
+            "staging gate must strip comments it does strip"
+        );
+    }
+
+    #[test]
     fn strips_line_comments() {
         let input = "{\n  \"a\": 1, // keep this\n  \"b\": 2 // trailing\n}\n";
         let out = strip_jsonc(input);

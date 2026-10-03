@@ -270,11 +270,29 @@ fn bench_jsonc_edit(c: &mut Criterion) {
     group.finish();
 }
 
+fn urls_json(target: usize) -> String {
+    let mut text = String::from("{\n");
+    let mut idx = 0usize;
+    while text.len() < target {
+        text.push_str("  \"key");
+        text.push_str(&idx.to_string());
+        text.push_str("\": \"https://host.example/");
+        text.push_str(&idx.to_string());
+        text.push('/');
+        text.push_str(&filler(idx, 20));
+        text.push_str("\",\n");
+        idx += 1;
+    }
+    text.push_str("  \"last\": 0\n}\n");
+    text
+}
+
 fn bench_strip_jsonc(c: &mut Criterion) {
     let cases = [
         ("clean_32k", clean_json(32_768)),
         ("commented_32k", commented_jsonc(32_768)),
         ("trailing_comma_32k", trailing_comma_jsonc(32_768)),
+        ("urls_32k", urls_json(32_768)),
     ];
     let mut group = c.benchmark_group("strip_jsonc");
     for (name, text) in &cases {
@@ -317,12 +335,19 @@ fn bench_lexical_diff(c: &mut Criterion) {
 fn bench_validate_bytes(c: &mut Criterion) {
     let strict_body = clean_json(16_384).into_bytes();
     let jsonc_body = commented_jsonc(16_384).into_bytes();
+    let jsonc_urls_body = urls_json(16_384).into_bytes();
     let toml_body = toml_doc(16_384).into_bytes();
     let yaml_body = yaml_doc(16_384).into_bytes();
     document::validate_bytes_for_kind(&strict_body, DocumentKind::StrictJson, Path::new("b.json"))
         .expect("json corpus must pass the gate");
     document::validate_bytes_for_kind(&jsonc_body, DocumentKind::JsonC, Path::new("b.jsonc"))
         .expect("jsonc corpus must pass the gate");
+    document::validate_bytes_for_kind(
+        &jsonc_urls_body,
+        DocumentKind::JsonC,
+        Path::new("b.urls.jsonc"),
+    )
+    .expect("jsonc urls corpus must pass the gate");
     document::validate_bytes_for_kind(&toml_body, DocumentKind::Toml, Path::new("b.toml"))
         .expect("toml corpus must pass the gate");
     document::validate_bytes_for_kind(&yaml_body, DocumentKind::Yaml, Path::new("b.yaml"))
@@ -344,6 +369,15 @@ fn bench_validate_bytes(c: &mut Criterion) {
                 std::hint::black_box(&jsonc_body),
                 DocumentKind::JsonC,
                 Path::new("b.jsonc"),
+            )
+        });
+    });
+    group.bench_function("jsonc_urls_16k", |b| {
+        b.iter(|| {
+            document::validate_bytes_for_kind(
+                std::hint::black_box(&jsonc_urls_body),
+                DocumentKind::JsonC,
+                Path::new("b.urls.jsonc"),
             )
         });
     });

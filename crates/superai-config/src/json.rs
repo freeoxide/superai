@@ -547,4 +547,37 @@ mod tests {
             other => panic!("expected Json error for BOM-prefixed json, got {other:?}"),
         }
     }
+
+    #[test]
+    fn staging_gate_refuses_bom_strict_json_bytes() {
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(b"{\"a\":1}");
+        let verdict = crate::document::validate_bytes_for_kind(
+            &bytes,
+            crate::document::DocumentKind::StrictJson,
+            Path::new("bom.json"),
+        );
+        assert!(
+            verdict.is_err(),
+            "staging gate must refuse BOM'd strict json"
+        );
+    }
+
+    #[test]
+    fn staging_gate_is_lenient_where_strict_parse_rejects() {
+        let dup = "{\"a\":1,\"a\":2}";
+        let lenient = crate::document::validate_bytes_for_kind(
+            dup.as_bytes(),
+            crate::document::DocumentKind::StrictJson,
+            Path::new("dup.json"),
+        );
+        assert!(
+            lenient.is_ok(),
+            "staging gate is deliberately last-wins on duplicate keys"
+        );
+        assert!(
+            parse_strict_raw(dup).is_err(),
+            "strict read-side parse must reject duplicate keys"
+        );
+    }
 }
