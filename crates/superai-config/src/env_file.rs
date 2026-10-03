@@ -711,6 +711,23 @@ mod tests {
     }
 
     #[test]
+    fn edit_removing_every_key_writes_the_skeleton_back() {
+        let path = scratch("remove-all.env");
+        std::fs::write(&path, "# header\nA=1\n\nB=2\n").unwrap();
+        edit(&path, |map| {
+            map.remove("A");
+            map.remove("B");
+        })
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "# header\n\n",
+            "remove-all keeps comments and blank lines, drops every entry"
+        );
+        drop(std::fs::remove_file(&path));
+    }
+
+    #[test]
     fn preserves_comments_and_blank_lines_on_edit() {
         let path = scratch("preserve.env");
         let original = "# header comment\nFOO=bar\n\n# middle\nBAZ=qux\n";
