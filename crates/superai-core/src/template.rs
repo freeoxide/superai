@@ -1246,7 +1246,10 @@ fn classify_template_fetch_error(e: &crate::template_fetch::TemplateFetchError) 
         E::NotFound { .. } => FetchErrorClass::Missing,
         E::DigestMismatch { .. } => FetchErrorClass::DigestMismatch,
         E::Network { .. } | E::RateLimited { .. } => FetchErrorClass::Offline,
-        _ => FetchErrorClass::Other,
+        E::SchemaInvalid { .. }
+        | E::InvalidUrl { .. }
+        | E::SizeLimit { .. }
+        | E::RedirectLimit { .. } => FetchErrorClass::Other,
     }
 }
 

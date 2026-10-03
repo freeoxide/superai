@@ -2149,4 +2149,72 @@ mod tests {
         );
         drop(std::fs::remove_dir_all(&dir));
     }
+    #[test]
+    fn commit_rewrite_preserves_foreign_order_bytes_are_pinned() {
+        let dir = tmp_dir("rewrite-pins");
+        let cc = crate::adapters::claude_code::ClaudeCodeAdapter::new().unwrap();
+        let inst = instance_in(&dir, "claude-code", "rw-json");
+        let settings = inst.config_root.as_path().join("settings.json");
+        std::fs::write(
+            &settings,
+            b"{\n  \"zebra\": 1,\n  \"foreign\": true,\n  \"alpha\": [1, 2]\n}\n",
+        )
+        .unwrap();
+        commit_provider_change(
+            &inst,
+            &cc,
+            &ProviderChange::AddOrUpdate {
+                provider: &universal_provider("rw-prov"),
+            },
+            &ProviderChangeOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&settings).unwrap(),
+            "{\n  \"zebra\": 1,\n  \"foreign\": true,\n  \"alpha\": [\n    1,\n    2\n  ],\n  \"env\": {\n    \"ANTHROPIC_BASE_URL\": \"https://api.example.com/anthropic\"\n  },\n  \"model\": \"model-a\"\n}\n",
+            "foreign keys keep their original order ahead of appended provider keys"
+        );
+
+        let cd = crate::adapters::continue_dev::ContinueDevAdapter::new().unwrap();
+        let inst = instance_in(&dir, "continue", "rw-yaml");
+        let config = inst.config_root.as_path().join("config.yaml");
+        std::fs::write(&config, "zebra: 1\nforeign: true\nalpha:\n  - 1\n  - 2\n").unwrap();
+        commit_provider_change(
+            &inst,
+            &cd,
+            &ProviderChange::AddOrUpdate {
+                provider: &universal_provider("rw-prov"),
+            },
+            &ProviderChangeOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&config).unwrap(),
+            "zebra: 1\nforeign: true\nalpha:\n- 1\n- 2\nprovider:\n  rw-prov:\n    options:\n      baseUrl: https://api.example.com/v1\n    apiKey: '{env:UNIVERSAL_API_KEY}'\nmodel: rw-prov/model-a\n"
+        );
+
+        let cx = crate::adapters::codex_cli::CodexCliAdapter::new().unwrap();
+        let inst = instance_in(&dir, "codex-cli", "rw-toml");
+        let config = inst.config_root.as_path().join("config.toml");
+        std::fs::write(
+            &config,
+            "# top comment\nzebra = 1\nforeign = true\n\n[alpha]\nid = 2\n",
+        )
+        .unwrap();
+        commit_provider_change(
+            &inst,
+            &cx,
+            &ProviderChange::AddOrUpdate {
+                provider: &universal_provider("rw-prov"),
+            },
+            &ProviderChangeOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&config).unwrap(),
+            "# top comment\nzebra = 1\nforeign = true\nmodel_provider = \"rw-prov\"\nmodel = \"model-a\"\n\n[alpha]\nid = 2\n\n[model_providers]\n\n[model_providers.rw-prov]\nname = \"Universal\"\nbase_url = \"https://api.example.com/v1\"\nenv_key = \"UNIVERSAL_API_KEY\"\nwire_api = \"chat\"\n",
+            "toml decor, foreign scalars, and foreign tables survive the rewrite verbatim"
+        );
+        drop(std::fs::remove_dir_all(&dir));
+    }
 }
