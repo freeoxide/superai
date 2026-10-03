@@ -101,6 +101,50 @@ fn comment_pair_at(bytes: &[u8], at: usize) -> bool {
     bytes.get(at) == Some(&b'/') && matches!(bytes.get(at + 1), Some(b'/' | b'*'))
 }
 
+fn flush_span(out: &mut String, text: &str, run: usize, end: usize) {
+    if out.capacity() == 0 {
+        out.reserve(text.len() - run);
+    }
+    out.push_str(span(text, run, end));
+}
+
+pub(crate) fn strip_jsonc_comments_cow(text: &str) -> Cow<'_, str> {
+    let bytes = text.as_bytes();
+    if memchr(b'/', bytes).is_none() {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::new();
+    let mut run = 0usize;
+    let mut in_string = false;
+    let mut skip_until = 0usize;
+    for p in memchr2_iter(b'"', b'/', bytes) {
+        if p < skip_until {
+            continue;
+        }
+        if in_string {
+            if bytes.get(p) == Some(&b'"') && !escaped_at(bytes, p) {
+                in_string = false;
+            }
+            continue;
+        }
+        if bytes.get(p) == Some(&b'"') {
+            in_string = true;
+            continue;
+        }
+        if comment_pair_at(bytes, p) {
+            flush_span(&mut out, text, run, p);
+            let end = comment_end_at(bytes, p);
+            skip_until = end;
+            run = end;
+        }
+    }
+    if out.is_empty() && run == 0 {
+        return Cow::Borrowed(text);
+    }
+    flush_span(&mut out, text, run, bytes.len());
+    Cow::Owned(out)
+}
+
 fn strip_fused_cow(text: &str) -> Cow<'_, str> {
     let bytes = text.as_bytes();
     let mut out = String::new();
@@ -122,7 +166,7 @@ fn strip_fused_cow(text: &str) -> Cow<'_, str> {
             continue;
         }
         if comment_pair_at(bytes, p) {
-            out.push_str(span(text, run, p));
+            flush_span(&mut out, text, run, p);
             let end = comment_end_at(bytes, p);
             skip_until = end;
             run = end;
@@ -142,22 +186,19 @@ fn strip_fused_cow(text: &str) -> Cow<'_, str> {
             }
         }
         if matches!(bytes.get(look), Some(b'}' | b']')) {
-            out.push_str(span(text, run, p));
+            flush_span(&mut out, text, run, p);
             run = p + 1;
         }
     }
     if out.is_empty() && run == 0 {
         return Cow::Borrowed(text);
     }
-    out.push_str(span(text, run, bytes.len()));
+    flush_span(&mut out, text, run, bytes.len());
     Cow::Owned(out)
 }
 
 fn strip_trailing_commas_cow(text: &str) -> Cow<'_, str> {
     let bytes = text.as_bytes();
-    if memchr(b',', bytes).is_none() {
-        return Cow::Borrowed(text);
-    }
     let mut out = String::new();
     let mut run = 0usize;
     let mut in_string = false;
@@ -177,14 +218,14 @@ fn strip_trailing_commas_cow(text: &str) -> Cow<'_, str> {
             look += 1;
         }
         if matches!(bytes.get(look), Some(b'}' | b']')) {
-            out.push_str(span(text, run, p));
+            flush_span(&mut out, text, run, p);
             run = p + 1;
         }
     }
     if out.is_empty() && run == 0 {
         return Cow::Borrowed(text);
     }
-    out.push_str(span(text, run, bytes.len()));
+    flush_span(&mut out, text, run, bytes.len());
     Cow::Owned(out)
 }
 
@@ -366,6 +407,11 @@ mod tests {
                 scalar_strip_jsonc(case),
                 "cow case {case:?}"
             );
+            assert_eq!(
+                strip_jsonc_comments_cow(case).as_ref(),
+                crate::document::strip_jsonc_comments(case),
+                "comments-only cow case {case:?}"
+            );
         }
     }
 
@@ -415,6 +461,11 @@ mod tests {
                 scalar_strip_jsonc(&input),
                 "input {input:?}"
             );
+            assert_eq!(
+                strip_jsonc_comments_cow(&input).as_ref(),
+                crate::document::strip_jsonc_comments(&input),
+                "comments-only input {input:?}"
+            );
         }
     }
 
@@ -422,6 +473,58 @@ mod tests {
     fn line_comment_swallows_the_cr_of_crlf() {
         let input = "{\"a\":1, // c\r\n\"b\":2}\n";
         assert_eq!(strip_jsonc(input), "{\"a\":1, \n\"b\":2}\n");
+    }
+
+    #[test]
+    fn fast_strip_matches_scalar_on_pathological_inputs() {
+        let mut escaped_quotes = String::from("\"");
+        for _ in 0..2000 {
+            escaped_quotes.push('\\');
+            escaped_quotes.push('"');
+        }
+        escaped_quotes.push(',');
+        let mut comma_comment_pairs = String::from("[");
+        for i in 0..2000 {
+            std::fmt::Write::write_fmt(&mut comma_comment_pairs, format_args!("{i}, /* c{i} "))
+                .unwrap();
+        }
+        comma_comment_pairs.push_str("*/ ]");
+        let unterminated = "1, /* never closed, ".repeat(1000);
+        let star_storm = format!("/*{}*/ 1, ", "*".repeat(4000));
+        let crlf_comments = "a: 1, // c\r\n".repeat(1000);
+        let cases = [
+            escaped_quotes,
+            comma_comment_pairs,
+            unterminated,
+            star_storm,
+            crlf_comments,
+        ];
+        for case in &cases {
+            assert_eq!(
+                strip_jsonc_cow(case).as_ref(),
+                scalar_strip_jsonc(case),
+                "pathological input of len {}",
+                case.len()
+            );
+            assert_eq!(
+                strip_jsonc_comments_cow(case).as_ref(),
+                crate::document::strip_jsonc_comments(case),
+                "pathological comments-only input of len {}",
+                case.len()
+            );
+        }
+    }
+
+    #[test]
+    fn bom_is_not_stripped_in_jsonc() {
+        let path = scratch("bom.jsonc");
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(b"{\"a\": 1}");
+        std::fs::write(&path, bytes).unwrap();
+        match load(&path) {
+            Err(ConfigError::Json { .. }) => {}
+            other => panic!("expected Json error for BOM-prefixed jsonc, got {other:?}"),
+        }
     }
 
     #[test]

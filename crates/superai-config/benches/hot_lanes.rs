@@ -270,7 +270,6 @@ fn bench_jsonc_edit(c: &mut Criterion) {
     group.finish();
 }
 
-/// The two-pass strip chain on 32 KiB buffers: the fast-path candidates.
 fn bench_strip_jsonc(c: &mut Criterion) {
     let cases = [
         ("clean_32k", clean_json(32_768)),

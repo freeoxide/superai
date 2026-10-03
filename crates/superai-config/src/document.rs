@@ -782,13 +782,8 @@ pub fn validate_bytes_for_kind(content: &[u8], kind: DocumentKind, path: &Path) 
                     std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid utf8 in jsonc"),
                 )
             })?;
-            let stripped;
-            let parse_input = if text.contains('/') {
-                stripped = strip_jsonc_comments(text);
-                stripped.as_str()
-            } else {
-                text
-            };
+            let stripped = crate::jsonc::strip_jsonc_comments_cow(text);
+            let parse_input: &str = &stripped;
             serde_json::from_str::<Value>(parse_input).map_err(|source| ConfigError::Json {
                 path: path.to_path_buf(),
                 source,
@@ -858,7 +853,7 @@ pub fn validate_bytes_for_kind(content: &[u8], kind: DocumentKind, path: &Path) 
     }
 }
 
-/// Strip `//` and `/* */` comments outside strings; strings survive verbatim.
+#[cfg(test)]
 #[expect(
     clippy::excessive_nesting,
     reason = "comment stripping state machine requires nesting"

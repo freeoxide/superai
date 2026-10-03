@@ -535,4 +535,16 @@ mod tests {
         let loaded = load_value(&path).unwrap();
         assert_eq!(loaded, val);
     }
+
+    #[test]
+    fn bom_is_not_stripped_in_strict_json() {
+        let path = scratch("bom.json");
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(b"{\"a\":1}");
+        std::fs::write(&path, bytes).unwrap();
+        match load(&path) {
+            Err(ConfigError::Json { .. }) => {}
+            other => panic!("expected Json error for BOM-prefixed json, got {other:?}"),
+        }
+    }
 }
