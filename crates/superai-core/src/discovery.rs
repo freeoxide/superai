@@ -2856,6 +2856,53 @@ mod tests {
         assert!(matches!(foreign.kind, WrapperFindingKind::Foreign { .. }));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn foreign_check_evidence_names_the_config_read_attempt() {
+        let home = tmp_home("foreign_unreadable");
+        let multi_dir = home.join(".claude-multi");
+        std::fs::create_dir_all(&multi_dir).unwrap();
+        let config = multi_dir.join("config.json");
+        std::fs::write(&config, "{}").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mut perms = std::fs::metadata(&config).unwrap().permissions();
+            perms.set_mode(0o000);
+            std::fs::set_permissions(&config, perms).unwrap();
+        }
+        let candidate = home.join("cand");
+        std::fs::create_dir_all(&candidate).unwrap();
+
+        let check = is_foreign_managed(&candidate, Some(&home));
+        let checking = check
+            .evidence
+            .iter()
+            .any(|e| e.starts_with("checking foreign manager config at"));
+        let could_not = check
+            .evidence
+            .iter()
+            .any(|e| e.starts_with("could not read"));
+        let not_referenced = check
+            .evidence
+            .iter()
+            .any(|e| e.contains("not referenced in"));
+        assert!(checking, "evidence: {:?}", check.evidence);
+        if std::fs::read(&config).is_ok() {
+            assert!(not_referenced, "evidence: {:?}", check.evidence);
+        } else {
+            assert!(could_not, "evidence: {:?}", check.evidence);
+            assert!(!check.is_foreign);
+        }
+
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mut perms = std::fs::metadata(&config).unwrap().permissions();
+            perms.set_mode(0o644);
+            std::fs::set_permissions(&config, perms).unwrap();
+        }
+        drop(std::fs::remove_dir_all(&home));
+    }
+
     /// DRF-04: ambiguous ownership evidence (a foreign manager present but
     /// linking nothing) BLOCKS adoption instead of resolving to unmanaged.
     #[test]

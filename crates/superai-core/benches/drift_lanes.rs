@@ -188,6 +188,43 @@ fn bench_drift_report(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_drift_report_foreign_files(c: &mut Criterion) {
+    let scratch = Scratch::new("drift_foreign");
+    fs::create_dir_all(scratch.path(".conductor")).expect("conductor dir must create");
+    fs::write(
+        scratch.path(".conductor/settings.toml"),
+        "theme = \"dark\"\n",
+    )
+    .expect("conductor settings must write");
+    fs::create_dir_all(scratch.path(".sculptor")).expect("sculptor dir must create");
+    fs::write(scratch.path(".sculptor/.env"), "SCULPTOR_LOG=debug\n")
+        .expect("sculptor env must write");
+    let mut roots = Vec::new();
+    for i in 0..8 {
+        let root = scratch.path(format!("custom-{i}"));
+        fs::create_dir_all(&root).expect("candidate root must create");
+        roots.push(root);
+    }
+    let options = ScanOptions {
+        extra_roots: roots,
+        wrapper_dirs: Vec::new(),
+        max_entries: 64,
+    };
+    let registry = Registry::default();
+    let mut group = c.benchmark_group("drift_report");
+    group.measurement_time(Duration::from_secs(3));
+    group.bench_function("eight_candidates_with_foreign_files_present", |b| {
+        b.iter(|| {
+            discovery::drift_report_with_options(
+                std::hint::black_box(&registry),
+                std::hint::black_box(scratch.dir.as_path()),
+                std::hint::black_box(&options),
+            )
+        });
+    });
+    group.finish();
+}
+
 /// The corpus build `scan_with_diagnostics` paid per call before the
 /// `OnceLock`; the shipped path now pays it once per process.
 fn bench_adapter_corpus_build(c: &mut Criterion) {
@@ -217,11 +254,18 @@ fn write_fake_manager(dir: &Path, name: &str, body: &str) {
 /// three real spawns per call, spread over concurrent families instead of
 /// one sequential chain.
 #[cfg(unix)]
-fn bench_detect_package_probes(c: &mut Criterion) {
+fn bench_detect_fixtures(
+    tag: &str,
+) -> (
+    Scratch,
+    superai_core::install_catalog::InstallCatalogEntry,
+    DetectOptions,
+    PathBuf,
+) {
     use superai_core::install_catalog::{
         DetectHints, InstallCatalogEntry, InstallMethod, InstallMethodKind, PlatformConstraints,
     };
-    let scratch = Scratch::new("detect");
+    let scratch = Scratch::new(tag);
     let bin = scratch.path("bin");
     let home = scratch.path("home");
     fs::create_dir_all(&bin).expect("detect bin dir must create");
@@ -282,6 +326,12 @@ fn bench_detect_package_probes(c: &mut Criterion) {
         probe_timeout: Duration::from_secs(2),
         ..DetectOptions::default()
     };
+    (scratch, entry, opts, bin)
+}
+
+#[cfg(unix)]
+fn bench_detect_package_probes(c: &mut Criterion) {
+    let (_scratch, entry, opts, bin) = bench_detect_fixtures("detect");
     let exec_opts = process::ExecuteOpts {
         timeout: Some(Duration::from_secs(2)),
         ..process::ExecuteOpts::default()
@@ -317,13 +367,51 @@ fn bench_detect_package_probes(c: &mut Criterion) {
     group.finish();
 }
 
+/// The mixed case: a PATH hit whose version probe answers slowly must not
+/// delay the package-manager families. Wave overlap keeps the call near
+/// max(100ms, package spawns); re-serialization shows up as their sum.
+#[cfg(unix)]
+fn bench_detect_slow_path_hit_with_managers(c: &mut Criterion) {
+    let (scratch, entry, opts, bin) = bench_detect_fixtures("detect-slow");
+    let slow_dir = scratch.path("slowbin");
+    fs::create_dir_all(&slow_dir).expect("slow bin dir must create");
+    let slow = slow_dir.join("my-exe");
+    fs::write(&slow, "#!/bin/sh\nsleep 0.1\necho \"slow 7.7.7\"\n").expect("slow exe must write");
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut perms = fs::metadata(&slow)
+            .expect("slow exe must stat")
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&slow, perms).expect("slow exe must become executable");
+    }
+    let opts_with_hit = DetectOptions {
+        path_dirs: Some(vec![slow_dir, bin]),
+        ..opts
+    };
+    let mut group = c.benchmark_group("detect");
+    group.measurement_time(Duration::from_secs(6));
+    group.sample_size(30);
+    group.bench_function("slow_path_hit_with_managers", |b| {
+        b.iter(|| {
+            detect::detect_all_for_entry(std::hint::black_box(&entry), &opts_with_hit)
+                .iter()
+                .filter(|d| d.version.is_some())
+                .count()
+        });
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_read_bounded_algorithms,
     bench_fingerprint_candidate,
     bench_scan_wrapper_dirs,
     bench_drift_report,
+    bench_drift_report_foreign_files,
     bench_adapter_corpus_build,
     bench_detect_package_probes,
+    bench_detect_slow_path_hit_with_managers,
 );
 criterion_main!(benches);

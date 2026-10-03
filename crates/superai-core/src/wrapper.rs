@@ -547,10 +547,11 @@ pub fn detect_wrapper_kind(path: &Path) -> WrapperKind {
 }
 
 pub(crate) fn wrapper_kind_from_bytes(data: &[u8], total_len: u64) -> WrapperKind {
-    if total_len > MAX_WRAPPER_BYTES as u64 {
+    if data.len() > MAX_WRAPPER_BYTES {
+        let reported = total_len.max(data.len() as u64);
         return WrapperKind::Opaque {
             reason: format!(
-                "wrapper too large ({total_len} bytes > {MAX_WRAPPER_BYTES}); refusing to parse"
+                "wrapper too large ({reported} bytes > {MAX_WRAPPER_BYTES}); refusing to parse"
             ),
         };
     }
