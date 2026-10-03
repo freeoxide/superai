@@ -772,10 +772,9 @@ fn commit_document(
     };
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     if !parent.as_os_str().is_empty() && !parent.exists() {
-        std::fs::create_dir_all(parent).map_err(|e| CoreError::Commit {
-            path: path.to_path_buf(),
-            reason: format!("create parent {}: {e}", parent.display()),
-        })?;
+        // Directory creation must stay inside the transaction: rollback
+        // removes a directory it created and a foreign dir aborts the step.
+        return commit_document_creating_dir(path, kind, bytes, engine_kind, parent);
     }
     let file_label = path
         .file_name()
@@ -814,16 +813,85 @@ fn commit_document(
             });
         }
     }
-    read_outer_value(path, kind).map_err(|e| CoreError::Verification {
-        path: path.to_path_buf(),
-        kind: "parse".to_owned(),
-        reason: format!("written mcp config failed read-back verification: {e}"),
+    verify_written_parses(path, kind)
+}
+
+fn commit_document_creating_dir(
+    path: &Path,
+    kind: DocumentKind,
+    bytes: &[u8],
+    engine_kind: superai_config::document::DocumentKind,
+    parent: &Path,
+) -> Result<()> {
+    let steps = vec![
+        superai_config::transaction::FileAction::CreateDir {
+            path: parent.to_path_buf(),
+        },
+        superai_config::transaction::FileAction::Write {
+            path: path.to_path_buf(),
+            content: bytes.to_vec(),
+            kind: engine_kind,
+        },
+    ];
+    let snap_before = superai_config::snapshot::snapshot(path);
+    let file_label = path
+        .file_name()
+        .map_or_else(|| "config".to_owned(), |n| n.to_string_lossy().to_string());
+    let op_id_str = format!(
+        "mcp-{}-{}",
+        file_label,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis())
+    );
+    let op_id = superai_config::transaction::OperationId::new(&op_id_str).map_err(|e| {
+        CoreError::Validation {
+            field: "operation_id".to_owned(),
+            reason: format!("invalid operation id: {e}"),
+        }
     })?;
-    Ok(())
+    let mut txn = superai_config::transaction::Transaction::new(op_id, steps);
+    txn.validate_plan().map_err(|e| CoreError::Validation {
+        field: "mcp_transaction".to_owned(),
+        reason: format!("transaction plan invalid: {e}"),
+    })?;
+    let outcome = txn.execute().map_err(|e| CoreError::Commit {
+        path: path.to_path_buf(),
+        reason: format!("transaction failed: {e}"),
+    })?;
+    if !outcome.success {
+        let diag = outcome.diagnostics_redacted.join("; ");
+        if diag.contains("modified") || diag.contains("concurrent") {
+            let snap_after = superai_config::snapshot::snapshot(path);
+            let exp = snap_before.digest.unwrap_or_else(|| "missing".to_owned());
+            let act = snap_after.digest.unwrap_or_else(|| "missing".to_owned());
+            return Err(CoreError::ConcurrentModification {
+                path: path.to_path_buf(),
+                expected: exp,
+                actual: act,
+            });
+        }
+        return Err(CoreError::Commit {
+            path: path.to_path_buf(),
+            reason: format!("mcp commit failed: {diag}"),
+        });
+    }
+    verify_written_parses(path, kind)
+}
+
+fn verify_written_parses(path: &Path, kind: DocumentKind) -> Result<()> {
+    read_outer_value(path, kind)
+        .map(|_| ())
+        .map_err(|e| CoreError::Verification {
+            path: path.to_path_buf(),
+            kind: "parse".to_owned(),
+            reason: format!("written mcp config failed read-back verification: {e}"),
+        })
 }
 
 struct DestRead {
     outer: Value,
+    doc: Option<toml_edit::DocumentMut>,
     snap: superai_config::snapshot::Snapshot,
 }
 
@@ -831,8 +899,27 @@ fn read_dest(path: &Path, decl: &McpAdapterDecl) -> Result<DestRead> {
     // The snapshot must precede the parse: swapped, a change landing between
     // the two would pass the token check while the write base predates it.
     let snap = superai_config::snapshot::snapshot(path);
+    if decl.kind == DocumentKind::Toml {
+        let doc = superai_config::toml_file::load(path)?;
+        let outer = crate::toml_convert::document_to_value(&doc);
+        if !outer.is_object() {
+            return Err(CoreError::SchemaValidation {
+                path: path.to_path_buf(),
+                details: format!("mcp config must be an object, got {outer}"),
+            });
+        }
+        return Ok(DestRead {
+            outer,
+            doc: Some(doc),
+            snap,
+        });
+    }
     let outer = read_outer_value(path, decl.kind)?;
-    Ok(DestRead { outer, snap })
+    Ok(DestRead {
+        outer,
+        doc: None,
+        snap,
+    })
 }
 
 fn write_server_entry(
@@ -840,7 +927,7 @@ fn write_server_entry(
     decl: &McpAdapterDecl,
     id: &str,
     write: &ServerWrite,
-    base: Option<&DestRead>,
+    base: Option<DestRead>,
 ) -> Result<()> {
     if let Some(reason) = &decl.read_only {
         return Err(CoreError::UnsupportedOperation {
@@ -867,16 +954,17 @@ fn write_server_entry(
             let base = if let Some(base) = base {
                 base
             } else {
-                &read_dest(path, decl)?
+                read_dest(path, decl)?
             };
-            write_json_server(path, decl, id, write, shape, base)
+            write_json_server(path, decl, id, write, shape, &base)
         }
         (DocumentKind::Toml, shape) => {
-            let snap = if let Some(base) = base {
-                base.snap.clone()
-            } else {
-                superai_config::snapshot::snapshot(path)
-            };
+            if let Some(base) = base
+                && let Some(doc) = base.doc
+            {
+                return write_toml_doc(path, decl, id, write, shape, doc, &base.snap);
+            }
+            let snap = superai_config::snapshot::snapshot(path);
             write_toml_server(path, decl, id, write, shape, &snap)
         }
         (other, _) => Err(CoreError::UnsupportedOperation {
@@ -1071,7 +1159,23 @@ fn write_toml_server(
     shape: &crate::adapter::McpDestShape,
     expected: &superai_config::snapshot::Snapshot,
 ) -> Result<()> {
-    let mut doc = superai_config::toml_file::load(path)?;
+    let doc = superai_config::toml_file::load(path)?;
+    write_toml_doc(path, decl, id, write, shape, doc, expected)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "split from write_toml_server so a caller-held document skips the reload"
+)]
+fn write_toml_doc(
+    path: &Path,
+    decl: &McpAdapterDecl,
+    id: &str,
+    write: &ServerWrite,
+    shape: &crate::adapter::McpDestShape,
+    mut doc: toml_edit::DocumentMut,
+    expected: &superai_config::snapshot::Snapshot,
+) -> Result<()> {
     let schema_err = |msg: String| CoreError::SchemaValidation {
         path: path.to_path_buf(),
         details: msg,
@@ -1299,7 +1403,7 @@ pub fn install_mcp_server(
         decl,
         server.id.as_str(),
         &ServerWrite::Upsert(merged),
-        Some(&dest),
+        Some(dest),
     )?;
     Ok(server.clone())
 }
@@ -1330,7 +1434,7 @@ pub fn set_mcp_enabled(
         decl,
         id.as_str(),
         &ServerWrite::Upsert(merged),
-        Some(&dest),
+        Some(dest),
     )?;
     Ok(def)
 }
@@ -1348,7 +1452,7 @@ pub fn remove_mcp_server(
         None => return Ok(None),
     };
     let def = from_native_value(id.as_str(), &existing_val)?;
-    write_server_entry(path, decl, id.as_str(), &ServerWrite::Remove, Some(&dest))?;
+    write_server_entry(path, decl, id.as_str(), &ServerWrite::Remove, Some(dest))?;
     Ok(Some(def))
 }
 
