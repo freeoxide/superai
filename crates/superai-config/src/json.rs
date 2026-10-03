@@ -580,4 +580,16 @@ mod tests {
             "strict read-side parse must reject duplicate keys"
         );
     }
+
+    #[test]
+    fn formatting_change_warning_edges() {
+        assert_eq!(formatting_change_warning(""), None);
+        assert_eq!(formatting_change_warning("   \n"), None);
+        assert_eq!(formatting_change_warning("not json"), None);
+        assert_eq!(formatting_change_warning("{\n  \"a\": 1\n}\n"), None);
+        assert_eq!(formatting_change_warning("42\n"), None);
+        assert!(formatting_change_warning("{\"a\":1}").is_some());
+        assert!(formatting_change_warning("{\n  \"a\": 1\n}").is_some());
+        assert!(formatting_change_warning("{\n    \"a\": 1\n}\n").is_some());
+    }
 }

@@ -108,6 +108,19 @@ mod tests {
     }
 
     #[test]
+    fn formatting_change_warning_edges() {
+        assert_eq!(formatting_change_warning(""), None);
+        assert_eq!(formatting_change_warning("not toml at all"), None);
+        assert_eq!(formatting_change_warning("# c\na = 1\n"), None);
+        assert_eq!(formatting_change_warning("a  =  1\n"), None);
+        assert_eq!(formatting_change_warning("a = 1\n\n\n"), None);
+        assert_eq!(formatting_change_warning("\ta = 1\n"), None);
+        assert_eq!(formatting_change_warning("a = 1 \n"), None);
+        assert!(formatting_change_warning("a = 1\r\n").is_some());
+        assert!(formatting_change_warning("a = 1\r\nb = 2\n").is_some());
+    }
+
+    #[test]
     fn edit_preserves_comments_and_untouched_keys() {
         let path = scratch("comment.toml");
         std::fs::write(

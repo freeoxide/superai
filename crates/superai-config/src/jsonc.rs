@@ -570,6 +570,19 @@ mod tests {
     }
 
     #[test]
+    fn formatting_change_warning_edges() {
+        assert_eq!(formatting_change_warning(""), None);
+        assert_eq!(formatting_change_warning("{\n  \"a\": 1\n}\n"), None);
+        assert!(formatting_change_warning("{\"a\":1}").is_some());
+        assert_eq!(
+            formatting_change_warning("// header\n{\"a\": 1}\n"),
+            None,
+            "comment-carrying files never reformat: their writes are refused"
+        );
+        assert_eq!(formatting_change_warning("{\"a\": 1,}\n"), None);
+    }
+
+    #[test]
     fn strips_line_comments() {
         let input = "{\n  \"a\": 1, // keep this\n  \"b\": 2 // trailing\n}\n";
         let out = strip_jsonc(input);
