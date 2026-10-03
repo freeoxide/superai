@@ -502,6 +502,81 @@ mod tests {
         drop(std::fs::remove_dir_all(&home));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn recovery_degrades_an_unreadable_backup_to_a_residual_and_continues() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = home_dir();
+        let denied = home.join("denied.json");
+        let healthy = home.join("healthy.json");
+        std::fs::write(&denied, b"denied").unwrap();
+        std::fs::write(&healthy, b"healthy").unwrap();
+        let denied_entry = crate::backup::backup(&denied)
+            .unwrap()
+            .expect("denied backup");
+        let healthy_entry = crate::backup::backup(&healthy)
+            .unwrap()
+            .expect("healthy backup");
+        std::fs::write(&healthy, b"foreign edit").unwrap();
+        std::fs::set_permissions(
+            &denied_entry.backup_path,
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+
+        let jroot = journal_dir(&home);
+        std::fs::create_dir_all(&jroot).unwrap();
+        let jpath = journal_path(&jroot, "op-denied-backup");
+        let mut journal = CrashJournal::new(
+            "op-denied-backup",
+            JournalPhase::Commit,
+            vec![
+                denied.to_string_lossy().into_owned(),
+                healthy.to_string_lossy().into_owned(),
+            ],
+        );
+        journal.backups.push(JournalBackup {
+            resource: denied.to_string_lossy().into_owned(),
+            backup_id: denied_entry.id.to_string(),
+        });
+        journal.backups.push(JournalBackup {
+            resource: healthy.to_string_lossy().into_owned(),
+            backup_id: healthy_entry.id.to_string(),
+        });
+        journal
+            .completed
+            .push(denied.to_string_lossy().into_owned());
+        journal
+            .completed
+            .push(healthy.to_string_lossy().into_owned());
+        journal.write_to(&jpath).unwrap();
+
+        let report = recover_pending(&home).unwrap();
+        let rec = report
+            .journals
+            .first()
+            .cloned()
+            .expect("the journal is reported");
+        assert!(!report.all_recovered(), "{:?}", report.journals);
+        assert_eq!(
+            rec.residuals,
+            vec![denied.clone()],
+            "the unreadable backup is a residual, not an abort"
+        );
+        assert_eq!(
+            std::fs::read(&healthy).unwrap(),
+            b"healthy",
+            "recovery continues past the unreadable backup and restores the drifted one"
+        );
+        assert_eq!(
+            std::fs::read(&denied).unwrap(),
+            b"denied",
+            "the residual resource is never written by recovery"
+        );
+        assert!(jpath.exists(), "journal is retained while residuals stand");
+        drop(std::fs::remove_dir_all(&home));
+    }
+
     #[test]
     fn recovery_never_removes_uncommitted_foreign_files() {
         let home = home_dir();

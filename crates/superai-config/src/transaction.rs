@@ -2932,9 +2932,12 @@ mod tests {
         let target = root.join("order.json");
         std::fs::write(&target, b"old").unwrap();
         let recorder = Recorder(Mutex::new(Vec::new()));
-        let temp = stage_temp_file(&target, b"new", None).unwrap();
+        let temp = stage_temp_file(&target, b"new", Some(&recorder)).unwrap();
         commit_staged_file(&target, &temp, None, Some(&recorder)).unwrap();
         let expected = [
+            Point::TempCreate,
+            Point::TempWrite,
+            Point::TempFlush,
             Point::ConflictRecheck,
             Point::AtomicReplace,
             Point::ParentSync,
@@ -2948,7 +2951,7 @@ mod tests {
             .collect();
         assert_eq!(
             observed, expected,
-            "the mutation boundary must recheck, rename, sync the parent, then read back"
+            "staging must fsync the temp before the boundary rechecks, renames, syncs the parent, reads back"
         );
         drop(std::fs::remove_dir_all(&root));
     }
