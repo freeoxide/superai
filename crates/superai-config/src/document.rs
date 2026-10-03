@@ -763,13 +763,13 @@ pub(crate) fn resolve_dotted<'a>(value: &'a Value, path: &str) -> Option<&'a Val
 pub fn validate_bytes_for_kind(content: &[u8], kind: DocumentKind, path: &Path) -> Result<()> {
     match kind {
         DocumentKind::StrictJson => {
-            std::str::from_utf8(content).map_err(|_err| {
+            let text = std::str::from_utf8(content).map_err(|_err| {
                 ConfigError::io(
                     path,
                     std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid utf8 in json"),
                 )
             })?;
-            serde_json::from_slice::<Value>(content).map_err(|source| ConfigError::Json {
+            serde_json::from_str::<Value>(text).map_err(|source| ConfigError::Json {
                 path: path.to_path_buf(),
                 source,
             })?;
