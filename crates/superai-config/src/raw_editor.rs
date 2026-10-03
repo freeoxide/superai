@@ -240,11 +240,11 @@ fn parse_semantic_value(content: &[u8], kind: DocumentKind) -> Option<Value> {
     match kind {
         DocumentKind::StrictJson => crate::json::parse_strict_raw(text).ok(),
         DocumentKind::JsonC => {
-            let stripped = crate::jsonc::strip_jsonc(text);
+            let stripped = crate::jsonc::strip_jsonc_cow(text);
             if stripped.trim().is_empty() {
                 Some(Value::Object(Map::new()))
             } else {
-                crate::json::parse_strict_raw(&stripped).ok()
+                crate::json::parse_strict_raw(stripped.as_ref()).ok()
             }
         }
         DocumentKind::Yaml => crate::yaml::parse_strict_raw(text).ok(),
@@ -273,11 +273,11 @@ fn validate_json(text: &str) -> Vec<Diagnostic> {
 }
 
 fn validate_jsonc(text: &str) -> Vec<Diagnostic> {
-    let stripped = crate::jsonc::strip_jsonc(text);
+    let stripped = crate::jsonc::strip_jsonc_cow(text);
     if stripped.trim().is_empty() {
         return Vec::new();
     }
-    validate_json(&stripped)
+    validate_json(stripped.as_ref())
 }
 
 fn validate_toml(text: &str) -> Vec<Diagnostic> {
@@ -624,16 +624,19 @@ fn jsonc_semantic_diff(old: &[u8], new: &[u8]) -> Vec<SemanticOp> {
         Ok(s) => s,
         Err(_) => return Vec::new(),
     };
-    let old_stripped = crate::jsonc::strip_jsonc(old_text);
-    let new_stripped = crate::jsonc::strip_jsonc(new_text);
+    let old_stripped = crate::jsonc::strip_jsonc_cow(old_text);
+    let new_stripped = crate::jsonc::strip_jsonc_cow(new_text);
     if old_stripped.trim().is_empty() && new_stripped.trim().is_empty() {
         return Vec::new();
     }
-    let old_val = match crate::json::parse_strict_raw(&old_stripped) {
+    if old_stripped == new_stripped {
+        return Vec::new();
+    }
+    let old_val = match crate::json::parse_strict_raw(old_stripped.as_ref()) {
         Ok(v) => v,
         Err(_) => return Vec::new(),
     };
-    let new_val = match crate::json::parse_strict_raw(&new_stripped) {
+    let new_val = match crate::json::parse_strict_raw(new_stripped.as_ref()) {
         Ok(v) => v,
         Err(_) => return Vec::new(),
     };
@@ -1164,11 +1167,10 @@ pub fn commit_with_snapshot(
     commit_inner(path, new_content, digest_opt, expected, None)
 }
 
-/// [`commit_with_snapshot`] for text fragments where the caller holds the
-/// bytes it just read from `path` this operation: the span gate compares
-/// against `base` instead of re-reading. The snapshot token is still
-/// re-checked fresh, so a file that changed since `base` was read aborts
-/// before any disk mutation.
+/// [`commit_with_snapshot`] with the fragment bytes the caller read from
+/// `path` this operation: the span gate compares against `base` instead of
+/// re-reading, and the snapshot token still freshly re-checks, so a file
+/// changed since `base` aborts before any disk mutation.
 pub fn commit_with_snapshot_and_base(
     path: &Path,
     new_content: &[u8],

@@ -761,6 +761,15 @@ mod tests {
     }
 
     #[test]
+    fn crlf_fragment_span_body_pinned_shape() {
+        let codec = SpanCodec::default();
+        let lf = codec.insert_span("", "x", "body").unwrap();
+        let crlf = lf.replace('\n', "\r\n");
+        assert_eq!(crlf, "# superai:begin:x\r\nbody\r\n# superai:end:x\r\n");
+        assert_eq!(codec.span_body(&crlf, "x").unwrap().unwrap(), "\nbody\r\n#");
+    }
+
+    #[test]
     fn custom_comment_prefix_and_crlf_tolerant_names() {
         let codec = SpanCodec::new("//");
         let text = codec.insert_span("js\n", "cfg", "v=1").unwrap();

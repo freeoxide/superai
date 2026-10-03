@@ -1299,7 +1299,12 @@ fn apply_text_fragment(path: &Path, op: &Operation) -> Result<OperationOutcome> 
         });
     }
 
-    crate::raw_editor::commit_with_snapshot(path, new_text.as_bytes(), Some(&snap))?;
+    crate::raw_editor::commit_with_snapshot_and_base(
+        path,
+        new_text.as_bytes(),
+        Some(&snap),
+        &old_bytes,
+    )?;
     Ok(OperationOutcome {
         changed: true,
         redacted_summary: changed_summary(
