@@ -2217,4 +2217,95 @@ mod tests {
         );
         drop(std::fs::remove_dir_all(&dir));
     }
+
+    #[test]
+    fn commit_rewrite_string_escaping_bytes_are_pinned() {
+        let dir = tmp_dir("escape-pins");
+        let cc = crate::adapters::claude_code::ClaudeCodeAdapter::new().unwrap();
+        let inst = instance_in(&dir, "claude-code", "esc-json");
+        let settings = inst.config_root.as_path().join("settings.json");
+        std::fs::write(
+            &settings,
+            b"{\n  \"msg\": \"she said \\\"hi\\\" \\\\tab \\u00e9nd\\n\",\n  \"done\": true\n}\n",
+        )
+        .unwrap();
+        commit_provider_change(
+            &inst,
+            &cc,
+            &ProviderChange::AddOrUpdate {
+                provider: &universal_provider("esc-prov"),
+            },
+            &ProviderChangeOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&settings).unwrap(),
+            "{\n  \"msg\": \"she said \\\"hi\\\" \\\\tab \u{e9}nd\\n\",\n  \"done\": true,\n  \"env\": {\n    \"ANTHROPIC_BASE_URL\": \"https://api.example.com/anthropic\"\n  },\n  \"model\": \"model-a\"\n}\n",
+            "quote/backslash/newline stay escaped, non-ASCII stays raw"
+        );
+
+        let cd = crate::adapters::continue_dev::ContinueDevAdapter::new().unwrap();
+        let inst = instance_in(&dir, "continue", "esc-yaml");
+        let config = inst.config_root.as_path().join("config.yaml");
+        std::fs::write(
+            &config,
+            "msg: \"she said \\\"hi\\\" \\ttab \u{e9}nd\"\ndone: true\n",
+        )
+        .unwrap();
+        commit_provider_change(
+            &inst,
+            &cd,
+            &ProviderChange::AddOrUpdate {
+                provider: &universal_provider("esc-prov"),
+            },
+            &ProviderChangeOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&config).unwrap(),
+            "msg: \"she said \\\"hi\\\" \\ttab \u{e9}nd\"\ndone: true\nprovider:\n  esc-prov:\n    options:\n      baseUrl: https://api.example.com/v1\n    apiKey: '{env:UNIVERSAL_API_KEY}'\nmodel: esc-prov/model-a\n"
+        );
+
+        let cx = crate::adapters::codex_cli::CodexCliAdapter::new().unwrap();
+        let inst = instance_in(&dir, "codex-cli", "esc-toml");
+        let config = inst.config_root.as_path().join("config.toml");
+        std::fs::write(
+            &config,
+            "msg = \"she said \\\"hi\\\" \\\\ \u{e9}nd\"\ndone = true\n",
+        )
+        .unwrap();
+        commit_provider_change(
+            &inst,
+            &cx,
+            &ProviderChange::AddOrUpdate {
+                provider: &universal_provider("esc-prov"),
+            },
+            &ProviderChangeOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&config).unwrap(),
+            "msg = \"she said \\\"hi\\\" \\\\ \u{e9}nd\"\ndone = true\nmodel_provider = \"esc-prov\"\nmodel = \"model-a\"\n\n[model_providers]\n\n[model_providers.esc-prov]\nname = \"Universal\"\nbase_url = \"https://api.example.com/v1\"\nenv_key = \"UNIVERSAL_API_KEY\"\nwire_api = \"chat\"\n",
+            "toml basic-string escapes survive verbatim"
+        );
+
+        let inst = instance_in(&dir, "claude-code", "esc-jsonc");
+        let settings = inst.config_root.as_path().join("settings.json");
+        std::fs::write(&settings, b"{\n  \"done\": true\n}\n").unwrap();
+        commit_provider_change(
+            &inst,
+            &cc,
+            &ProviderChange::AddOrUpdate {
+                provider: &universal_provider("esc-prov"),
+            },
+            &ProviderChangeOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&settings).unwrap(),
+            "{\n  \"done\": true,\n  \"env\": {\n    \"ANTHROPIC_BASE_URL\": \"https://api.example.com/anthropic\"\n  },\n  \"model\": \"model-a\"\n}\n",
+            "comment-free jsonc commits through the same writer as json"
+        );
+        drop(std::fs::remove_dir_all(&dir));
+    }
 }

@@ -1245,11 +1245,12 @@ fn classify_template_fetch_error(e: &crate::template_fetch::TemplateFetchError) 
     match e {
         E::NotFound { .. } => FetchErrorClass::Missing,
         E::DigestMismatch { .. } => FetchErrorClass::DigestMismatch,
-        E::Network { .. } | E::RateLimited { .. } => FetchErrorClass::Offline,
-        E::SchemaInvalid { .. }
-        | E::InvalidUrl { .. }
-        | E::SizeLimit { .. }
-        | E::RedirectLimit { .. } => FetchErrorClass::Other,
+        E::Network { .. } | E::RateLimited { .. } | E::RedirectLimit { .. } => {
+            FetchErrorClass::Offline
+        }
+        E::SchemaInvalid { .. } | E::InvalidUrl { .. } | E::SizeLimit { .. } => {
+            FetchErrorClass::Other
+        }
     }
 }
 
@@ -2728,11 +2729,35 @@ mod tests {
                 template: "t".to_owned(),
                 reason: "429".to_owned(),
             },
+            E::RedirectLimit {
+                template: "t".to_owned(),
+                reason: "loop".to_owned(),
+            },
         ];
         for err in &transient {
             assert!(
                 matches!(classify_template_fetch_error(err), FetchErrorClass::Offline),
                 "a transient fetch failure must be Offline, not a compatibility verdict (got {err:?})"
+            );
+        }
+        let template_verdicts = [
+            E::SchemaInvalid {
+                template: "t".to_owned(),
+                reason: "bad".to_owned(),
+            },
+            E::InvalidUrl {
+                template: "t".to_owned(),
+                reason: "http".to_owned(),
+            },
+            E::SizeLimit {
+                template: "t".to_owned(),
+                reason: "big".to_owned(),
+            },
+        ];
+        for err in &template_verdicts {
+            assert!(
+                matches!(classify_template_fetch_error(err), FetchErrorClass::Other),
+                "a deterministic template/repo defect carries Incompatible-with-reason (got {err:?})"
             );
         }
     }
