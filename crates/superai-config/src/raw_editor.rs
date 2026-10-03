@@ -11,7 +11,7 @@ use crate::atomic::compute_digest;
 use crate::backup::{BackupEntry, backup_with_reason};
 use crate::document::{Diagnostic, DocumentKind, Encoding, NewlineStyle, detect_newline};
 use crate::error::{ConfigError, Result};
-use crate::snapshot::{Snapshot, is_modified, snapshot};
+use crate::snapshot::{Snapshot, is_modified, snapshot, snapshot_with_bytes};
 
 /// Sensitive bytes whose `Debug`/`Display` are redacted; the raw value is
 /// reachable only via [`Self::expose`] (RAW-01).
@@ -153,12 +153,18 @@ pub fn validate(content: &[u8], kind: DocumentKind) -> Vec<Diagnostic> {
     }
 
     // Invalid UTF-8 is always a diagnostic, even for opaque fragments.
-    let without_bom = bytes_without_bom(content);
-    let text = match std::str::from_utf8(without_bom) {
+    // JSON kinds keep a BOM so validate matches the staging gate
+    // (document.rs validate_bytes_for_kind); yaml strips it (yaml.rs).
+    let parse_bytes = if matches!(kind, DocumentKind::StrictJson | DocumentKind::JsonC) {
+        content
+    } else {
+        bytes_without_bom(content)
+    };
+    let text = match std::str::from_utf8(parse_bytes) {
         Ok(text) => text,
         Err(err) => {
             let valid_up_to = err.valid_up_to();
-            let (line, col) = offset_to_line_col(without_bom, valid_up_to);
+            let (line, col) = offset_to_line_col(parse_bytes, valid_up_to);
             let len = err.error_len().unwrap_or(1);
             diagnostics.push(Diagnostic::new(
                 line,
@@ -1323,7 +1329,11 @@ fn commit_inner(
         enforce_span_only_change(path, new_content, base)?;
     }
 
-    let current_snapshot = snapshot(path);
+    let existing = std::fs::read(path).ok();
+    let current_snapshot = match &existing {
+        Some(bytes) => snapshot_with_bytes(path, bytes),
+        None => snapshot(path),
+    };
 
     if let Some(expected) = expected_snapshot {
         if is_modified(expected, &current_snapshot) {
@@ -1363,9 +1373,8 @@ fn commit_inner(
         ));
     }
 
-    if current_snapshot.exists
-        && let Ok(existing) = std::fs::read(path)
-        && existing == new_content
+    if let Some(existing_bytes) = existing.as_deref()
+        && existing_bytes == new_content
     {
         let new_digest = compute_digest(new_content);
         return Ok(CommitReport {
@@ -1467,6 +1476,32 @@ mod tests {
         assert!(
             diags.is_empty(),
             "valid json should have no diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn bom_json_drafts_fail_validation_like_the_staging_gate() {
+        let bom_json: &[u8] = b"\xef\xbb\xbf{\"a\":1}";
+        assert!(
+            !validate(bom_json, DocumentKind::StrictJson).is_empty(),
+            "a BOM'd json draft must diagnose like the staging gate that parses raw bytes"
+        );
+        assert!(
+            !validate(bom_json, DocumentKind::JsonC).is_empty(),
+            "a BOM'd jsonc draft must diagnose like the staging gate"
+        );
+        assert!(
+            crate::document::validate_bytes_for_kind(
+                bom_json,
+                DocumentKind::StrictJson,
+                Path::new("b.json")
+            )
+            .is_err()
+        );
+        let bom_yaml: &[u8] = b"\xef\xbb\xbfa: 1";
+        assert!(
+            validate(bom_yaml, DocumentKind::Yaml).is_empty(),
+            "yaml keeps its BOM-stripping loader behavior"
         );
     }
 
