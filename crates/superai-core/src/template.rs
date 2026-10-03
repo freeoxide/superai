@@ -1245,7 +1245,7 @@ fn classify_template_fetch_error(e: &crate::template_fetch::TemplateFetchError) 
     match e {
         E::NotFound { .. } => FetchErrorClass::Missing,
         E::DigestMismatch { .. } => FetchErrorClass::DigestMismatch,
-        E::Network { .. } => FetchErrorClass::Offline,
+        E::Network { .. } | E::RateLimited { .. } => FetchErrorClass::Offline,
         _ => FetchErrorClass::Other,
     }
 }
@@ -2716,16 +2716,21 @@ mod tests {
             }),
             FetchErrorClass::DigestMismatch
         ));
-        let network = E::Network {
-            template: "t".to_owned(),
-            reason: "dns lookup said not found".to_owned(),
-        };
-        assert!(
-            matches!(
-                classify_template_fetch_error(&network),
-                FetchErrorClass::Offline
-            ),
-            "a network failure is Offline, and its text mentioning 'not found' must not classify as Missing"
-        );
+        let transient = [
+            E::Network {
+                template: "t".to_owned(),
+                reason: "dns lookup said not found".to_owned(),
+            },
+            E::RateLimited {
+                template: "t".to_owned(),
+                reason: "429".to_owned(),
+            },
+        ];
+        for err in &transient {
+            assert!(
+                matches!(classify_template_fetch_error(err), FetchErrorClass::Offline),
+                "a transient fetch failure must be Offline, not a compatibility verdict (got {err:?})"
+            );
+        }
     }
 }

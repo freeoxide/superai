@@ -153,8 +153,15 @@ fn basename_if_settings_json(fallback: &str) -> Option<&str> {
 }
 
 /// Load the local map for a three-way merge, or refuse honestly (DOC-05):
-/// unparseable bytes must not become an empty map; typed lossy-write error.
+/// unparseable or non-object bytes must not become an empty map; typed
+/// lossy-write error.
 fn load_local_map(path: &Path) -> Result<Map<String, Value>> {
+    let not_mergeable = || {
+        CoreError::Config(superai_config::ConfigError::LossyWrite {
+            path: path.to_path_buf(),
+            format: "jsonc",
+        })
+    };
     match std::fs::read(path) {
         Ok(bytes) => {
             if bytes.is_empty() || bytes.iter().all(u8::is_ascii_whitespace) {
@@ -162,11 +169,7 @@ fn load_local_map(path: &Path) -> Result<Map<String, Value>> {
             }
             match serde_json::from_slice::<Value>(&bytes) {
                 Ok(Value::Object(m)) => Ok(m),
-                Ok(_) => Ok(Map::new()),
-                Err(_) => Err(CoreError::Config(superai_config::ConfigError::LossyWrite {
-                    path: path.to_path_buf(),
-                    format: "jsonc",
-                })),
+                Ok(_) | Err(_) => Err(not_mergeable()),
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Map::new()),
@@ -1961,6 +1964,18 @@ mod tests {
         assert!(
             load_local_map(&path).is_err(),
             "an unreadable local config must not become an empty merge base"
+        );
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn load_local_map_refuses_non_object_local_root() {
+        let dir = crate::test_util::temp_dir_unique("load-local-map-non-object");
+        let path = dir.join("settings.json");
+        std::fs::write(&path, b"[1, 2, 3]\n").unwrap();
+        assert!(
+            load_local_map(&path).is_err(),
+            "a sequence-root local config must not become an empty merge base"
         );
         drop(std::fs::remove_dir_all(&dir));
     }
