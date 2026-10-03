@@ -39,7 +39,7 @@ minimum_test_timeout = 30
 # adjudication.
 exclude_re = [
     # Re-anchored 2026-10-02 after the perf campaign (snapshot byte reuse,
-    # backup split, byte-parity restore/verify) shifted lines; classes unchanged.
+    # backup split, byte-parity verify rework) shifted lines; classes unchanged.
     # warn_io only writes a line to stderr; no in-process test observes the
     # log without capturing it — logging-only class.
     '^crates/superai-config/src/atomic\.rs:27:5: replace warn_io with \(\)$',
@@ -115,5 +115,5 @@ exclude_re = [
     '^crates/superai-config/src/transaction\.rs:554:25: replace == with != in commit_staged_file$',
     '^crates/superai-config/src/transaction\.rs:554:83: replace == with != in commit_staged_file$',
     '^crates/superai-config/src/transaction\.rs:722:69: replace \|\| with && in commit_file_expecting_with_roots$',
-    '^crates/superai-config/src/transaction\.rs:2003:70: replace \|\| with && in Transaction::verify$',
+    '^crates/superai-config/src/transaction\.rs:2002:70: replace \|\| with && in Transaction::verify$',
 ]
