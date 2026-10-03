@@ -1106,7 +1106,7 @@ pub struct CommitOutcome {
 pub struct VerifyOutcome {
     /// Path that was verified.
     pub path: PathBuf,
-    /// Whether digest matches expected.
+    /// Whether the committed bytes match the planned content.
     pub digest_ok: bool,
     /// Whether parse succeeded.
     pub parse_ok: bool,
@@ -1572,6 +1572,7 @@ impl Transaction {
                     "transaction prepare",
                     self.injector.as_deref(),
                     &bytes,
+                    current.digest.as_deref(),
                 )?,
                 None => backup_with_injector(
                     p,
@@ -1987,17 +1988,15 @@ impl Transaction {
                         continue;
                     }
                 };
-                let expected_digest = compute_digest(content);
-                let actual_digest = compute_digest(&bytes);
-                let digest_ok = expected_digest == actual_digest;
-                let parse_ok = bytes.as_slice() == content.as_slice()
-                    || validate_bytes_for_kind(&bytes, *kind, path).is_ok();
-                let message = if digest_ok && parse_ok {
+                let bytes_equal = bytes.as_slice() == content.as_slice();
+                let digest_ok = bytes_equal;
+                let parse_ok = bytes_equal || validate_bytes_for_kind(&bytes, *kind, path).is_ok();
+                let message = if bytes_equal {
                     "verified".to_owned()
-                } else if !digest_ok {
-                    format!("digest mismatch: expected {expected_digest}, got {actual_digest}")
                 } else {
-                    "parse failed after commit".to_owned()
+                    let expected_digest = compute_digest(content);
+                    let actual_digest = compute_digest(&bytes);
+                    format!("digest mismatch: expected {expected_digest}, got {actual_digest}")
                 };
                 // No raw bytes in messages: secret-like content is redacted.
                 let redacted_message = if message.contains("apiKey") || message.contains("secret") {
@@ -2913,6 +2912,44 @@ mod tests {
         let err = txn.commit().unwrap_err();
         assert!(matches!(err, ConfigError::ConcurrentModification { .. }));
         assert_eq!(std::fs::read(&target).unwrap(), b"foreign");
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    #[derive(Debug)]
+    struct Recorder(Mutex<Vec<Point>>);
+    impl Injector for Recorder {
+        fn inject(&self, point: Point) -> Result<()> {
+            if let Ok(mut points) = self.0.lock() {
+                points.push(point);
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn commit_path_durability_points_fire_in_order() {
+        let root = tmp_root();
+        let target = root.join("order.json");
+        std::fs::write(&target, b"old").unwrap();
+        let recorder = Recorder(Mutex::new(Vec::new()));
+        let temp = stage_temp_file(&target, b"new", None).unwrap();
+        commit_staged_file(&target, &temp, None, Some(&recorder)).unwrap();
+        let expected = [
+            Point::ConflictRecheck,
+            Point::AtomicReplace,
+            Point::ParentSync,
+            Point::ReadBackVerify,
+        ];
+        let seen = recorder.0.lock().unwrap();
+        let observed: Vec<Point> = seen
+            .iter()
+            .copied()
+            .filter(|p| expected.contains(p))
+            .collect();
+        assert_eq!(
+            observed, expected,
+            "the mutation boundary must recheck, rename, sync the parent, then read back"
+        );
         drop(std::fs::remove_dir_all(&root));
     }
 

@@ -261,18 +261,29 @@ pub fn backup_with_injector(
     backup_inner(path, operation_id, reason, injector)
 }
 
+struct BackupContext<'a> {
+    operation_id: Option<&'a str>,
+    reason: &'a str,
+    injector: Option<&'a dyn Injector>,
+}
+
 fn backup_inner(
     path: &Path,
     operation_id: Option<&str>,
     reason: &str,
     injector: Option<&dyn Injector>,
 ) -> Result<Option<BackupEntry>> {
-    inject(injector, Point::BackupOpen)?;
+    let ctx = BackupContext {
+        operation_id,
+        reason,
+        injector,
+    };
+    inject(ctx.injector, Point::BackupOpen)?;
     let Some(meta) = backup_source_meta(path)? else {
         return Ok(None);
     };
     let original_bytes = std::fs::read(path).map_err(|e| ConfigError::io(path, e))?;
-    backup_from_meta(path, operation_id, reason, injector, &meta, &original_bytes)
+    backup_from_meta(path, &ctx, &meta, &original_bytes, None)
 }
 
 pub(crate) fn backup_bytes_with_injector(
@@ -281,12 +292,18 @@ pub(crate) fn backup_bytes_with_injector(
     reason: &str,
     injector: Option<&dyn Injector>,
     original_bytes: &[u8],
+    known_digest: Option<&str>,
 ) -> Result<Option<BackupEntry>> {
-    inject(injector, Point::BackupOpen)?;
+    let ctx = BackupContext {
+        operation_id,
+        reason,
+        injector,
+    };
+    inject(ctx.injector, Point::BackupOpen)?;
     let Some(meta) = backup_source_meta(path)? else {
         return Ok(None);
     };
-    backup_from_meta(path, operation_id, reason, injector, &meta, original_bytes)
+    backup_from_meta(path, &ctx, &meta, original_bytes, known_digest)
 }
 
 fn backup_source_meta(path: &Path) -> Result<Option<std::fs::Metadata>> {
@@ -325,17 +342,16 @@ fn backup_source_meta(path: &Path) -> Result<Option<std::fs::Metadata>> {
 
 fn backup_from_meta(
     path: &Path,
-    operation_id: Option<&str>,
-    reason: &str,
-    injector: Option<&dyn Injector>,
+    ctx: &BackupContext<'_>,
     meta: &std::fs::Metadata,
     original_bytes: &[u8],
+    known_digest: Option<&str>,
 ) -> Result<Option<BackupEntry>> {
-    let digest = compute_digest(original_bytes);
+    let digest = known_digest.map_or_else(|| compute_digest(original_bytes), str::to_owned);
     let size = original_bytes.len() as u64;
     let permissions = get_permissions_u32(meta);
 
-    inject(injector, Point::BackupWrite)?;
+    inject(ctx.injector, Point::BackupWrite)?;
     // Unix exclusive-creates the backup: a symlink planted at the name is
     // refused, never followed. Windows fs::copy leaves a probe-to-copy race.
     #[cfg(unix)]
@@ -353,11 +369,11 @@ fn backup_from_meta(
     }
 
     {
-        inject(injector, Point::BackupFlush)?;
+        inject(ctx.injector, Point::BackupFlush)?;
         flush_backup_file(&target)?;
     }
 
-    inject(injector, Point::BackupVerify)?;
+    inject(ctx.injector, Point::BackupVerify)?;
     let backup_bytes = std::fs::read(&target).map_err(|e| ConfigError::io(&target, e))?;
     if backup_bytes != original_bytes {
         let backup_digest = compute_digest(&backup_bytes);
@@ -371,7 +387,7 @@ fn backup_from_meta(
 
     Ok(Some(BackupEntry {
         id,
-        operation_id: operation_id.map(ToOwned::to_owned),
+        operation_id: ctx.operation_id.map(ToOwned::to_owned),
         original_path: path.to_path_buf(),
         backup_path: target,
         timestamp_millis: millis,
@@ -379,7 +395,7 @@ fn backup_from_meta(
         digest,
         size,
         permissions,
-        reason: reason.to_owned(),
+        reason: ctx.reason.to_owned(),
     }))
 }
 
@@ -492,7 +508,6 @@ pub fn list_backups(original_path: &Path) -> Result<Vec<BackupEntry>> {
     Ok(entries)
 }
 
-/// Whether already-read bytes match the entry's recorded digest and size.
 fn verify_backup_bytes(entry: &BackupEntry, bytes: &[u8]) -> bool {
     compute_digest(bytes) == entry.digest && bytes.len() as u64 == entry.size
 }
@@ -504,7 +519,6 @@ pub fn verify_backup(entry: &BackupEntry) -> Result<bool> {
     Ok(verify_backup_bytes(entry, &bytes))
 }
 
-/// Path-only half of the relation check (MUT-07); reads no contents.
 fn backup_relation_holds(entry: &BackupEntry, target: &Path) -> bool {
     if entry.original_path != target {
         return false;

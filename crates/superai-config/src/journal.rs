@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::backup::{BackupId, find_backup_by_id, restore_verified, verify_backup};
+use crate::backup::{BackupId, find_backup_by_id, restore_verified};
 use crate::error::{ConfigError, Result};
 
 /// Pending-operation journals for `home`, under `<home>/.superai/journal`.
@@ -222,7 +222,7 @@ pub fn recover_journal_file(journal_path: &Path) -> Result<JournalRecovery> {
     };
 
     let (removed_temps, mut residuals) = remove_stale_temps(&journal);
-    let (restored, restore_residuals) = restore_recorded_backups(&journal)?;
+    let (restored, restore_residuals) = restore_recorded_backups(&journal);
     residuals.extend(restore_residuals);
     let (removed_creations, creation_residuals) = remove_committed_creations(&journal);
     residuals.extend(creation_residuals);
@@ -368,7 +368,7 @@ fn remove_stale_temps(journal: &CrashJournal) -> (Vec<PathBuf>, Vec<PathBuf>) {
 }
 
 /// Restore resources whose bytes differ from their recorded backup.
-fn restore_recorded_backups(journal: &CrashJournal) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+fn restore_recorded_backups(journal: &CrashJournal) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let mut restored = Vec::new();
     let mut residuals = Vec::new();
     for backup in &journal.backups {
@@ -382,10 +382,6 @@ fn restore_recorded_backups(journal: &CrashJournal) -> Result<(Vec<PathBuf>, Vec
             residuals.push(resource);
             continue;
         };
-        if !verify_backup(&entry)? {
-            residuals.push(resource);
-            continue;
-        }
         let current_matches_pre = crate::snapshot::snapshot(&resource)
             .digest
             .as_deref()
@@ -398,7 +394,7 @@ fn restore_recorded_backups(journal: &CrashJournal) -> Result<(Vec<PathBuf>, Vec
             Err(_) => residuals.push(resource),
         }
     }
-    Ok((restored, residuals))
+    (restored, residuals)
 }
 
 /// Remove committed creations (no backup); uncommitted paths stay untouched.

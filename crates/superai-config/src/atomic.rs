@@ -408,6 +408,51 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct Recorder(std::sync::Mutex<Vec<Point>>);
+    impl Injector for Recorder {
+        fn inject(&self, point: Point) -> Result<()> {
+            if let Ok(mut points) = self.0.lock() {
+                points.push(point);
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn durability_points_fire_in_order_during_a_normal_write() {
+        let recorder = Recorder(std::sync::Mutex::new(Vec::new()));
+        let path = unique_scratch("durability-order");
+        atomic_write_expecting(
+            &path,
+            b"durable bytes",
+            WriteExpectation::Any,
+            None,
+            Some(&recorder),
+        )
+        .unwrap();
+        let expected = [
+            Point::TempCreate,
+            Point::TempWrite,
+            Point::TempFlush,
+            Point::ConflictRecheck,
+            Point::AtomicReplace,
+            Point::ParentSync,
+            Point::ReadBackVerify,
+        ];
+        let seen = recorder.0.lock().unwrap();
+        let observed: Vec<Point> = seen
+            .iter()
+            .copied()
+            .filter(|p| expected.contains(p))
+            .collect();
+        assert_eq!(
+            observed, expected,
+            "temp fsync must precede the rename, parent fsync and read-back follow it"
+        );
+        drop(std::fs::remove_file(&path));
+    }
+
     #[test]
     fn atomic_write_overwrites_atomically_without_truncation() {
         let path = unique_scratch("atomic-overwrite");
