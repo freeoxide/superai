@@ -31,6 +31,11 @@ pub const MAX_OUTPUT_BYTES: usize = 1_048_576;
 /// Default wall-clock timeout for process execution.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
+// A killed or exited child that backgrounded a descendant still holds the
+// capture pipes; the post-kill reap is grace-bounded so the orphan's
+// lifetime never extends a probe past its budget.
+const REAP_GRACE: Duration = Duration::from_millis(500);
+
 /// Flags whose following value is redacted; long-form only, since short
 /// flags like `-p` alias to non-secret meanings across tools.
 pub const REDACT_FLAGS: &[&str] = &[
@@ -380,9 +385,11 @@ pub fn run_command(
             let kill_note = handle
                 .kill()
                 .map_or_else(|e| format!(" (kill failed: {e})"), |()| String::new());
-            let wait_note = handle
-                .wait()
-                .map_or_else(|e| format!(" (wait failed: {e})"), |_| String::new());
+            let wait_note = match handle.wait_timeout(REAP_GRACE) {
+                Ok(Some(_)) => String::new(),
+                Ok(None) => " (descendant still holds the pipes; abandoned)".to_owned(),
+                Err(e) => format!(" (wait failed: {e})"),
+            };
             let reason = format!(
                 "command timed out after {}s: `{display}`{kill_note}{wait_note}",
                 timeout.as_secs()
@@ -654,6 +661,30 @@ mod tests {
         };
         let err = run_command("sleep", &["2".to_owned()], &opts).unwrap_err();
         assert!(format!("{err}").contains("timed out"));
+    }
+
+    /// A child that backgrounds a descendant holds the capture pipes past
+    /// its own exit; the timeout must bound wall time at the orphan's
+    /// expense, not the other way around.
+    #[test]
+    #[cfg(unix)]
+    fn run_command_timeout_bounds_orphan_pipe_holders() {
+        let opts = ExecuteOpts {
+            timeout: Some(Duration::from_millis(300)),
+            ..Default::default()
+        };
+        let start = std::time::Instant::now();
+        let script = "sleep 5 & echo hi".to_owned();
+        let err = run_command("/bin/sh", &["-c".to_owned(), script], &opts).unwrap_err();
+        let elapsed = start.elapsed();
+        assert!(
+            format!("{err}").contains("timed out"),
+            "expected a timeout refusal, got: {err}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "wall time must be bounded near the budget, took {elapsed:?}"
+        );
     }
 
     #[test]

@@ -85,10 +85,9 @@ pub(crate) fn find_in_path_within(path_var: &std::ffi::OsStr, names: &[&str]) ->
     None
 }
 
-/// First PATH hit for `names`, dir-major: the earliest directory holding any
-/// name wins. A non-UTF8 `PATH` yields `None` here, unlike lossy
-/// [`find_in_path`]; both divergences from the name-major order are
-/// per-adapter contract.
+/// First PATH hit for `names`, dir-major: the earliest directory holding
+/// any name wins; a non-UTF8 `PATH` yields `None`, unlike lossy
+/// [`find_in_path`] — per-adapter contract, not duplication.
 pub(crate) fn find_in_path_dir_first(names: &[&str]) -> Option<PathBuf> {
     let path_var = std::env::var("PATH").ok()?;
     find_in_path_dir_first_within(&path_var, names)
@@ -172,7 +171,8 @@ pub(crate) fn parse_version_output(output: &str) -> Option<String> {
 }
 
 /// Run `<binary> args...` under `budget` and return the combined stdout and
-/// stderr; a child still running at the budget is killed and reaped.
+/// stderr; a child still running at the budget is killed and reaped, and a
+/// pipe held by an inherited grandchild is abandoned at the same bound.
 pub(crate) fn run_capturing(binary: &Path, args: &[&str], budget: Duration) -> Option<String> {
     let owned = binary.to_path_buf();
     let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
@@ -180,10 +180,12 @@ pub(crate) fn run_capturing(binary: &Path, args: &[&str], budget: Duration) -> O
     // The send Result is the closure's value: a timed-out caller has dropped
     // the receiver, and that failure is expected, not an error to log.
     thread::spawn(move || tx.send(run_probe(&owned, &args, budget)));
-    // A timeout here never leaves the probe running: the worker kills the
-    // child at its own identical deadline.
+    // A timeout here never leaves the child running: the worker kills it at
+    // the same deadline and itself exits within the reclaim grace after it.
     rx.recv_timeout(budget).unwrap_or_default()
 }
+
+const PIPE_RECLAIM_GRACE: Duration = Duration::from_millis(500);
 
 fn drain_pipe(pipe: Option<impl Read>, buf: &mut Vec<u8>, binary: &Path, side: &str) {
     let Some(mut pipe) = pipe else {
@@ -201,24 +203,44 @@ fn drain_pipe_concurrently(
     pipe: Option<impl Read + Send + 'static>,
     binary: &Path,
     side: &'static str,
-) -> thread::JoinHandle<Vec<u8>> {
+    tx: mpsc::Sender<Vec<u8>>,
+) {
     let binary = binary.to_path_buf();
     thread::spawn(move || {
         let mut buf = Vec::new();
         drain_pipe(pipe, &mut buf, &binary, side);
-        buf
-    })
+        if tx.send(buf).is_err() {
+            eprintln!(
+                "superai-core: probe of {} abandoned pending {side} output",
+                binary.display()
+            );
+        }
+    });
 }
 
-fn join_pipe_reader(handle: thread::JoinHandle<Vec<u8>>, binary: &Path) -> Vec<u8> {
-    if let Ok(buf) = handle.join() {
-        return buf;
+fn reclaim_pipe(
+    rx: &mpsc::Receiver<Vec<u8>>,
+    by: Instant,
+    binary: &Path,
+    side: &'static str,
+) -> Option<Vec<u8>> {
+    match rx.recv_timeout(by.saturating_duration_since(Instant::now())) {
+        Ok(buf) => Some(buf),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            eprintln!(
+                "superai-core: probe of {} {side} pipe held past the reclaim deadline",
+                binary.display()
+            );
+            None
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            eprintln!(
+                "superai-core: probe of {} {side} reader ended without output",
+                binary.display()
+            );
+            None
+        }
     }
-    eprintln!(
-        "superai-core: probe reader for {} failed before EOF",
-        binary.display()
-    );
-    Vec::new()
 }
 
 fn run_probe(binary: &Path, args: &[String], budget: Duration) -> Option<String> {
@@ -239,8 +261,10 @@ fn run_probe(binary: &Path, args: &[String], budget: Duration) -> Option<String>
         }
     };
     let deadline = Instant::now() + budget;
-    let stdout = drain_pipe_concurrently(child.stdout.take(), binary, "stdout");
-    let stderr = drain_pipe_concurrently(child.stderr.take(), binary, "stderr");
+    let (out_tx, out_rx) = mpsc::channel();
+    let (err_tx, err_rx) = mpsc::channel();
+    drain_pipe_concurrently(child.stdout.take(), binary, "stdout", out_tx);
+    drain_pipe_concurrently(child.stderr.take(), binary, "stderr", err_tx);
     let mut poll = Duration::from_micros(500);
     let status: ExitStatus = loop {
         match child.try_wait() {
@@ -276,8 +300,9 @@ fn run_probe(binary: &Path, args: &[String], budget: Duration) -> Option<String>
             }
         }
     };
-    let out = join_pipe_reader(stdout, binary);
-    let err = join_pipe_reader(stderr, binary);
+    let reclaim_by = Instant::now() + PIPE_RECLAIM_GRACE;
+    let out = reclaim_pipe(&out_rx, reclaim_by, binary, "stdout")?;
+    let err = reclaim_pipe(&err_rx, reclaim_by, binary, "stderr")?;
     if !status.success() && out.is_empty() && err.is_empty() {
         return None;
     }
@@ -541,9 +566,8 @@ mod decl_tests {
     }
 
     /// A probe whose output passes the OS pipe capacity must capture the
-    /// version at the stream's end: only an unblocked child that wrote
-    /// everything and exited can produce it; budget-paying failures do not
-    /// retry, only fast transient spawn failures do.
+    /// version at the stream's end — only an unblocked child that wrote
+    /// everything and exited can produce it; budget-paying failures fail.
     #[test]
     #[cfg(unix)]
     fn probe_drains_output_past_pipe_capacity() {
@@ -573,6 +597,32 @@ mod decl_tests {
             version.as_deref(),
             Some("9.9.9"),
             "version past the pipe capacity was lost"
+        );
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// A grandchild inheriting the pipe cannot hold the probe open: the
+    /// reclaim is abandoned inside the grace, so the caller gets None well
+    /// inside the budget instead of waiting out the grandchild's lifetime.
+    #[test]
+    #[cfg(unix)]
+    fn run_capturing_abandons_a_grandchild_held_pipe_inside_the_budget() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_util::temp_dir_unique("probe-orphan");
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("spawner");
+        std::fs::write(&script, "#!/bin/sh\n(sleep 10) &\nprintf 'tool 1.2.3\\n'\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let started = std::time::Instant::now();
+        let out = super::run_capturing(&script, &[], std::time::Duration::from_secs(2));
+        assert!(
+            out.is_none(),
+            "unreclaimable output must yield None, got {out:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "grandchild-held pipe outlived the reclaim grace: {:?}",
+            started.elapsed()
         );
         drop(std::fs::remove_dir_all(&dir));
     }
