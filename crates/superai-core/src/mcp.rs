@@ -851,8 +851,6 @@ fn commit_document_creating_dir(
     if let Err(e) = txn.commit() {
         return Err(map_transaction_error(path, e));
     }
-    // verify() reports digest/parse failures as outcome flags, never as Err;
-    // inspect them exactly as the engine's execute() does.
     let verification = txn.verify().map_err(|e| CoreError::Verification {
         path: path.to_path_buf(),
         kind: "verify".to_owned(),
@@ -2184,7 +2182,6 @@ mod tests {
             mcp2.contains_key("foreign-one"),
             "foreign must remain after removal"
         );
-        // Remove non-existent should be Ok(None) and not touch file
         let none = remove_mcp_server(&path, &d, &McpServerId::new("nonexistent").unwrap()).unwrap();
         assert!(none.is_none());
 
