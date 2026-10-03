@@ -1008,7 +1008,7 @@ pub fn read(path: &Path) -> Result<RawDocument> {
     let bom = detect_bom(&bytes);
     let newline_style = detect_newline(&bytes);
     let digest = compute_digest(&bytes);
-    let snapshot = snapshot(path);
+    let snapshot = snapshot_with_bytes(path, &bytes);
     let diagnostics = validate(&bytes, kind);
 
     Ok(RawDocument {
@@ -1257,7 +1257,7 @@ fn validate_for_commit(path: &Path, content: &[u8], kind: DocumentKind) -> Resul
     let msg = format!("{}:{}: {}", first.line, first.col, first.message);
     match kind {
         DocumentKind::StrictJson | DocumentKind::JsonC => {
-            let text = std::str::from_utf8(bytes_without_bom(content)).unwrap_or_default();
+            let text = std::str::from_utf8(gate_parse_bytes(kind, content)).unwrap_or_default();
             match crate::json::parse_strict_raw(text) {
                 Ok(_) => Err(ConfigError::Io {
                     path: path.to_path_buf(),
@@ -1270,7 +1270,7 @@ fn validate_for_commit(path: &Path, content: &[u8], kind: DocumentKind) -> Resul
             }
         }
         DocumentKind::Toml => {
-            let text = std::str::from_utf8(bytes_without_bom(content)).unwrap_or_default();
+            let text = std::str::from_utf8(gate_parse_bytes(kind, content)).unwrap_or_default();
             let parse_err: std::result::Result<DocumentMut, toml_edit::TomlError> = text.parse();
             match parse_err {
                 Ok(_) => Err(ConfigError::Io {
@@ -1284,7 +1284,7 @@ fn validate_for_commit(path: &Path, content: &[u8], kind: DocumentKind) -> Resul
             }
         }
         DocumentKind::Yaml => {
-            let text = std::str::from_utf8(bytes_without_bom(content)).unwrap_or_default();
+            let text = std::str::from_utf8(gate_parse_bytes(kind, content)).unwrap_or_default();
             match crate::yaml::parse_strict_raw(text) {
                 Ok(_) => Err(ConfigError::Io {
                     path: path.to_path_buf(),
@@ -1502,6 +1502,18 @@ mod tests {
                 .all(|d| !d.message.contains("deprecated")),
             "unparsable content must get syntax diagnostics only: {diagnostics:?}"
         );
+    }
+
+    #[test]
+    fn bom_json_commit_refusal_is_a_json_error() {
+        let path = raw_scratch("bom-commit", "settings.json");
+        std::fs::write(&path, br#"{"a":1}"#).unwrap();
+        let err = commit(&path, b"\xef\xbb\xbf{\"a\":2}", None).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Json { .. }),
+            "the BOM refusal must surface as the json parse error it is: {err}"
+        );
+        drop(std::fs::remove_file(&path));
     }
 
     #[test]

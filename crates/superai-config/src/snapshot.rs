@@ -91,8 +91,8 @@ pub fn snapshot(path: &Path) -> Snapshot {
     snapshot_inner(path, None)
 }
 
-/// [`snapshot`] computed from `bytes` plus a fresh metadata walk; equal to
-/// [`snapshot`] whenever `bytes` are `path`'s current contents.
+/// [`snapshot`] over bytes the caller read fresh from `path` in this
+/// operation; equal to [`snapshot`] whenever the bytes are current.
 pub fn snapshot_with_bytes(path: &Path, bytes: &[u8]) -> Snapshot {
     snapshot_inner(path, Some(bytes))
 }
