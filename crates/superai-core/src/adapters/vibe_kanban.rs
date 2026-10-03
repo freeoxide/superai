@@ -423,8 +423,6 @@ mod tests {
     #[test]
     fn adapter_identity() {
         let a = adapter();
-        // Constructor wiring plus catalog registration: an id the catalog
-        // does not know can never reconcile with detection or instances.
         assert_eq!(a.id().as_str(), HARNESS_ID_STR);
         assert!(crate::harness_catalog::find_by_id(HARNESS_ID_STR).is_some());
         assert_eq!(a.product_status(), ProductStatus::Sunset);
