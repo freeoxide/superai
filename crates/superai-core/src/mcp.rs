@@ -774,7 +774,7 @@ fn commit_document(
     if !parent.as_os_str().is_empty() && !parent.exists() {
         // Directory creation must stay inside the transaction: rollback
         // removes a directory it created and a foreign dir aborts the step.
-        return commit_document_creating_dir(path, kind, bytes, engine_kind, parent);
+        return commit_document_creating_dir(path, kind, bytes, engine_kind, parent, expected);
     }
     let file_label = path
         .file_name()
@@ -822,7 +822,18 @@ fn commit_document_creating_dir(
     bytes: &[u8],
     engine_kind: superai_config::document::DocumentKind,
     parent: &Path,
+    expected: &superai_config::snapshot::Snapshot,
 ) -> Result<()> {
+    let current = superai_config::snapshot::snapshot(path);
+    if superai_config::snapshot::is_modified(expected, &current) {
+        let exp = expected.digest.as_deref().unwrap_or("missing");
+        let act = current.digest.as_deref().unwrap_or("missing");
+        return Err(CoreError::ConcurrentModification {
+            path: path.to_path_buf(),
+            expected: exp.to_owned(),
+            actual: act.to_owned(),
+        });
+    }
     let steps = vec![
         superai_config::transaction::FileAction::CreateDir {
             path: parent.to_path_buf(),
@@ -833,7 +844,6 @@ fn commit_document_creating_dir(
             kind: engine_kind,
         },
     ];
-    let snap_before = superai_config::snapshot::snapshot(path);
     let file_label = path
         .file_name()
         .map_or_else(|| "config".to_owned(), |n| n.to_string_lossy().to_string());
@@ -855,25 +865,35 @@ fn commit_document_creating_dir(
         field: "mcp_transaction".to_owned(),
         reason: format!("transaction plan invalid: {e}"),
     })?;
-    let outcome = txn.execute().map_err(|e| CoreError::Commit {
+    txn.prepare().map_err(|e| CoreError::Commit {
         path: path.to_path_buf(),
         reason: format!("transaction failed: {e}"),
     })?;
-    if !outcome.success {
-        let diag = outcome.diagnostics_redacted.join("; ");
-        if diag.contains("modified") || diag.contains("concurrent") {
-            let snap_after = superai_config::snapshot::snapshot(path);
-            let exp = snap_before.digest.unwrap_or_else(|| "missing".to_owned());
-            let act = snap_after.digest.unwrap_or_else(|| "missing".to_owned());
-            return Err(CoreError::ConcurrentModification {
+    if let Err(e) = txn.commit() {
+        return Err(match e {
+            superai_config::ConfigError::ConcurrentModification {
+                path,
+                expected,
+                actual,
+            } => CoreError::ConcurrentModification {
+                path,
+                expected,
+                actual,
+            },
+            e => CoreError::Commit {
                 path: path.to_path_buf(),
-                expected: exp,
-                actual: act,
-            });
+                reason: format!("transaction failed: {e}"),
+            },
+        });
+    }
+    if let Err(e) = txn.verify() {
+        if let Err(rollback_err) = txn.rollback() {
+            eprintln!("superai-core: mcp rollback after verify failure failed: {rollback_err}");
         }
-        return Err(CoreError::Commit {
+        return Err(CoreError::Verification {
             path: path.to_path_buf(),
-            reason: format!("mcp commit failed: {diag}"),
+            kind: "verify".to_owned(),
+            reason: format!("post-commit verification failed: {e}"),
         });
     }
     verify_written_parses(path, kind)
@@ -2013,6 +2033,22 @@ mod tests {
             ConfigScope::User,
             RestartBehavior::None,
         )
+    }
+
+    #[test]
+    fn install_creates_missing_destination_parent_transactionally() {
+        let root = crate::test_util::temp_dir_unique("mcp-missing-parent");
+        let path = root.join("nested").join("settings.json");
+        let d = decl();
+        let id = McpServerId::new("fresh").unwrap();
+        let server = McpServerDef::stdio(id, "uvx", vec!["s.js".to_owned()]).unwrap();
+        install_mcp_server(&path, &d, &server).unwrap();
+        let installed = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            installed.contains("\"fresh\""),
+            "installed server must be present: {installed}"
+        );
+        assert!(path.parent().is_some_and(Path::is_dir));
     }
 
     #[test]
