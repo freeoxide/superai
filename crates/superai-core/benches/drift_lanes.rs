@@ -403,6 +403,40 @@ fn bench_detect_slow_path_hit_with_managers(c: &mut Criterion) {
     group.finish();
 }
 
+/// The mise-present case: a hanging shim pays its full probe budget while
+/// the package-manager families run concurrently, so the call lands near
+/// max(shim budget, families). Re-serializing the shim probes behind the
+/// families shows up as the two budgets added together.
+#[cfg(unix)]
+fn bench_detect_broken_shim_with_slow_manager(c: &mut Criterion) {
+    let (scratch, entry, opts, bin) = bench_detect_fixtures("detect-shim");
+    let shims = scratch.path("home").join(".local/share/mise/shims");
+    fs::create_dir_all(&shims).expect("shim dir must create");
+    write_fake_manager(&shims, "my-exe", "#!/bin/sh\nsleep 2\necho never\n");
+    write_fake_manager(
+        &bin,
+        "dpkg",
+        "#!/bin/sh\nsleep 1\nprintf 'Package: my-pkg\\nStatus: install ok installed\\nVersion: 1.4.2\\n'\n",
+    );
+    let opts = DetectOptions {
+        probe_mise: true,
+        probe_timeout: Duration::from_millis(400),
+        ..opts
+    };
+    let mut group = c.benchmark_group("detect");
+    group.measurement_time(Duration::from_secs(6));
+    group.sample_size(10);
+    group.bench_function("broken_shim_with_slow_manager", |b| {
+        b.iter(|| {
+            detect::detect_all_for_entry(std::hint::black_box(&entry), &opts)
+                .iter()
+                .filter(|d| d.version.is_some())
+                .count()
+        });
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_read_bounded_algorithms,
@@ -413,5 +447,6 @@ criterion_group!(
     bench_adapter_corpus_build,
     bench_detect_package_probes,
     bench_detect_slow_path_hit_with_managers,
+    bench_detect_broken_shim_with_slow_manager,
 );
 criterion_main!(benches);

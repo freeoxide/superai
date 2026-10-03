@@ -554,11 +554,13 @@ fn fingerprint_candidate_with_path_cache(
 
 fn read_bounded(path: &Path, max_bytes: usize) -> std::io::Result<String> {
     let data = crate::wrapper::read_up_to(path, u64::try_from(max_bytes).unwrap_or(u64::MAX))?;
-    let valid_len = match std::str::from_utf8(&data) {
-        Ok(_) => data.len(),
-        Err(err) => err.valid_up_to(),
+    let text = match std::str::from_utf8(&data) {
+        Ok(text) => text.to_owned(),
+        Err(err) => {
+            let valid = data.get(..err.valid_up_to()).unwrap_or_default();
+            String::from_utf8_lossy(valid).into_owned()
+        }
     };
-    let text = String::from_utf8_lossy(data.get(..valid_len).unwrap_or_default()).into_owned();
     Ok(text)
 }
 

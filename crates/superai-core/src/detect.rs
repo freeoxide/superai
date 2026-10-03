@@ -254,53 +254,36 @@ pub fn detect_all_for_entry(entry: &InstallCatalogEntry, opts: &DetectOptions) -
     let path_dirs = opts.resolve_path_dirs();
     let home = opts.resolve_home();
 
-    // Wave 1: every probe family that never consults `seen_paths` runs
-    // concurrently (configured, PATH, all package managers, apps).
-    let (configured, path_hits, mise_managed, brew, npm, cargo, pipx, uv, system, apps) =
-        std::thread::scope(|scope| {
+    // The eight families that never consult `seen_paths` run concurrently
+    // with everything below; the mise-shim probes wait for configured+PATH
+    // to seed `seen_paths`, then overlap those families from this thread.
+    let (detections, mut seen_paths, mise_shims, families) = std::thread::scope(|scope| {
+        let families = scope.spawn(|| manager_families(entry, &path_dirs, home.as_ref(), opts));
+        let (configured, path_hits) = std::thread::scope(|scope| {
             let configured = scope.spawn(|| configured_binary_detections(entry, opts));
             let path_hits = scope.spawn(|| path_detections(entry, &path_dirs, opts, home.as_ref()));
-            let mise_managed = scope.spawn(|| mise_managed_detections(entry, home.as_ref(), opts));
-            let brew = scope.spawn(|| brew_detections(entry, opts));
-            let npm = scope.spawn(|| npm_detections(entry, opts));
-            let cargo = scope.spawn(|| cargo_detections(entry, home.as_deref(), opts));
-            let pipx = scope.spawn(|| pipx_detections(entry, &path_dirs, home.as_deref(), opts));
-            let uv = scope.spawn(|| uv_detections(entry, &path_dirs, home.as_deref(), opts));
-            let system =
-                scope.spawn(|| system_detections(entry, &path_dirs, home.as_deref(), opts));
-            let apps = scope.spawn(|| app_detections(entry, opts));
-            (
-                join_probe(configured),
-                join_probe(path_hits),
-                join_probe(mise_managed),
-                join_probe(brew),
-                join_probe(npm),
-                join_probe(cargo),
-                join_probe(pipx),
-                join_probe(uv),
-                join_probe(system),
-                join_probe(apps),
-            )
+            (join_probe(configured), join_probe(path_hits))
         });
 
-    let mut detections: Vec<Detection> = Vec::new();
-    let mut seen_paths: HashSet<PathBuf> = HashSet::new();
+        let mut detections: Vec<Detection> = Vec::new();
+        let mut seen_paths: HashSet<PathBuf> = HashSet::new();
+        for d in configured.detections {
+            detections.push(d);
+        }
+        for canon in configured.seen_canons {
+            seen_paths.insert(canon);
+        }
+        for d in path_hits {
+            seen_paths.insert(canonical_or_clone(&d.path));
+            detections.push(d);
+        }
 
-    for d in configured.detections {
-        detections.push(d);
-    }
-    for canon in configured.seen_canons {
-        seen_paths.insert(canon);
-    }
+        let mise_shims = mise_shim_detections(entry, home.as_ref(), opts, &seen_paths);
+        (detections, seen_paths, mise_shims, join_probe(families))
+    });
 
-    for d in path_hits {
-        seen_paths.insert(canonical_or_clone(&d.path));
-        detections.push(d);
-    }
-
-    // Wave 2: the mise-shim probes consult `seen_paths`, which wave 1's
-    // configured and PATH canonical paths must have seeded.
-    let mise_shims = mise_shim_detections(entry, home.as_ref(), opts, &seen_paths);
+    let (mise_managed, brew, npm, cargo, pipx, uv, system, apps) = families;
+    let mut detections = detections;
 
     for (canon, d) in mise_shims {
         if !seen_paths.contains(&canon) {
@@ -332,6 +315,45 @@ pub fn detect_all_for_entry(entry: &InstallCatalogEntry, opts: &DetectOptions) -
 
     // Insertion order: PATH hits first (PATH order), then shim and package probes.
     detections
+}
+
+fn manager_families(
+    entry: &InstallCatalogEntry,
+    path_dirs: &[PathBuf],
+    home: Option<&PathBuf>,
+    opts: &DetectOptions,
+) -> (
+    Option<Vec<Detection>>,
+    Vec<Detection>,
+    Vec<Detection>,
+    Vec<Detection>,
+    Vec<Detection>,
+    Vec<Detection>,
+    Vec<Detection>,
+    Vec<Detection>,
+) {
+    std::thread::scope(|scope| {
+        let mise_managed = scope.spawn(|| mise_managed_detections(entry, home, opts));
+        let brew = scope.spawn(|| brew_detections(entry, opts));
+        let npm = scope.spawn(|| npm_detections(entry, opts));
+        let cargo = scope.spawn(|| cargo_detections(entry, home.map(PathBuf::as_path), opts));
+        let pipx =
+            scope.spawn(|| pipx_detections(entry, path_dirs, home.map(PathBuf::as_path), opts));
+        let uv = scope.spawn(|| uv_detections(entry, path_dirs, home.map(PathBuf::as_path), opts));
+        let system =
+            scope.spawn(|| system_detections(entry, path_dirs, home.map(PathBuf::as_path), opts));
+        let apps = scope.spawn(|| app_detections(entry, opts));
+        (
+            join_probe(mise_managed),
+            join_probe(brew),
+            join_probe(npm),
+            join_probe(cargo),
+            join_probe(pipx),
+            join_probe(uv),
+            join_probe(system),
+            join_probe(apps),
+        )
+    })
 }
 
 struct ConfiguredDetections {
@@ -750,9 +772,11 @@ fn probe_version_for_path(
     // Exact path first; the basename fallback resolves the first executable
     // match among the injected dirs (ambient PATH when none) so shims that
     // delegate to mise still answer. The child env itself stays ambient.
-    let fallback = fallback_target(exe, opts);
     let out = run_command(path.to_string_lossy().as_ref(), &probe_args, &exec_opts)
-        .or_else(|_| run_command(&fallback, &probe_args, &exec_opts))
+        .or_else(|_| {
+            let fallback = fallback_target(exe, opts);
+            run_command(&fallback, &probe_args, &exec_opts)
+        })
         .ok()?;
     if !out.success && out.stdout.trim().is_empty() && out.stderr.trim().is_empty() {
         return None;
@@ -781,19 +805,22 @@ fn fallback_target(exe: &str, opts: &DetectOptions) -> String {
 #[cfg(unix)]
 fn is_executable_file(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt as _;
-    std::fs::metadata(path).is_ok_and(|meta| meta.permissions().mode() & 0o111 != 0)
+    std::fs::metadata(path)
+        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
 }
 
 #[cfg(windows)]
 fn is_executable_file(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|ext| {
-            matches!(
-                ext.to_ascii_lowercase().as_str(),
-                "exe" | "cmd" | "bat" | "com"
-            )
-        })
+    std::fs::metadata(path).is_ok_and(|meta| meta.is_file())
+        && path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|ext| {
+                matches!(
+                    ext.to_ascii_lowercase().as_str(),
+                    "exe" | "cmd" | "bat" | "com"
+                )
+            })
 }
 
 fn probe_arch_mismatch(path: &Path, opts: &DetectOptions) -> bool {
