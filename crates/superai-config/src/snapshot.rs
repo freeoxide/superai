@@ -91,8 +91,8 @@ pub fn snapshot(path: &Path) -> Snapshot {
     snapshot_inner(path, None)
 }
 
-/// [`snapshot`] reusing bytes the caller read fresh from `path` inside the
-/// same operation; the token is identical, the second read is not paid.
+/// [`snapshot`] computed from `bytes` plus a fresh metadata walk; equal to
+/// [`snapshot`] whenever `bytes` are `path`'s current contents.
 pub fn snapshot_with_bytes(path: &Path, bytes: &[u8]) -> Snapshot {
     snapshot_inner(path, Some(bytes))
 }
@@ -279,6 +279,33 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_millis());
         scratch(&format!("{prefix}-{now}-{}", std::process::id()))
+    }
+
+    #[test]
+    fn snapshot_with_bytes_matches_snapshot_on_a_quiescent_file() {
+        let path = unique_scratch("parity");
+        std::fs::write(&path, b"token parity bytes").unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(
+            snapshot_with_bytes(&path, &bytes),
+            snapshot(&path),
+            "the bytes-lending token must equal the self-reading token"
+        );
+        drop(std::fs::remove_file(&path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_with_bytes_matches_snapshot_through_a_symlink() {
+        let target = unique_scratch("parity-target");
+        let link = unique_scratch("parity-link");
+        std::fs::write(&target, b"through the link").unwrap();
+        drop(std::fs::remove_file(&link));
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let bytes = std::fs::read(&link).unwrap();
+        assert_eq!(snapshot_with_bytes(&link, &bytes), snapshot(&link));
+        drop(std::fs::remove_file(&link));
+        drop(std::fs::remove_file(&target));
     }
 
     #[test]
