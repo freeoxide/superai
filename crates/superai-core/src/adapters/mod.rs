@@ -206,15 +206,12 @@ fn drain_pipe_concurrently(
     tx: mpsc::Sender<Vec<u8>>,
 ) {
     let binary = binary.to_path_buf();
+    // The send Result is the thread's value: the worker departs at the
+    // reclaim deadline, and a send into a departed worker is expected.
     thread::spawn(move || {
         let mut buf = Vec::new();
         drain_pipe(pipe, &mut buf, &binary, side);
-        if tx.send(buf).is_err() {
-            eprintln!(
-                "superai-core: probe of {} abandoned pending {side} output",
-                binary.display()
-            );
-        }
+        tx.send(buf)
     });
 }
 
@@ -235,7 +232,7 @@ fn reclaim_pipe(
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
             eprintln!(
-                "superai-core: probe of {} {side} reader ended without output",
+                "superai-core: probe of {} {side} reader failed before delivering",
                 binary.display()
             );
             None
@@ -301,8 +298,11 @@ fn run_probe(binary: &Path, args: &[String], budget: Duration) -> Option<String>
         }
     };
     let reclaim_by = Instant::now() + PIPE_RECLAIM_GRACE;
-    let out = reclaim_pipe(&out_rx, reclaim_by, binary, "stdout")?;
-    let err = reclaim_pipe(&err_rx, reclaim_by, binary, "stderr")?;
+    let out = reclaim_pipe(&out_rx, reclaim_by, binary, "stdout");
+    let err = reclaim_pipe(&err_rx, reclaim_by, binary, "stderr");
+    let (Some(out), Some(err)) = (out, err) else {
+        return None;
+    };
     if !status.success() && out.is_empty() && err.is_empty() {
         return None;
     }

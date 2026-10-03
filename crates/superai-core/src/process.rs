@@ -382,13 +382,18 @@ pub fn run_command(
         // wait_timeout borrows the handle; clone unhooks the captured bytes.
         Ok(Some(output)) => output.clone(),
         Ok(None) => {
-            let kill_note = handle
-                .kill()
-                .map_or_else(|e| format!(" (kill failed: {e})"), |()| String::new());
-            let wait_note = match handle.wait_timeout(REAP_GRACE) {
-                Ok(Some(_)) => String::new(),
-                Ok(None) => " (descendant still holds the pipes; abandoned)".to_owned(),
-                Err(e) => format!(" (wait failed: {e})"),
+            let kill_err = handle.kill().err();
+            let (wait_note, include_kill_note) = match handle.wait_timeout(REAP_GRACE) {
+                Ok(Some(_)) => (String::new(), true),
+                Ok(None) => (
+                    " (descendant still holds the pipes; abandoned)".to_owned(),
+                    false,
+                ),
+                Err(e) => (format!(" (wait failed: {e})"), true),
+            };
+            let kill_note = match (&kill_err, include_kill_note) {
+                (Some(e), true) => format!(" (kill failed: {e})"),
+                _ => String::new(),
             };
             let reason = format!(
                 "command timed out after {}s: `{display}`{kill_note}{wait_note}",

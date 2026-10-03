@@ -409,10 +409,10 @@ fn bench_detect_slow_path_hit_with_managers(c: &mut Criterion) {
 /// The mise-present case: the hanging shim execs its sleep so the probe
 /// budget's kill reclaims the pipe, letting the call land near
 /// max(shim budget, manager budget). Re-serializing the shim probes behind
-/// the families shows up as the two budgets added together. A shim that
-/// only spawns the sleep (no exec) instead pays the orphan's lifetime —
-/// `run_command`'s kill does not reap grandchildren; that hazard is
-/// process.rs's to fix, deliberately not pinned here.
+/// the families shows up as the two budgets added together. A spawn-shim
+/// (no exec) is also bounded: `run_command`'s post-kill reap abandons a
+/// pipe-holding descendant after `REAP_GRACE`, so wall time never tracks
+/// the orphan's lifetime (pinned in process.rs).
 #[cfg(unix)]
 fn bench_detect_broken_shim_with_slow_manager(c: &mut Criterion) {
     let (scratch, entry, opts, bin) = bench_detect_fixtures("detect-shim");
