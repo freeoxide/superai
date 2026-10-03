@@ -70,15 +70,18 @@ fn old_backoff_text(data: &[u8], max_bytes: usize) -> String {
     String::from_utf8_lossy(slice.get(..valid_len).unwrap_or_default()).into_owned()
 }
 
-/// The shipped single-pass boundary via [`Utf8Error::valid_up_to`].
+/// The shipped single-pass boundary via [`Utf8Error::valid_up_to`],
+/// mirroring discovery's `read_bounded` arm for arm.
 fn valid_up_to_text(data: &[u8], max_bytes: usize) -> String {
     let len = std::cmp::min(data.len(), max_bytes);
     let slice = data.get(..len).unwrap_or_default();
-    let valid_len = match std::str::from_utf8(slice) {
-        Ok(_) => slice.len(),
-        Err(err) => err.valid_up_to(),
-    };
-    String::from_utf8_lossy(slice.get(..valid_len).unwrap_or_default()).into_owned()
+    match std::str::from_utf8(slice) {
+        Ok(text) => text.to_owned(),
+        Err(err) => {
+            let valid = slice.get(..err.valid_up_to()).unwrap_or_default();
+            String::from_utf8_lossy(valid).into_owned()
+        }
+    }
 }
 
 /// Schema text with one invalid byte at the midpoint of the 64KiB cap the
@@ -403,16 +406,19 @@ fn bench_detect_slow_path_hit_with_managers(c: &mut Criterion) {
     group.finish();
 }
 
-/// The mise-present case: a hanging shim pays its full probe budget while
-/// the package-manager families run concurrently, so the call lands near
-/// max(shim budget, families). Re-serializing the shim probes behind the
-/// families shows up as the two budgets added together.
+/// The mise-present case: the hanging shim execs its sleep so the probe
+/// budget's kill reclaims the pipe, letting the call land near
+/// max(shim budget, manager budget). Re-serializing the shim probes behind
+/// the families shows up as the two budgets added together. A shim that
+/// only spawns the sleep (no exec) instead pays the orphan's lifetime —
+/// `run_command`'s kill does not reap grandchildren; that hazard is
+/// process.rs's to fix, deliberately not pinned here.
 #[cfg(unix)]
 fn bench_detect_broken_shim_with_slow_manager(c: &mut Criterion) {
     let (scratch, entry, opts, bin) = bench_detect_fixtures("detect-shim");
     let shims = scratch.path("home").join(".local/share/mise/shims");
     fs::create_dir_all(&shims).expect("shim dir must create");
-    write_fake_manager(&shims, "my-exe", "#!/bin/sh\nsleep 2\necho never\n");
+    write_fake_manager(&shims, "my-exe", "#!/bin/sh\nexec sleep 2\n");
     write_fake_manager(
         &bin,
         "dpkg",
@@ -437,6 +443,44 @@ fn bench_detect_broken_shim_with_slow_manager(c: &mut Criterion) {
     group.finish();
 }
 
+/// The per-PATH-hit lane: eight shadowed hits each pay a version spawn plus
+/// a `file` arch spawn, run four hits wide instead of one at a time. The
+/// sequential shape this replaced pays all sixteen spawns end to end.
+#[cfg(unix)]
+fn bench_detect_eight_path_hits(c: &mut Criterion) {
+    let (scratch, entry, _opts, _bin) = bench_detect_fixtures("detect-hits");
+    let mut dirs = Vec::new();
+    for i in 0..8 {
+        let dir = scratch.path(format!("hit-{i}"));
+        fs::create_dir_all(&dir).expect("hit dir must create");
+        write_fake_manager(&dir, "my-exe", &format!("#!/bin/sh\necho \"{i}.1.0\"\n"));
+        dirs.push(dir);
+    }
+    let opts = DetectOptions {
+        path_dirs: Some(dirs),
+        probe_mise: false,
+        probe_brew: false,
+        probe_npm: false,
+        probe_cargo: false,
+        probe_pipx: false,
+        probe_uv: false,
+        probe_system: false,
+        probe_apps: false,
+        ..DetectOptions::default()
+    };
+    let mut group = c.benchmark_group("detect");
+    group.measurement_time(Duration::from_secs(4));
+    group.bench_function("eight_path_hits", |b| {
+        b.iter(|| {
+            detect::detect_all_for_entry(std::hint::black_box(&entry), &opts)
+                .iter()
+                .filter(|d| d.version.is_some())
+                .count()
+        });
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_read_bounded_algorithms,
@@ -448,5 +492,6 @@ criterion_group!(
     bench_detect_package_probes,
     bench_detect_slow_path_hit_with_managers,
     bench_detect_broken_shim_with_slow_manager,
+    bench_detect_eight_path_hits,
 );
 criterion_main!(benches);

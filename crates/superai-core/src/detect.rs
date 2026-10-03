@@ -1740,6 +1740,34 @@ mod tests {
         );
     }
 
+    /// A directory named like the executable carries the exec bit on unix
+    /// and must not satisfy the fallback resolution.
+    #[cfg(unix)]
+    #[test]
+    fn probe_version_fallback_skips_a_directory_named_like_the_exe() {
+        use std::os::unix::fs::PermissionsExt;
+        let decoy_dir = make_temp_dir("probe-fallback-decoy");
+        let real_dir = make_temp_dir("probe-fallback-real");
+        let probe_dir = make_temp_dir("probe-fallback-probe");
+        let impostor = decoy_dir.join("my-exe");
+        fs::create_dir(&impostor).unwrap();
+        write_fake_exe(&real_dir, "my-exe", "my-exe 2.2.2");
+        let unspawnable = probe_dir.join("my-exe");
+        fs::write(&unspawnable, "#!/bin/sh\necho nothing\n").unwrap();
+        fs::set_permissions(&unspawnable, fs::Permissions::from_mode(0o644)).unwrap();
+        let opts = DetectOptions {
+            path_dirs: Some(vec![decoy_dir, real_dir]),
+            ..Default::default()
+        };
+        let entry = pythonish_entry();
+        let version = probe_version_for_path(&unspawnable, &entry, &opts);
+        assert_eq!(
+            version.as_deref(),
+            Some("2.2.2"),
+            "the fallback must skip the impostor directory and resolve the real executable"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn detect_reports_pipx_uv_and_system_package_sources() {
@@ -1909,6 +1937,56 @@ mod tests {
             Some("9.9.9"),
             "the fallback must take the first executable match from the injected PATH dirs: {hits:?}"
         );
+        drop(fs::remove_dir_all(&dir1));
+        drop(fs::remove_dir_all(&dir2));
+        drop(fs::remove_dir_all(&home));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn version_probe_fallback_skips_directories_named_like_the_exe() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir0 = make_temp_dir("fallback-dir0");
+        let dir1 = make_temp_dir("fallback-dir1");
+        let dir2 = make_temp_dir("fallback-dir2");
+        let home = make_temp_dir("fallback-dir-home");
+        let unspawnable = dir0.join("my-exe");
+        fs::write(&unspawnable, "#!/bin/sh\necho should-not-run\n").unwrap();
+        let exe_named_dir = dir1.join("my-exe");
+        fs::create_dir_all(&exe_named_dir).unwrap();
+        {
+            let mut perms = fs::metadata(&exe_named_dir).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&exe_named_dir, perms).unwrap();
+        }
+        write_fake_exe(&dir2, "my-exe", "8.8.8");
+
+        let entry = pythonish_entry();
+        let opts = DetectOptions {
+            path_dirs: Some(vec![dir0.clone(), dir1.clone(), dir2.clone()]),
+            home_dir: Some(home.clone()),
+            probe_mise: false,
+            probe_brew: false,
+            probe_npm: false,
+            probe_cargo: false,
+            probe_pipx: false,
+            probe_uv: false,
+            probe_system: false,
+            probe_apps: false,
+            ..Default::default()
+        };
+        let hits = detect_all_for_entry(&entry, &opts);
+        let path_hit = hits
+            .iter()
+            .find(|d| d.source == DetectionSource::Path)
+            .unwrap_or_else(|| panic!("PATH hit expected: {hits:?}"));
+        assert_eq!(path_hit.path, unspawnable);
+        assert_eq!(
+            path_hit.version.as_deref(),
+            Some("8.8.8"),
+            "the fallback must skip an exec-bit directory and take the next executable file: {hits:?}"
+        );
+        drop(fs::remove_dir_all(&dir0));
         drop(fs::remove_dir_all(&dir1));
         drop(fs::remove_dir_all(&dir2));
         drop(fs::remove_dir_all(&home));
