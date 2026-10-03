@@ -74,6 +74,17 @@ fn detect_bom(bytes: &[u8]) -> bool {
         && bytes.get(2).copied() == Some(0xBF)
 }
 
+// JSON kinds parse the raw bytes so every gate in one write path agrees
+// with the staging gate (document.rs validate_bytes_for_kind); yaml strips
+// its BOM (yaml.rs).
+fn gate_parse_bytes(kind: DocumentKind, content: &[u8]) -> &[u8] {
+    if matches!(kind, DocumentKind::StrictJson | DocumentKind::JsonC) {
+        content
+    } else {
+        bytes_without_bom(content)
+    }
+}
+
 fn bytes_without_bom(bytes: &[u8]) -> &[u8] {
     if detect_bom(bytes) {
         bytes.get(3..).unwrap_or(&[])
@@ -153,13 +164,7 @@ pub fn validate(content: &[u8], kind: DocumentKind) -> Vec<Diagnostic> {
     }
 
     // Invalid UTF-8 is always a diagnostic, even for opaque fragments.
-    // JSON kinds keep a BOM so validate matches the staging gate
-    // (document.rs validate_bytes_for_kind); yaml strips it (yaml.rs).
-    let parse_bytes = if matches!(kind, DocumentKind::StrictJson | DocumentKind::JsonC) {
-        content
-    } else {
-        bytes_without_bom(content)
-    };
+    let parse_bytes = gate_parse_bytes(kind, content);
     let text = match std::str::from_utf8(parse_bytes) {
         Ok(text) => text,
         Err(err) => {
@@ -239,7 +244,7 @@ pub fn validate_with_schema(
 
 /// Parse `content` per `kind` into the semantic value tree, when possible.
 fn parse_semantic_value(content: &[u8], kind: DocumentKind) -> Option<Value> {
-    let text = std::str::from_utf8(bytes_without_bom(content)).ok()?;
+    let text = std::str::from_utf8(gate_parse_bytes(kind, content)).ok()?;
     if text.trim().is_empty() {
         return Some(Value::Object(Map::new()));
     }
@@ -1477,6 +1482,35 @@ mod tests {
             diags.is_empty(),
             "valid json should have no diagnostics: {diags:?}"
         );
+    }
+
+    #[test]
+    fn bom_json_schema_validation_stays_syntax_only() {
+        let bom_json: &[u8] = b"\xef\xbb\xbf{\"deprecated\": 1}";
+        let schema = crate::document::SemanticSchema {
+            validator: None,
+            deprecated_keys: vec![crate::document::DeprecatedKey {
+                key: "deprecated".to_owned(),
+                replacement: None,
+            }],
+        };
+        let diagnostics = validate_with_schema(bom_json, DocumentKind::StrictJson, Some(&schema));
+        assert!(!diagnostics.is_empty(), "the BOM syntax error must surface");
+        assert!(
+            diagnostics
+                .iter()
+                .all(|d| !d.message.contains("deprecated")),
+            "unparsable content must get syntax diagnostics only: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn snapshot_with_bytes_matches_a_fresh_snapshot() {
+        let path = raw_scratch("snap-parity", "doc.json");
+        std::fs::write(&path, br#"{"a":"payload"}"#).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(snapshot_with_bytes(&path, &bytes), snapshot(&path));
+        drop(std::fs::remove_file(&path));
     }
 
     #[test]
