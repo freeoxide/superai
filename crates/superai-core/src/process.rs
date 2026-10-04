@@ -365,7 +365,7 @@ pub fn run_command(
         cmd = cmd.full_env(compose_child_env(opts));
     }
 
-    cmd = cmd.stdout_capture().stderr_capture();
+    cmd = cmd.stdin_null().stdout_capture().stderr_capture();
 
     let timeout = opts.timeout.unwrap_or(DEFAULT_TIMEOUT);
     let display = display_command(executable, args, opts.redact);
@@ -385,10 +385,18 @@ pub fn run_command(
             let kill_err = handle.kill().err();
             let (wait_note, include_kill_note) = match handle.wait_timeout(REAP_GRACE) {
                 Ok(Some(_)) => (String::new(), true),
-                Ok(None) => (
-                    " (descendant still holds the pipes; abandoned)".to_owned(),
-                    false,
-                ),
+                Ok(None) => {
+                    // NotFound means the child already exited, so the pipe
+                    // holder is a descendant; any other kill failure leaves
+                    // the child itself alive and holding the pipe.
+                    let keep_kill_note = kill_err
+                        .as_ref()
+                        .is_some_and(|e| e.kind() != std::io::ErrorKind::NotFound);
+                    (
+                        " (descendant still holds the pipes; abandoned)".to_owned(),
+                        keep_kill_note,
+                    )
+                }
                 Err(e) => (format!(" (wait failed: {e})"), true),
             };
             let kill_note = match (&kill_err, include_kill_note) {
@@ -681,14 +689,43 @@ mod tests {
         let start = std::time::Instant::now();
         let script = "sleep 5 & echo hi".to_owned();
         let err = run_command("/bin/sh", &["-c".to_owned(), script], &opts).unwrap_err();
+        let text = format!("{err}");
         let elapsed = start.elapsed();
         assert!(
-            format!("{err}").contains("timed out"),
+            text.contains("timed out"),
             "expected a timeout refusal, got: {err}"
+        );
+        assert!(
+            text.contains("abandoned"),
+            "the pipe-hold cause must lead the message, got: {err}"
+        );
+        // The child exits before the kill lands (NotFound), so the doomed
+        // kill must not be blamed ahead of the abandonment note.
+        assert!(
+            !text.contains("kill failed"),
+            "an already-dead child's kill failure is noise, got: {err}"
         );
         assert!(
             elapsed < Duration::from_secs(2),
             "wall time must be bounded near the budget, took {elapsed:?}"
+        );
+    }
+
+    /// Probes never need stdin: a child that would prompt gets EOF instead of
+    /// the parent's terminal.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn run_command_gives_the_child_a_null_stdin() {
+        let opts = ExecuteOpts {
+            timeout: Some(Duration::from_secs(5)),
+            ..Default::default()
+        };
+        let script = "printf 'stdin=%s' \"$(readlink /proc/self/fd/0)\"".to_owned();
+        let out = run_command("/bin/sh", &["-c".to_owned(), script], &opts).unwrap();
+        assert!(
+            out.stdout.contains("stdin=/dev/null"),
+            "the child must observe a null stdin, got: {}",
+            out.stdout
         );
     }
 

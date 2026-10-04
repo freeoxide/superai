@@ -2188,8 +2188,8 @@ mod tests {
         drop(std::fs::remove_file(&path));
     }
 
-    /// '&' and '=' are legal inside a query string; everywhere else they
-    /// stay refused as metachars.
+    // '&' and '=' are legal inside a query string; everywhere else they
+    // stay refused as metachars.
     #[test]
     fn remote_urls_may_carry_query_strings() {
         let id = McpServerId::new("remote-query").unwrap();
@@ -2231,8 +2231,8 @@ mod tests {
         assert!(doubled_amp.is_err(), "doubled '&' in query must be refused");
     }
 
-    /// One invalid foreign entry must not fail the whole inspect: the good
-    /// servers still land in `servers` and the bad one is named in `invalid`.
+    // One invalid foreign entry must not fail the whole inspect: the good
+    // servers still land in `servers` and the bad one is named in `invalid`.
     #[test]
     fn inspect_continues_past_an_invalid_foreign_entry() {
         let dir = crate::test_util::temp_dir_unique("mcp-inspect-bad");
@@ -2701,7 +2701,7 @@ mod tests {
     };
     use crate::instance::Instance;
 
-    /// Writable-JSON-MCP adapter for lifecycle tests.
+    // Writable-JSON-MCP adapter for lifecycle tests.
     #[derive(Debug)]
     struct WritableMcpAdapter {
         read_only: bool,
@@ -2784,7 +2784,7 @@ mod tests {
         }
     }
 
-    /// Adapter with verified MCP absence.
+    // Adapter with verified MCP absence.
     #[derive(Debug)]
     struct NoMcpAdapter;
 

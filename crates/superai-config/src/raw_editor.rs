@@ -1140,7 +1140,7 @@ pub fn create_file_with_injector(
     Ok(CommitReport {
         backup: None,
         new_digest,
-        new_snapshot: snapshot(path),
+        new_snapshot: snapshot_with_bytes(path, &read_back),
         is_noop: false,
     })
 }
@@ -2446,6 +2446,17 @@ mod tests {
         );
         assert_eq!(std::fs::read(&base).unwrap(), br#"{"a":1}"#.to_vec());
         drop(std::fs::remove_file(&base));
+    }
+
+    #[test]
+    fn create_file_jsonc_trailing_comma_draft_refuses_at_staging() {
+        let path = raw_scratch("trailing", "settings.jsonc");
+        let _err = create_file(&path, b"{\"a\":1,\n}").unwrap_err();
+        assert!(
+            !path.exists(),
+            "the staging gate must refuse the draft with nothing written"
+        );
+        drop(std::fs::remove_dir_all(path.parent().unwrap()));
     }
 
     #[test]

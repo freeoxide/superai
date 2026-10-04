@@ -187,15 +187,32 @@ pub(crate) fn run_capturing(binary: &Path, args: &[&str], budget: Duration) -> O
 
 const PIPE_RECLAIM_GRACE: Duration = Duration::from_millis(500);
 
+const MAX_PROBE_OUTPUT_BYTES: u64 = 1024 * 1024;
+
 fn drain_pipe(pipe: Option<impl Read>, buf: &mut Vec<u8>, binary: &Path, side: &str) {
     let Some(mut pipe) = pipe else {
         return;
     };
-    if let Err(err) = pipe.read_to_end(buf) {
+    if let Err(err) = (&mut pipe).take(MAX_PROBE_OUTPUT_BYTES).read_to_end(buf) {
         eprintln!(
             "superai-core: probe of {} lost {side} output: {err}",
             binary.display()
         );
+        return;
+    }
+    let mut scratch = [0u8; 8192];
+    loop {
+        match pipe.read(&mut scratch) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(err) => {
+                eprintln!(
+                    "superai-core: probe of {} lost {side} tail past the cap: {err}",
+                    binary.display()
+                );
+                break;
+            }
+        }
     }
 }
 
@@ -627,6 +644,44 @@ mod decl_tests {
         drop(std::fs::remove_dir_all(&dir));
     }
 
+    /// A probe's captured output is capped and the drain keeps discarding
+    /// past the cap, so a binary streaming far past it is neither buffered
+    /// whole nor left blocked on a full pipe.
+    #[test]
+    #[cfg(unix)]
+    fn run_capturing_caps_captured_output_and_keeps_draining() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_util::temp_dir_unique("probe-flood");
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("flooder");
+        let line = "x".repeat(4096);
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\nprintf 'tool 7.7.7\\n'\nyes '{line}' | head -c 8388608\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let started = std::time::Instant::now();
+        let out = super::run_capturing(&script, &[], std::time::Duration::from_secs(2));
+        let out = out.expect("flooder probe must return its leading output");
+        assert!(
+            out.starts_with("tool 7.7.7"),
+            "leading version line lost: {:?}",
+            out.chars().take(64).collect::<String>()
+        );
+        assert!(
+            out.len() <= 2 * 1024 * 1024,
+            "captured {} bytes, past the per-pipe cap",
+            out.len()
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "capped writer was left blocked: {:?}",
+            started.elapsed()
+        );
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
     /// A probe child sees EOF on stdin, never the parent's terminal: `cat`
     /// blocks on any inherited open stdin until the kill budget, and only a
     /// terminated child prints at all; budget-paying failures do not retry.
@@ -746,11 +801,16 @@ mod decl_tests {
             let id = adapter.id().as_str().to_owned();
             let first = adapter.detection();
             let second = adapter.detection();
-            assert_eq!(first.present, second.present, "{id}");
-            // Version probing runs the real binary under a wall-clock budget,
-            // so under load one call may time out where the other succeeds;
-            // confidence is only pinned when the two probes agree.
+            // A probe under a wall-clock budget can flap under load, flipping
+            // present between Present and UnknownVersion with the version;
+            // absence never depends on a probe and must always agree.
+            assert_eq!(
+                first.present == crate::state::InstallPresence::Absent,
+                second.present == crate::state::InstallPresence::Absent,
+                "{id}"
+            );
             if first.version == second.version {
+                assert_eq!(first.present, second.present, "{id}");
                 assert_eq!(first.confidence, second.confidence, "{id}");
             }
         }
