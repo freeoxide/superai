@@ -758,6 +758,7 @@ mod decl_tests {
         })
     }
 
+    #[cfg(all(test, unix))]
     fn argv_entry_is_our_child(entry: &std::fs::DirEntry, wanted: &[&str], parent: u32) -> bool {
         let Ok(cmd) = std::fs::read_to_string(entry.path().join("cmdline")) else {
             return false;

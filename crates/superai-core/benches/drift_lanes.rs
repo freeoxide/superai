@@ -489,9 +489,19 @@ criterion_group!(
     bench_drift_report,
     bench_drift_report_foreign_files,
     bench_adapter_corpus_build,
+);
+
+#[cfg(unix)]
+criterion_group!(
+    unix_benches,
     bench_detect_package_probes,
     bench_detect_slow_path_hit_with_managers,
     bench_detect_broken_shim_with_slow_manager,
     bench_detect_eight_path_hits,
 );
+
+#[cfg(unix)]
+criterion_main!(benches, unix_benches);
+
+#[cfg(not(unix))]
 criterion_main!(benches);
