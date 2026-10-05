@@ -16,7 +16,7 @@ use crate::atomic::{
 use crate::backup::{BackupEntry, backup_bytes_with_injector, backup_with_injector, verify_backup};
 use crate::document::{DocumentKind, validate_bytes_for_kind};
 use crate::error::{ConfigError, Result};
-use crate::injector::{Injector, Point};
+use crate::injector::{Injector, Point, run as inject};
 use crate::journal::{CrashJournal, JournalBackup, JournalPhase};
 use crate::safe_paths::home_dir;
 use crate::snapshot::{Snapshot, is_modified, snapshot, snapshot_with_bytes};
@@ -1549,6 +1549,7 @@ impl Transaction {
             }
             // One fresh read serves both the recheck token and the backup
             // bytes; both consumers live inside this prepare pass.
+            inject(self.injector.as_deref(), Point::BackupRead)?;
             let read = match std::fs::read(p) {
                 Ok(bytes) => Some(bytes),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -3102,6 +3103,127 @@ mod tests {
             err.to_string().contains("staged bytes mismatch"),
             "unexpected error: {err}"
         );
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    #[derive(Debug)]
+    struct RemoveTargetAtBackupRead {
+        path: PathBuf,
+    }
+
+    impl Injector for RemoveTargetAtBackupRead {
+        fn inject(&self, point: Point) -> Result<()> {
+            if point == Point::BackupRead {
+                std::fs::remove_file(&self.path).map_err(|e| ConfigError::io(&self.path, e))?;
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn prepare_flags_a_target_vanishing_before_the_backup_read_as_concurrent() {
+        let root = tmp_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let a = root.join("a.txt");
+        std::fs::write(&a, b"pre-op").unwrap();
+        let inj = Arc::new(RemoveTargetAtBackupRead { path: a.clone() });
+        let id = OperationId::new("op-backup-vanish").unwrap();
+        let mut txn = Transaction::new(
+            id,
+            vec![FileAction::Write {
+                path: a,
+                content: b"planned".to_vec(),
+                kind: DocumentKind::TextFragment,
+            }],
+        )
+        .with_injector(inj);
+        match txn.prepare() {
+            Err(ConfigError::ConcurrentModification { .. }) => {}
+            other => panic!("expected ConcurrentModification, got {other:?}"),
+        }
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    #[test]
+    fn verify_flags_digest_mismatch_while_still_parsing_the_landed_bytes() {
+        let root = tmp_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let a = root.join("a.json");
+        std::fs::write(&a, br#"{"a":0}"#).unwrap();
+        let id = OperationId::new("op-verify-foreign").unwrap();
+        let mut txn = Transaction::new(
+            id,
+            vec![FileAction::Write {
+                path: a.clone(),
+                content: br#"{"a":1}"#.to_vec(),
+                kind: DocumentKind::StrictJson,
+            }],
+        );
+        txn.prepare().unwrap();
+        txn.commit().unwrap();
+        std::fs::write(&a, br#"{"b":2}"#).unwrap();
+        let outcomes = txn.verify().unwrap();
+        let outcome = &outcomes[0];
+        assert!(
+            !outcome.digest_ok,
+            "foreign bytes must fail the digest check"
+        );
+        assert!(
+            outcome.parse_ok,
+            "a parseable foreign landing must still parse_ok regardless of the digest"
+        );
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    #[cfg(unix)]
+    #[derive(Debug)]
+    struct DenyTargetReadAtBackupRead {
+        path: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl Injector for DenyTargetReadAtBackupRead {
+        fn inject(&self, point: Point) -> Result<()> {
+            if point == Point::BackupRead {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o000))
+                    .map_err(|e| ConfigError::io(&self.path, e))?;
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_surfaces_io_when_the_backup_read_is_denied() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tmp_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let a = root.join("a.txt");
+        std::fs::write(&a, b"pre-op").unwrap();
+        std::fs::set_permissions(&a, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let root_can_still_read = std::fs::read(&a).is_ok();
+        std::fs::set_permissions(&a, std::fs::Permissions::from_mode(0o644)).unwrap();
+        if root_can_still_read {
+            drop(std::fs::remove_dir_all(&root));
+            return;
+        }
+        let inj = Arc::new(DenyTargetReadAtBackupRead { path: a.clone() });
+        let id = OperationId::new("op-backup-denied").unwrap();
+        let mut txn = Transaction::new(
+            id,
+            vec![FileAction::Write {
+                path: a.clone(),
+                content: b"planned".to_vec(),
+                kind: DocumentKind::TextFragment,
+            }],
+        )
+        .with_injector(inj);
+        match txn.prepare() {
+            Err(ConfigError::Io { .. }) => {}
+            other => panic!("expected Io, got {other:?}"),
+        }
+        std::fs::set_permissions(&a, std::fs::Permissions::from_mode(0o644)).unwrap();
         drop(std::fs::remove_dir_all(&root));
     }
 

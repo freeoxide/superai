@@ -115,5 +115,5 @@ exclude_re = [
     '^crates/superai-config/src/transaction\.rs:554:25: replace == with != in commit_staged_file$',
     '^crates/superai-config/src/transaction\.rs:554:83: replace == with != in commit_staged_file$',
     '^crates/superai-config/src/transaction\.rs:722:69: replace \|\| with && in commit_file_expecting_with_roots$',
-    '^crates/superai-config/src/transaction\.rs:2002:70: replace \|\| with && in Transaction::verify$',
+    '^crates/superai-config/src/transaction\.rs:2003:70: replace \|\| with && in Transaction::verify$',
 ]

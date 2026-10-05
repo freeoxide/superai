@@ -280,7 +280,7 @@ struct ConfigInjector<'a>(&'a dyn FailureInjector);
 fn map_config_point(point: superai_config::injector::Point) -> FailurePoint {
     use superai_config::injector::Point as P;
     match point {
-        P::BackupOpen => FailurePoint::BackupOpen,
+        P::BackupRead | P::BackupOpen => FailurePoint::BackupOpen,
         P::BackupWrite | P::JournalPrepareBackup => FailurePoint::BackupWrite,
         P::BackupFlush => FailurePoint::BackupFlush,
         P::BackupVerify => FailurePoint::BackupVerify,
