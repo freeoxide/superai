@@ -70,8 +70,6 @@ pub const OWNED_SELECTORS: &[&str] = &[
 /// Constrained note: the server is separate, one per provider.
 pub const CONSTRAINED_NOTE: &str = "client config isolated via LETTA_LOCAL_BACKEND_DIR; separate server per provider state (LETTA_BASE_URL, LETTA_API_KEY, Ollama/vLLM) is separate server and not per-instance mutated: run one server per provider (different ports/volumes at /root/.letta)";
 
-/// Evidence preview for an env value: KEY/TOKEN names redact entirely, so a
-/// long secret cannot ride the 80-char truncation rule into detection output.
 fn env_preview(var: &str, val: &str) -> String {
     if var.contains("KEY") || var.contains("TOKEN") {
         "[REDACTED]".to_owned()
@@ -286,9 +284,8 @@ impl Adapter for LettaAdapter {
         DetectionResult::new(present, version, evidence, confidence)
     }
 
-    fn version_resolution(&self) -> VersionResolution {
-        let detection = self.detection();
-        if let Some(v) = detection.version {
+    fn version_resolution_from(&self, detection: &DetectionResult) -> VersionResolution {
+        if let Some(v) = detection.version.clone() {
             let mut notes = Vec::new();
             notes.push(format!("detected letta-code version {v}"));
             notes.push(format!("mapped to schema version {SCHEMA_VERSION_STR}"));
@@ -299,7 +296,7 @@ impl Adapter for LettaAdapter {
             res
         } else {
             let mut res = VersionResolution::unknown();
-            res.notes = detection.evidence;
+            res.notes.clone_from(&detection.evidence);
             res
         }
     }
@@ -584,8 +581,6 @@ mod tests {
     #[test]
     fn adapter_identity() {
         let a = adapter();
-        // Constructor wiring plus catalog registration: an id the catalog
-        // does not know can never reconcile with detection or instances.
         assert_eq!(a.id().as_str(), HARNESS_ID_STR);
         assert!(crate::harness_catalog::find_by_id(HARNESS_ID_STR).is_some());
         assert_eq!(a.product_status(), ProductStatus::Active);

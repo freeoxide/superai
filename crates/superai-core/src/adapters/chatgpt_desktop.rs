@@ -73,8 +73,6 @@ impl ChatGptDesktopAdapter {
         Some(home.join(".codex"))
     }
 
-    /// The GUI binary name is unverified, so evidence keys on the shared
-    /// store and must say the files may equally be a codex-cli install.
     #[expect(clippy::excessive_nesting, reason = "evidence branches explicit")]
     fn collect_config_evidence(evidence: &mut Vec<String>) {
         evidence.push(format!(
@@ -176,10 +174,9 @@ impl Adapter for ChatGptDesktopAdapter {
         DetectionResult::new(present, None, evidence, confidence)
     }
 
-    fn version_resolution(&self) -> VersionResolution {
-        let detection = self.detection();
+    fn version_resolution_from(&self, detection: &DetectionResult) -> VersionResolution {
         let mut res = VersionResolution::new(None, Some(SCHEMA_VERSION_STR.to_owned()), false);
-        res.notes = detection.evidence;
+        res.notes.clone_from(&detection.evidence);
         res.notes.push(
             "desktop app versioning is CalVer (e.g. 26.812.10818) with no documented \
              --version probe; writes are codex-cli's business, not this adapter's"
@@ -290,8 +287,6 @@ impl Adapter for ChatGptDesktopAdapter {
         ]
     }
 
-    /// Setting `CODEX_HOME` here would fabricate undocumented GUI relocation;
-    /// the empty env set is what the alias core refuses on (alias codex-cli).
     fn plan_wrapper(&self, instance: &Instance) -> Result<WrapperPlan, CoreError> {
         super::ensure_instance_harness(&self.id, instance)?;
         instance.validate()?;
@@ -414,8 +409,6 @@ mod tests {
     #[test]
     fn adapter_identity() {
         let a = adapter();
-        // Constructor wiring plus catalog registration: an id the catalog
-        // does not know can never reconcile with detection or instances.
         let entry = crate::harness_catalog::find_by_id(HARNESS_ID_STR).unwrap();
         assert_eq!(a.id().as_str(), HARNESS_ID_STR);
         assert_eq!(a.product_status(), entry.product_status);

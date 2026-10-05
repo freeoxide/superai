@@ -159,7 +159,6 @@ pub fn run_token_command(tokens: &CommandTokens, redact: bool) -> Result<Process
     run_structured_command(&tokens.executable, &tokens.args, redact)
 }
 
-/// Stable file-name fragment for a method's receipt file.
 fn method_id(method: &InstallMethodKind) -> &'static str {
     match method {
         InstallMethodKind::Npm => "npm",
@@ -238,7 +237,6 @@ pub fn receipts_root(home: &Path) -> PathBuf {
     home.join(".superai").join("install_receipts")
 }
 
-/// Receipt file for a `(harness, method)` pair.
 fn receipt_path(home: &Path, harness: &str, method: &InstallMethodKind) -> PathBuf {
     receipts_root(home).join(format!("{harness}-{}.json", method_id(method)))
 }
@@ -263,8 +261,6 @@ pub fn persist_receipt(
         field: "receipt".to_owned(),
         reason: format!("serialize receipt failed: {e}"),
     })?;
-    // Receipts persist through the config crate's ONE mutation boundary; the
-    // pretty-JSON payload gets staged parse-validation before it lands.
     superai_config::transaction::commit_file(
         "persist-receipt",
         &path,
@@ -363,8 +359,6 @@ pub fn find_receipt(
     Ok(None)
 }
 
-/// Package-manager executable for a method; one map shared by the update
-/// and uninstall previews.
 fn executable_for_method(method: &InstallMethodKind) -> &'static str {
     match method {
         InstallMethodKind::Npm => "npm",
@@ -377,8 +371,6 @@ fn executable_for_method(method: &InstallMethodKind) -> &'static str {
     }
 }
 
-/// Package-manager argv for the newest available version; `package` is a
-/// name or `name@version` spec. Shared by the update preview and probes.
 pub(crate) fn availability_argv(
     method: &InstallMethodKind,
     package: &str,
@@ -423,7 +415,6 @@ pub(crate) fn availability_argv(
     }
 }
 
-/// One channel list shared with the install-plan channel check.
 pub(crate) fn is_channel(value: &str) -> bool {
     const CHANNELS: &[&str] = &[
         "latest", "stable", "beta", "nightly", "next", "canary", "lts",
@@ -431,8 +422,6 @@ pub(crate) fn is_channel(value: &str) -> bool {
     CHANNELS.contains(&value)
 }
 
-/// Whether a version satisfies a requested range/channel: channels always
-/// satisfy; otherwise `semver` `VersionReq` against the detected version.
 fn version_satisfies(requested: &str, detected: &str) -> bool {
     if is_channel(requested.trim()) {
         return true;
@@ -453,12 +442,10 @@ fn version_satisfies(requested: &str, detected: &str) -> bool {
         .to_owned();
     let det_token_clean = det_token.strip_prefix('v').unwrap_or(&det_token).trim();
 
-    // Try VersionReq first (handles `>=1.0.0`, `^1.2.3`, `~1.2`, `*`)
     if let Ok(req) = semver::VersionReq::parse(req_clean) {
         if let Ok(ver) = semver::Version::parse(det_token_clean) {
             return req.matches(&ver);
         }
-        // If detected is not strict semver, try prefix match for partial versions
         if det_token_clean.starts_with(req_clean) {
             return true;
         }
@@ -470,18 +457,14 @@ fn version_satisfies(requested: &str, detected: &str) -> bool {
         }
         return req_clean == det_token_clean;
     }
-    // Fallback: prefix equality handles `1.2` vs `1.2.3`
     if det_token_clean.starts_with(req_clean) {
         return true;
     }
     req_clean == det_token_clean
 }
 
-/// Run a non-mutating smoke probe (`--help` / `--version`) against `path`;
-/// succeeds only when the binary runs and produces help/version-like output.
 fn smoke_probe(path: &Path) -> Result<(), CoreError> {
     let exe_str = path.to_string_lossy().into_owned();
-    // Ordered by likelihood; the first set that yields help/version text wins.
     let sets: Vec<Vec<String>> = vec![
         vec!["--help".to_owned()],
         vec!["--version".to_owned()],
@@ -521,7 +504,6 @@ fn smoke_probe(path: &Path) -> Result<(), CoreError> {
                 });
             }
             Err(e) => {
-                // A spawn failure means the binary cannot run at all.
                 return Err(CoreError::Verification {
                     path: path.to_path_buf(),
                     kind: "smoke_probe".to_owned(),
@@ -537,8 +519,6 @@ fn smoke_probe(path: &Path) -> Result<(), CoreError> {
     }))
 }
 
-/// Select the best post-install detection: non-broken, non-shadowed `Path`
-/// rank 0 first, then any non-broken hit by confidence.
 fn select_best_detection(detections: &[Detection]) -> Option<&Detection> {
     if let Some(d) = detections
         .iter()
@@ -547,7 +527,6 @@ fn select_best_detection(detections: &[Detection]) -> Option<&Detection> {
         return Some(d);
     }
     let mut candidates: Vec<&Detection> = detections.iter().filter(|d| !d.broken_shim).collect();
-    // Highest confidence first (High > Medium > Low), then lowest path rank.
     candidates.sort_by(|a, b| {
         let rank = |c: &Detection| match c.confidence {
             crate::detect::DetectionConfidence::High => 0,
@@ -617,8 +596,6 @@ pub fn verify_install(
         return Ok(None);
     }
 
-    // With any pre-existing non-broken detection, claim only when a requested
-    // version is satisfied by a detected version the pre state did not have.
     let has_pre = pre_detections.iter().any(|d| !d.broken_shim);
     if has_pre {
         if let Some(req) = requested_version {
@@ -658,7 +635,6 @@ pub fn verify_install(
                 return Ok(None);
             }
         } else {
-            // No requested version and pre-existed: ambiguous, do not claim.
             return Ok(None);
         }
     }
@@ -726,7 +702,6 @@ pub fn execute_and_verify(
         field: "harness".to_owned(),
         reason: format!("invalid harness in plan: {e}"),
     })?;
-    // PKG-10: no safe non-interactive command exists for this method.
     if let Some(external) = &plan.external_install {
         return Err(CoreError::ExternalInstallRequired {
             harness: plan.harness.clone(),
@@ -740,8 +715,6 @@ pub fn execute_and_verify(
     })?;
     let pre = detect_all_for_entry(entry, detect_opts);
 
-    // PKG-07 existing-install skip: a non-broken pre-install detection whose
-    // version satisfies the request means the binary matches; decline to re-run.
     let requested = plan.version.as_deref().or(plan.channel.as_deref());
     if let Some(best_pre) = select_best_detection(&pre) {
         let already_satisfies = match (requested, best_pre.version.as_deref()) {
@@ -844,8 +817,6 @@ impl UpdatePlan {
     }
 }
 
-/// Heuristic adapter compatibility: same major, or current unknown and new
-/// >=1.0.0; real adapters may be tighter (PKG-07 blocking signal).
 #[expect(clippy::redundant_closure, reason = "String vs &str coercion")]
 fn update_compat_for_versions(current: Option<&str>, available: &str) -> (bool, bool, String) {
     let cur_ver = current
@@ -893,8 +864,6 @@ fn update_compat_for_versions(current: Option<&str>, available: &str) -> (bool, 
     }
 }
 
-/// Fetch the available version: the manager's query command, bounded; `None`
-/// when missing or failed. `injected_available` overrides (tests).
 fn fetch_available_version(
     entry: &crate::install_catalog::InstallCatalogEntry,
     method: &InstallMethodKind,
@@ -1134,7 +1103,6 @@ pub trait UpdateCommandRunner {
     ) -> Result<ProcessOutput, CoreError>;
 }
 
-/// Production runner: the real bounded subprocess via [`run_command`].
 struct SystemUpdateRunner;
 
 impl UpdateCommandRunner for SystemUpdateRunner {
@@ -1232,41 +1200,37 @@ pub fn execute_update_with_runner(
     let catalog = InstallCatalog::embedded()?;
     if let Some(entry) = catalog.get(&harness_id) {
         let post = detect_all_for_entry(entry, detect_opts);
-        if let Some(best) = select_best_detection(&post) {
-            // PKG-07 strict post-update validation: when the available version
-            // was resolved, the detected version must satisfy it.
-            if let Some(expected) = plan.available_version.as_deref() {
-                match best.version.as_deref() {
-                    Some(detected) => {
-                        let det_clean =
-                            extract_version(detected).unwrap_or_else(|| detected.to_owned());
-                        if det_clean.is_empty() {
-                            return Err(CoreError::Verification {
-                                path: best.path.clone(),
-                                kind: "version".to_owned(),
-                                reason: format!("post-update version empty (expected {expected})"),
-                            });
-                        }
-                        if !version_satisfies(expected, &det_clean) {
-                            return Err(CoreError::Verification {
-                                path: best.path.clone(),
-                                kind: "version".to_owned(),
-                                reason: format!(
-                                    "post-update version `{det_clean}` does not satisfy \
-                                     expected available `{expected}`"
-                                ),
-                            });
-                        }
+        if let Some(best) = select_best_detection(&post)
+            && let Some(expected) = plan.available_version.as_deref()
+        {
+            match best.version.as_deref() {
+                Some(detected) => {
+                    let det_clean =
+                        extract_version(detected).unwrap_or_else(|| detected.to_owned());
+                    if det_clean.is_empty() {
+                        return Err(CoreError::Verification {
+                            path: best.path.clone(),
+                            kind: "version".to_owned(),
+                            reason: format!("post-update version empty (expected {expected})"),
+                        });
                     }
-                    None => {
+                    if !version_satisfies(expected, &det_clean) {
                         return Err(CoreError::Verification {
                             path: best.path.clone(),
                             kind: "version".to_owned(),
                             reason: format!(
-                                "post-update version probe failed (expected {expected})"
+                                "post-update version `{det_clean}` does not satisfy \
+                                 expected available `{expected}`"
                             ),
                         });
                     }
+                }
+                None => {
+                    return Err(CoreError::Verification {
+                        path: best.path.clone(),
+                        kind: "version".to_owned(),
+                        reason: format!("post-update version probe failed (expected {expected})"),
+                    });
                 }
             }
         }
@@ -1369,8 +1333,6 @@ pub struct UninstallPlan {
     pub docs: String,
 }
 
-/// Build the list of paths that uninstall must preserve (PKG-08): config,
-/// instances, wrappers, backups, templates, assets are never deleted.
 fn preserved_paths_for(registry: Option<&Registry>, harness: &HarnessId) -> Vec<PathBuf> {
     let mut out = Vec::new();
     if let Some(reg) = registry {
@@ -1460,8 +1422,6 @@ pub fn plan_uninstall(
 
     let shared = detections.len() > 1 || referencing_instances.len() > 1;
 
-    // A persisted receipt for this (harness, method) proves superai performed
-    // the install.
     let receipt = find_receipt(home, harness, Some(&method))?;
     let receipt_owned = receipt.is_some();
 
@@ -1483,8 +1443,6 @@ pub fn plan_uninstall(
             && !best.path.to_string_lossy().contains("/.local/bin")))
         && !receipt_owned;
 
-    // Auto-delete requires proven ownership (package manager or receipt) and
-    // not a foreign manual file.
     let can_auto_delete = (is_managed_source || receipt_owned) && !foreign;
 
     let preserved = preserved_paths_for(registry, harness);
@@ -2285,7 +2243,6 @@ mod tests {
         let cfg_file = config_root.join("settings.json");
         fs::write(&cfg_file, r#"{"model":"test"}"#).unwrap();
 
-        // Build a registry with an instance pointing at that config root
         let reg_path = tmp.join("registry.json");
         let instance_json = serde_json::json!([{
             "id": "test-id-1",
@@ -2347,7 +2304,6 @@ mod tests {
         echo_plan.blocked_reason = None;
         let out = execute_uninstall(&echo_plan, true, false).unwrap();
         assert!(out.success);
-        // Verify config file still exists (uninstall preserves config)
         assert!(
             cfg_file.exists(),
             "config must be preserved after uninstall"

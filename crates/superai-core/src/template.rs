@@ -966,7 +966,7 @@ impl Template {
 
 /// True when `full` equals `prefix` plus one or more dot-separated levels
 /// under it (allocation-free `starts_with(prefix + ".")`).
-fn extends_by_dot(prefix: &str, full: &str) -> bool {
+pub(crate) fn extends_by_dot(prefix: &str, full: &str) -> bool {
     full.len() > prefix.len()
         && full.starts_with(prefix)
         && full.as_bytes().get(prefix.len()) == Some(&b'.')
@@ -982,18 +982,25 @@ impl Template {
     pub fn validate_against_adapter(&self, adapter: &dyn Adapter) -> Result<()> {
         let surfaces = adapter.config_surfaces();
         let mut owned: HashSet<String> = HashSet::new();
-        for surface in &surfaces {
-            for sel in &surface.owned_selectors {
-                owned.insert(sel.clone());
+        let mut owned_plain_keys: HashSet<String> = HashSet::new();
+        let mut admit = |entry: &str| {
+            owned.insert(entry.to_owned());
+            if let Ok(parsed) = superai_config::document::Selector::parse(entry) {
                 // Also insert the typed-string form so both `model` and
                 // `key:model` are recognised.
-                if let Ok(parsed) = superai_config::document::Selector::parse(sel) {
-                    owned.insert(parsed.to_typed_string());
+                owned.insert(parsed.to_typed_string());
+                if let superai_config::document::Selector::Key(k) = &parsed {
+                    owned_plain_keys.insert(k.clone());
                 }
+            }
+        };
+        for surface in &surfaces {
+            for sel in &surface.owned_selectors {
+                admit(sel);
             }
         }
         for (op, _support) in adapter.supported_operations() {
-            owned.insert(op);
+            admit(&op);
         }
 
         for patch in &self.patches {
@@ -1001,7 +1008,8 @@ impl Template {
             if owned.contains(selector) {
                 continue;
             }
-            let canonical = match superai_config::document::Selector::parse(selector) {
+            let parsed = superai_config::document::Selector::parse(selector);
+            let canonical = match &parsed {
                 Ok(s) => s.to_typed_string(),
                 Err(_) => selector.to_owned(),
             };
@@ -1009,26 +1017,19 @@ impl Template {
                 continue;
             }
             let mut matched = false;
-            if let Ok(superai_config::document::Selector::Key(k)) =
-                superai_config::document::Selector::parse(selector)
-            {
-                if owned.contains(&k) {
+            if let Ok(superai_config::document::Selector::Key(k)) = &parsed {
+                if owned.contains(k) {
                     matched = true;
                 }
-                if !matched {
-                    for o in &owned {
-                        if extends_by_dot(o, &k) || extends_by_dot(&k, o) {
-                            matched = true;
-                            break;
-                        }
-                        if let Ok(superai_config::document::Selector::Key(ok)) =
-                            superai_config::document::Selector::parse(o)
-                            && ok == k
-                        {
-                            matched = true;
-                            break;
-                        }
-                    }
+                if !matched
+                    && owned
+                        .iter()
+                        .any(|o| extends_by_dot(o, k) || extends_by_dot(k, o))
+                {
+                    matched = true;
+                }
+                if !matched && owned_plain_keys.contains(k) {
+                    matched = true;
                 }
             }
             if matched {
@@ -1219,19 +1220,36 @@ pub fn check_update(instance: &Instance, repo: &TemplateRepoConfig) -> UpdateSta
                 Err(reason) => UpdateStatus::Incompatible { reason },
             }
         }
-        Err(e) => {
-            let msg = format!("{e}");
-            if msg.contains("not found") || msg.contains("NotFound") {
-                UpdateStatus::CurrentMissing
-            } else if msg.contains("digest") || msg.contains("DigestMismatch") {
-                UpdateStatus::Incompatible {
-                    reason: format!("latest template digest mismatch: {msg}"),
-                }
-            } else {
-                UpdateStatus::Incompatible {
-                    reason: format!("cannot fetch latest template `{latest_str}`: {msg}"),
-                }
-            }
+        Err(e) => match classify_template_fetch_error(&e) {
+            FetchErrorClass::Missing => UpdateStatus::CurrentMissing,
+            FetchErrorClass::DigestMismatch => UpdateStatus::Incompatible {
+                reason: format!("latest template digest mismatch: {e}"),
+            },
+            FetchErrorClass::Offline => UpdateStatus::Offline,
+            FetchErrorClass::Other => UpdateStatus::Incompatible {
+                reason: format!("cannot fetch latest template `{latest_str}`: {e}"),
+            },
+        },
+    }
+}
+
+enum FetchErrorClass {
+    Missing,
+    DigestMismatch,
+    Offline,
+    Other,
+}
+
+fn classify_template_fetch_error(e: &crate::template_fetch::TemplateFetchError) -> FetchErrorClass {
+    use crate::template_fetch::TemplateFetchError as E;
+    match e {
+        E::NotFound { .. } => FetchErrorClass::Missing,
+        E::DigestMismatch { .. } => FetchErrorClass::DigestMismatch,
+        E::Network { .. } | E::RateLimited { .. } | E::RedirectLimit { .. } => {
+            FetchErrorClass::Offline
+        }
+        E::SchemaInvalid { .. } | E::InvalidUrl { .. } | E::SizeLimit { .. } => {
+            FetchErrorClass::Other
         }
     }
 }
@@ -2683,5 +2701,64 @@ mod tests {
             diff.harness_version_req_changed,
             Some((Some(">=1.0.0".to_owned()), Some(">=2.0.0".to_owned())))
         );
+    }
+    #[test]
+    fn template_fetch_errors_classify_by_variant_not_text() {
+        use crate::template_fetch::TemplateFetchError as E;
+        assert!(matches!(
+            classify_template_fetch_error(&E::NotFound {
+                template: "t".to_owned(),
+                reason: "gone".to_owned()
+            }),
+            FetchErrorClass::Missing
+        ));
+        assert!(matches!(
+            classify_template_fetch_error(&E::DigestMismatch {
+                template: "t".to_owned(),
+                expected: "a".to_owned(),
+                actual: "b".to_owned()
+            }),
+            FetchErrorClass::DigestMismatch
+        ));
+        let transient = [
+            E::Network {
+                template: "t".to_owned(),
+                reason: "dns lookup said not found".to_owned(),
+            },
+            E::RateLimited {
+                template: "t".to_owned(),
+                reason: "429".to_owned(),
+            },
+            E::RedirectLimit {
+                template: "t".to_owned(),
+                reason: "loop".to_owned(),
+            },
+        ];
+        for err in &transient {
+            assert!(
+                matches!(classify_template_fetch_error(err), FetchErrorClass::Offline),
+                "a transient fetch failure must be Offline, not a compatibility verdict (got {err:?})"
+            );
+        }
+        let template_verdicts = [
+            E::SchemaInvalid {
+                template: "t".to_owned(),
+                reason: "bad".to_owned(),
+            },
+            E::InvalidUrl {
+                template: "t".to_owned(),
+                reason: "http".to_owned(),
+            },
+            E::SizeLimit {
+                template: "t".to_owned(),
+                reason: "big".to_owned(),
+            },
+        ];
+        for err in &template_verdicts {
+            assert!(
+                matches!(classify_template_fetch_error(err), FetchErrorClass::Other),
+                "a deterministic template/repo defect carries Incompatible-with-reason (got {err:?})"
+            );
+        }
     }
 }

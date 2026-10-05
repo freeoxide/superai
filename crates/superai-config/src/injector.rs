@@ -5,6 +5,8 @@
 /// failure tests plus the §4.2 recheck, fired just before the step it names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Point {
+    /// The target is about to be re-read fresh for its recheck token and backup bytes.
+    BackupRead,
     /// The target is opened/read for backup; any bytes are still untouched.
     BackupOpen,
     /// The backup copy is about to be written.
@@ -52,6 +54,7 @@ pub enum Point {
 impl std::fmt::Display for Point {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
+            Self::BackupRead => "backup_read",
             Self::BackupOpen => "backup_open",
             Self::BackupWrite => "backup_write",
             Self::BackupFlush => "backup_flush",

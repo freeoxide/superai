@@ -16,7 +16,7 @@ use crate::adapter::{Adapter, ConfigSurface, DocumentKind};
 use crate::error::{CoreError, Result};
 use crate::ids::ProviderId;
 use crate::instance::Instance;
-use crate::provider::{ApiKeySink, Protocol, ProviderDefinition, resolve_api_key_sink};
+use crate::provider::{ApiKeySink, Protocol, ProviderDefinition};
 use crate::template::Template;
 
 /// A successful render: typed engine operations against one surface, plus
@@ -180,12 +180,28 @@ fn auth_env_var(provider: &ProviderDefinition, warnings: &mut Vec<String>) -> St
 
 /// Render a provider into typed adapter mutations (PRV-03): pure, nothing
 /// is written; auth appears as a sink/variable name only, never a secret.
-#[expect(clippy::too_many_lines, reason = "strategy table is deliberate")]
 pub fn render_provider_into_adapter(
     provider: &ProviderDefinition,
     template: Option<&Template>,
     adapter: &dyn Adapter,
     instance: &Instance,
+) -> RenderOutcome {
+    render_provider_with_surfaces(
+        provider,
+        template,
+        adapter,
+        instance,
+        &adapter.config_surfaces(),
+    )
+}
+
+#[expect(clippy::too_many_lines, reason = "strategy table is deliberate")]
+fn render_provider_with_surfaces(
+    provider: &ProviderDefinition,
+    template: Option<&Template>,
+    adapter: &dyn Adapter,
+    instance: &Instance,
+    surfaces: &[ConfigSurface],
 ) -> RenderOutcome {
     let mut warnings: Vec<String> = Vec::new();
     if !instance.harness.eq_case_fold(&adapter.id()) {
@@ -204,7 +220,6 @@ pub fn render_provider_into_adapter(
     }
     // Render to the FIRST writable surface in declaration order; per-profile
     // override layers are user-created and must not be hijacked.
-    let surfaces = adapter.config_surfaces();
     let Some((surface, strategy)) = surfaces
         .iter()
         .find_map(|surface| strategy_for(surface).map(|strategy| (surface, strategy)))
@@ -397,7 +412,7 @@ pub fn render_provider_into_adapter(
         }
     }
 
-    let auth_sink = resolve_api_key_sink(adapter).ok();
+    let auth_sink = crate::provider::resolve_api_key_sink_in(surfaces, &adapter.id()).ok();
     if auth_sink.is_none() {
         warnings.push(format!(
             "harness `{}` declares no config/env key sink; auth placement may require external login",
@@ -522,8 +537,34 @@ fn load_surface_value(path: &std::path::Path, kind: DocumentKind) -> Result<Opti
                 })?,
             )
         }
-        DocumentKind::Jsonc => serde_json::from_slice::<Value>(&bytes).ok(),
-        DocumentKind::Yaml => yaml_serde::from_slice::<Value>(&bytes).ok(),
+        DocumentKind::Jsonc => {
+            let text = std::str::from_utf8(&bytes).map_err(|e| CoreError::Parse {
+                path: path.to_path_buf(),
+                kind: "jsonc".to_owned(),
+                message: format!("invalid utf-8: {e}"),
+            })?;
+            let stripped = superai_config::jsonc::strip_jsonc(text);
+            if stripped.trim().is_empty() {
+                None
+            } else {
+                Some(
+                    serde_json::from_str::<Value>(&stripped).map_err(|e| CoreError::Parse {
+                        path: path.to_path_buf(),
+                        kind: "jsonc".to_owned(),
+                        message: e.to_string(),
+                    })?,
+                )
+            }
+        }
+        DocumentKind::Yaml => {
+            Some(
+                yaml_serde::from_slice::<Value>(&bytes).map_err(|e| CoreError::Parse {
+                    path: path.to_path_buf(),
+                    kind: "yaml".to_owned(),
+                    message: e.to_string(),
+                })?,
+            )
+        }
         DocumentKind::Toml => {
             let text = String::from_utf8_lossy(&bytes);
             let doc = text
@@ -533,7 +574,7 @@ fn load_surface_value(path: &std::path::Path, kind: DocumentKind) -> Result<Opti
                     kind: "toml".to_owned(),
                     message: e.to_string(),
                 })?;
-            Some(crate::toml_convert::document_to_value(&doc))
+            Some(crate::toml_convert::document_into_value(doc))
         }
         _ => None,
     };
@@ -563,9 +604,9 @@ pub fn inspect_effective_provider(
     let mut unknown_fields: Vec<String> = Vec::new();
     let mut winning_precedence: Option<u8> = None;
 
-    let mut surfaces: Vec<ConfigSurface> = adapter
-        .config_surfaces()
-        .into_iter()
+    let all_surfaces = adapter.config_surfaces();
+    let mut surfaces: Vec<&ConfigSurface> = all_surfaces
+        .iter()
         .filter(|s| {
             writable_surface_kinds(s.kind)
                 && !matches!(
@@ -690,7 +731,7 @@ pub fn inspect_effective_provider(
                 if surface
                     .owned_selectors
                     .iter()
-                    .any(|s| s.eq_ignore_ascii_case(key) || s.starts_with(&format!("{key}.")))
+                    .any(|s| s.eq_ignore_ascii_case(key) || crate::template::extends_by_dot(key, s))
                 {
                     continue;
                 }
@@ -720,7 +761,13 @@ pub fn inspect_effective_provider(
                 .find(|p| Some(p.id.to_string()) == found.id);
             match matched {
                 Some(provider) => {
-                    let outcome = render_provider_into_adapter(provider, None, adapter, instance);
+                    let outcome = render_provider_with_surfaces(
+                        provider,
+                        None,
+                        adapter,
+                        instance,
+                        &all_surfaces,
+                    );
                     match outcome {
                         RenderOutcome::Supported(_) => CompatVerdict::Compatible,
                         RenderOutcome::Unsupported(reason) => CompatVerdict::Incompatible {
@@ -806,13 +853,15 @@ pub struct ProviderChangeOutcome {
 }
 
 /// The surface a change targets, resolved from the render strategy.
-fn target_surface(adapter: &dyn Adapter) -> Result<(ConfigSurface, RenderStrategy)> {
-    adapter
-        .config_surfaces()
-        .into_iter()
-        .find_map(|surface| strategy_for(&surface).map(|strategy| (surface, strategy)))
+fn target_surface(
+    surfaces: &[ConfigSurface],
+    harness: &str,
+) -> Result<(ConfigSurface, RenderStrategy)> {
+    surfaces
+        .iter()
+        .find_map(|surface| strategy_for(surface).map(|strategy| (surface.clone(), strategy)))
         .ok_or_else(|| CoreError::UnsupportedOperation {
-            harness: adapter.id().to_string(),
+            harness: harness.to_owned(),
             operation: "provider_lifecycle".to_owned(),
             reason: "harness declares no writable provider-owned selectors (managed backend)"
                 .to_owned(),
@@ -867,6 +916,7 @@ fn plan_change(
     instance: &Instance,
     adapter: &dyn Adapter,
     change: &ProviderChange<'_>,
+    surfaces: &[ConfigSurface],
 ) -> Result<(
     Vec<EngineOperation>,
     Vec<String>,
@@ -874,7 +924,7 @@ fn plan_change(
     DocumentKind,
     ConfigSurface,
 )> {
-    let (surface, strategy) = target_surface(adapter)?;
+    let (surface, strategy) = target_surface(surfaces, &adapter.id())?;
     let owned_keys = surface.owned_selectors.clone();
     let owned = |needle: &str| {
         surface
@@ -912,7 +962,8 @@ fn plan_change(
 
     match change {
         ProviderChange::AddOrUpdate { provider } => {
-            let outcome = render_provider_into_adapter(provider, None, adapter, instance);
+            let outcome =
+                render_provider_with_surfaces(provider, None, adapter, instance, surfaces);
             match outcome {
                 RenderOutcome::Supported(render) => {
                     if render.surface_id != surface.id {
@@ -1112,11 +1163,12 @@ pub fn preview_provider_change(
     adapter: &dyn Adapter,
     change: &ProviderChange<'_>,
 ) -> ProviderChangePreview {
-    let surface_id = target_surface(adapter).map(|(s, _)| s.id);
+    let surfaces = adapter.config_surfaces();
+    let surface_id = target_surface(&surfaces, &adapter.id()).map(|(s, _)| s.id);
     match surface_id {
         Ok(surface_id) => {
             let path = instance.config_root.as_path().join(&surface_id);
-            match plan_change(instance, adapter, change) {
+            match plan_change(instance, adapter, change, &surfaces) {
                 Ok((_, edits, warnings, _, _)) => ProviderChangePreview {
                     surface_id,
                     path,
@@ -1195,7 +1247,6 @@ fn ensure_table<'t>(
 
 /// Apply engine Set/Remove operations to a TOML document in place,
 /// preserving decor of untouched keys.
-#[expect(clippy::excessive_nesting, reason = "set/remove navigation branches")]
 fn apply_ops_to_toml(doc: &mut toml_edit::DocumentMut, ops: &[EngineOperation]) -> Result<()> {
     for op in ops {
         match &op.kind {
@@ -1211,14 +1262,21 @@ fn apply_ops_to_toml(doc: &mut toml_edit::DocumentMut, ops: &[EngineOperation]) 
                 let Some((last, parents)) = segments.split_last() else {
                     continue;
                 };
-                if let Some(table) = ensure_table(doc.as_table_mut(), parents) {
-                    if table.get(last).is_some() {
-                        // Index assignment keeps the existing key's decor
-                        // (comments, spacing); `insert` would drop it.
-                        table[last] = crate::toml_convert::json_value_to_toml_lenient(value);
-                    } else {
-                        table.insert(last, crate::toml_convert::json_value_to_toml_lenient(value));
-                    }
+                let Some(table) = ensure_table(doc.as_table_mut(), parents) else {
+                    return Err(CoreError::UnsupportedOperation {
+                        harness: "toml".to_owned(),
+                        operation: "provider_render".to_owned(),
+                        reason: format!(
+                            "dotted key `{key}` crosses a non-table value; refusing the write"
+                        ),
+                    });
+                };
+                if table.get(last).is_some() {
+                    // Index assignment keeps the existing key's decor
+                    // (comments, spacing); `insert` would drop it.
+                    table[last] = crate::toml_convert::json_value_to_toml_lenient(value);
+                } else {
+                    table.insert(last, crate::toml_convert::json_value_to_toml_lenient(value));
                 }
             }
             EditOperation::Remove { selector } => {
@@ -1229,9 +1287,16 @@ fn apply_ops_to_toml(doc: &mut toml_edit::DocumentMut, ops: &[EngineOperation]) 
                 let Some((last, parents)) = segments.split_last() else {
                     continue;
                 };
-                if let Some(table) = ensure_table(doc.as_table_mut(), parents) {
-                    table.remove(last);
-                }
+                let Some(table) = ensure_table(doc.as_table_mut(), parents) else {
+                    return Err(CoreError::UnsupportedOperation {
+                        harness: "toml".to_owned(),
+                        operation: "provider_render".to_owned(),
+                        reason: format!(
+                            "dotted key `{key}` crosses a non-table value; refusing the removal"
+                        ),
+                    });
+                };
+                table.remove(last);
             }
             _ => {
                 return Err(CoreError::UnsupportedOperation {
@@ -1255,7 +1320,8 @@ pub fn commit_provider_change(
     change: &ProviderChange<'_>,
     options: &ProviderChangeOptions,
 ) -> Result<ProviderChangeOutcome> {
-    let (ops, edits, warnings, kind, surface) = plan_change(instance, adapter, change)?;
+    let (ops, edits, warnings, kind, surface) =
+        plan_change(instance, adapter, change, &adapter.config_surfaces())?;
     if ops.is_empty() {
         return Err(CoreError::Validation {
             field: "provider_change".to_owned(),
@@ -1315,11 +1381,29 @@ pub fn commit_provider_change(
                         }
                     }
                 }
-                _ => yaml_serde::from_slice::<Value>(existing.as_deref().unwrap_or_default())
-                    .unwrap_or(Value::Object(serde_json::Map::new())),
+                _ => {
+                    let bytes = existing.as_deref().unwrap_or_default();
+                    if bytes.is_empty() || bytes.iter().all(u8::is_ascii_whitespace) {
+                        Value::Object(serde_json::Map::new())
+                    } else {
+                        yaml_serde::from_slice::<Value>(bytes).map_err(|e| CoreError::Parse {
+                            path: path.clone(),
+                            kind: "yaml".to_owned(),
+                            message: e.to_string(),
+                        })?
+                    }
+                }
             };
             if !value.is_object() {
-                value = Value::Object(serde_json::Map::new());
+                return Err(CoreError::Parse {
+                    path: path.clone(),
+                    kind: match kind {
+                        DocumentKind::Yaml => "yaml".to_owned(),
+                        DocumentKind::Jsonc => "jsonc".to_owned(),
+                        _ => "json".to_owned(),
+                    },
+                    message: "document root is not an object; refusing the rewrite".to_owned(),
+                });
             }
             for op in &ops {
                 superai_config::executor::apply_to_value(&path, &mut value, op)
@@ -1908,6 +1992,319 @@ mod tests {
             std::fs::read_to_string(&config).unwrap(),
             "model = \"old-model\"\n",
             "preview must not write"
+        );
+        drop(std::fs::remove_dir_all(&dir));
+    }
+    #[test]
+    fn apply_ops_to_toml_refuses_ops_through_scalar_parents() {
+        let mut doc = "a = 1\n".parse::<toml_edit::DocumentMut>().unwrap();
+        let ops = vec![set_op("a.b", Value::Bool(true), Vec::new())];
+        let err = apply_ops_to_toml(&mut doc, &ops).unwrap_err();
+        assert!(
+            err.to_string().contains("crosses a non-table value"),
+            "got: {err}"
+        );
+        assert_eq!(doc.to_string(), "a = 1\n");
+
+        let mut doc = "a = 1\n".parse::<toml_edit::DocumentMut>().unwrap();
+        let ops = vec![remove_op("a.b", Vec::new())];
+        let err = apply_ops_to_toml(&mut doc, &ops).unwrap_err();
+        assert!(
+            err.to_string().contains("crosses a non-table value"),
+            "got: {err}"
+        );
+        assert_eq!(doc.to_string(), "a = 1\n");
+    }
+
+    #[test]
+    fn commit_refuses_unparseable_yaml_instead_of_resetting() {
+        let dir = tmp_dir("yaml-unparseable");
+        let adapter = crate::adapters::continue_dev::ContinueDevAdapter::new().unwrap();
+        let instance = instance_in(&dir, "continue", "yaml-bad");
+        let config = instance.config_root.as_path().join("config.yaml");
+        let original = b"{ [ this is not yaml";
+        std::fs::write(&config, original).unwrap();
+        let provider = universal_provider("yaml-bad-prov");
+        let err = commit_provider_change(
+            &instance,
+            &adapter,
+            &ProviderChange::AddOrUpdate {
+                provider: &provider,
+            },
+            &ProviderChangeOptions::default(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("yaml"), "got: {err}");
+        assert_eq!(std::fs::read(&config).unwrap(), original.to_vec());
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn commit_refuses_yaml_sequence_root_instead_of_resetting() {
+        let dir = tmp_dir("yaml-sequence");
+        let adapter = crate::adapters::continue_dev::ContinueDevAdapter::new().unwrap();
+        let instance = instance_in(&dir, "continue", "yaml-seq");
+        let config = instance.config_root.as_path().join("config.yaml");
+        let original = b"- a\n- b\n";
+        std::fs::write(&config, original).unwrap();
+        let provider = universal_provider("yaml-seq-prov");
+        let err = commit_provider_change(
+            &instance,
+            &adapter,
+            &ProviderChange::AddOrUpdate {
+                provider: &provider,
+            },
+            &ProviderChangeOptions::default(),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("root is not an object"),
+            "got: {err}"
+        );
+        assert_eq!(std::fs::read(&config).unwrap(), original.to_vec());
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn inspect_reads_jsonc_comments_and_refuses_broken_jsonc() {
+        let dir = tmp_dir("jsonc-inspect");
+        let adapter = crate::adapters::claude_code::ClaudeCodeAdapter::new().unwrap();
+        let instance = instance_in(&dir, "claude-code", "jsonc-inspect");
+        let settings = instance.config_root.as_path().join("settings.json");
+        std::fs::write(
+            &settings,
+            b"{\n  // user comment\n  \"env\": {\"ANTHROPIC_BASE_URL\": \"https://api.anthropic.com\"}\n}\n",
+        )
+        .unwrap();
+        let providers = crate::provider::bundled_providers().unwrap();
+        let report = inspect_effective_provider(&instance, &adapter, providers).unwrap();
+        let detected = report
+            .detected_provider
+            .expect("endpoint visible through comments");
+        assert!(detected.endpoint.contains("anthropic"));
+
+        std::fs::write(&settings, b"{ broken").unwrap();
+        let err = inspect_effective_provider(&instance, &adapter, providers).unwrap_err();
+        assert!(err.to_string().contains("jsonc"), "got: {err}");
+
+        std::fs::write(&settings, b"// only a comment\n/* and a block */\n").unwrap();
+        let report = inspect_effective_provider(&instance, &adapter, providers)
+            .expect("comments-only jsonc is content-free, not an error");
+        assert!(
+            report.detected_provider.is_none(),
+            "no provider can be detected from comments alone"
+        );
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn commit_json_yaml_and_toml_output_bytes_are_pinned() {
+        let dir = tmp_dir("byte-pins");
+        let cc = crate::adapters::claude_code::ClaudeCodeAdapter::new().unwrap();
+        let inst = instance_in(&dir, "claude-code", "pin-json");
+        commit_provider_change(
+            &inst,
+            &cc,
+            &ProviderChange::AddOrUpdate {
+                provider: &universal_provider("pin-prov"),
+            },
+            &ProviderChangeOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(inst.config_root.as_path().join("settings.json")).unwrap(),
+            "{\n  \"env\": {\n    \"ANTHROPIC_BASE_URL\": \"https://api.example.com/anthropic\"\n  },\n  \"model\": \"model-a\"\n}\n"
+        );
+
+        let cd = crate::adapters::continue_dev::ContinueDevAdapter::new().unwrap();
+        let inst = instance_in(&dir, "continue", "pin-yaml");
+        commit_provider_change(
+            &inst,
+            &cd,
+            &ProviderChange::AddOrUpdate {
+                provider: &universal_provider("pin-prov"),
+            },
+            &ProviderChangeOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(inst.config_root.as_path().join("config.yaml")).unwrap(),
+            "provider:\n  pin-prov:\n    options:\n      baseUrl: https://api.example.com/v1\n    apiKey: '{env:UNIVERSAL_API_KEY}'\nmodel: pin-prov/model-a\n"
+        );
+
+        let cx = crate::adapters::codex_cli::CodexCliAdapter::new().unwrap();
+        let inst = instance_in(&dir, "codex-cli", "pin-toml");
+        commit_provider_change(
+            &inst,
+            &cx,
+            &ProviderChange::AddOrUpdate {
+                provider: &universal_provider("pin-prov"),
+            },
+            &ProviderChangeOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(inst.config_root.as_path().join("config.toml")).unwrap(),
+            "model_provider = \"pin-prov\"\nmodel = \"model-a\"\n\n[model_providers]\n\n[model_providers.pin-prov]\nname = \"Universal\"\nbase_url = \"https://api.example.com/v1\"\nenv_key = \"UNIVERSAL_API_KEY\"\nwire_api = \"chat\"\n"
+        );
+        drop(std::fs::remove_dir_all(&dir));
+    }
+    #[test]
+    fn commit_rewrite_preserves_foreign_order_bytes_are_pinned() {
+        let dir = tmp_dir("rewrite-pins");
+        let cc = crate::adapters::claude_code::ClaudeCodeAdapter::new().unwrap();
+        let inst = instance_in(&dir, "claude-code", "rw-json");
+        let settings = inst.config_root.as_path().join("settings.json");
+        std::fs::write(
+            &settings,
+            b"{\n  \"zebra\": 1,\n  \"foreign\": true,\n  \"alpha\": [1, 2]\n}\n",
+        )
+        .unwrap();
+        commit_provider_change(
+            &inst,
+            &cc,
+            &ProviderChange::AddOrUpdate {
+                provider: &universal_provider("rw-prov"),
+            },
+            &ProviderChangeOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&settings).unwrap(),
+            "{\n  \"zebra\": 1,\n  \"foreign\": true,\n  \"alpha\": [\n    1,\n    2\n  ],\n  \"env\": {\n    \"ANTHROPIC_BASE_URL\": \"https://api.example.com/anthropic\"\n  },\n  \"model\": \"model-a\"\n}\n",
+            "foreign keys keep their original order ahead of appended provider keys"
+        );
+
+        let cd = crate::adapters::continue_dev::ContinueDevAdapter::new().unwrap();
+        let inst = instance_in(&dir, "continue", "rw-yaml");
+        let config = inst.config_root.as_path().join("config.yaml");
+        std::fs::write(&config, "zebra: 1\nforeign: true\nalpha:\n  - 1\n  - 2\n").unwrap();
+        commit_provider_change(
+            &inst,
+            &cd,
+            &ProviderChange::AddOrUpdate {
+                provider: &universal_provider("rw-prov"),
+            },
+            &ProviderChangeOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&config).unwrap(),
+            "zebra: 1\nforeign: true\nalpha:\n- 1\n- 2\nprovider:\n  rw-prov:\n    options:\n      baseUrl: https://api.example.com/v1\n    apiKey: '{env:UNIVERSAL_API_KEY}'\nmodel: rw-prov/model-a\n"
+        );
+
+        let cx = crate::adapters::codex_cli::CodexCliAdapter::new().unwrap();
+        let inst = instance_in(&dir, "codex-cli", "rw-toml");
+        let config = inst.config_root.as_path().join("config.toml");
+        std::fs::write(
+            &config,
+            "# top comment\nzebra = 1\nforeign = true\n\n[alpha]\nid = 2\n",
+        )
+        .unwrap();
+        commit_provider_change(
+            &inst,
+            &cx,
+            &ProviderChange::AddOrUpdate {
+                provider: &universal_provider("rw-prov"),
+            },
+            &ProviderChangeOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&config).unwrap(),
+            "# top comment\nzebra = 1\nforeign = true\nmodel_provider = \"rw-prov\"\nmodel = \"model-a\"\n\n[alpha]\nid = 2\n\n[model_providers]\n\n[model_providers.rw-prov]\nname = \"Universal\"\nbase_url = \"https://api.example.com/v1\"\nenv_key = \"UNIVERSAL_API_KEY\"\nwire_api = \"chat\"\n",
+            "toml decor, foreign scalars, and foreign tables survive the rewrite verbatim"
+        );
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn commit_rewrite_string_escaping_bytes_are_pinned() {
+        let dir = tmp_dir("escape-pins");
+        let cc = crate::adapters::claude_code::ClaudeCodeAdapter::new().unwrap();
+        let inst = instance_in(&dir, "claude-code", "esc-json");
+        let settings = inst.config_root.as_path().join("settings.json");
+        std::fs::write(
+            &settings,
+            b"{\n  \"msg\": \"she said \\\"hi\\\" \\\\tab \\u00e9nd\\n\",\n  \"done\": true\n}\n",
+        )
+        .unwrap();
+        commit_provider_change(
+            &inst,
+            &cc,
+            &ProviderChange::AddOrUpdate {
+                provider: &universal_provider("esc-prov"),
+            },
+            &ProviderChangeOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&settings).unwrap(),
+            "{\n  \"msg\": \"she said \\\"hi\\\" \\\\tab \u{e9}nd\\n\",\n  \"done\": true,\n  \"env\": {\n    \"ANTHROPIC_BASE_URL\": \"https://api.example.com/anthropic\"\n  },\n  \"model\": \"model-a\"\n}\n",
+            "quote/backslash/newline stay escaped, non-ASCII stays raw"
+        );
+
+        let cd = crate::adapters::continue_dev::ContinueDevAdapter::new().unwrap();
+        let inst = instance_in(&dir, "continue", "esc-yaml");
+        let config = inst.config_root.as_path().join("config.yaml");
+        std::fs::write(
+            &config,
+            "msg: \"she said \\\"hi\\\" \\ttab \u{e9}nd\"\ndone: true\n",
+        )
+        .unwrap();
+        commit_provider_change(
+            &inst,
+            &cd,
+            &ProviderChange::AddOrUpdate {
+                provider: &universal_provider("esc-prov"),
+            },
+            &ProviderChangeOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&config).unwrap(),
+            "msg: \"she said \\\"hi\\\" \\ttab \u{e9}nd\"\ndone: true\nprovider:\n  esc-prov:\n    options:\n      baseUrl: https://api.example.com/v1\n    apiKey: '{env:UNIVERSAL_API_KEY}'\nmodel: esc-prov/model-a\n"
+        );
+
+        let cx = crate::adapters::codex_cli::CodexCliAdapter::new().unwrap();
+        let inst = instance_in(&dir, "codex-cli", "esc-toml");
+        let config = inst.config_root.as_path().join("config.toml");
+        std::fs::write(
+            &config,
+            "msg = \"she said \\\"hi\\\" \\\\ \u{e9}nd\"\ndone = true\n",
+        )
+        .unwrap();
+        commit_provider_change(
+            &inst,
+            &cx,
+            &ProviderChange::AddOrUpdate {
+                provider: &universal_provider("esc-prov"),
+            },
+            &ProviderChangeOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&config).unwrap(),
+            "msg = \"she said \\\"hi\\\" \\\\ \u{e9}nd\"\ndone = true\nmodel_provider = \"esc-prov\"\nmodel = \"model-a\"\n\n[model_providers]\n\n[model_providers.esc-prov]\nname = \"Universal\"\nbase_url = \"https://api.example.com/v1\"\nenv_key = \"UNIVERSAL_API_KEY\"\nwire_api = \"chat\"\n",
+            "toml basic-string escapes survive verbatim"
+        );
+
+        let inst = instance_in(&dir, "claude-code", "esc-jsonc");
+        let settings = inst.config_root.as_path().join("settings.json");
+        std::fs::write(&settings, b"{\n  \"done\": true\n}\n").unwrap();
+        commit_provider_change(
+            &inst,
+            &cc,
+            &ProviderChange::AddOrUpdate {
+                provider: &universal_provider("esc-prov"),
+            },
+            &ProviderChangeOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&settings).unwrap(),
+            "{\n  \"done\": true,\n  \"env\": {\n    \"ANTHROPIC_BASE_URL\": \"https://api.example.com/anthropic\"\n  },\n  \"model\": \"model-a\"\n}\n",
+            "comment-free jsonc commits through the same writer as json"
         );
         drop(std::fs::remove_dir_all(&dir));
     }

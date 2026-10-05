@@ -1,8 +1,6 @@
 //! MCP canonical definition and lifecycle (EXT-08..10): per-entry merges
 //! keep foreign servers and unmodelled keys; JSONC/YAML refuse writes.
 
-// The per-format (JSON/TOML/YAML) walkers branch per node kind, so deep
-// nesting is intrinsic to the serialization dispatch.
 #![expect(
     clippy::excessive_nesting,
     reason = "per-format walkers branch per node kind"
@@ -459,7 +457,6 @@ pub fn from_native_value(id: &str, value: &Value) -> Result<McpServerDef> {
             .filter_map(|v| v.as_str().map(ToOwned::to_owned))
             .collect::<Vec<_>>()
     } else if let Some(parts) = obj.get("command").and_then(Value::as_array) {
-        // Kilo argv arrays: everything after the first element is args.
         parts
             .iter()
             .skip(1)
@@ -710,6 +707,41 @@ fn inner_entries(outer: &Value, decl: &McpAdapterDecl) -> BTreeMap<String, Value
     out
 }
 
+fn owned_entry<'a>(outer: &'a Value, decl: &McpAdapterDecl, id: &str) -> Option<&'a Value> {
+    let container = navigate_dotted(outer, &decl.dest_key)?;
+    match &decl.shape {
+        crate::adapter::McpDestShape::NameMap => container.as_object().and_then(|m| m.get(id)),
+        crate::adapter::McpDestShape::IdentityList { key } => container.as_array().and_then(|a| {
+            a.iter()
+                .find(|item| item.get(key).and_then(Value::as_str) == Some(id))
+        }),
+    }
+}
+
+fn inner_keys<'a>(outer: &'a Value, decl: &McpAdapterDecl) -> std::collections::BTreeSet<&'a str> {
+    let mut out = std::collections::BTreeSet::new();
+    let Some(container) = navigate_dotted(outer, &decl.dest_key) else {
+        return out;
+    };
+    match &decl.shape {
+        crate::adapter::McpDestShape::NameMap => {
+            if let Some(map) = container.as_object() {
+                out.extend(map.keys().map(String::as_str));
+            }
+        }
+        crate::adapter::McpDestShape::IdentityList { key } => {
+            if let Some(arr) = container.as_array() {
+                for item in arr {
+                    if let Some(id) = item.get(key).and_then(Value::as_str) {
+                        out.insert(id);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 /// A single owned-server mutation to stage (EXT-09 per-entry writes keep
 /// foreign servers and their lexical presentation untouched).
 #[derive(Debug, Clone, PartialEq)]
@@ -718,16 +750,12 @@ enum ServerWrite {
     Remove,
 }
 
-/// Commit `bytes` through the compensated transaction: backup, atomic
-/// write, read-back parse verification (EXT-07/EXT-10).
-fn commit_document(path: &Path, kind: DocumentKind, bytes: Vec<u8>) -> Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut steps: Vec<superai_config::transaction::FileAction> = Vec::new();
-    if !parent.as_os_str().is_empty() && !parent.exists() {
-        steps.push(superai_config::transaction::FileAction::CreateDir {
-            path: parent.to_path_buf(),
-        });
-    }
+fn commit_document(
+    path: &Path,
+    kind: DocumentKind,
+    bytes: &[u8],
+    expected: &superai_config::snapshot::Snapshot,
+) -> Result<()> {
     let engine_kind = match kind {
         DocumentKind::Json => superai_config::document::DocumentKind::StrictJson,
         DocumentKind::Jsonc => superai_config::document::DocumentKind::JsonC,
@@ -741,12 +769,63 @@ fn commit_document(path: &Path, kind: DocumentKind, bytes: Vec<u8>) -> Result<()
             });
         }
     };
-    steps.push(superai_config::transaction::FileAction::Write {
-        path: path.to_path_buf(),
-        content: bytes,
-        kind: engine_kind,
-    });
-    let snap_before = superai_config::snapshot::snapshot(path);
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    if !parent.as_os_str().is_empty() && !parent.exists() {
+        // Directory creation must stay inside the transaction: rollback
+        // removes a directory it created and a foreign dir aborts the step.
+        return commit_document_creating_dir(path, kind, bytes, engine_kind, parent, expected);
+    }
+    let file_label = path
+        .file_name()
+        .map_or_else(|| "config".to_owned(), |n| n.to_string_lossy().to_string());
+    let op_id_str = format!(
+        "mcp-{}-{}",
+        file_label,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis())
+    );
+    let commit = superai_config::transaction::commit_file_expecting(
+        &op_id_str,
+        path,
+        bytes,
+        engine_kind,
+        Some(expected),
+    );
+    if let Err(e) = commit {
+        return Err(map_transaction_error(path, e));
+    }
+    verify_written_parses(path, kind)
+}
+
+fn commit_document_creating_dir(
+    path: &Path,
+    kind: DocumentKind,
+    bytes: &[u8],
+    engine_kind: superai_config::document::DocumentKind,
+    parent: &Path,
+    expected: &superai_config::snapshot::Snapshot,
+) -> Result<()> {
+    let current = superai_config::snapshot::snapshot(path);
+    if superai_config::snapshot::is_modified(expected, &current) {
+        let exp = expected.digest.as_deref().unwrap_or("missing");
+        let act = current.digest.as_deref().unwrap_or("missing");
+        return Err(CoreError::ConcurrentModification {
+            path: path.to_path_buf(),
+            expected: exp.to_owned(),
+            actual: act.to_owned(),
+        });
+    }
+    let steps = vec![
+        superai_config::transaction::FileAction::CreateDir {
+            path: parent.to_path_buf(),
+        },
+        superai_config::transaction::FileAction::Write {
+            path: path.to_path_buf(),
+            content: bytes.to_vec(),
+            kind: engine_kind,
+        },
+    ];
     let file_label = path
         .file_name()
         .map_or_else(|| "config".to_owned(), |n| n.to_string_lossy().to_string());
@@ -768,43 +847,95 @@ fn commit_document(path: &Path, kind: DocumentKind, bytes: Vec<u8>) -> Result<()
         field: "mcp_transaction".to_owned(),
         reason: format!("transaction plan invalid: {e}"),
     })?;
-    let outcome = txn.execute().map_err(|e| CoreError::Commit {
+    txn.prepare().map_err(|e| map_transaction_error(path, e))?;
+    if let Err(e) = txn.commit() {
+        return Err(map_transaction_error(path, e));
+    }
+    let verification = txn.verify().map_err(|e| CoreError::Verification {
         path: path.to_path_buf(),
-        reason: format!("transaction failed: {e}"),
+        kind: "verify".to_owned(),
+        reason: format!("post-commit verification read failed: {e}"),
     })?;
-    if !outcome.success {
-        let diag = outcome.diagnostics_redacted.join("; ");
-        if diag.contains("modified") || diag.contains("concurrent") {
-            let snap_after = superai_config::snapshot::snapshot(path);
-            let exp = snap_before.digest.unwrap_or_else(|| "missing".to_owned());
-            let act = snap_after.digest.unwrap_or_else(|| "missing".to_owned());
-            return Err(CoreError::ConcurrentModification {
-                path: path.to_path_buf(),
-                expected: exp,
-                actual: act,
-            });
+    if let Some(failed) = verification.iter().find(|v| !v.digest_ok || !v.parse_ok) {
+        if let Err(rollback_err) = txn.rollback() {
+            eprintln!("superai-core: mcp rollback after verify failure failed: {rollback_err}");
         }
-        return Err(CoreError::Commit {
+        return Err(CoreError::Verification {
             path: path.to_path_buf(),
-            reason: format!("mcp commit failed: {diag}"),
+            kind: "verify".to_owned(),
+            reason: failed.message.clone(),
         });
     }
-    // The written bytes must parse under the same codec.
-    read_outer_value(path, kind).map_err(|e| CoreError::Verification {
-        path: path.to_path_buf(),
-        kind: "parse".to_owned(),
-        reason: format!("written mcp config failed read-back verification: {e}"),
-    })?;
-    Ok(())
+    verify_written_parses(path, kind)
 }
 
-/// Write one owned server entry, preserving every other key, server, and
-/// (for TOML) comment/decor in the destination (EXT-09).
+fn map_transaction_error(path: &Path, e: superai_config::ConfigError) -> CoreError {
+    match e {
+        superai_config::ConfigError::ConcurrentModification {
+            path,
+            expected,
+            actual,
+        } => CoreError::ConcurrentModification {
+            path,
+            expected,
+            actual,
+        },
+        e => CoreError::Commit {
+            path: path.to_path_buf(),
+            reason: format!("transaction failed: {e}"),
+        },
+    }
+}
+
+fn verify_written_parses(path: &Path, kind: DocumentKind) -> Result<()> {
+    read_outer_value(path, kind)
+        .map(|_| ())
+        .map_err(|e| CoreError::Verification {
+            path: path.to_path_buf(),
+            kind: "parse".to_owned(),
+            reason: format!("written mcp config failed read-back verification: {e}"),
+        })
+}
+
+struct DestRead {
+    outer: Value,
+    doc: Option<toml_edit::DocumentMut>,
+    snap: superai_config::snapshot::Snapshot,
+}
+
+fn read_dest(path: &Path, decl: &McpAdapterDecl) -> Result<DestRead> {
+    // The snapshot must precede the parse: swapped, a change landing between
+    // the two would pass the token check while the write base predates it.
+    let snap = superai_config::snapshot::snapshot(path);
+    if decl.kind == DocumentKind::Toml {
+        let doc = superai_config::toml_file::load(path)?;
+        let outer = crate::toml_convert::document_to_value(&doc);
+        if !outer.is_object() {
+            return Err(CoreError::SchemaValidation {
+                path: path.to_path_buf(),
+                details: format!("mcp config must be an object, got {outer}"),
+            });
+        }
+        return Ok(DestRead {
+            outer,
+            doc: Some(doc),
+            snap,
+        });
+    }
+    let outer = read_outer_value(path, decl.kind)?;
+    Ok(DestRead {
+        outer,
+        doc: None,
+        snap,
+    })
+}
+
 fn write_server_entry(
     path: &Path,
     decl: &McpAdapterDecl,
     id: &str,
     write: &ServerWrite,
+    base: Option<DestRead>,
 ) -> Result<()> {
     if let Some(reason) = &decl.read_only {
         return Err(CoreError::UnsupportedOperation {
@@ -827,8 +958,23 @@ fn write_server_entry(
         }));
     }
     match (decl.kind, &decl.shape) {
-        (DocumentKind::Json, shape) => write_json_server(path, decl, id, write, shape),
-        (DocumentKind::Toml, shape) => write_toml_server(path, decl, id, write, shape),
+        (DocumentKind::Json, shape) => {
+            let base = if let Some(base) = base {
+                base
+            } else {
+                read_dest(path, decl)?
+            };
+            write_json_server(path, decl, id, write, shape, &base)
+        }
+        (DocumentKind::Toml, shape) => {
+            if let Some(base) = base
+                && let Some(doc) = base.doc
+            {
+                return write_toml_doc(path, decl, id, write, shape, doc, &base.snap);
+            }
+            let snap = superai_config::snapshot::snapshot(path);
+            write_toml_server(path, decl, id, write, shape, &snap)
+        }
         (other, _) => Err(CoreError::UnsupportedOperation {
             harness: "mcp".to_owned(),
             operation: format!("write `{}` entry `{id}`", decl.dest_key),
@@ -938,21 +1084,21 @@ fn apply_json_server_write(
     Ok(())
 }
 
-/// Write one server entry into a JSON destination (foreign keys preserved).
 fn write_json_server(
     path: &Path,
     decl: &McpAdapterDecl,
     id: &str,
     write: &ServerWrite,
     shape: &crate::adapter::McpDestShape,
+    base: &DestRead,
 ) -> Result<()> {
-    let mut outer = read_outer_value(path, decl.kind)?;
+    let mut outer = base.outer.clone();
     apply_json_server_write(&mut outer, decl, id, write, shape)?;
     let bytes = serde_json::to_vec_pretty(&outer).map_err(|e| CoreError::Validation {
         field: "mcp_config".to_owned(),
         reason: format!("serialize failed: {e}"),
     })?;
-    commit_document(path, decl.kind, bytes)
+    commit_document(path, decl.kind, &bytes, &base.snap)
 }
 
 /// Convert a server entry to a TOML table; sub-tables become
@@ -1019,8 +1165,25 @@ fn write_toml_server(
     id: &str,
     write: &ServerWrite,
     shape: &crate::adapter::McpDestShape,
+    expected: &superai_config::snapshot::Snapshot,
 ) -> Result<()> {
-    let mut doc = superai_config::toml_file::load(path)?;
+    let doc = superai_config::toml_file::load(path)?;
+    write_toml_doc(path, decl, id, write, shape, doc, expected)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "split from write_toml_server so a caller-held document skips the reload"
+)]
+fn write_toml_doc(
+    path: &Path,
+    decl: &McpAdapterDecl,
+    id: &str,
+    write: &ServerWrite,
+    shape: &crate::adapter::McpDestShape,
+    mut doc: toml_edit::DocumentMut,
+    expected: &superai_config::snapshot::Snapshot,
+) -> Result<()> {
     let schema_err = |msg: String| CoreError::SchemaValidation {
         path: path.to_path_buf(),
         details: msg,
@@ -1090,7 +1253,8 @@ fn write_toml_server(
             }
         }
     }
-    commit_document(path, decl.kind, doc.to_string().into_bytes())
+    let bytes = doc.to_string().into_bytes();
+    commit_document(path, decl.kind, &bytes, expected)
 }
 
 /// One destination scan: parseable servers keyed by id, plus `(key, reason)`
@@ -1152,16 +1316,21 @@ pub fn preview_install(
     server: &McpServerDef,
 ) -> Result<McpInstallPreview> {
     server.validate()?;
-    let (_outer, inner) = read_outer_and_inner(path, decl)?;
-    let existing_val = inner.get(server.id.as_str()).cloned();
-    let existing = if let Some(v) = existing_val {
-        Some(from_native_value(server.id.as_str(), &v)?)
-    } else {
-        None
-    };
+    let outer = read_outer_value(path, decl.kind)?;
+    preview_from_base(server, &outer, decl)
+}
+
+fn preview_from_base(
+    server: &McpServerDef,
+    outer: &Value,
+    decl: &McpAdapterDecl,
+) -> Result<McpInstallPreview> {
+    let existing = owned_entry(outer, decl, server.id.as_str())
+        .map(|v| from_native_value(server.id.as_str(), v))
+        .transpose()?;
     let is_update = existing.is_some();
     let mut conflicts: Vec<String> = Vec::new();
-    for existing_key in inner.keys() {
+    for existing_key in inner_keys(outer, decl) {
         if existing_key.to_lowercase() == server.id.as_str().to_lowercase()
             && existing_key != server.id.as_str()
         {
@@ -1221,7 +1390,8 @@ pub fn install_mcp_server(
     server: &McpServerDef,
 ) -> Result<McpServerDef> {
     server.validate()?;
-    let preview = preview_install(path, decl, server)?;
+    let dest = read_dest(path, decl)?;
+    let preview = preview_from_base(server, &dest.outer, decl)?;
     if !preview.can_auto_apply {
         return Err(CoreError::NameCollision {
             kind: "McpServerId".to_owned(),
@@ -1234,11 +1404,15 @@ pub fn install_mcp_server(
     {
         return Ok(server.clone());
     }
-    // Read fresh for the merge; disk is truth.
-    let (_outer, inner) = read_outer_and_inner(path, decl)?;
-    let existing_native = inner.get(server.id.as_str());
+    let existing_native = owned_entry(&dest.outer, decl, server.id.as_str());
     let merged = merge_server_native(existing_native, &to_native_value(server));
-    write_server_entry(path, decl, server.id.as_str(), &ServerWrite::Upsert(merged))?;
+    write_server_entry(
+        path,
+        decl,
+        server.id.as_str(),
+        &ServerWrite::Upsert(merged),
+        Some(dest),
+    )?;
     Ok(server.clone())
 }
 
@@ -1249,9 +1423,8 @@ pub fn set_mcp_enabled(
     id: &McpServerId,
     enabled: bool,
 ) -> Result<McpServerDef> {
-    let (_outer, inner) = read_outer_and_inner(path, decl)?;
-    let val = inner
-        .get(id.as_str())
+    let dest = read_dest(path, decl)?;
+    let val = owned_entry(&dest.outer, decl, id.as_str())
         .cloned()
         .ok_or_else(|| CoreError::Validation {
             field: "mcp.id".to_owned(),
@@ -1260,8 +1433,17 @@ pub fn set_mcp_enabled(
     let mut def = from_native_value(id.as_str(), &val)?;
     def.disabled = !enabled;
     def.validate()?;
-    let merged = merge_server_native(inner.get(id.as_str()), &to_native_value(&def));
-    write_server_entry(path, decl, id.as_str(), &ServerWrite::Upsert(merged))?;
+    let merged = merge_server_native(
+        owned_entry(&dest.outer, decl, id.as_str()),
+        &to_native_value(&def),
+    );
+    write_server_entry(
+        path,
+        decl,
+        id.as_str(),
+        &ServerWrite::Upsert(merged),
+        Some(dest),
+    )?;
     Ok(def)
 }
 
@@ -1272,13 +1454,13 @@ pub fn remove_mcp_server(
     decl: &McpAdapterDecl,
     id: &McpServerId,
 ) -> Result<Option<McpServerDef>> {
-    let (_outer, inner) = read_outer_and_inner(path, decl)?;
-    let existing_val = match inner.get(id.as_str()) {
+    let dest = read_dest(path, decl)?;
+    let existing_val = match owned_entry(&dest.outer, decl, id.as_str()) {
         Some(v) => v.clone(),
         None => return Ok(None),
     };
     let def = from_native_value(id.as_str(), &existing_val)?;
-    write_server_entry(path, decl, id.as_str(), &ServerWrite::Remove)?;
+    write_server_entry(path, decl, id.as_str(), &ServerWrite::Remove, Some(dest))?;
     Ok(Some(def))
 }
 
@@ -1354,10 +1536,9 @@ pub fn preview_scope_transfer(
     id: &McpServerId,
     action: ScopeTransfer,
 ) -> Result<McpScopeTransferPreview> {
-    let (_src_outer, src_inner) = read_outer_and_inner(source_path, source_decl)?;
-    let source_val = src_inner
-        .get(id.as_str())
-        .ok_or_else(|| CoreError::Validation {
+    let src_outer = read_outer_value(source_path, source_decl.kind)?;
+    let source_val =
+        owned_entry(&src_outer, source_decl, id.as_str()).ok_or_else(|| CoreError::Validation {
             field: "mcp.id".to_owned(),
             reason: format!(
                 "mcp server `{id}` not found at source {}",
@@ -1365,9 +1546,8 @@ pub fn preview_scope_transfer(
             ),
         })?;
     let source_existing = from_native_value(id.as_str(), source_val)?;
-    let (_dst_outer, dst_inner) = read_outer_and_inner(dest_path, dest_decl)?;
-    let dest_existing = dst_inner
-        .get(id.as_str())
+    let dst_outer = read_outer_value(dest_path, dest_decl.kind)?;
+    let dest_existing = owned_entry(&dst_outer, dest_decl, id.as_str())
         .map(|v| from_native_value(id.as_str(), v))
         .transpose()?;
 
@@ -1424,20 +1604,32 @@ pub fn transfer_between_scopes(
         && *dest == preview.source_existing
     {
         if action == ScopeTransfer::Move {
-            write_server_entry(source_path, source_decl, id.as_str(), &ServerWrite::Remove)?;
+            write_server_entry(
+                source_path,
+                source_decl,
+                id.as_str(),
+                &ServerWrite::Remove,
+                None,
+            )?;
         }
         return Ok(Some(preview.source_existing));
     }
-    // Destination write first (additive, foreign preserved).
     let merged = merge_server_native(None, &to_native_value(&preview.source_existing));
     write_server_entry(
         dest_path,
         dest_decl,
         id.as_str(),
         &ServerWrite::Upsert(merged),
+        None,
     )?;
     if action == ScopeTransfer::Move {
-        write_server_entry(source_path, source_decl, id.as_str(), &ServerWrite::Remove)?;
+        write_server_entry(
+            source_path,
+            source_decl,
+            id.as_str(),
+            &ServerWrite::Remove,
+            None,
+        )?;
     }
     Ok(Some(preview.source_existing))
 }
@@ -1574,10 +1766,12 @@ pub fn bulk_plan(targets: &[BulkTarget], action: &BulkAction) -> BulkPlan {
         let mut expected = None;
         if unsupported_reason.is_none() {
             if dest_path.exists() {
-                expected = Some(superai_config::snapshot::snapshot(&dest_path));
-                match read_outer_and_inner(&dest_path, &decl) {
-                    Ok((_outer, inner)) => {
-                        if let Some(v) = inner.get(action.server_id().as_str()) {
+                match read_dest(&dest_path, &decl) {
+                    Ok(dest) => {
+                        expected = Some(dest.snap);
+                        if let Some(v) =
+                            owned_entry(&dest.outer, &decl, action.server_id().as_str())
+                        {
                             match from_native_value(action.server_id().as_str(), v) {
                                 Ok(def) => existing = Some(def),
                                 Err(e) => conflicts.push(format!(
@@ -1593,7 +1787,7 @@ pub fn bulk_plan(targets: &[BulkTarget], action: &BulkAction) -> BulkPlan {
                             ));
                         }
                         if let BulkAction::InstallMcpServer { server } = action {
-                            for key in inner.keys() {
+                            for key in inner_keys(&dest.outer, &decl) {
                                 if key.to_lowercase() == server.id.as_str().to_lowercase()
                                     && key != server.id.as_str()
                                 {
@@ -1830,6 +2024,22 @@ mod tests {
     }
 
     #[test]
+    fn install_creates_missing_destination_parent_transactionally() {
+        let root = crate::test_util::temp_dir_unique("mcp-missing-parent");
+        let path = root.join("nested").join("settings.json");
+        let d = decl();
+        let id = McpServerId::new("fresh").unwrap();
+        let server = McpServerDef::stdio(id, "uvx", vec!["s.js".to_owned()]).unwrap();
+        install_mcp_server(&path, &d, &server).unwrap();
+        let installed = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            installed.contains("\"fresh\""),
+            "installed server must be present: {installed}"
+        );
+        assert!(path.parent().is_some_and(Path::is_dir));
+    }
+
+    #[test]
     fn mcp_definition_round_trip() {
         let id = McpServerId::new("my-mcp").unwrap();
         let mut server =
@@ -1972,15 +2182,14 @@ mod tests {
             mcp2.contains_key("foreign-one"),
             "foreign must remain after removal"
         );
-        // Remove non-existent should be Ok(None) and not touch file
         let none = remove_mcp_server(&path, &d, &McpServerId::new("nonexistent").unwrap()).unwrap();
         assert!(none.is_none());
 
         drop(std::fs::remove_file(&path));
     }
 
-    /// '&' and '=' are legal inside a query string; everywhere else they
-    /// stay refused as metachars.
+    // '&' and '=' are legal inside a query string; everywhere else they
+    // stay refused as metachars.
     #[test]
     fn remote_urls_may_carry_query_strings() {
         let id = McpServerId::new("remote-query").unwrap();
@@ -2022,8 +2231,8 @@ mod tests {
         assert!(doubled_amp.is_err(), "doubled '&' in query must be refused");
     }
 
-    /// One invalid foreign entry must not fail the whole inspect: the good
-    /// servers still land in `servers` and the bad one is named in `invalid`.
+    // One invalid foreign entry must not fail the whole inspect: the good
+    // servers still land in `servers` and the bad one is named in `invalid`.
     #[test]
     fn inspect_continues_past_an_invalid_foreign_entry() {
         let dir = crate::test_util::temp_dir_unique("mcp-inspect-bad");
@@ -2073,7 +2282,6 @@ mod tests {
             server.validate().is_err(),
             "shell in args should be rejected"
         );
-        // disabled round-trip
         server.args = vec!["good".to_owned()];
         server.disabled = true;
         server.validate().unwrap();
@@ -2493,7 +2701,7 @@ mod tests {
     };
     use crate::instance::Instance;
 
-    /// Writable-JSON-MCP adapter for lifecycle tests.
+    // Writable-JSON-MCP adapter for lifecycle tests.
     #[derive(Debug)]
     struct WritableMcpAdapter {
         read_only: bool,
@@ -2576,7 +2784,7 @@ mod tests {
         }
     }
 
-    /// Adapter with verified MCP absence.
+    // Adapter with verified MCP absence.
     #[derive(Debug)]
     struct NoMcpAdapter;
 

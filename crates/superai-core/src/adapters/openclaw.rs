@@ -212,9 +212,8 @@ impl Adapter for OpenClawAdapter {
         DetectionResult::new(present, version, evidence, confidence)
     }
 
-    fn version_resolution(&self) -> VersionResolution {
-        let detection = self.detection();
-        if let Some(v) = detection.version {
+    fn version_resolution_from(&self, detection: &DetectionResult) -> VersionResolution {
+        if let Some(v) = detection.version.clone() {
             let mut notes = Vec::new();
             notes.push(format!("detected openclaw version {v}"));
             notes.push(format!("research blocked: {BLOCKED_REASON}"));
@@ -223,7 +222,7 @@ impl Adapter for OpenClawAdapter {
             res
         } else {
             let mut res = VersionResolution::unknown();
-            res.notes = detection.evidence;
+            res.notes.clone_from(&detection.evidence);
             res.notes
                 .push(format!("research blocked: {BLOCKED_REASON}"));
             res
@@ -254,7 +253,6 @@ impl Adapter for OpenClawAdapter {
             "models.providers".to_owned(),
         ];
         config_surface.backup_required = true;
-        // JSON5 allows comments; must be format-preserving, but we model as Json for now.
         config_surface.restart_behavior = RestartBehavior::Restart;
         surfaces.push(config_surface);
 
@@ -431,8 +429,6 @@ mod tests {
     #[test]
     fn adapter_identity() {
         let a = adapter();
-        // Constructor wiring plus catalog registration: an id the catalog
-        // does not know can never reconcile with detection or instances.
         let entry = crate::harness_catalog::find_by_id(HARNESS_ID_STR).unwrap();
         assert_eq!(a.id().as_str(), HARNESS_ID_STR);
         assert_eq!(a.product_status(), entry.product_status);

@@ -1,12 +1,11 @@
 use std::path::Path;
 
 use serde::de::{self, Deserialize, MapAccess, SeqAccess, Visitor};
+use serde_json::map::Entry;
 use serde_json::{Map, Number, Value};
 
 use crate::error::{ConfigError, Result};
 
-/// Deserializes any JSON value but rejects duplicate keys; `Number` keeps
-/// i64/u64/f64 distinct so `1` and `1.0` stay different (DOC-03).
 struct StrictValue(Value);
 
 impl<'de> Deserialize<'de> for StrictValue {
@@ -108,10 +107,17 @@ impl<'de> Deserialize<'de> for StrictValue {
             {
                 let mut m = Map::new();
                 while let Some((key, value)) = map.next_entry::<String, StrictValue>()? {
-                    if m.contains_key(&key) {
-                        return Err(de::Error::custom(format!("duplicate key `{key}`")));
+                    match m.entry(key) {
+                        Entry::Occupied(existing) => {
+                            return Err(de::Error::custom(format!(
+                                "duplicate key `{}`",
+                                existing.key()
+                            )));
+                        }
+                        Entry::Vacant(slot) => {
+                            slot.insert(value.0);
+                        }
                     }
-                    m.insert(key, value.0);
                 }
                 Ok(StrictValue(Value::Object(m)))
             }
@@ -121,7 +127,6 @@ impl<'de> Deserialize<'de> for StrictValue {
     }
 }
 
-/// Strict parse: duplicates rejected, number types preserved, no trailing content.
 pub(crate) fn parse_strict_raw(text: &str) -> std::result::Result<Value, serde_json::Error> {
     let mut de = serde_json::Deserializer::from_str(text);
     let v = StrictValue::deserialize(&mut de)?;
@@ -246,15 +251,44 @@ pub fn formatting_change_warning(text: &str) -> Option<&'static str> {
         return None;
     }
     let value = serde_json::from_str::<Value>(text).ok()?;
-    let mut normalized = serde_json::to_string_pretty(&value).ok()?;
-    normalized.push('\n');
-    if normalized == text {
+    let bytes = text.as_bytes();
+    let mut canonical = CanonicalPretty {
+        expected: bytes,
+        pos: 0,
+    };
+    let matches = serde_json::to_writer_pretty(&mut canonical, &value).is_ok()
+        && canonical.pos + 1 == bytes.len()
+        && bytes.last() == Some(&b'\n');
+    if matches {
         None
     } else {
         Some(
             "strict json codec normalizes whitespace and indentation on changing writes; \
              surrounding formatting will change even where semantics do not",
         )
+    }
+}
+
+struct CanonicalPretty<'a> {
+    expected: &'a [u8],
+    pos: usize,
+}
+
+impl std::io::Write for CanonicalPretty<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let end = self.pos + buf.len();
+        if self.expected.get(self.pos..end) != Some(buf) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "not canonical pretty json",
+            ));
+        }
+        self.pos = end;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -500,5 +534,62 @@ mod tests {
         store_value(&path, &val).unwrap();
         let loaded = load_value(&path).unwrap();
         assert_eq!(loaded, val);
+    }
+
+    #[test]
+    fn bom_is_not_stripped_in_strict_json() {
+        let path = scratch("bom.json");
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(b"{\"a\":1}");
+        std::fs::write(&path, bytes).unwrap();
+        match load(&path) {
+            Err(ConfigError::Json { .. }) => {}
+            other => panic!("expected Json error for BOM-prefixed json, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn staging_gate_refuses_bom_strict_json_bytes() {
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(b"{\"a\":1}");
+        let verdict = crate::document::validate_bytes_for_kind(
+            &bytes,
+            crate::document::DocumentKind::StrictJson,
+            Path::new("bom.json"),
+        );
+        assert!(
+            verdict.is_err(),
+            "staging gate must refuse BOM'd strict json"
+        );
+    }
+
+    #[test]
+    fn staging_gate_is_lenient_where_strict_parse_rejects() {
+        let dup = "{\"a\":1,\"a\":2}";
+        let lenient = crate::document::validate_bytes_for_kind(
+            dup.as_bytes(),
+            crate::document::DocumentKind::StrictJson,
+            Path::new("dup.json"),
+        );
+        assert!(
+            lenient.is_ok(),
+            "staging gate is deliberately last-wins on duplicate keys"
+        );
+        assert!(
+            parse_strict_raw(dup).is_err(),
+            "strict read-side parse must reject duplicate keys"
+        );
+    }
+
+    #[test]
+    fn formatting_change_warning_edges() {
+        assert_eq!(formatting_change_warning(""), None);
+        assert_eq!(formatting_change_warning("   \n"), None);
+        assert_eq!(formatting_change_warning("not json"), None);
+        assert_eq!(formatting_change_warning("{\n  \"a\": 1\n}\n"), None);
+        assert_eq!(formatting_change_warning("42\n"), None);
+        assert!(formatting_change_warning("{\"a\":1}").is_some());
+        assert!(formatting_change_warning("{\n  \"a\": 1\n}").is_some());
+        assert!(formatting_change_warning("{\n    \"a\": 1\n}\n").is_some());
     }
 }

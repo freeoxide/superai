@@ -54,8 +54,6 @@ pub fn contains_real_secret(content: &[u8], kind: DocumentKind) -> bool {
         if trimmed.len() >= 4 && !is_obviously_fake(trimmed) {
             return true;
         }
-        // Short non-fake values can still be real; only the placeholder form
-        // is excused.
         if !trimmed.eq_ignore_ascii_case("[REDACTED]") && trimmed.len() > 2 {
             return true;
         }
@@ -579,7 +577,7 @@ mod tests {
 
     #[test]
     fn platform_gate_unsupported_when_not_in_list() {
-        // Pick a platform that is not current: if current is Linux, use Windows
+        // Pick a platform that is not the current one.
         let current = current_platform();
         let other_os = match current.os {
             Os::Linux => Os::Windows,
@@ -978,7 +976,6 @@ mod tests {
         for f in fixtures {
             let via = harness.version_for(&f.name);
             if f.is_timeout || f.is_huge || f.exit_code.is_some_and(|c| c != 0) {
-                // These should not parse as success
                 if f.is_timeout || f.is_huge {
                     assert!(
                         via.is_none(),
@@ -1055,7 +1052,6 @@ mod tests {
         let dir = crate::test_util::temp_dir_unique("mutant-backup");
         std::fs::create_dir_all(&dir).unwrap();
 
-        // happy: regular file backup succeeds and verifies
         let file = dir.join("config.json");
         std::fs::write(&file, br#"{"a":1}"#).unwrap();
         let entry = superai_config::backup::backup(&file)
@@ -1274,16 +1270,12 @@ mod tests {
         };
         let r = superai_config::quarantine::validate_quarantine_target(&fs_root);
         assert!(r.is_err(), "broad root {fs_root:?} should be rejected");
-        // home dir must be rejected
         if let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
             && home.is_absolute()
         {
-            // only test if path exists or not, validate checks equality before existence for home
             let r = superai_config::quarantine::validate_quarantine_target(&home);
-            // home may not exist in temp HOME override, but still should be rejected as broad root/home
             assert!(r.is_err(), "home {} should be rejected", home.display());
         }
-        // globs must be rejected before existence check
         let tmp = crate::test_util::tmp_abs("mutant-glob");
         for p in [
             tmp.join("*.json"),
@@ -1294,7 +1286,6 @@ mod tests {
             let r = superai_config::quarantine::validate_quarantine_target(&p);
             assert!(r.is_err(), "glob {p:?} should be rejected");
         }
-        // unresolved variables must be rejected
         for p in [
             tmp.join("$HOME/foo"),
             tmp.join("%USERPROFILE%/bar"),
@@ -1303,7 +1294,6 @@ mod tests {
             let r = superai_config::quarantine::validate_quarantine_target(&p);
             assert!(r.is_err(), "var {p:?} should be rejected");
         }
-        // relative and traversal must be rejected
         assert!(
             superai_config::quarantine::validate_quarantine_target(Path::new("relative/path"))
                 .is_err(),

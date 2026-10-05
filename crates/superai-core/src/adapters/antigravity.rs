@@ -174,9 +174,8 @@ impl Adapter for AntigravityAdapter {
         DetectionResult::new(present, version, evidence, confidence)
     }
 
-    fn version_resolution(&self) -> VersionResolution {
-        let detection = self.detection();
-        if let Some(v) = detection.version {
+    fn version_resolution_from(&self, detection: &DetectionResult) -> VersionResolution {
+        if let Some(v) = detection.version.clone() {
             let mut notes = Vec::new();
             notes.push(format!("detected antigravity-cli version {v}"));
             notes.push(format!("research blocked: {HOME_WORKAROUND_NOTE}"));
@@ -185,7 +184,7 @@ impl Adapter for AntigravityAdapter {
             res
         } else {
             let mut res = VersionResolution::unknown();
-            res.notes = detection.evidence;
+            res.notes.clone_from(&detection.evidence);
             res.notes
                 .push(format!("research blocked: {HOME_WORKAROUND_NOTE}"));
             res
@@ -376,8 +375,6 @@ mod tests {
     #[test]
     fn adapter_identity() {
         let a = adapter();
-        // Constructor wiring plus catalog registration: an id the catalog
-        // does not know can never reconcile with detection or instances.
         let entry = crate::harness_catalog::find_by_id(HARNESS_ID_STR).unwrap();
         assert_eq!(a.id().as_str(), HARNESS_ID_STR);
         assert_eq!(a.product_status(), entry.product_status);

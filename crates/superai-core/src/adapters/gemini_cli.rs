@@ -211,9 +211,8 @@ impl Adapter for GeminiCliAdapter {
         DetectionResult::new(present, version, evidence, confidence)
     }
 
-    fn version_resolution(&self) -> VersionResolution {
-        let detection = self.detection();
-        if let Some(v) = detection.version {
+    fn version_resolution_from(&self, detection: &DetectionResult) -> VersionResolution {
+        if let Some(v) = detection.version.clone() {
             let mut notes = Vec::new();
             notes.push(format!("detected gemini-cli version {v}"));
             notes.push(format!("mapped to schema version {SCHEMA_VERSION_STR}"));
@@ -226,7 +225,7 @@ impl Adapter for GeminiCliAdapter {
             res
         } else {
             let mut res = VersionResolution::unknown();
-            res.notes = detection.evidence;
+            res.notes.clone_from(&detection.evidence);
             res.notes.push(format!("migration tip: {MIGRATION_TIP}"));
             res
         }
@@ -372,7 +371,6 @@ impl Adapter for GeminiCliAdapter {
         Vec::new()
     }
 
-    /// Server address precedence inside a `mcpServers` entry: `httpUrl` > `url` > `command`.
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(
             crate::adapter::McpAdapterDecl::new(
@@ -433,8 +431,6 @@ mod tests {
     #[test]
     fn adapter_identity() {
         let a = adapter();
-        // Constructor wiring plus catalog registration: an id the catalog
-        // does not know can never reconcile with detection or instances.
         assert_eq!(a.id().as_str(), HARNESS_ID_STR);
         assert!(crate::harness_catalog::find_by_id(HARNESS_ID_STR).is_some());
         assert_eq!(a.product_status(), ProductStatus::Retired);

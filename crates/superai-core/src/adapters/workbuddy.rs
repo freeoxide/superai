@@ -102,20 +102,15 @@ impl WorkBuddyAdapter {
         super::run_capturing(binary, args, Duration::from_secs(2))
     }
 
-    /// The exact `cbc --version` format is unverified (workbuddy.md §7), so
-    /// this is best-effort; detection falls back to npm metadata.
     fn probe_binary_version(binary: &Path) -> Option<String> {
         super::parse_version_output(&Self::run_with_timeout(binary, &["--version"])?)
     }
 
-    /// Preferred version source (CLI format unverified); the package is global only.
-    /// `npm` resolves to the first PATH match, never cwd; a hostile earlier entry still shadows it.
     fn probe_npm_version() -> Option<String> {
         let path_var = std::env::var_os("PATH")?;
         Self::probe_npm_version_from(&path_var)
     }
 
-    /// [`probe_npm_version`] against an explicit PATH value (hermetic seam).
     fn probe_npm_version_from(path_var: &std::ffi::OsStr) -> Option<String> {
         let npm = super::find_in_path_within(path_var, &["npm"])?;
         let output = Self::run_with_timeout(&npm, &["ls", "-g"])?;
@@ -156,8 +151,6 @@ impl WorkBuddyAdapter {
         }
     }
 
-    /// At or past the autocompact-window era boundary; unparseable versions
-    /// are conservatively `false` (the version gate blocks writes anyway).
     fn is_auto_compact_window_era(version: &str) -> bool {
         match Self::parse_version_triple(version) {
             Some(triple) => triple >= AUTO_COMPACT_WINDOW_MIN_VERSION,
@@ -165,8 +158,6 @@ impl WorkBuddyAdapter {
         }
     }
 
-    /// cbc >= 2.103.4 carries the window in `CODEBUDDY_AUTO_COMPACT_WINDOW`; string
-    /// `maxInputTokens` is the legacy `${ENV}` preset carrier, never written to a current install.
     fn models_era_conflict(version: &str, content: &[u8]) -> Option<String> {
         if !Self::is_auto_compact_window_era(version) {
             return None;
@@ -341,11 +332,10 @@ impl Adapter for WorkBuddyAdapter {
         DetectionResult::new(present, version, evidence, confidence)
     }
 
-    fn version_resolution(&self) -> VersionResolution {
-        let detection = self.detection();
-        let Some(v) = detection.version else {
+    fn version_resolution_from(&self, detection: &DetectionResult) -> VersionResolution {
+        let Some(v) = detection.version.clone() else {
             let mut res = VersionResolution::unknown();
-            res.notes = detection.evidence;
+            res.notes.clone_from(&detection.evidence);
             return res;
         };
         let era = if Self::is_auto_compact_window_era(&v) {
@@ -398,8 +388,6 @@ impl Adapter for WorkBuddyAdapter {
         models.restart_behavior = RestartBehavior::Restart;
         surfaces.push(models);
 
-        // Schema only partially published: unmodelled keys must survive
-        // write-back verbatim.
         let settings_resolver = PathResolver::new(
             Some("$CODEBUDDY_CONFIG_DIR/settings.json"),
             Some("$CODEBUDDY_CONFIG_DIR/settings.json"),
@@ -522,8 +510,6 @@ impl Adapter for WorkBuddyAdapter {
             surfaces.push(surface);
         }
 
-        // Environment surface: documented env vars (auth priority
-        // CODEBUDDY_AUTH_TOKEN > settings apiKeyHelper > CODEBUDDY_API_KEY).
         let mut env = ConfigSurface::new(
             "env",
             PathResolver::fallback_only("process environment (CBC_/CODEBUDDY_ vars)"),
@@ -689,7 +675,6 @@ impl Adapter for WorkBuddyAdapter {
         Self::models_era_conflict(&version, content)
     }
 
-    // LinkAll first: relink_skills takes the first supported mode.
     fn supported_skill_modes(&self) -> Vec<crate::adapter::SkillMode> {
         vec![
             crate::adapter::SkillMode::LinkAll,
@@ -781,8 +766,6 @@ mod tests {
     #[test]
     fn adapter_identity() {
         let a = adapter();
-        // Constructor wiring plus catalog registration: an id the catalog
-        // does not know can never reconcile with detection or instances.
         let entry = crate::harness_catalog::find_by_id(HARNESS_ID_STR).unwrap();
         assert_eq!(a.id().as_str(), HARNESS_ID_STR);
         assert_eq!(a.product_status(), entry.product_status);

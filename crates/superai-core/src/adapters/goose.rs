@@ -209,8 +209,8 @@ impl Adapter for GooseAdapter {
         DetectionResult::new(present, version, evidence, confidence)
     }
 
-    fn version_resolution(&self) -> VersionResolution {
-        super::resolution_from_detection(self.detection(), "goose", SCHEMA_VERSION_STR)
+    fn version_resolution_from(&self, detection: &DetectionResult) -> VersionResolution {
+        super::resolution_from_detection(detection, "goose", SCHEMA_VERSION_STR)
     }
 
     #[expect(clippy::too_many_lines, reason = "surfaces are declarative")]
@@ -390,7 +390,6 @@ impl Adapter for GooseAdapter {
         super::skill_modes_link_first()
     }
 
-    /// `extensions:` maps name to stdio/remote config; `enabled_extensions` lists the bundled ones.
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(crate::adapter::McpAdapterDecl::new(
             "config.yaml",
@@ -445,8 +444,6 @@ mod tests {
     #[test]
     fn adapter_identity() {
         let a = adapter();
-        // Constructor wiring plus catalog registration: an id the catalog
-        // does not know can never reconcile with detection or instances.
         let entry = crate::harness_catalog::find_by_id(HARNESS_ID_STR).unwrap();
         assert_eq!(a.id().as_str(), HARNESS_ID_STR);
         assert_eq!(a.product_status(), entry.product_status);
@@ -638,10 +635,11 @@ mod tests {
         assert!(candidates.iter().any(|c| c.contains(CONFIG_ENV_VAR)));
     }
 
-    /// Real goose nests `config/` inside `$GOOSE_PATH_ROOT` (live 1.51.0: a
-    /// flat config.yaml there is ignored); hints must carry the segment.
     #[test]
     fn env_relocated_surface_hints_nest_config_segment() {
+        // Live goose 1.51.0 ignores a flat config.yaml in $GOOSE_PATH_ROOT;
+        // it only reads the nested config/ segment.
+
         let a = adapter();
         let env_prefix = format!("{ISOLATED_CONFIG_ROOT_HINT}/");
         let win_prefix = "%GOOSE_PATH_ROOT%\\config\\";

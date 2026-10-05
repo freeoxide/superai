@@ -213,8 +213,7 @@ impl Adapter for ZcodeAdapter {
         DetectionResult::new(present, version, evidence, confidence)
     }
 
-    fn version_resolution(&self) -> VersionResolution {
-        let detection = self.detection();
+    fn version_resolution_from(&self, detection: &DetectionResult) -> VersionResolution {
         if let Some(v) = detection.version.clone() {
             let mut notes = Vec::new();
             notes.push(format!("detected zcode version {v}"));
@@ -228,14 +227,14 @@ impl Adapter for ZcodeAdapter {
         } else if detection.present == InstallPresence::Present {
             // Config exists with version unknown: still compatible via fixed-path schema.
             let mut res = VersionResolution::new(None, Some(SCHEMA_VERSION_STR.to_owned()), true);
-            res.notes = detection.evidence;
+            res.notes.clone_from(&detection.evidence);
             res.notes.push(format!(
                 "fixed path {FIXED_CONFIG_PATH} schema {SCHEMA_VERSION_STR}"
             ));
             res
         } else {
             let mut res = VersionResolution::unknown();
-            res.notes = detection.evidence;
+            res.notes.clone_from(&detection.evidence);
             res
         }
     }
@@ -303,11 +302,9 @@ impl Adapter for ZcodeAdapter {
     fn plan_wrapper(&self, instance: &Instance) -> Result<WrapperPlan, CoreError> {
         super::ensure_instance_harness(&self.id, instance)?;
         instance.validate()?;
-        // Fixed path: no relocation; wrapper is identity (single instance).
         let mut plan = WrapperPlan::new(
             "fixed path single instance: no isolation, writes to ~/.zcode/v2/config.json in place",
         );
-        // No env vars; the harness always reads the fixed path.
         plan.description = format!(
             " single instance at {FIXED_CONFIG_PATH}; wrapper is no-op (config_root {} is informative, not used for isolation)",
             instance.config_root
@@ -324,8 +321,6 @@ impl Adapter for ZcodeAdapter {
         instance.validate()?;
         match instance.isolation {
             Isolation::FixedPathSingle | Isolation::Unknown | Isolation::RelocatedRoot => {
-                // Config content under the root must satisfy the declared
-                // root shape (full schema still research-gated).
                 crate::adapter::validate_instance_surfaces(self, instance.config_root.as_path())
             }
             other => Err(CoreError::Validation {
@@ -394,8 +389,6 @@ mod tests {
     #[test]
     fn adapter_identity() {
         let a = adapter();
-        // Constructor wiring plus catalog registration: an id the catalog
-        // does not know can never reconcile with detection or instances.
         let entry = crate::harness_catalog::find_by_id(HARNESS_ID_STR).unwrap();
         assert_eq!(a.id().as_str(), HARNESS_ID_STR);
         assert_eq!(a.product_status(), entry.product_status);

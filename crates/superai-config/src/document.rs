@@ -760,20 +760,16 @@ pub(crate) fn resolve_dotted<'a>(value: &'a Value, path: &str) -> Option<&'a Val
 
 /// Parse-check `bytes` as `kind` (staging and restore verification);
 /// env lines must be blank, comments, or `KEY=VALUE`.
-pub(crate) fn validate_bytes_for_kind(
-    content: &[u8],
-    kind: DocumentKind,
-    path: &Path,
-) -> Result<()> {
+pub fn validate_bytes_for_kind(content: &[u8], kind: DocumentKind, path: &Path) -> Result<()> {
     match kind {
         DocumentKind::StrictJson => {
-            std::str::from_utf8(content).map_err(|_err| {
+            let text = std::str::from_utf8(content).map_err(|_err| {
                 ConfigError::io(
                     path,
                     std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid utf8 in json"),
                 )
             })?;
-            serde_json::from_slice::<Value>(content).map_err(|source| ConfigError::Json {
+            serde_json::from_str::<Value>(text).map_err(|source| ConfigError::Json {
                 path: path.to_path_buf(),
                 source,
             })?;
@@ -786,8 +782,9 @@ pub(crate) fn validate_bytes_for_kind(
                     std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid utf8 in jsonc"),
                 )
             })?;
-            let stripped = strip_jsonc_comments(text);
-            serde_json::from_str::<Value>(&stripped).map_err(|source| ConfigError::Json {
+            let stripped = crate::jsonc::strip_jsonc_comments_cow(text);
+            let parse_input: &str = &stripped;
+            serde_json::from_str::<Value>(parse_input).map_err(|source| ConfigError::Json {
                 path: path.to_path_buf(),
                 source,
             })?;
@@ -856,7 +853,7 @@ pub(crate) fn validate_bytes_for_kind(
     }
 }
 
-/// Strip `//` and `/* */` comments outside strings; strings survive verbatim.
+#[cfg(test)]
 #[expect(
     clippy::excessive_nesting,
     reason = "comment stripping state machine requires nesting"
@@ -928,6 +925,32 @@ mod tests {
             .join(name)
             .to_string_lossy()
             .into_owned()
+    }
+
+    #[test]
+    fn strip_jsonc_comments_pins_line_comment_cr_bytes() {
+        // The line-comment loop breaks only on '\n', so the CR of a CRLF
+        // inside a comment is swallowed while the LF survives; a lone CR is
+        // eaten as comment bytes too.
+        assert_eq!(
+            strip_jsonc_comments("{\r\n  // note\r\n  \"a\": 1\r\n}\r\n"),
+            "{\r\n  \n  \"a\": 1\r\n}\r\n"
+        );
+        assert_eq!(
+            strip_jsonc_comments("{\"a\": 1 // tail\r\n}"),
+            "{\"a\": 1 \n}"
+        );
+        assert_eq!(strip_jsonc_comments("// a\rb\nz"), "\nz");
+    }
+
+    #[test]
+    fn strip_jsonc_comments_pins_block_comment_deletion_bytes() {
+        // Block comments are deleted with no replacement byte.
+        assert_eq!(strip_jsonc_comments("{\"a\"/* gone */: 1}"), "{\"a\": 1}");
+        assert_eq!(
+            strip_jsonc_comments("[ 1, /* multi\nline */ 2 ]"),
+            "[ 1,  2 ]"
+        );
     }
 
     #[test]

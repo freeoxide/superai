@@ -3,11 +3,12 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::adapter::{Adapter, DocumentKind, SurfaceOwnership};
+use crate::adapter::{Adapter, ConfigSurface, DocumentKind, SurfaceOwnership};
 use crate::capability::{Capability, Support};
 use crate::error::{CoreError, RedactedString, Result};
 use crate::ids::ProviderId;
@@ -1048,8 +1049,19 @@ fn is_valid_base_url(url: &str) -> (bool, String) {
 pub const BUNDLED_PROVIDERS_JSON: &str = include_str!("../assets/providers.json");
 
 /// Load providers from the bundled `assets/providers.json`, validating
-/// each definition and rejecting duplicates.
+/// each definition and rejecting duplicates. The asset is a compile-time
+/// constant, so the validated list is cached after the first call.
 pub fn load_bundled_providers() -> Result<Vec<ProviderDefinition>> {
+    Ok(bundled_providers()?.to_vec())
+}
+
+/// The validated bundled providers as a static slice: same validation and
+/// caching as [`load_bundled_providers`] without the per-call copy.
+pub(crate) fn bundled_providers() -> Result<&'static [ProviderDefinition]> {
+    static CACHED: OnceLock<Vec<ProviderDefinition>> = OnceLock::new();
+    if let Some(providers) = CACHED.get() {
+        return Ok(providers);
+    }
     let providers: Vec<ProviderDefinition> =
         serde_json::from_str(BUNDLED_PROVIDERS_JSON).map_err(|source| CoreError::Parse {
             path: PathBuf::from("assets/providers.json"),
@@ -1060,7 +1072,7 @@ pub fn load_bundled_providers() -> Result<Vec<ProviderDefinition>> {
         p.validate()?;
     }
     validate_no_duplicates(&providers)?;
-    Ok(providers)
+    Ok(CACHED.get_or_init(|| providers))
 }
 
 /// Result of a health probe; `base_url` and `reason` are redacted and
@@ -1203,9 +1215,17 @@ pub fn validate_api_key_value(provider: &ProviderDefinition, key: &str) -> Resul
 /// Resolve the harness-supported api-key sink: a writable surface with an
 /// api-key-shaped selector, else an env file; never registry/logs/keychain.
 pub fn resolve_api_key_sink(adapter: &dyn Adapter) -> Result<ApiKeySink> {
-    let surfaces = adapter.config_surfaces();
+    resolve_api_key_sink_in(&adapter.config_surfaces(), &adapter.id())
+}
+
+/// [`resolve_api_key_sink`] over a surface list the caller already built,
+/// so one flow does not rebuild the adapter's surfaces per step.
+pub(crate) fn resolve_api_key_sink_in(
+    surfaces: &[ConfigSurface],
+    harness: &str,
+) -> Result<ApiKeySink> {
     // Prefer a writable document surface with an api-key-shaped owned selector.
-    for surface in &surfaces {
+    for surface in surfaces {
         if surface.ownership == SurfaceOwnership::ExternalSecretStore {
             continue;
         }
@@ -1245,7 +1265,7 @@ pub fn resolve_api_key_sink(adapter: &dyn Adapter) -> Result<ApiKeySink> {
         }
     }
     // Second, an env file under the isolated root.
-    for surface in &surfaces {
+    for surface in surfaces {
         if surface.kind == DocumentKind::Env
             && matches!(
                 surface.ownership,
@@ -1272,7 +1292,7 @@ pub fn resolve_api_key_sink(adapter: &dyn Adapter) -> Result<ApiKeySink> {
     // No generic wrapper literal sink is invented: without a declared
     // config/env sink the placement is Unsupported.
     Err(CoreError::UnsupportedOperation {
-        harness: adapter.id().to_string(),
+        harness: harness.to_owned(),
         operation: "place_api_key".to_owned(),
         reason: "harness declares no writable config or env sink for api key".to_owned(),
     })
@@ -1406,12 +1426,8 @@ fn write_config_field(
         field: "selector".to_owned(),
         reason: format!("selector `{selector}` does not address an object"),
     };
-    // Selectors may carry a "key:" or "env." prefix; strip both when present.
-    let sel = selector
-        .strip_prefix("key:")
-        .unwrap_or(selector)
-        .strip_prefix("env.")
-        .unwrap_or(selector);
+    let after_key = selector.strip_prefix("key:").unwrap_or(selector);
+    let sel = after_key.strip_prefix("env.").unwrap_or(after_key);
     let (target_obj, leaf_key) = if selector.contains("env.") {
         if !root.is_object() {
             root = Value::Object(serde_json::Map::new());
@@ -1429,9 +1445,9 @@ fn write_config_field(
             env_entry,
             sel.split('.').next_back().unwrap_or(sel).to_owned(),
         )
-    } else if selector.contains('.') {
-        let parts: Vec<&str> = selector.split('.').collect();
-        let leaf = parts.last().copied().unwrap_or(selector).to_owned();
+    } else if sel.contains('.') {
+        let parts: Vec<&str> = sel.split('.').collect();
+        let leaf = parts.last().copied().unwrap_or(sel).to_owned();
         let mut cur = &mut root;
         for part in parts.iter().take(parts.len().saturating_sub(1)) {
             if !cur.is_object() {
@@ -2788,5 +2804,34 @@ status: active
         assert!(sonnet.supports_tools);
         assert!(sonnet.input_modalities.contains(&Modality::Image));
         assert!(!anthropic.capabilities.is_empty());
+    }
+    #[test]
+    fn write_config_field_splits_typed_dotted_selector_after_prefix() {
+        let dir = tmp_dir("typed-selector");
+        let bin_dir = dir.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let fake_claude = write_fake_claude(&bin_dir);
+        let adapter =
+            crate::adapters::claude_code::ClaudeCodeAdapter::with_configured_binary(fake_claude)
+                .unwrap();
+        let dest = dir.join("settings.json");
+        write_config_field(
+            &dest,
+            "key:providers.glm.apiKey",
+            "sk-typed-0123456789abcdef",
+            &adapter,
+        )
+        .unwrap();
+        let value: Value = serde_json::from_str(&std::fs::read_to_string(&dest).unwrap()).unwrap();
+        assert_eq!(
+            value["providers"]["glm"]["apiKey"].as_str(),
+            Some("sk-typed-0123456789abcdef"),
+            "got: {value}"
+        );
+        assert!(
+            value.get("key:providers").is_none(),
+            "raw prefix must not become an object: {value}"
+        );
+        drop(std::fs::remove_dir_all(&dir));
     }
 }

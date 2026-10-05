@@ -352,6 +352,9 @@ fn upsert_leaf(
             "selector parent is not an object".to_owned(),
         ));
     };
+    if map.get(leaf) == Some(new_value) {
+        return Ok(false);
+    }
     map.insert(leaf.to_owned(), new_value.clone());
     Ok(true)
 }
@@ -413,6 +416,7 @@ fn merge_into(
 
     let selector = op.selector().to_typed_string();
     let target = navigate_ref(root, segments, path, &selector)?;
+    let target_existed = target.is_some();
     let target_ok = match target {
         None => op.create_parent,
         Some(Value::Object(_)) => true,
@@ -438,10 +442,14 @@ fn merge_into(
             "merge target is not an object".to_owned(),
         ));
     };
+    let mut changed = !target_existed;
     for (key, value) in merge_map {
-        map.insert(key.clone(), value.clone());
+        if map.insert(key.clone(), value.clone()).as_ref() == Some(value) {
+            continue;
+        }
+        changed = true;
     }
-    Ok(true)
+    Ok(changed)
 }
 
 /// Read-only array resolution: `Ok(None)` absent (creation allowed), `Err`
@@ -547,6 +555,9 @@ fn append_identity_item(
             let items = ensure_array_mut(root, &parent, &leaf, op.create_parent, path, &selector)?;
             match items.get_mut(idx) {
                 Some(slot) => {
+                    if *slot == *item {
+                        return Ok(false);
+                    }
                     *slot = item.clone();
                     Ok(true)
                 }
@@ -643,6 +654,9 @@ fn root_array_edit(
     };
     match items.get_mut(idx) {
         Some(slot) => {
+            if *slot == *replacement {
+                return Ok(false);
+            }
             *slot = replacement.clone();
             Ok(true)
         }
@@ -654,36 +668,31 @@ fn root_array_edit(
 /// the value is untouched and `path` is error context only.
 pub fn apply_to_value(path: &Path, value: &mut Value, op: &Operation) -> Result<OperationOutcome> {
     check_ownership(path, op)?;
-    let original = value.clone();
-
-    match &op.kind {
+    let before = value_at(value, op.selector()).cloned();
+    let changed = match &op.kind {
         EditOperation::Set {
             selector,
             value: new_value,
-        } => {
-            apply_set_variant(path, op, value, selector, new_value)?;
-        }
+        } => apply_set_variant(path, op, value, selector, new_value)?,
         EditOperation::InsertEntry {
             selector,
             key,
             value: new_value,
         } => {
             let parent_segments = full_key_segments(selector, path, op)?;
-            upsert_leaf(path, op, value, &parent_segments, key, new_value)?;
+            upsert_leaf(path, op, value, &parent_segments, key, new_value)?
         }
-        EditOperation::Remove { selector } => {
-            apply_remove_variant(path, op, value, selector)?;
-        }
+        EditOperation::Remove { selector } => apply_remove_variant(path, op, value, selector)?,
         EditOperation::Merge {
             selector,
             value: merge_value,
         } => {
             let segments = full_key_segments(selector, path, op)?;
-            merge_into(path, op, value, &segments, merge_value)?;
+            merge_into(path, op, value, &segments, merge_value)?
         }
         EditOperation::EnableDisable { selector, enabled } => {
             let (parent, leaf) = key_target(selector, path, op)?;
-            upsert_leaf(path, op, value, &parent, &leaf, &Value::Bool(*enabled))?;
+            upsert_leaf(path, op, value, &parent, &leaf, &Value::Bool(*enabled))?
         }
         EditOperation::AppendIdentityItem {
             selector,
@@ -691,19 +700,17 @@ pub fn apply_to_value(path: &Path, value: &mut Value, op: &Operation) -> Result<
             identity_key,
         } => {
             let segments = full_key_segments(selector, path, op)?;
-            append_identity_item(path, op, value, &segments, item, identity_key)?;
+            append_identity_item(path, op, value, &segments, item, identity_key)?
         }
         EditOperation::EnsureDirEntry {
             selector,
             path: entry,
         } => {
             let segments = full_key_segments(selector, path, op)?;
-            ensure_dir_entry(path, op, value, &segments, entry)?;
+            ensure_dir_entry(path, op, value, &segments, entry)?
         }
-    }
-
-    let changed = *value != original;
-    let summary = summarize(op, &original, value);
+    };
+    let summary = summarize(op, before.as_ref(), value);
     Ok(OperationOutcome {
         changed,
         redacted_summary: summary,
@@ -717,16 +724,14 @@ fn apply_set_variant(
     value: &mut Value,
     selector: &Selector,
     new_value: &Value,
-) -> Result<()> {
+) -> Result<bool> {
     match selector {
         Selector::Key(_) | Selector::TomlTable(_) => {
             let (parent, leaf) = key_target(selector, path, op)?;
-            upsert_leaf(path, op, value, &parent, &leaf, new_value)?;
-            Ok(())
+            upsert_leaf(path, op, value, &parent, &leaf, new_value)
         }
         Selector::Index(_) | Selector::Identity { .. } => {
-            root_array_edit(path, op, value, false, Some(new_value))?;
-            Ok(())
+            root_array_edit(path, op, value, false, Some(new_value))
         }
         Selector::ManagedSpan(_) => Err(ConfigError::unsupported_operation(
             path,
@@ -741,16 +746,14 @@ fn apply_remove_variant(
     op: &Operation,
     value: &mut Value,
     selector: &Selector,
-) -> Result<()> {
+) -> Result<bool> {
     match selector {
         Selector::Key(_) | Selector::TomlTable(_) => {
             let (parent, leaf) = key_target(selector, path, op)?;
-            remove_leaf(path, op, value, &parent, &leaf)?;
-            Ok(())
+            remove_leaf(path, op, value, &parent, &leaf)
         }
         Selector::Index(_) | Selector::Identity { .. } => {
-            root_array_edit(path, op, value, true, None)?;
-            Ok(())
+            root_array_edit(path, op, value, true, None)
         }
         Selector::ManagedSpan(_) => Err(ConfigError::unsupported_operation(
             path,
@@ -782,7 +785,7 @@ fn value_at<'a>(value: &'a Value, selector: &Selector) -> Option<&'a Value> {
     }
 }
 
-fn summarize(op: &Operation, before: &Value, after: &Value) -> String {
+fn summarize(op: &Operation, before: Option<&Value>, after: &Value) -> String {
     let verb = match &op.kind {
         EditOperation::Set { .. } => "set",
         EditOperation::InsertEntry { .. } => "insert",
@@ -796,7 +799,7 @@ fn summarize(op: &Operation, before: &Value, after: &Value) -> String {
     let selector = render_selector(op, &op.selector().to_typed_string());
     format!(
         "{verb} {selector}: {} -> {}",
-        render_slot(op, value_at(before, op.selector())),
+        render_slot(op, before),
         render_slot(op, value_at(after, op.selector()))
     )
 }
@@ -834,13 +837,27 @@ fn read_text_or_empty(path: &Path) -> Result<String> {
     }
 }
 
+fn text_value(text: &str, path: &Path, parse: fn(&str, &Path) -> Result<Value>) -> Result<Value> {
+    if text.trim().is_empty() {
+        return Ok(Value::Object(Map::new()));
+    }
+    parse(text, path)
+}
+
 fn apply_json_family(path: &Path, op: &Operation, family: JsonFamily) -> Result<OperationOutcome> {
-    let mut value = match family {
-        JsonFamily::Strict => crate::json::load_value(path)?,
-        JsonFamily::JsonC => crate::jsonc::load_value(path)?,
-        JsonFamily::Yaml => crate::yaml::load_value(path)?,
-    };
     let old_text = read_text_or_empty(path)?;
+    let mut value = match family {
+        JsonFamily::Strict => text_value(&old_text, path, crate::json::parse_strict)?,
+        JsonFamily::JsonC => text_value(&old_text, path, |text, path| {
+            crate::json::parse_strict(&crate::jsonc::strip_jsonc_cow(text), path)
+        })?,
+        JsonFamily::Yaml => text_value(&old_text, path, |text, path| {
+            crate::yaml::parse_strict_raw(text).map_err(|source| ConfigError::Yaml {
+                path: path.to_path_buf(),
+                source,
+            })
+        })?,
+    };
     let mut outcome = apply_to_value(path, &mut value, op)?;
     if outcome.changed {
         match family {
@@ -1161,40 +1178,40 @@ fn value_to_env_map(
 }
 
 fn apply_env(path: &Path, op: &Operation) -> Result<OperationOutcome> {
-    let vars = crate::env_file::load(path)?;
-    let mut view = env_map_to_value(&vars);
-    let outcome = apply_to_value(path, &mut view, op)?;
+    let fresh = crate::env_file::read_fresh(path)?;
+    let mut view = env_map_to_value(fresh.effective_map());
+    let mut outcome = apply_to_value(path, &mut view, op)?;
     if !outcome.changed {
         return Ok(outcome);
     }
     let new_vars = value_to_env_map(&view, path, op)?;
-    // The lexical-preserving edit applies the delta: removals dropped,
-    // sets written in place.
-    let removed: Vec<String> = vars
-        .keys()
-        .filter(|k| !new_vars.contains_key(*k))
-        .cloned()
-        .collect();
-    crate::env_file::edit(path, |map| {
-        for key in &removed {
-            map.remove(key);
-        }
-        for (key, val) in &new_vars {
-            map.insert(key.clone(), val.clone());
-        }
-    })?;
+    if new_vars == *fresh.effective_map() {
+        // The env rendering cannot carry the type change (e.g. Bool over
+        // "true"); identical effective map means no write is warranted.
+        outcome.changed = false;
+        return Ok(outcome);
+    }
+    crate::env_file::commit_delta(path, fresh, &new_vars)?;
     Ok(outcome)
+}
+
+fn read_fragment_and_snapshot(path: &Path) -> Result<(Vec<u8>, crate::snapshot::Snapshot)> {
+    let read = match std::fs::read(path) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(ConfigError::io(path, e)),
+    };
+    let snap = match &read {
+        Some(bytes) => crate::snapshot::snapshot_with_bytes(path, bytes),
+        None => crate::snapshot::snapshot(path),
+    };
+    Ok((read.unwrap_or_default(), snap))
 }
 
 fn apply_text_fragment(path: &Path, op: &Operation) -> Result<OperationOutcome> {
     check_ownership(path, op)?;
     let codec = crate::span_codec::SpanCodec::default();
-    let snap = crate::snapshot::snapshot(path);
-    let old_bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(e) => return Err(ConfigError::io(path, e)),
-    };
+    let (old_bytes, snap) = read_fragment_and_snapshot(path)?;
     let old_text = std::str::from_utf8(&old_bytes).map_err(|err| {
         ConfigError::io(
             path,
@@ -1282,7 +1299,12 @@ fn apply_text_fragment(path: &Path, op: &Operation) -> Result<OperationOutcome> 
         });
     }
 
-    crate::raw_editor::commit_with_snapshot(path, new_text.as_bytes(), Some(&snap))?;
+    crate::raw_editor::commit_with_snapshot_and_base(
+        path,
+        new_text.as_bytes(),
+        Some(&snap),
+        &old_bytes,
+    )?;
     Ok(OperationOutcome {
         changed: true,
         redacted_summary: changed_summary(
@@ -1944,6 +1966,25 @@ mod tests {
         assert!(after.contains("# top comment"), "{after}");
         assert!(after.contains("MODEL=sonnet"));
         assert!(after.contains("OTHER=1"));
+        drop(std::fs::remove_file(&path));
+    }
+
+    #[test]
+    fn file_apply_env_typed_noop_writes_nothing() {
+        let path = scratch("apply-env-noop", ".env");
+        let before = b"# keep\nA=true\nN=42\n";
+        std::fs::write(&path, before).unwrap();
+
+        for (selector, value, key) in [("key:A", Value::Bool(true), "A"), ("key:N", json!(42), "N")]
+        {
+            let op = set_op(selector, value).with_owned_keys(vec![key.into()]);
+            let outcome = apply(&path, DocumentKind::Env, &op).unwrap();
+            assert!(!outcome.changed, "env rendering is unchanged: {outcome:?}");
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let dir = path.parent().unwrap();
+        let siblings = std::fs::read_dir(dir).unwrap().flatten().count();
+        assert_eq!(siblings, 1, "a no-op must not leave a backup sibling");
         drop(std::fs::remove_file(&path));
     }
 

@@ -45,4 +45,9 @@ mod property_tests;
 #[cfg(test)]
 mod fuzz;
 
+// Dev-dep of the bench target only; mark it used for the test build so
+// `unused_crate_dependencies` stays quiet without an allow.
+#[cfg(test)]
+use criterion as _;
+
 pub use error::{ConfigError, Result};

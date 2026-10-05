@@ -83,7 +83,6 @@ impl ClaudeDesktopAdapter {
         )?)
     }
 
-    /// Per-OS default root; the app has no relocation env var, so this is the only root.
     fn default_config_root() -> Option<PathBuf> {
         let home = super::home_dir()?;
         if cfg!(target_os = "macos") {
@@ -253,9 +252,8 @@ impl Adapter for ClaudeDesktopAdapter {
         DetectionResult::new(present, version, evidence, confidence)
     }
 
-    fn version_resolution(&self) -> VersionResolution {
-        let detection = self.detection();
-        if let Some(v) = detection.version {
+    fn version_resolution_from(&self, detection: &DetectionResult) -> VersionResolution {
+        if let Some(v) = detection.version.clone() {
             let notes = vec![
                 format!("detected claude-desktop version {v} (date-stamped build scheme)"),
                 format!("mapped to schema version {SCHEMA_VERSION_STR}"),
@@ -266,14 +264,14 @@ impl Adapter for ClaudeDesktopAdapter {
             res
         } else if detection.present == InstallPresence::Present {
             let mut res = VersionResolution::new(None, Some(SCHEMA_VERSION_STR.to_owned()), true);
-            res.notes = detection.evidence;
+            res.notes.clone_from(&detection.evidence);
             res.notes.push(format!(
                 "config-present detection; schema {SCHEMA_VERSION_STR} is the documented mcpServers shape"
             ));
             res
         } else {
             let mut res = VersionResolution::unknown();
-            res.notes = detection.evidence;
+            res.notes.clone_from(&detection.evidence);
             res
         }
     }
@@ -381,8 +379,6 @@ impl Adapter for ClaudeDesktopAdapter {
         ]
     }
 
-    /// The app reads one hardcoded per-OS path; no env var points elsewhere.
-    /// The alias core refuses aliasing on exactly this empty env set.
     fn plan_wrapper(&self, instance: &Instance) -> Result<WrapperPlan, CoreError> {
         super::ensure_instance_harness(&self.id, instance)?;
         instance.validate()?;
@@ -456,7 +452,6 @@ impl Adapter for ClaudeDesktopAdapter {
         ]
     }
 
-    /// Remote connectors are UI-managed and intentionally not modeled here.
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(crate::adapter::McpAdapterDecl::new(
             CONFIG_FILE,
@@ -512,8 +507,6 @@ mod tests {
     #[test]
     fn adapter_identity() {
         let a = adapter();
-        // Constructor wiring plus catalog registration: an id the catalog
-        // does not know can never reconcile with detection or instances.
         let entry = crate::harness_catalog::find_by_id(HARNESS_ID_STR).unwrap();
         assert_eq!(a.id().as_str(), HARNESS_ID_STR);
         assert_eq!(a.product_status(), entry.product_status);

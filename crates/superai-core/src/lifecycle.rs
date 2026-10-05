@@ -1,8 +1,6 @@
 //! Instance lifecycle orchestration (INS-01..09): inspect, create, rename,
 //! reconfigure, detach, remove, repair; the registry record commits last.
 
-// Preview and commit arms mirror each other per action kind, so the nested
-// guards are deliberate; flattening would interleave unrelated branches.
 #![expect(
     clippy::excessive_nesting,
     reason = "preview and commit arms mirror each other per action kind"
@@ -363,8 +361,8 @@ fn collect_files_recursive(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-/// Credential file names that must never be mirrored (corpus-derived),
-/// matched on path components so nested secrets are caught, `.env.example` not.
+// Corpus-derived credential file names; matched on path components so
+// nested secrets are caught, `.env.example` is not.
 const CREDENTIAL_FILE_NAMES: &[&str] = &[
     "credentials",
     ".credentials.json",
@@ -378,12 +376,10 @@ const CREDENTIAL_FILE_NAMES: &[&str] = &[
     "gptme.local.toml",
 ];
 
-/// Substrings marking credential material anywhere in a relative mirror path;
-/// covers `.anthropic/credentials`-style paths and `credentials/` trees.
 const CREDENTIAL_PATH_MARKERS: &[&str] = &["credentials", ".keychain"];
 
-/// Whether a relative mirror path names credential material; such entries are
-/// classified [`MirrorKind::ExternalAuth`] and never copied (re-auth instead).
+// Credential entries are classified ExternalAuth and never copied; the user
+// re-auths instead.
 fn is_credential_path(relative: &Path, credential_names: &[String]) -> bool {
     let rel = relative.to_string_lossy();
     if CREDENTIAL_PATH_MARKERS
@@ -403,8 +399,8 @@ fn is_credential_path(relative: &Path, credential_names: &[String]) -> bool {
     })
 }
 
-/// File names of every secret-store surface the adapter declares: defense in
-/// depth beyond the static corpus list (file-backed surfaces contribute names).
+// Adapter-declared secret-store names add defense in depth beyond the static
+// corpus list.
 fn adapter_credential_file_names(adapter: &dyn Adapter) -> Vec<String> {
     adapter
         .config_surfaces()
@@ -420,7 +416,6 @@ fn adapter_credential_file_names(adapter: &dyn Adapter) -> Vec<String> {
         .collect()
 }
 
-/// Fresh unix mode of `path`, when statable (INS-03 mode preservation).
 fn observed_mode(path: &Path) -> Option<u32> {
     #[cfg(unix)]
     {
@@ -435,8 +430,6 @@ fn observed_mode(path: &Path) -> Option<u32> {
     }
 }
 
-/// Whether a relative mirror path matches an adapter-declared link-safe or
-/// rewrite-declared name (leading component or full path).
 fn matches_declared_path(relative: &Path, declared: &[String]) -> bool {
     let rel = relative.to_string_lossy();
     let first = relative
@@ -510,7 +503,6 @@ fn build_mirror_plan(
         } else if let Ok(rel) = src.strip_prefix(source_root) {
             rel.to_path_buf()
         } else {
-            // Fallback: skip if cannot make relative
             skipped.push(MirrorEntry {
                 source: src.clone(),
                 target: target_root.join(src.file_name().unwrap_or_default()),
@@ -682,8 +674,6 @@ pub fn inspect_default(
     inspect_default_with_home(harness, registry, adapter, &home)
 }
 
-/// Absolute placeholder under the platform temp dir for preview fields whose
-/// real path is unknown; typed error when the temp dir is not absolute.
 fn absolute_preview_placeholder(label: &str) -> Result<AbsolutePath> {
     let candidate = std::env::temp_dir().join(label);
     AbsolutePath::from_path(&candidate).map_err(|e| CoreError::InvalidPath {
@@ -1068,8 +1058,6 @@ fn build_default_instance(
     })
 }
 
-/// Stable instance id derived from prefix, harness, and config root: preview
-/// and commit always agree. Falls back to a bare digest at the length limit.
 fn stable_instance_id(
     prefix: &str,
     harness: &HarnessId,
@@ -1135,14 +1123,11 @@ pub struct AdoptPreview {
     pub preview: OperationPreview,
 }
 
-/// Isolation class recorded for an adopted harness: the declared class from
-/// the catalog, never a relocation claim. Uncataloged records `Unknown`.
 fn adopted_isolation(harness: &HarnessId) -> Isolation {
     crate::harness_catalog::find_by_id(harness.as_str())
         .map_or(Isolation::Unknown, |entry| entry.isolation)
 }
 
-/// Render a digest token set for an error message (names and digests only).
 fn format_config_tokens(tokens: &[(String, String)]) -> String {
     if tokens.is_empty() {
         "<no readable canonical config file>".to_owned()
@@ -1492,8 +1477,6 @@ pub fn adopt(preview: &AdoptPreview, registry_path: &Path) -> Result<OperationRe
     })
 }
 
-/// Sum of the file bytes a mirror plan intends to copy, freshly stated from
-/// disk (INS-02 disk-space input; never a cached number).
 fn planned_copy_bytes(plan: &MirrorPlan) -> u64 {
     let mut total = 0u64;
     for entry in &plan.copied {
@@ -1506,8 +1489,6 @@ fn planned_copy_bytes(plan: &MirrorPlan) -> u64 {
     total
 }
 
-/// Nearest existing ancestor of `path` (for filesystem-level probes that
-/// require the path to exist).
 fn nearest_existing_ancestor(path: &Path) -> PathBuf {
     let mut current = path.to_path_buf();
     while !current.exists() {
@@ -1519,25 +1500,13 @@ fn nearest_existing_ancestor(path: &Path) -> PathBuf {
     current
 }
 
-/// Outcome of comparing required bytes against measured availability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DiskSpaceStatus {
-    /// Enough space measured.
-    Sufficient {
-        /// Bytes available.
-        available: u64,
-    },
-    /// Not enough space measured.
-    Insufficient {
-        /// Bytes available.
-        available: u64,
-    },
-    /// Availability could not be measured on this platform.
+    Sufficient { available: u64 },
+    Insufficient { available: u64 },
     Unknown,
 }
 
-/// Classify required-vs-available; pure so both branches are testable on
-/// every platform.
 fn disk_space_status(available: Option<u64>, required: u64) -> DiskSpaceStatus {
     match available {
         Some(a) if a >= required => DiskSpaceStatus::Sufficient { available: a },
@@ -1546,8 +1515,6 @@ fn disk_space_status(available: Option<u64>, required: u64) -> DiskSpaceStatus {
     }
 }
 
-/// Measure available bytes on the filesystem containing `path` (INS-02):
-/// `df -k -P` argv tokens on unix; `None` elsewhere, no invented number.
 fn disk_space_available(path: &Path) -> Option<u64> {
     #[cfg(unix)]
     {
@@ -1650,7 +1617,6 @@ fn preflight_create(
         }
     }
 
-    // Source must exist and be readable.
     let src_snapshot = snapshot(source_root);
     preconditions.push(Precondition {
         kind: PreconditionKind::Exists,
@@ -1676,7 +1642,6 @@ fn preflight_create(
         });
     }
 
-    // Target must be absent, or empty, or already owned.
     let tgt_snapshot = snapshot(target_root);
     if tgt_snapshot.exists {
         let is_empty = if tgt_snapshot.is_dir {
@@ -2050,8 +2015,6 @@ fn preflight_create(
     Ok((preconditions, conflicts, warnings))
 }
 
-/// The target files a template mutation will rewrite during the copy
-/// (INS-03 `Transformed` classification for the template path).
 fn template_transform_targets(target_root: &Path, template: Option<&TemplateRef>) -> Vec<PathBuf> {
     if template.is_some() {
         vec![target_root.join("settings.json")]
@@ -2114,8 +2077,6 @@ pub fn plan_mirror_with_asset_choice(
     )
 }
 
-/// INS-02: opted-out names must be declared link-safe assets; a name the
-/// adapter already mirror-excludes needs no inheritance choice.
 fn validate_asset_exclusions(
     asset_inheritance: &AssetInheritance,
     link_paths: &[String],
@@ -2163,8 +2124,6 @@ pub fn preview_create_mirrored(
     )
 }
 
-/// The mirror plan for a create request; an undeclared exclusion is planned
-/// as unchosen: preflight surfaces the conflict, commit refuses.
 fn mirror_plan_for_create(
     request: &CreateRequest,
     adapter: &dyn Adapter,
@@ -2376,7 +2335,6 @@ fn preview_create_from_plan(
     let rollback_plan = RollbackPlan {
         steps: {
             let mut steps = Vec::new();
-            // Rollback in reverse: remove wrapper, remove target dir
             let mut o = 0;
             if let Some(wrapper_path) = &request.wrapper
                 && let Ok(abs) = AbsolutePath::from_path(wrapper_path.as_path())
@@ -2614,8 +2572,7 @@ fn isolate_and_configure(
     Ok(steps)
 }
 
-/// The adapter's wrapper plan, or the generic env-var plan when the adapter
-/// provides none. The plan description never reaches the generated content.
+// The plan description never reaches the generated wrapper content.
 fn wrapper_plan_for(instance: &Instance, adapter: &dyn Adapter) -> WrapperPlan {
     adapter.plan_wrapper(instance).unwrap_or_else(|_| {
         let mut plan = WrapperPlan::new(&format!("wrapper for {}", instance.harness));
@@ -2627,8 +2584,7 @@ fn wrapper_plan_for(instance: &Instance, adapter: &dyn Adapter) -> WrapperPlan {
     })
 }
 
-/// Apply a plan-observed unix mode to a superai-owned target (INS-03);
-/// best-effort: a chmod failure never fails the create after bytes landed.
+// Best-effort: a chmod failure never fails the create after bytes landed.
 fn apply_observed_mode(path: &Path, mode: Option<u32>) {
     #[cfg(unix)]
     if let Some(mode) = mode {
@@ -2644,8 +2600,8 @@ fn apply_observed_mode(path: &Path, mode: Option<u32>) {
     }
 }
 
-/// Best-effort failure-path cleanup: the operation is already failing, so a
-/// cleanup error goes to stderr instead of masking the real one or vanishing.
+// Failure-path cleanup: the operation is already failing, so a cleanup error
+// goes to stderr instead of masking the real one.
 fn cleanup_logged<E: std::fmt::Display>(
     action: &str,
     path: &Path,
@@ -2656,8 +2612,8 @@ fn cleanup_logged<E: std::fmt::Display>(
     }
 }
 
-/// Digest of every file under `root`, sorted by path (INS-04 source-unchanged
-/// proof); an unreadable entry is an error, never a silent omission.
+// Source-unchanged proof input: an unreadable entry is an error, never a
+// silent omission.
 fn source_tree_digests(root: &Path) -> Result<Vec<(PathBuf, String)>> {
     let io_err = |path: &Path, source: std::io::Error| {
         CoreError::Config(ConfigError::Io {
@@ -2685,8 +2641,6 @@ fn source_tree_digests(root: &Path) -> Result<Vec<(PathBuf, String)>> {
     Ok(out)
 }
 
-/// Deterministic instance id for a create: name + digest of the target root
-/// (the derivation the record and the DRF-05 marker share).
 fn derive_instance_id(name: &InstanceName, target_root: &str) -> Result<InstanceId> {
     let candidate = format!(
         "{}_{}",
@@ -2731,8 +2685,7 @@ fn guess_document_kind(path: &Path) -> superai_config::document::DocumentKind {
     }
 }
 
-/// Mutate settings bytes with template markers, or refuse honestly (DOC-05):
-/// JSONC input is never rewritten as normalized JSON; refuse typed instead.
+// JSONC input is never rewritten as normalized JSON; refuse typed instead.
 fn mutate_settings_with_template(
     target: &Path,
     existing: Option<&[u8]>,
@@ -3042,8 +2995,6 @@ pub fn create_mirrored(
     })
 }
 
-/// Quarantine a failed create's target root and planned wrapper. Residual
-/// cleanup is best-effort: the operation is already failing.
 fn quarantine_root_and_wrapper(target_root: &Path, wrapper: Option<&WrapperPath>, op_id: &str) {
     cleanup_logged(
         "quarantine",
@@ -3242,7 +3193,6 @@ pub fn rename_instance(
             .map(|w| w.path.as_path().to_path_buf())
         && old_path.exists()
     {
-        // Move the wrapper file only when its file name equals the old name.
         let old_file_name = old_path
             .file_name()
             .and_then(|n| n.to_str())
@@ -3271,7 +3221,6 @@ pub fn rename_instance(
         } else {
             None
         };
-        // Reflect the new wrapper location in the record before it is stored.
         let mut removed =
             registry
                 .remove(new_name.as_str())
@@ -3301,7 +3250,6 @@ pub fn rename_instance(
     }
 
     registry.store(registry_path)?;
-    // Verify id, root, and template survived the rename.
     let after = Registry::load(registry_path)?;
     let inst_after = after
         .get(new_name.as_str())
@@ -3436,7 +3384,6 @@ impl ReconfigureRequest {
     }
 }
 
-/// Resolve a provider from the bundled catalog (case-folded).
 fn resolve_bundled_provider(
     provider_id: &ProviderId,
 ) -> Result<crate::provider::ProviderDefinition> {
@@ -3454,8 +3401,6 @@ fn resolve_bundled_provider(
         })
 }
 
-/// Resolve the provider definitions a provider action needs (owned, so the
-/// borrowed change outlives each call site).
 fn resolve_action_providers(
     action: &ReconfigureAction,
 ) -> Result<(
@@ -3484,8 +3429,6 @@ fn resolve_action_providers(
     }
 }
 
-/// Construct the borrowed provider change for an already-resolved action;
-/// non-provider actions are refused.
 fn provider_change_with<'a>(
     action: &'a ReconfigureAction,
     primary: &'a crate::provider::ProviderDefinition,
@@ -3514,8 +3457,6 @@ fn provider_change_with<'a>(
     }
 }
 
-/// Redacted line diff between two file contents (WRP-08/INS-06 preview
-/// diffs): positional +/- lines, secret-shaped values redacted, bounded.
 pub(crate) fn redacted_line_diff(old: &str, new: &str, max_lines: usize) -> String {
     let redact_line = |line: &str| -> String {
         if (line.contains("sk-") || line.contains("apiKey") || line.contains("api_key"))
@@ -3549,8 +3490,6 @@ pub(crate) fn redacted_line_diff(old: &str, new: &str, max_lines: usize) -> Stri
     out.join("\n")
 }
 
-/// The skills destination dir the adapter declares for the instance root,
-/// when it declares one (surface id containing `skills`).
 fn adapter_skills_dir(instance: &Instance, adapter: &dyn Adapter) -> Option<PathBuf> {
     adapter
         .config_surfaces()
@@ -3559,7 +3498,6 @@ fn adapter_skills_dir(instance: &Instance, adapter: &dyn Adapter) -> Option<Path
         .map(|surface| instance.config_root.as_path().join(&surface.id))
 }
 
-/// MCP destination path for the instance, from the adapter's declaration.
 fn mcp_dest_path(
     instance: &Instance,
     adapter: &dyn Adapter,
@@ -3574,14 +3512,10 @@ fn mcp_dest_path(
     Ok((instance.config_root.as_path().join(&decl.dest_file), decl))
 }
 
-/// The superai-owned plugin registry root: `<home>/.superai/plugins`, outside
-/// every harness tree, same discipline as the skills root.
 fn plugin_registry_root(home: &Path) -> PathBuf {
     home.join(".superai").join("plugins")
 }
 
-/// Destination path a plugin declaration mutates: the config FILE for
-/// config-entry plugins, the bundle DIRECTORY otherwise.
 fn plugin_dest_path(instance: &Instance, decl: &crate::adapter::PluginAdapterDecl) -> PathBuf {
     if decl.kind == crate::adapter::PluginKind::DirectoryBundle
         && let Some(dir) = decl.dest_dir.as_deref()
@@ -3592,8 +3526,6 @@ fn plugin_dest_path(instance: &Instance, decl: &crate::adapter::PluginAdapterDec
     }
 }
 
-/// Resolve the plugin registry record FRESH from disk; `Ok(None)` means the
-/// id is unknown, never guessed at.
 fn plugin_record_for(home: &Path, plugin: &str) -> Result<Option<crate::plugin::PluginRecord>> {
     let registry = crate::plugin::PluginRegistry::load(&plugin_registry_root(home))?;
     Ok(crate::ids::PluginId::new(plugin)
@@ -4137,7 +4069,6 @@ pub fn reconfigure_with_home(
         registry.store(registry_path)?;
     }
 
-    // Validate via adapter against the mutated target.
     let updated_instance = registry.get(name).ok_or_else(|| CoreError::Validation {
         field: "name".to_owned(),
         reason: "instance missing after update".to_owned(),
@@ -4446,15 +4377,13 @@ fn apply_reconfigure_action(
     Ok(())
 }
 
-/// One byte-restorable surface captured before the action that mutates it.
 struct AppliedRevert {
     path: PathBuf,
     pre: Option<Vec<u8>>,
     existed: bool,
 }
 
-/// Capture the pre-image of `path` once per request (first writer wins, so
-/// the captured bytes are the request-start state).
+// First writer wins, so the captured bytes are the request-start state.
 fn capture_revert(path: &Path, reverts: &mut Vec<AppliedRevert>) {
     if reverts.iter().any(|r| r.path == path) {
         return;
@@ -4475,8 +4404,7 @@ fn capture_revert(path: &Path, reverts: &mut Vec<AppliedRevert>) {
     }
 }
 
-/// Restore captured pre-images in reverse order; files the request created
-/// (absent at capture) are quarantined, never deleted.
+// Files the request created (absent at capture) are quarantined, never deleted.
 fn rollback_applied_reverts(reverts: &[AppliedRevert]) -> (RollbackStatus, Vec<String>) {
     let op = crate::registry::unique_operation_string("op");
     let mut notes = Vec::new();
@@ -5157,7 +5085,6 @@ pub fn detect_repairs_with_home(
 ) -> Vec<RepairItem> {
     let mut items: Vec<RepairItem> = Vec::new();
     for inst in registry.instances() {
-        // Missing wrapper / wrapper drift (full-content comparison)
         if let Some(wrapper) = &inst.wrapper {
             let wrapper_path = wrapper.path.as_path();
             if wrapper_path.exists() {
@@ -5219,7 +5146,6 @@ pub fn detect_repairs_with_home(
             });
         }
 
-        // Binary missing (if binary is absolute path)
         if let Some(binary) = &inst.binary
             && let Some(abs) = binary.as_absolute_path()
             && !abs.as_path().exists()

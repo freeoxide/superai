@@ -188,8 +188,8 @@ impl Adapter for AiderAdapter {
         DetectionResult::new(present, version, evidence, confidence)
     }
 
-    fn version_resolution(&self) -> VersionResolution {
-        super::resolution_from_detection(self.detection(), "aider", SCHEMA_VERSION_STR)
+    fn version_resolution_from(&self, detection: &DetectionResult) -> VersionResolution {
+        super::resolution_from_detection(detection, "aider", SCHEMA_VERSION_STR)
     }
 
     fn config_surfaces(&self) -> Vec<ConfigSurface> {
@@ -475,8 +475,6 @@ mod tests {
     #[test]
     fn adapter_identity() {
         let a = adapter();
-        // Constructor wiring plus catalog registration: an id the catalog
-        // does not know can never reconcile with detection or instances.
         let entry = crate::harness_catalog::find_by_id(HARNESS_ID_STR).unwrap();
         assert_eq!(a.id().as_str(), HARNESS_ID_STR);
         assert_eq!(a.product_status(), entry.product_status);
@@ -670,7 +668,6 @@ mod tests {
         assert_eq!(env_val, tmp_root.as_str());
         assert!(!env_val.contains('"'));
         assert!(env_val.contains(' '));
-        // Args with spaces must be preserved verbatim (shell quoting handled by wrapper generator)
         let config_path = plan
             .args
             .windows(2)

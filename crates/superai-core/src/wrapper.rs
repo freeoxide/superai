@@ -356,13 +356,37 @@ fn extract_digest(content: &str) -> Option<String> {
     }
 }
 
+pub(crate) fn read_up_to(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path)?;
+    let mut buf = Vec::new();
+    file.take(limit).read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
 /// Whether a wrapper is superai-owned: parseable against the generated
 /// grammar plus marker+digest (WRP-08; never a substring match).
 pub fn is_owned_wrapper(path: &Path, expected_digest: Option<&str>) -> bool {
-    let Ok(content) = std::fs::read_to_string(path) else {
+    let Ok(bytes) = read_up_to(path, MAX_WRAPPER_BYTES as u64 + 1) else {
         return false;
     };
-    let Some(parsed) = parse_wrapper_content(&content) else {
+    if bytes.len() > MAX_WRAPPER_BYTES {
+        return false;
+    }
+    let Ok(content) = String::from_utf8(bytes) else {
+        return false;
+    };
+    owned_wrapper_from_content(Some(content.as_str()), expected_digest)
+}
+
+pub(crate) fn owned_wrapper_from_content(
+    content: Option<&str>,
+    expected_digest: Option<&str>,
+) -> bool {
+    let Some(content) = content else {
+        return false;
+    };
+    let Some(parsed) = parse_wrapper_content(content) else {
         return false;
     };
     let Some(marker) = parsed.marker.as_deref() else {
@@ -510,7 +534,8 @@ pub fn detect_wrapper_kind(path: &Path) -> WrapperKind {
             reason: format!("wrapper path {} is a directory", path.display()),
         };
     }
-    let data = match std::fs::read(path) {
+    let total_len = meta.len();
+    let data = match read_up_to(path, MAX_WRAPPER_BYTES as u64 + 1) {
         Ok(d) => d,
         Err(e) => {
             return WrapperKind::Opaque {
@@ -518,16 +543,19 @@ pub fn detect_wrapper_kind(path: &Path) -> WrapperKind {
             };
         }
     };
+    wrapper_kind_from_bytes(&data, total_len)
+}
+
+pub(crate) fn wrapper_kind_from_bytes(data: &[u8], total_len: u64) -> WrapperKind {
     if data.len() > MAX_WRAPPER_BYTES {
+        let reported = total_len.max(data.len() as u64);
         return WrapperKind::Opaque {
             reason: format!(
-                "wrapper too large ({} bytes > {}); refusing to parse",
-                data.len(),
-                MAX_WRAPPER_BYTES
+                "wrapper too large ({reported} bytes > {MAX_WRAPPER_BYTES}); refusing to parse"
             ),
         };
     }
-    let content = String::from_utf8_lossy(&data);
+    let content = String::from_utf8_lossy(data);
     detect_wrapper_kind_from_content(&content)
 }
 
@@ -941,14 +969,31 @@ pub fn resolve_wrapper_destination(
     Ok(wrapper_path)
 }
 
-/// Verify a wrapper against the expected instance/plan: bounded parse,
-/// marker, digest, env/unsets, exec target, `"$@"`, exact content.
-pub fn verify_wrapper(path: &Path, instance: &Instance, plan: &WrapperPlan) -> Result<()> {
-    let content = std::fs::read_to_string(path).map_err(|e| CoreError::Verification {
+fn wrapper_content(path: &Path) -> Result<String> {
+    let bytes =
+        read_up_to(path, MAX_WRAPPER_BYTES as u64 + 1).map_err(|e| CoreError::Verification {
+            path: path.to_path_buf(),
+            kind: "read".to_owned(),
+            reason: format!("cannot read wrapper at {}: {e}", path.display()),
+        })?;
+    if bytes.len() > MAX_WRAPPER_BYTES {
+        return Err(CoreError::Verification {
+            path: path.to_path_buf(),
+            kind: "parse".to_owned(),
+            reason: "wrapper does not match generated grammar (opaque)".to_owned(),
+        });
+    }
+    String::from_utf8(bytes).map_err(|e| CoreError::Verification {
         path: path.to_path_buf(),
         kind: "read".to_owned(),
         reason: format!("cannot read wrapper at {}: {e}", path.display()),
-    })?;
+    })
+}
+
+/// Verify a wrapper against the expected instance/plan: bounded parse,
+/// marker, digest, env/unsets, exec target, `"$@"`, exact content.
+pub fn verify_wrapper(path: &Path, instance: &Instance, plan: &WrapperPlan) -> Result<()> {
+    let content = wrapper_content(path)?;
     let parsed = parse_wrapper_content(&content).ok_or_else(|| CoreError::Verification {
         path: path.to_path_buf(),
         kind: "parse".to_owned(),
@@ -1690,6 +1735,16 @@ mod tests {
         std::fs::write(&real, &content).unwrap();
         assert!(is_owned_wrapper(&real, Some(&digest)));
         assert!(!is_owned_wrapper(&real, Some("deadbeef")));
+
+        let big = dir.join("big");
+        std::fs::write(&big, vec![b'#'; 33 * 1024]).unwrap();
+        assert!(!is_owned_wrapper(&big, None));
+        match detect_wrapper_kind(&big) {
+            WrapperKind::Opaque { reason } => {
+                assert!(reason.contains("too large (33792 bytes"), "{reason}");
+            }
+            other => panic!("expected Opaque, got {other:?}"),
+        }
 
         // Forged: a body carrying the digest with no parseable superai
         // marker line must not count as ownership.

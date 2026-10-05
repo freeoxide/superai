@@ -94,8 +94,6 @@ impl CursorAdapter {
         Some(home.join(".cursor"))
     }
 
-    /// The agent reads user MCP only from `$HOME/.cursor/mcp.json` and
-    /// ignores env relocation (probe-verified 2026-09-18).
     fn mcp_read_path() -> Option<PathBuf> {
         let home = super::home_dir()?;
         Some(home.join(".cursor").join("mcp.json"))
@@ -283,8 +281,8 @@ impl Adapter for CursorAdapter {
         DetectionResult::new(present, version, evidence, confidence)
     }
 
-    fn version_resolution(&self) -> VersionResolution {
-        super::resolution_from_detection(self.detection(), "cursor", SCHEMA_VERSION_STR)
+    fn version_resolution_from(&self, detection: &DetectionResult) -> VersionResolution {
+        super::resolution_from_detection(detection, "cursor", SCHEMA_VERSION_STR)
     }
 
     fn config_surfaces(&self) -> Vec<ConfigSurface> {
@@ -491,7 +489,6 @@ impl Adapter for CursorAdapter {
         super::skill_modes_link_first()
     }
 
-    /// The agent never reads `$CURSOR_CONFIG_DIR/mcp.json` (probe 2026-09-18).
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(crate::adapter::McpAdapterDecl::new(
             "mcp.json",
@@ -547,8 +544,6 @@ mod tests {
     #[test]
     fn adapter_identity() {
         let a = adapter();
-        // Constructor wiring plus catalog registration: an id the catalog
-        // does not know can never reconcile with detection or instances.
         let entry = crate::harness_catalog::find_by_id(HARNESS_ID_STR).unwrap();
         assert_eq!(a.id().as_str(), HARNESS_ID_STR);
         assert_eq!(a.product_status(), entry.product_status);

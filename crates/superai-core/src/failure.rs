@@ -274,17 +274,13 @@ fn injected_error(point: FailurePoint, nth: usize) -> CoreError {
     }
 }
 
-/// Adapter presenting a core [`FailureInjector`] as a
-/// `superai_config::injector::Injector`.
 #[derive(Debug, Clone, Copy)]
 struct ConfigInjector<'a>(&'a dyn FailureInjector);
 
 fn map_config_point(point: superai_config::injector::Point) -> FailurePoint {
     use superai_config::injector::Point as P;
-    // Journal-phase points double as the crash-at-phase simulation, sharing
-    // the boundary that historically simulated each phase.
     match point {
-        P::BackupOpen => FailurePoint::BackupOpen,
+        P::BackupRead | P::BackupOpen => FailurePoint::BackupOpen,
         P::BackupWrite | P::JournalPrepareBackup => FailurePoint::BackupWrite,
         P::BackupFlush => FailurePoint::BackupFlush,
         P::BackupVerify => FailurePoint::BackupVerify,
@@ -319,8 +315,6 @@ impl superai_config::injector::Injector for OwnedConfigInjector {
     }
 }
 
-/// The one injection path both config adapters share: remap the config-phase
-/// point onto the core boundary and map the error back.
 fn inject_config_point(
     injector: &dyn FailureInjector,
     point: superai_config::injector::Point,
@@ -368,7 +362,6 @@ pub fn injected_stage_temp(
     let temp = superai_config::transaction::stage_temp_file(target, content, Some(&adapter))
         .map_err(CoreError::Config)?;
     injector.inject(FailurePoint::ParseStaged)?;
-    // Read errors can move `temp` into the error: both paths end this fn.
     let bytes = match std::fs::read(&temp) {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -561,7 +554,6 @@ pub struct FakeProcessOutcome {
 /// Minimal fake process harness: no live spawn, deterministic fixtures.
 #[derive(Debug, Clone, Default)]
 pub struct FakeProcessHarness {
-    /// Map from fixture name to outcome.
     fixtures: BTreeMap<String, FakeProcessOutcome>,
 }
 
@@ -830,7 +822,6 @@ pub struct FakeHttpResponse {
 /// Deterministic fake network harness (no live network).
 #[derive(Debug, Clone, Default)]
 pub struct FakeNetworkHarness {
-    /// Map from url substring key to response (deterministic fixture).
     responses: BTreeMap<String, Result<FakeHttpResponse, String>>,
 }
 

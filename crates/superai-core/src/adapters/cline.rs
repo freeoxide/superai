@@ -73,7 +73,6 @@ impl ClineAdapter {
         Ok(Self { id })
     }
 
-    /// Cline first; a lone VS Code binary still counts as install evidence.
     fn find_binary_in_path() -> Option<PathBuf> {
         super::find_in_path(&[EXECUTABLE]).or_else(|| super::find_in_path(&[VSCODE_EXECUTABLE]))
     }
@@ -101,7 +100,6 @@ impl ClineAdapter {
                     .join("settings"),
             )
         } else if cfg!(windows) {
-            // Approximate via APPDATA.
             if let Ok(appdata) = std::env::var("APPDATA")
                 && !appdata.trim().is_empty()
             {
@@ -364,8 +362,8 @@ impl Adapter for ClineAdapter {
         DetectionResult::new(present, version, evidence, confidence)
     }
 
-    fn version_resolution(&self) -> VersionResolution {
-        super::resolution_from_detection(self.detection(), "cline", SCHEMA_VERSION_STR)
+    fn version_resolution_from(&self, detection: &DetectionResult) -> VersionResolution {
+        super::resolution_from_detection(detection, "cline", SCHEMA_VERSION_STR)
     }
 
     #[expect(clippy::too_many_lines, reason = "surfaces are declarative")]
@@ -717,8 +715,6 @@ mod tests {
     #[test]
     fn adapter_identity() {
         let a = adapter();
-        // Constructor wiring plus catalog registration: an id the catalog
-        // does not know can never reconcile with detection or instances.
         let entry = crate::harness_catalog::find_by_id(HARNESS_ID_STR).unwrap();
         assert_eq!(a.id().as_str(), HARNESS_ID_STR);
         assert_eq!(a.product_status(), entry.product_status);

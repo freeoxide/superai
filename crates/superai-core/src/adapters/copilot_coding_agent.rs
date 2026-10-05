@@ -88,7 +88,6 @@ impl CopilotCodingAgentAdapter {
             "no MCP local, no skills local, no API key local: org policy + repo settings govern"
                 .to_owned(),
         );
-        // GH token env (but don't leak)
         if let Ok(val) = std::env::var("GH_TOKEN")
             && !val.trim().is_empty()
         {
@@ -155,7 +154,6 @@ impl Adapter for CopilotCodingAgentAdapter {
                 EXECUTABLE,
                 path.display()
             ));
-            // The gh version is evidence, never claimed as coding-agent version.
             match super::probe_version(path) {
                 Some(v) => {
                     evidence.push(format!(
@@ -179,17 +177,15 @@ impl Adapter for CopilotCodingAgentAdapter {
 
         self.collect_config_evidence(&mut evidence);
 
-        // The agent is cloud-owned, so local presence is always Absent.
         let present = InstallPresence::Absent;
         let confidence = DetectionConfidence::High;
 
         DetectionResult::new(present, version, evidence, confidence)
     }
 
-    fn version_resolution(&self) -> VersionResolution {
-        let detection = self.detection();
+    fn version_resolution_from(&self, detection: &DetectionResult) -> VersionResolution {
         let mut res = VersionResolution::unknown();
-        res.notes = detection.evidence;
+        res.notes.clone_from(&detection.evidence);
         res.notes.push(format!("unsupported: {UNSUPPORTED_REASON}"));
         res.notes.push(format!(
             "schema version {SCHEMA_VERSION_STR} is placeholder, no local config schema"
@@ -199,7 +195,6 @@ impl Adapter for CopilotCodingAgentAdapter {
     }
 
     fn config_surfaces(&self) -> Vec<ConfigSurface> {
-        // Cloud-owned surfaces are exposed as Opaque for documentation.
         let mut surfaces = Vec::new();
 
         let cloud_instructions_resolver = PathResolver::fallback_only(
@@ -357,8 +352,6 @@ mod tests {
     #[test]
     fn adapter_identity() {
         let a = adapter();
-        // Constructor wiring plus catalog registration: an id the catalog
-        // does not know can never reconcile with detection or instances.
         let entry = crate::harness_catalog::find_by_id(HARNESS_ID_STR).unwrap();
         assert_eq!(a.id().as_str(), HARNESS_ID_STR);
         assert_eq!(a.product_status(), entry.product_status);

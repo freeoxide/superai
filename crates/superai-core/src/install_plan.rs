@@ -123,7 +123,6 @@ pub trait VersionProbe {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemVersionProbe;
 
-/// Bounded probe timeout for availability queries.
 const AVAILABILITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl VersionProbe for SystemVersionProbe {
@@ -146,8 +145,6 @@ impl VersionProbe for SystemVersionProbe {
         let unavailable = |reason: String| VersionAvailability::Unavailable { reason };
         match method {
             InstallMethodKind::Npm => {
-                // Concrete versions ask the registry for that exact spec;
-                // channels and latest ask for the newest.
                 let spec = match requested {
                     Some(r) if !crate::install_execute::is_channel(r) => format!("{package}@{r}"),
                     _ => package.to_owned(),
@@ -270,8 +267,6 @@ fn first_line(text: &str) -> String {
 }
 
 impl VersionAvailability {
-    /// When both the probe and the caller resolved a concrete version,
-    /// reconcile: an answer that does not cover the request is `Unavailable`.
     fn pipe_match_requested(self, requested: Option<&str>) -> Self {
         let Some(requested) = requested else {
             return self;
@@ -461,8 +456,6 @@ pub fn plan_install_for_entry_with_probe(
         })?;
     let package_name = method.package_name.clone();
 
-    // Syntactic gate rejects injection-shaped inputs outright; whether a
-    // well-formed version is actually offered is the probe's typed answer.
     validate_version_shape(request.version.as_deref(), request.channel.as_deref())?;
     let requested_version = request.version.as_deref().or(request.channel.as_deref());
     let version_availability =
@@ -489,8 +482,6 @@ pub fn plan_install_for_entry_with_probe(
     let expected_executable =
         derive_expected_executable(entry, method, request.destination.as_deref());
 
-    // PKG-10: External/Direct methods have no safe non-interactive install
-    // command; no installer (in particular `mise install`) is fabricated.
     let external_install = match request.method {
         InstallMethodKind::External => Some(ExternalInstall {
             docs: entry.docs.clone(),
@@ -530,8 +521,6 @@ pub fn plan_install_for_entry_with_probe(
     })
 }
 
-/// Reject injection-shaped version/channel strings: NUL, shell metachars,
-/// and path separators are errors before any probe runs.
 fn validate_version_shape(version: Option<&str>, channel: Option<&str>) -> Result<(), CoreError> {
     let check = |field: &str, value: &str| -> Result<(), CoreError> {
         if value.contains('\0') {
@@ -601,8 +590,6 @@ fn check_destination_writable(dest: Option<&Path>) -> Result<bool, CoreError> {
             Ok(dir_is_writable(path, &meta))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // Missing destination is fine only when its parent exists, is a
-            // directory, and is writable.
             if let Some(parent) = path.parent() {
                 if parent.as_os_str().is_empty() {
                     return Ok(false);
@@ -627,8 +614,6 @@ fn check_destination_writable(dest: Option<&Path>) -> Result<bool, CoreError> {
     }
 }
 
-/// Whether new files can be created inside `dir`. Unix: the mode bits
-/// carry the owner/group/other write permission.
 #[cfg(unix)]
 fn dir_is_writable(_dir: &Path, meta: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::PermissionsExt;
@@ -636,8 +621,6 @@ fn dir_is_writable(_dir: &Path, meta: &std::fs::Metadata) -> bool {
     mode & 0o200 != 0 || mode & 0o020 != 0 || mode & 0o002 != 0
 }
 
-/// Whether new files can be created inside `dir`. Windows has no write bit,
-/// so writability is proven by creating and removing an exclusive probe file.
 #[cfg(not(unix))]
 fn dir_is_writable(dir: &Path, _meta: &std::fs::Metadata) -> bool {
     let probe = dir.join(format!(
@@ -710,8 +693,6 @@ fn build_command_preview(
         method.package_name.clone()
     };
 
-    // PKG-10: External and Direct methods have no safe non-interactive install
-    // command; the preview opens the docs URL instead.
     if matches!(
         method.kind,
         InstallMethodKind::External | InstallMethodKind::Direct

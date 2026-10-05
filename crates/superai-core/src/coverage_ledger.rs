@@ -4,36 +4,23 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-/// Reference date for the freshness ledger (QAL-14); updated by the
-/// pre-release recheck after re-verifying the catalog.
 const FRESHNESS_AS_OF: &str = "2026-09-18";
 
-/// Maximum tolerated age of a catalog `last_verified` date, in days, at the
-/// last recorded recheck.
 const MAX_ENTRY_AGE_DAYS: i64 = 365;
 
-/// A piece of evidence backing one ledger row.
 #[derive(Debug, Clone, Copy)]
 enum Evidence {
-    /// A test function: `name` must appear as `fn <name>(` in `file`.
     Test {
-        /// Source file, relative to this crate's manifest directory.
         file: &'static str,
-        /// The test function name.
         name: &'static str,
     },
-    /// A non-test artifact: `file` must exist and contain `needle`
-    /// (e.g. a CI gate step, a committed tool configuration).
     Contains {
-        /// Artifact file, relative to this crate's manifest directory.
         file: &'static str,
-        /// Text the artifact must contain.
         needle: &'static str,
     },
 }
 
 impl Evidence {
-    /// Source file the item cites.
     fn file(&self) -> &str {
         match self {
             Self::Test { file, .. } | Self::Contains { file, .. } => file,
@@ -41,13 +28,10 @@ impl Evidence {
     }
 }
 
-/// Resolve an evidence `file` (relative to this crate's manifest dir).
 fn resolve(file: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(file)
 }
 
-/// Verify one evidence item against an already-read source text; returns a
-/// human-readable problem on failure.
 fn verify_evidence_src(evidence: &Evidence, src: &str) -> Result<(), String> {
     match evidence {
         Evidence::Test { file, name } => {
@@ -88,7 +72,6 @@ fn verify_evidence_src(evidence: &Evidence, src: &str) -> Result<(), String> {
     }
 }
 
-/// Read an evidence file once per run, memoizing per caller-supplied cache.
 fn cached_source(file: &str, cache: &mut HashMap<String, String>) -> Result<String, String> {
     if let Some(src) = cache.get(file) {
         return Ok(src.clone());
@@ -99,18 +82,12 @@ fn cached_source(file: &str, cache: &mut HashMap<String, String>) -> Result<Stri
     Ok(src)
 }
 
-/// One master-plan §9 row: the goal requirement sentence (must match the
-/// plan's table text exactly), plus its evidence.
 #[derive(Debug)]
 struct GoalRow {
-    /// The requirement sentence, first column of the §9 table.
     requirement: &'static str,
-    /// Evidence: tests or explicit artifacts.
     evidence: &'static [Evidence],
 }
 
-/// The full §9 ledger. The bidirectional test guarantees this list covers
-/// exactly the plan's rows, no orphans, no missing.
 const GOAL_ROWS: &[GoalRow] = &[
     GoalRow {
         requirement: "Existing/default installs are managed targets",
@@ -329,18 +306,13 @@ const GOAL_ROWS: &[GoalRow] = &[
     },
 ];
 
-/// One master-plan §10 checkbox: the 1-based checkbox number plus evidence.
 #[derive(Debug)]
 struct DodItem {
-    /// 1-based checkbox position in §10 (order-stable in the document).
     number: usize,
-    /// Short label for diagnostics.
     label: &'static str,
-    /// Evidence: tests or explicit artifacts.
     evidence: &'static [Evidence],
 }
 
-/// The §10 ledger (16 checkboxes).
 const DOD_ITEMS: &[DodItem] = &[
     DodItem {
         number: 1,
@@ -598,8 +570,6 @@ const DOD_ITEMS: &[DodItem] = &[
     },
 ];
 
-/// Extract the §9 requirement sentences (first column of the goal-coverage
-/// table), skipping the header and separator rows.
 fn section9_requirements(plan: &str) -> Vec<String> {
     let mut in_section = false;
     let mut rows = Vec::new();
@@ -628,7 +598,6 @@ fn section9_requirements(plan: &str) -> Vec<String> {
     rows
 }
 
-/// Count the `§10` `DoD` checkboxes and return their first-line texts.
 fn section10_items(plan: &str) -> Vec<String> {
     let mut in_section = false;
     let mut items = Vec::new();
@@ -649,7 +618,6 @@ fn section10_items(plan: &str) -> Vec<String> {
     items
 }
 
-/// Parse `YYYY-MM-DD` into `(year, month, day)`.
 fn parse_ymd(s: &str) -> Option<(i32, u32, u32)> {
     let mut parts = s.trim().split('-');
     let year: i32 = parts.next()?.parse().ok()?;
@@ -673,8 +641,6 @@ fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
-/// Age in days of a `last_verified` date relative to `as_of` (both
-/// `YYYY-MM-DD`). `None` when either date does not parse.
 fn staleness_days(last_verified: &str, as_of: &str) -> Option<i64> {
     let (ly, lm, ld) = parse_ymd(last_verified)?;
     let (ay, am, ad) = parse_ymd(as_of)?;

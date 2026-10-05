@@ -11,7 +11,7 @@ use crate::atomic::compute_digest;
 use crate::backup::{BackupEntry, backup_with_reason};
 use crate::document::{Diagnostic, DocumentKind, Encoding, NewlineStyle, detect_newline};
 use crate::error::{ConfigError, Result};
-use crate::snapshot::{Snapshot, is_modified, snapshot};
+use crate::snapshot::{Snapshot, is_modified, snapshot, snapshot_with_bytes};
 
 /// Sensitive bytes whose `Debug`/`Display` are redacted; the raw value is
 /// reachable only via [`Self::expose`] (RAW-01).
@@ -72,6 +72,17 @@ fn detect_bom(bytes: &[u8]) -> bool {
         && bytes.first().copied() == Some(0xEF)
         && bytes.get(1).copied() == Some(0xBB)
         && bytes.get(2).copied() == Some(0xBF)
+}
+
+// JSON kinds parse the raw bytes so every gate in one write path agrees
+// with the staging gate (document.rs validate_bytes_for_kind); yaml strips
+// its BOM (yaml.rs).
+fn gate_parse_bytes(kind: DocumentKind, content: &[u8]) -> &[u8] {
+    if matches!(kind, DocumentKind::StrictJson | DocumentKind::JsonC) {
+        content
+    } else {
+        bytes_without_bom(content)
+    }
 }
 
 fn bytes_without_bom(bytes: &[u8]) -> &[u8] {
@@ -153,12 +164,12 @@ pub fn validate(content: &[u8], kind: DocumentKind) -> Vec<Diagnostic> {
     }
 
     // Invalid UTF-8 is always a diagnostic, even for opaque fragments.
-    let without_bom = bytes_without_bom(content);
-    let text = match std::str::from_utf8(without_bom) {
+    let parse_bytes = gate_parse_bytes(kind, content);
+    let text = match std::str::from_utf8(parse_bytes) {
         Ok(text) => text,
         Err(err) => {
             let valid_up_to = err.valid_up_to();
-            let (line, col) = offset_to_line_col(without_bom, valid_up_to);
+            let (line, col) = offset_to_line_col(parse_bytes, valid_up_to);
             let len = err.error_len().unwrap_or(1);
             diagnostics.push(Diagnostic::new(
                 line,
@@ -233,18 +244,18 @@ pub fn validate_with_schema(
 
 /// Parse `content` per `kind` into the semantic value tree, when possible.
 fn parse_semantic_value(content: &[u8], kind: DocumentKind) -> Option<Value> {
-    let text = std::str::from_utf8(bytes_without_bom(content)).ok()?;
+    let text = std::str::from_utf8(gate_parse_bytes(kind, content)).ok()?;
     if text.trim().is_empty() {
         return Some(Value::Object(Map::new()));
     }
     match kind {
         DocumentKind::StrictJson => crate::json::parse_strict_raw(text).ok(),
         DocumentKind::JsonC => {
-            let stripped = crate::jsonc::strip_jsonc(text);
+            let stripped = crate::jsonc::strip_jsonc_cow(text);
             if stripped.trim().is_empty() {
                 Some(Value::Object(Map::new()))
             } else {
-                crate::json::parse_strict_raw(&stripped).ok()
+                crate::json::parse_strict_raw(stripped.as_ref()).ok()
             }
         }
         DocumentKind::Yaml => crate::yaml::parse_strict_raw(text).ok(),
@@ -273,11 +284,11 @@ fn validate_json(text: &str) -> Vec<Diagnostic> {
 }
 
 fn validate_jsonc(text: &str) -> Vec<Diagnostic> {
-    let stripped = crate::jsonc::strip_jsonc(text);
+    let stripped = crate::jsonc::strip_jsonc_cow(text);
     if stripped.trim().is_empty() {
         return Vec::new();
     }
-    validate_json(&stripped)
+    validate_json(stripped.as_ref())
 }
 
 fn validate_toml(text: &str) -> Vec<Diagnostic> {
@@ -485,7 +496,9 @@ fn formatting_change_warnings(
     .collect()
 }
 
-fn lexical_diff(old: &[u8], new: &[u8]) -> String {
+/// Unified-diff preview of two buffers, capped at 8 KiB of output; binary
+/// input yields a size/digest summary instead of content.
+pub fn lexical_diff(old: &[u8], new: &[u8]) -> String {
     if old == new {
         return String::new();
     }
@@ -509,18 +522,17 @@ fn lexical_diff(old: &[u8], new: &[u8]) -> String {
         return String::new();
     }
 
-    let old_lines: Vec<&str> = old_str.lines().collect();
-    let new_lines: Vec<&str> = new_str.lines().collect();
+    let mut old_lines = old_str.lines();
+    let mut new_lines = new_str.lines();
+    let mut lower_scratch = String::new();
 
     let mut out = String::new();
     out.push_str("--- old\n");
     out.push_str("+++ new\n");
 
-    let max = usize::max(old_lines.len(), new_lines.len());
-    for idx in 0..max {
-        let old_line = old_lines.get(idx).copied();
-        let new_line = new_lines.get(idx).copied();
-        match (old_line, new_line) {
+    loop {
+        match (old_lines.next(), new_lines.next()) {
+            (None, None) => break,
             (Some(a), Some(b)) if a == b => {
                 out.push(' ');
                 out.push_str(a);
@@ -528,23 +540,22 @@ fn lexical_diff(old: &[u8], new: &[u8]) -> String {
             }
             (Some(a), Some(b)) => {
                 out.push_str("- ");
-                out.push_str(&redact_line_for_preview(a));
+                out.push_str(&redact_line_for_preview(a, &mut lower_scratch));
                 out.push('\n');
                 out.push_str("+ ");
-                out.push_str(&redact_line_for_preview(b));
+                out.push_str(&redact_line_for_preview(b, &mut lower_scratch));
                 out.push('\n');
             }
             (Some(a), None) => {
                 out.push_str("- ");
-                out.push_str(&redact_line_for_preview(a));
+                out.push_str(&redact_line_for_preview(a, &mut lower_scratch));
                 out.push('\n');
             }
             (None, Some(b)) => {
                 out.push_str("+ ");
-                out.push_str(&redact_line_for_preview(b));
+                out.push_str(&redact_line_for_preview(b, &mut lower_scratch));
                 out.push('\n');
             }
-            (None, None) => {}
         }
         if out.len() > 8192 {
             out.push_str("... truncated\n");
@@ -555,8 +566,11 @@ fn lexical_diff(old: &[u8], new: &[u8]) -> String {
     out
 }
 
-fn redact_line_for_preview(line: &str) -> String {
-    if !contains_secret_marker(&line.to_ascii_lowercase()) {
+fn redact_line_for_preview(line: &str, lower: &mut String) -> String {
+    lower.clear();
+    lower.push_str(line);
+    lower.make_ascii_lowercase();
+    if !contains_secret_marker(lower) {
         return line.to_owned();
     }
     if let Some(pos) = line.find(':') {
@@ -621,16 +635,19 @@ fn jsonc_semantic_diff(old: &[u8], new: &[u8]) -> Vec<SemanticOp> {
         Ok(s) => s,
         Err(_) => return Vec::new(),
     };
-    let old_stripped = crate::jsonc::strip_jsonc(old_text);
-    let new_stripped = crate::jsonc::strip_jsonc(new_text);
+    let old_stripped = crate::jsonc::strip_jsonc_cow(old_text);
+    let new_stripped = crate::jsonc::strip_jsonc_cow(new_text);
     if old_stripped.trim().is_empty() && new_stripped.trim().is_empty() {
         return Vec::new();
     }
-    let old_val = match crate::json::parse_strict_raw(&old_stripped) {
+    if old_stripped == new_stripped {
+        return Vec::new();
+    }
+    let old_val = match crate::json::parse_strict_raw(old_stripped.as_ref()) {
         Ok(v) => v,
         Err(_) => return Vec::new(),
     };
-    let new_val = match crate::json::parse_strict_raw(&new_stripped) {
+    let new_val = match crate::json::parse_strict_raw(new_stripped.as_ref()) {
         Ok(v) => v,
         Err(_) => return Vec::new(),
     };
@@ -927,13 +944,17 @@ pub fn find_redaction_spans(content: &[u8], _kind: DocumentKind) -> Vec<Redactio
 
 fn find_redaction_spans_str(text: &str) -> Vec<RedactionSpan> {
     let mut spans = Vec::new();
+    let mut lower = String::new();
     let mut offset = 0usize;
     for line_with_nl in text.split_inclusive('\n') {
         let line = line_with_nl
             .strip_suffix('\n')
             .and_then(|l| l.strip_suffix('\r'))
             .unwrap_or(line_with_nl.trim_end_matches('\n'));
-        if let Some(span) = redaction_span_for_line(line, offset) {
+        lower.clear();
+        lower.push_str(line);
+        lower.make_ascii_lowercase();
+        if let Some(span) = redaction_span_for_line(line, &lower, offset) {
             spans.push(span);
         }
         offset = offset.saturating_add(line_with_nl.len());
@@ -941,13 +962,11 @@ fn find_redaction_spans_str(text: &str) -> Vec<RedactionSpan> {
     spans
 }
 
-fn redaction_span_for_line(line: &str, line_offset: usize) -> Option<RedactionSpan> {
-    let lower = line.to_ascii_lowercase();
-    if !contains_secret_marker(&lower) && !lower.contains("auth") {
+fn redaction_span_for_line(line: &str, lower: &str, line_offset: usize) -> Option<RedactionSpan> {
+    if !contains_secret_marker(lower) && !lower.contains("auth") {
         return None;
     }
     let Some(pos) = line.find(':').or_else(|| line.find('=')) else {
-        // No separator to anchor on: redact the whole line.
         return Some(RedactionSpan {
             start: line_offset,
             end: line_offset.saturating_add(line.len()),
@@ -989,7 +1008,7 @@ pub fn read(path: &Path) -> Result<RawDocument> {
     let bom = detect_bom(&bytes);
     let newline_style = detect_newline(&bytes);
     let digest = compute_digest(&bytes);
-    let snapshot = snapshot(path);
+    let snapshot = snapshot_with_bytes(path, &bytes);
     let diagnostics = validate(&bytes, kind);
 
     Ok(RawDocument {
@@ -1031,7 +1050,7 @@ pub fn create_file_with_injector(
     // RAW-05 empty-buffer rule and, for fragments, the span-only gate).
     validate_for_commit(path, new_content, kind)?;
     if kind == DocumentKind::TextFragment {
-        enforce_span_only_change(path, new_content)?;
+        enforce_span_only_change(path, new_content, None)?;
     }
     // The caller expects a missing target; an existing file is a conflict.
     if path.exists() {
@@ -1121,7 +1140,7 @@ pub fn create_file_with_injector(
     Ok(CommitReport {
         backup: None,
         new_digest,
-        new_snapshot: snapshot(path),
+        new_snapshot: snapshot_with_bytes(path, &read_back),
         is_noop: false,
     })
 }
@@ -1146,7 +1165,7 @@ pub fn commit(
     new_content: &[u8],
     expected_digest: Option<&str>,
 ) -> Result<CommitReport> {
-    commit_inner(path, new_content, expected_digest, None)
+    commit_inner(path, new_content, expected_digest, None, None)
 }
 
 /// Commit with an explicit [`Snapshot`] conflict token.
@@ -1156,40 +1175,45 @@ pub fn commit_with_snapshot(
     expected: Option<&Snapshot>,
 ) -> Result<CommitReport> {
     let digest_opt = expected.and_then(|s| s.digest.as_deref());
-    commit_inner(path, new_content, digest_opt, expected)
+    commit_inner(path, new_content, digest_opt, expected, None)
+}
+
+/// [`commit_with_snapshot`] with the fragment bytes the caller read from
+/// `path` this operation: the span gate compares against `base` instead of
+/// re-reading, and the snapshot token still freshly re-checks, so a file
+/// changed since `base` aborts before any disk mutation.
+pub fn commit_with_snapshot_and_base(
+    path: &Path,
+    new_content: &[u8],
+    expected: Option<&Snapshot>,
+    base: &[u8],
+) -> Result<CommitReport> {
+    let digest_opt = expected.and_then(|s| s.digest.as_deref());
+    commit_inner(path, new_content, digest_opt, expected, Some(base))
 }
 
 /// DOC-08 gate: both sides need well-formed sentinels and identical bytes
 /// outside all spans, else the write is refused (missing file = empty).
-fn enforce_span_only_change(path: &Path, new_content: &[u8]) -> Result<()> {
-    let old_bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(e) => return Err(ConfigError::io(path, e)),
+/// `base` supplies the caller's fresh bytes when it holds them.
+fn enforce_span_only_change(path: &Path, new_content: &[u8], base: Option<&[u8]>) -> Result<()> {
+    let read;
+    let old_bytes: &[u8] = if let Some(bytes) = base {
+        bytes
+    } else {
+        read = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(ConfigError::io(path, e)),
+        };
+        &read
     };
-    let to_text = |bytes: &[u8], label: &str| -> Result<String> {
-        std::str::from_utf8(bytes)
-            .map(str::to_owned)
-            .map_err(|err| {
-                ConfigError::io(
-                    path,
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("{label} content is not valid utf-8: {err}"),
-                    ),
-                )
-            })
-    };
-    let old_text = to_text(&old_bytes, "current")?;
-    let new_text = to_text(new_content, "new")?;
+    let old_text = commit_text(path, old_bytes, "current")?;
+    let new_text = commit_text(path, new_content, "new")?;
     let codec = crate::span_codec::SpanCodec::default();
-    let old_outside = codec
-        .outside_span_bytes(&old_text)
+    let outside_equal = codec
+        .outside_span_bytes_equal(old_text, new_text)
         .map_err(|e| e.into_config_error(path))?;
-    let new_outside = codec
-        .outside_span_bytes(&new_text)
-        .map_err(|e| e.into_config_error(path))?;
-    if old_outside == new_outside {
+    if outside_equal {
         return Ok(());
     }
     Err(ConfigError::unmanaged_span_write(
@@ -1198,6 +1222,18 @@ fn enforce_span_only_change(path: &Path, new_content: &[u8]) -> Result<()> {
          opaque/read-only (DOC-08)"
             .to_owned(),
     ))
+}
+
+fn commit_text<'a>(path: &Path, bytes: &'a [u8], label: &str) -> Result<&'a str> {
+    std::str::from_utf8(bytes).map_err(|err| {
+        ConfigError::io(
+            path,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{label} content is not valid utf-8: {err}"),
+            ),
+        )
+    })
 }
 
 fn validate_for_commit(path: &Path, content: &[u8], kind: DocumentKind) -> Result<()> {
@@ -1221,7 +1257,7 @@ fn validate_for_commit(path: &Path, content: &[u8], kind: DocumentKind) -> Resul
     let msg = format!("{}:{}: {}", first.line, first.col, first.message);
     match kind {
         DocumentKind::StrictJson | DocumentKind::JsonC => {
-            let text = std::str::from_utf8(bytes_without_bom(content)).unwrap_or_default();
+            let text = std::str::from_utf8(gate_parse_bytes(kind, content)).unwrap_or_default();
             match crate::json::parse_strict_raw(text) {
                 Ok(_) => Err(ConfigError::Io {
                     path: path.to_path_buf(),
@@ -1234,7 +1270,7 @@ fn validate_for_commit(path: &Path, content: &[u8], kind: DocumentKind) -> Resul
             }
         }
         DocumentKind::Toml => {
-            let text = std::str::from_utf8(bytes_without_bom(content)).unwrap_or_default();
+            let text = std::str::from_utf8(gate_parse_bytes(kind, content)).unwrap_or_default();
             let parse_err: std::result::Result<DocumentMut, toml_edit::TomlError> = text.parse();
             match parse_err {
                 Ok(_) => Err(ConfigError::Io {
@@ -1248,7 +1284,7 @@ fn validate_for_commit(path: &Path, content: &[u8], kind: DocumentKind) -> Resul
             }
         }
         DocumentKind::Yaml => {
-            let text = std::str::from_utf8(bytes_without_bom(content)).unwrap_or_default();
+            let text = std::str::from_utf8(gate_parse_bytes(kind, content)).unwrap_or_default();
             match crate::yaml::parse_strict_raw(text) {
                 Ok(_) => Err(ConfigError::Io {
                     path: path.to_path_buf(),
@@ -1271,12 +1307,12 @@ fn validate_for_commit(path: &Path, content: &[u8], kind: DocumentKind) -> Resul
     }
 }
 
-#[expect(clippy::too_many_lines, reason = "commit steps are sequential")]
 fn commit_inner(
     path: &Path,
     new_content: &[u8],
     expected_digest: Option<&str>,
     expected_snapshot: Option<&Snapshot>,
+    base: Option<&[u8]>,
 ) -> Result<CommitReport> {
     let kind = DocumentKind::from_path(path);
 
@@ -1295,10 +1331,14 @@ fn commit_inner(
 
     // DOC-08: fragments accept span-only edits; whole-file rewrites stay read-only.
     if kind == DocumentKind::TextFragment {
-        enforce_span_only_change(path, new_content)?;
+        enforce_span_only_change(path, new_content, base)?;
     }
 
-    let current_snapshot = snapshot(path);
+    let existing = std::fs::read(path).ok();
+    let current_snapshot = match &existing {
+        Some(bytes) => snapshot_with_bytes(path, bytes),
+        None => snapshot(path),
+    };
 
     if let Some(expected) = expected_snapshot {
         if is_modified(expected, &current_snapshot) {
@@ -1338,9 +1378,8 @@ fn commit_inner(
         ));
     }
 
-    if current_snapshot.exists
-        && let Ok(existing) = std::fs::read(path)
-        && existing == new_content
+    if let Some(existing_bytes) = existing.as_deref()
+        && existing_bytes == new_content
     {
         let new_digest = compute_digest(new_content);
         return Ok(CommitReport {
@@ -1374,19 +1413,6 @@ fn commit_inner(
         }
         return Err(e);
     }
-
-    let read_back = std::fs::read(path).map_err(|e| ConfigError::io(path, e))?;
-    let expected_digest_new = compute_digest(new_content);
-    let actual_digest = compute_digest(&read_back);
-    if expected_digest_new != actual_digest {
-        return Err(ConfigError::verification(
-            path,
-            format!(
-                "digest mismatch after commit: expected {expected_digest_new}, got {actual_digest}"
-            ),
-        ));
-    }
-    validate_for_commit(path, &read_back, kind)?;
 
     let new_snapshot = snapshot(path);
     let new_digest = new_snapshot
@@ -1455,6 +1481,73 @@ mod tests {
         assert!(
             diags.is_empty(),
             "valid json should have no diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn bom_json_schema_validation_stays_syntax_only() {
+        let bom_json: &[u8] = b"\xef\xbb\xbf{\"deprecated\": 1}";
+        let schema = crate::document::SemanticSchema {
+            validator: None,
+            deprecated_keys: vec![crate::document::DeprecatedKey {
+                key: "deprecated".to_owned(),
+                replacement: None,
+            }],
+        };
+        let diagnostics = validate_with_schema(bom_json, DocumentKind::StrictJson, Some(&schema));
+        assert!(!diagnostics.is_empty(), "the BOM syntax error must surface");
+        assert!(
+            diagnostics
+                .iter()
+                .all(|d| !d.message.contains("deprecated")),
+            "unparsable content must get syntax diagnostics only: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn bom_json_commit_refusal_is_a_json_error() {
+        let path = raw_scratch("bom-commit", "settings.json");
+        std::fs::write(&path, br#"{"a":1}"#).unwrap();
+        let err = commit(&path, b"\xef\xbb\xbf{\"a\":2}", None).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Json { .. }),
+            "the BOM refusal must surface as the json parse error it is: {err}"
+        );
+        drop(std::fs::remove_file(&path));
+    }
+
+    #[test]
+    fn snapshot_with_bytes_matches_a_fresh_snapshot() {
+        let path = raw_scratch("snap-parity", "doc.json");
+        std::fs::write(&path, br#"{"a":"payload"}"#).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(snapshot_with_bytes(&path, &bytes), snapshot(&path));
+        drop(std::fs::remove_file(&path));
+    }
+
+    #[test]
+    fn bom_json_drafts_fail_validation_like_the_staging_gate() {
+        let bom_json: &[u8] = b"\xef\xbb\xbf{\"a\":1}";
+        assert!(
+            !validate(bom_json, DocumentKind::StrictJson).is_empty(),
+            "a BOM'd json draft must diagnose like the staging gate that parses raw bytes"
+        );
+        assert!(
+            !validate(bom_json, DocumentKind::JsonC).is_empty(),
+            "a BOM'd jsonc draft must diagnose like the staging gate"
+        );
+        assert!(
+            crate::document::validate_bytes_for_kind(
+                bom_json,
+                DocumentKind::StrictJson,
+                Path::new("b.json")
+            )
+            .is_err()
+        );
+        let bom_yaml: &[u8] = b"\xef\xbb\xbfa: 1";
+        assert!(
+            validate(bom_yaml, DocumentKind::Yaml).is_empty(),
+            "yaml keeps its BOM-stripping loader behavior"
         );
     }
 
@@ -2353,6 +2446,17 @@ mod tests {
         );
         assert_eq!(std::fs::read(&base).unwrap(), br#"{"a":1}"#.to_vec());
         drop(std::fs::remove_file(&base));
+    }
+
+    #[test]
+    fn create_file_jsonc_trailing_comma_draft_refuses_at_staging() {
+        let path = raw_scratch("trailing", "settings.jsonc");
+        let _err = create_file(&path, b"{\"a\":1,\n}").unwrap_err();
+        assert!(
+            !path.exists(),
+            "the staging gate must refuse the draft with nothing written"
+        );
+        drop(std::fs::remove_dir_all(path.parent().unwrap()));
     }
 
     #[test]

@@ -13,13 +13,13 @@ use std::sync::Arc;
 use crate::atomic::{
     apply_mode, compute_digest, generate_temp_path, remove_temp, resolve_final_mode, sync_parent,
 };
-use crate::backup::{BackupEntry, backup_with_injector, verify_backup};
+use crate::backup::{BackupEntry, backup_bytes_with_injector, backup_with_injector, verify_backup};
 use crate::document::{DocumentKind, validate_bytes_for_kind};
 use crate::error::{ConfigError, Result};
-use crate::injector::{Injector, Point};
+use crate::injector::{Injector, Point, run as inject};
 use crate::journal::{CrashJournal, JournalBackup, JournalPhase};
 use crate::safe_paths::home_dir;
-use crate::snapshot::{Snapshot, is_modified, snapshot};
+use crate::snapshot::{Snapshot, is_modified, snapshot, snapshot_with_bytes};
 
 /// Stable operation identifier for quarantine and backup linkage.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -505,7 +505,6 @@ pub fn commit_staged_file(
 ) -> Result<()> {
     validate_path_safety(target)?;
     let staged_bytes = std::fs::read(staged).map_err(|e| ConfigError::io(staged, e))?;
-    let expected_digest = compute_digest(&staged_bytes);
 
     if let Some(parent) = target.parent()
         && !parent.as_os_str().is_empty()
@@ -568,21 +567,12 @@ pub fn commit_staged_file(
         injector.inject(Point::ReadBackVerify)?;
     }
     let read_back = std::fs::read(target).map_err(|e| ConfigError::io(target, e))?;
-    let actual = compute_digest(&read_back);
-    if expected_digest != actual {
+    if read_back != staged_bytes {
+        let expected_digest = compute_digest(&staged_bytes);
+        let actual = compute_digest(&read_back);
         return Err(ConfigError::verification(
             target,
             format!("digest mismatch after commit: expected {expected_digest}, got {actual}"),
-        ));
-    }
-    if read_back.len() != staged_bytes.len() {
-        return Err(ConfigError::verification(
-            target,
-            format!(
-                "size mismatch after commit: expected {}, got {}",
-                staged_bytes.len(),
-                read_back.len(),
-            ),
         ));
     }
     Ok(())
@@ -599,10 +589,9 @@ pub struct FileCommitReport {
 
 /// Detect a case-insensitive sibling (QAL-09): on such filesystems the write
 /// would silently land over the sibling, so the risk surfaces everywhere.
-pub(crate) fn case_fold_collision_in_dir(target: &Path) -> Option<PathBuf> {
+pub fn case_fold_collision_in_dir(target: &Path) -> Option<PathBuf> {
     let dir = target.parent()?;
     let target_name = target.file_name()?.to_string_lossy().into_owned();
-    let wanted = target_name.to_ascii_lowercase();
     let entries = std::fs::read_dir(dir).ok()?;
     let mut best: Option<PathBuf> = None;
     for entry in entries.flatten() {
@@ -611,7 +600,7 @@ pub(crate) fn case_fold_collision_in_dir(target: &Path) -> Option<PathBuf> {
         if name_str == target_name {
             continue;
         }
-        if name_str.to_ascii_lowercase() == wanted {
+        if name_str.eq_ignore_ascii_case(&target_name) {
             let variant = dir.join(&name);
             match &best {
                 Some(current) if current <= &variant => {}
@@ -1117,7 +1106,7 @@ pub struct CommitOutcome {
 pub struct VerifyOutcome {
     /// Path that was verified.
     pub path: PathBuf,
-    /// Whether digest matches expected.
+    /// Whether the committed bytes match the planned content.
     pub digest_ok: bool,
     /// Whether parse succeeded.
     pub parse_ok: bool,
@@ -1485,7 +1474,6 @@ impl Transaction {
             self.expected_states.insert(path, snap);
         }
 
-        // Every staged temp must still carry exactly its planned bytes.
         let planned: HashMap<&Path, &Vec<u8>> = self
             .steps
             .iter()
@@ -1498,13 +1486,11 @@ impl Transaction {
             let Some(content) = planned.get(target.as_path()) else {
                 continue;
             };
-            let expected = compute_digest(content);
             let staged_bytes = std::fs::read(&temp).map_err(|e| ConfigError::io(&temp, e))?;
-            let actual = compute_digest(&staged_bytes);
-            if expected != actual {
+            if staged_bytes != content.as_slice() {
                 return Err(ConfigError::verification(
                     &target,
-                    format!("staged digest mismatch for {}", target.display()),
+                    format!("staged bytes mismatch for {}", target.display()),
                 ));
             }
         }
@@ -1561,7 +1547,18 @@ impl Transaction {
             if !(snap.exists && snap.is_file) {
                 continue;
             }
-            let current = snapshot(p);
+            // One fresh read serves both the recheck token and the backup
+            // bytes; both consumers live inside this prepare pass.
+            inject(self.injector.as_deref(), Point::BackupRead)?;
+            let read = match std::fs::read(p) {
+                Ok(bytes) => Some(bytes),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => return Err(ConfigError::io(p, e)),
+            };
+            let current = match &read {
+                Some(bytes) => snapshot_with_bytes(p, bytes),
+                None => snapshot(p),
+            };
             if is_modified(snap, &current) {
                 return Err(ConfigError::concurrent_modification(
                     p,
@@ -1569,12 +1566,22 @@ impl Transaction {
                     current.digest.unwrap_or_default(),
                 ));
             }
-            let entry = backup_with_injector(
-                p,
-                Some(self.id.as_str()),
-                "transaction prepare",
-                self.injector.as_deref(),
-            )?;
+            let entry = match read {
+                Some(bytes) => backup_bytes_with_injector(
+                    p,
+                    Some(self.id.as_str()),
+                    "transaction prepare",
+                    self.injector.as_deref(),
+                    &bytes,
+                    current.digest.as_deref(),
+                )?,
+                None => backup_with_injector(
+                    p,
+                    Some(self.id.as_str()),
+                    "transaction prepare",
+                    self.injector.as_deref(),
+                )?,
+            };
             if let Some(entry) = entry {
                 self.backups.push(entry);
             }
@@ -1599,10 +1606,6 @@ impl Transaction {
                 self.inject(Point::ParseStaged)?;
                 validate_bytes_for_kind(content, *kind, path)?;
                 let temp_path = self.stage_write(path, content)?;
-                // The staged file itself must parse (read fresh).
-                let staged_bytes =
-                    std::fs::read(&temp_path).map_err(|e| ConfigError::io(&temp_path, e))?;
-                validate_bytes_for_kind(&staged_bytes, *kind, &temp_path)?;
                 staged.push(temp_path.clone());
                 staged_map.push((path.clone(), temp_path));
             }
@@ -1958,7 +1961,9 @@ impl Transaction {
         Ok(())
     }
 
-    /// Fresh read plus parse per Write step.
+    /// Fresh read per Write step; bytes equal to the staged content skip
+    /// the re-parse. Never errors on verification failure: each outcome
+    /// carries `digest_ok`/`parse_ok` and rollback is caller-driven.
     #[expect(
         clippy::excessive_nesting,
         reason = "verify checks digest and parse per file"
@@ -1984,16 +1989,15 @@ impl Transaction {
                         continue;
                     }
                 };
-                let expected_digest = compute_digest(content);
-                let actual_digest = compute_digest(&bytes);
-                let digest_ok = expected_digest == actual_digest;
-                let parse_ok = validate_bytes_for_kind(&bytes, *kind, path).is_ok();
-                let message = if digest_ok && parse_ok {
+                let bytes_equal = bytes.as_slice() == content.as_slice();
+                let digest_ok = bytes_equal;
+                let parse_ok = bytes_equal || validate_bytes_for_kind(&bytes, *kind, path).is_ok();
+                let message = if bytes_equal {
                     "verified".to_owned()
-                } else if !digest_ok {
-                    format!("digest mismatch: expected {expected_digest}, got {actual_digest}")
                 } else {
-                    "parse failed after commit".to_owned()
+                    let expected_digest = compute_digest(content);
+                    let actual_digest = compute_digest(&bytes);
+                    format!("digest mismatch: expected {expected_digest}, got {actual_digest}")
                 };
                 // No raw bytes in messages: secret-like content is redacted.
                 let redacted_message = if message.contains("apiKey") || message.contains("secret") {
@@ -2912,6 +2916,103 @@ mod tests {
         drop(std::fs::remove_dir_all(&root));
     }
 
+    #[derive(Debug)]
+    struct Recorder(Mutex<Vec<Point>>);
+    impl Injector for Recorder {
+        fn inject(&self, point: Point) -> Result<()> {
+            if let Ok(mut points) = self.0.lock() {
+                points.push(point);
+            }
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct SharedRecorder(Arc<Mutex<Vec<Point>>>);
+    impl Injector for SharedRecorder {
+        fn inject(&self, point: Point) -> Result<()> {
+            if let Ok(mut points) = self.0.lock() {
+                points.push(point);
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn full_transaction_backs_up_before_staging_before_commit() {
+        let root = tmp_root();
+        let target = root.join("full-order.json");
+        std::fs::write(&target, b"pre-existing").unwrap();
+        let id = OperationId::new("op-durability-order").unwrap();
+        let recorder = SharedRecorder(Arc::new(Mutex::new(Vec::new())));
+        let mut txn = Transaction::new(
+            id,
+            vec![FileAction::Write {
+                path: target,
+                content: b"replacement".to_vec(),
+                kind: DocumentKind::TextFragment,
+            }],
+        )
+        .with_injector(Arc::new(recorder.clone()));
+        txn.prepare().unwrap();
+        txn.commit().unwrap();
+        let expected = [
+            Point::BackupOpen,
+            Point::BackupWrite,
+            Point::BackupFlush,
+            Point::BackupVerify,
+            Point::ParseStaged,
+            Point::TempCreate,
+            Point::TempWrite,
+            Point::TempFlush,
+            Point::ConflictRecheck,
+            Point::AtomicReplace,
+            Point::ParentSync,
+            Point::ReadBackVerify,
+        ];
+        let seen = recorder.0.lock().unwrap();
+        let observed: Vec<Point> = seen
+            .iter()
+            .copied()
+            .filter(|p| expected.contains(p))
+            .collect();
+        assert_eq!(
+            observed, expected,
+            "a foreign-target commit must back up and flush before staging, and stage-fsync before the rename chain"
+        );
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    #[test]
+    fn commit_path_durability_points_fire_in_order() {
+        let root = tmp_root();
+        let target = root.join("order.json");
+        std::fs::write(&target, b"old").unwrap();
+        let recorder = Recorder(Mutex::new(Vec::new()));
+        let temp = stage_temp_file(&target, b"new", Some(&recorder)).unwrap();
+        commit_staged_file(&target, &temp, None, Some(&recorder)).unwrap();
+        let expected = [
+            Point::TempCreate,
+            Point::TempWrite,
+            Point::TempFlush,
+            Point::ConflictRecheck,
+            Point::AtomicReplace,
+            Point::ParentSync,
+            Point::ReadBackVerify,
+        ];
+        let seen = recorder.0.lock().unwrap();
+        let observed: Vec<Point> = seen
+            .iter()
+            .copied()
+            .filter(|p| expected.contains(p))
+            .collect();
+        assert_eq!(
+            observed, expected,
+            "staging must fsync the temp before the boundary rechecks, renames, syncs the parent, reads back"
+        );
+        drop(std::fs::remove_dir_all(&root));
+    }
+
     #[test]
     fn staged_temp_tampering_between_prepare_and_commit_is_detected() {
         let root = tmp_root();
@@ -2999,9 +3100,130 @@ mod tests {
             .prepare()
             .expect_err("tampered staged bytes must abort prepare");
         assert!(
-            err.to_string().contains("staged digest mismatch"),
+            err.to_string().contains("staged bytes mismatch"),
             "unexpected error: {err}"
         );
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    #[derive(Debug)]
+    struct RemoveTargetAtBackupRead {
+        path: PathBuf,
+    }
+
+    impl Injector for RemoveTargetAtBackupRead {
+        fn inject(&self, point: Point) -> Result<()> {
+            if point == Point::BackupRead {
+                std::fs::remove_file(&self.path).map_err(|e| ConfigError::io(&self.path, e))?;
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn prepare_flags_a_target_vanishing_before_the_backup_read_as_concurrent() {
+        let root = tmp_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let a = root.join("a.txt");
+        std::fs::write(&a, b"pre-op").unwrap();
+        let inj = Arc::new(RemoveTargetAtBackupRead { path: a.clone() });
+        let id = OperationId::new("op-backup-vanish").unwrap();
+        let mut txn = Transaction::new(
+            id,
+            vec![FileAction::Write {
+                path: a,
+                content: b"planned".to_vec(),
+                kind: DocumentKind::TextFragment,
+            }],
+        )
+        .with_injector(inj);
+        match txn.prepare() {
+            Err(ConfigError::ConcurrentModification { .. }) => {}
+            other => panic!("expected ConcurrentModification, got {other:?}"),
+        }
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    #[test]
+    fn verify_flags_digest_mismatch_while_still_parsing_the_landed_bytes() {
+        let root = tmp_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let a = root.join("a.json");
+        std::fs::write(&a, br#"{"a":0}"#).unwrap();
+        let id = OperationId::new("op-verify-foreign").unwrap();
+        let mut txn = Transaction::new(
+            id,
+            vec![FileAction::Write {
+                path: a.clone(),
+                content: br#"{"a":1}"#.to_vec(),
+                kind: DocumentKind::StrictJson,
+            }],
+        );
+        txn.prepare().unwrap();
+        txn.commit().unwrap();
+        std::fs::write(&a, br#"{"b":2}"#).unwrap();
+        let outcomes = txn.verify().unwrap();
+        let outcome = &outcomes[0];
+        assert!(
+            !outcome.digest_ok,
+            "foreign bytes must fail the digest check"
+        );
+        assert!(
+            outcome.parse_ok,
+            "a parseable foreign landing must still parse_ok regardless of the digest"
+        );
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    #[cfg(unix)]
+    #[derive(Debug)]
+    struct DenyTargetReadAtBackupRead {
+        path: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl Injector for DenyTargetReadAtBackupRead {
+        fn inject(&self, point: Point) -> Result<()> {
+            if point == Point::BackupRead {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o000))
+                    .map_err(|e| ConfigError::io(&self.path, e))?;
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_surfaces_io_when_the_backup_read_is_denied() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tmp_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let a = root.join("a.txt");
+        std::fs::write(&a, b"pre-op").unwrap();
+        std::fs::set_permissions(&a, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let root_can_still_read = std::fs::read(&a).is_ok();
+        std::fs::set_permissions(&a, std::fs::Permissions::from_mode(0o644)).unwrap();
+        if root_can_still_read {
+            drop(std::fs::remove_dir_all(&root));
+            return;
+        }
+        let inj = Arc::new(DenyTargetReadAtBackupRead { path: a.clone() });
+        let id = OperationId::new("op-backup-denied").unwrap();
+        let mut txn = Transaction::new(
+            id,
+            vec![FileAction::Write {
+                path: a.clone(),
+                content: b"planned".to_vec(),
+                kind: DocumentKind::TextFragment,
+            }],
+        )
+        .with_injector(inj);
+        match txn.prepare() {
+            Err(ConfigError::Io { .. }) => {}
+            other => panic!("expected Io, got {other:?}"),
+        }
+        std::fs::set_permissions(&a, std::fs::Permissions::from_mode(0o644)).unwrap();
         drop(std::fs::remove_dir_all(&root));
     }
 

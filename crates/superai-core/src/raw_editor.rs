@@ -48,19 +48,25 @@ pub fn surface_for_path(
     adapter: &dyn Adapter,
     path: &Path,
 ) -> Option<crate::adapter::ConfigSurface> {
+    surface_matching(&adapter.config_surfaces(), path)
+}
+
+fn surface_matching(
+    surfaces: &[crate::adapter::ConfigSurface],
+    path: &Path,
+) -> Option<crate::adapter::ConfigSurface> {
     let path_str = path.to_string_lossy();
     let path_lower = path_str.to_ascii_lowercase();
-    for surface in adapter.config_surfaces() {
-        let id_lower = surface.id.to_ascii_lowercase();
-        let fallback_lower = surface.path_resolver.fallback.to_ascii_lowercase();
-        let matches = path_lower.contains(id_lower.as_str())
-            || (!fallback_lower.is_empty() && path_lower.contains(fallback_lower.as_str()))
-            || path_lower.ends_with(id_lower.as_str());
-        if matches {
-            return Some(surface);
-        }
-    }
-    None
+    surfaces
+        .iter()
+        .find(|surface| {
+            let id_lower = surface.id.to_ascii_lowercase();
+            let fallback_lower = surface.path_resolver.fallback.to_ascii_lowercase();
+            path_lower.contains(id_lower.as_str())
+                || (!fallback_lower.is_empty() && path_lower.contains(fallback_lower.as_str()))
+                || path_lower.ends_with(id_lower.as_str())
+        })
+        .cloned()
 }
 
 /// Validate `content` against the surface schema the adapter declares for
@@ -104,8 +110,9 @@ pub fn commit_for_adapter(
 
     // Surface ownership gate (RAW-06): the first declared surface whose id
     // or fallback hint appears in the path decides the policy.
+    let surfaces = adapter.config_surfaces();
     let path_lower = path.to_string_lossy().to_ascii_lowercase();
-    if let Some(surface) = surface_for_path(adapter, path) {
+    if let Some(surface) = surface_matching(&surfaces, path) {
         match surface.kind {
             AdapterKind::Executable => {
                 return Err(CoreError::ResearchBlocked {
@@ -139,8 +146,7 @@ pub fn commit_for_adapter(
     // treat db/keychain-shaped unknowns as internal stores (RAW-06).
     let config_kind = ConfigKind::from_path(path);
     if config_kind == ConfigKind::Opaque {
-        let known_surface = adapter
-            .config_surfaces()
+        let known_surface = surfaces
             .iter()
             .any(|s| path_lower.contains(s.id.to_ascii_lowercase().as_str()));
         if !known_surface
@@ -157,7 +163,7 @@ pub fn commit_for_adapter(
     }
 
     // HAD-05/HAD-03: era-conflict refusal + semantic schema rejection.
-    surface_gates_for_adapter(path, new_content, adapter, &version, config_kind)?;
+    surface_gates_for_adapter(path, new_content, adapter, &surfaces, &version, config_kind)?;
 
     commit(path, new_content, expected_digest)
 }
@@ -168,10 +174,11 @@ fn surface_gates_for_adapter(
     path: &Path,
     new_content: &[u8],
     adapter: &dyn Adapter,
+    surfaces: &[crate::adapter::ConfigSurface],
     version: &crate::adapter::VersionResolution,
     config_kind: ConfigKind,
 ) -> Result<()> {
-    let Some(surface) = surface_for_path(adapter, path) else {
+    let Some(surface) = surface_matching(surfaces, path) else {
         return Ok(());
     };
     // Config-era gate: refuse writes on conflicting era.

@@ -218,8 +218,8 @@ impl Adapter for KimiCodeAdapter {
         DetectionResult::new(present, version, evidence, confidence)
     }
 
-    fn version_resolution(&self) -> VersionResolution {
-        super::resolution_from_detection(self.detection(), "kimi-code", SCHEMA_VERSION_STR)
+    fn version_resolution_from(&self, detection: &DetectionResult) -> VersionResolution {
+        super::resolution_from_detection(detection, "kimi-code", SCHEMA_VERSION_STR)
     }
 
     #[expect(clippy::too_many_lines, reason = "surfaces are declarative")]

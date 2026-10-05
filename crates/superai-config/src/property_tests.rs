@@ -677,4 +677,230 @@ mod tests {
         assert!(validate_quarantine_target(&std::env::temp_dir().join("../etc")).is_err());
         assert!(validate_quarantine_target(std::path::Path::new("relative")).is_err());
     }
+
+    /// Random JSONC corpus: line comments sprinkled after entry commas plus
+    /// an optional block comment, so the strip chain sees real lexical material.
+    fn random_jsonc_text(rng: &mut Prng, map: &Map<String, Value>) -> String {
+        let pretty = serde_json::to_string_pretty(&Value::Object(map.clone())).unwrap();
+        let mut text = String::with_capacity(pretty.len() + 64);
+        for (idx, line) in pretty.split('\n').enumerate() {
+            text.push_str(line);
+            if idx == 0 && rng.gen_bool() {
+                text.push_str(" /* header */");
+            } else if line.ends_with(',') && rng.gen_bool() {
+                text.push_str(" // note");
+                text.push_str(&idx.to_string());
+            }
+            text.push('\n');
+        }
+        text
+    }
+
+    #[test]
+    fn property_no_op_byte_identity_jsonc() {
+        for iter in 0..80u64 {
+            let mut rng = Prng::new(iter + 0x0c_cc);
+            let map = random_json_map(&mut rng, 5);
+            if map.is_empty() {
+                continue;
+            }
+            let text = random_jsonc_text(&mut rng, &map);
+
+            let path = scratch_path("prop-noop-jsonc", &format!("iter-{iter}.jsonc"));
+            std::fs::write(&path, text.as_bytes()).unwrap();
+            let before = std::fs::read(&path).unwrap();
+
+            let loaded = crate::jsonc::load(&path).unwrap();
+            assert_eq!(loaded, map, "jsonc load lost keys at {iter}");
+
+            crate::jsonc::edit(&path, |_| {}).unwrap();
+            let after = std::fs::read(&path).unwrap();
+            assert_eq!(before, after, "no-op byte identity failed at {iter}");
+            assert!(
+                list_backups(&path).unwrap().is_empty(),
+                "no-op should not create backup at {iter}"
+            );
+
+            // Strip oracle on the same corpus: the stripped bytes must be
+            // strict JSON holding the same values.
+            let stripped = crate::jsonc::strip_jsonc(&text);
+            let stripped_value = crate::json::parse_strict_raw(&stripped).unwrap();
+            assert_eq!(
+                stripped_value,
+                Value::Object(map.clone()),
+                "stripped corpus parse diverged at {iter}"
+            );
+            drop(std::fs::remove_dir_all(path.parent().unwrap()));
+        }
+    }
+
+    #[test]
+    fn property_unrelated_survive_jsonc() {
+        for iter in 0..80u64 {
+            let mut rng = Prng::new(iter + 0x0e_ee);
+            let mut map = random_json_map(&mut rng, 5);
+            while map.len() < 2 {
+                let k = random_key(&mut rng);
+                if !map.contains_key(&k) {
+                    map.insert(k, random_value(&mut rng));
+                }
+            }
+            let keys: Vec<String> = map.keys().cloned().collect();
+            let target_idx = rng.gen_range(0, keys.len());
+            let target_key = keys[target_idx].clone();
+            let new_val = Value::String(format!("updated-{iter}"));
+
+            let path = scratch_path("prop-unrelated-jsonc", &format!("iter-{iter}.jsonc"));
+            std::fs::write(
+                &path,
+                serde_json::to_string_pretty(&Value::Object(map.clone()))
+                    .unwrap()
+                    .as_bytes(),
+            )
+            .unwrap();
+
+            crate::jsonc::edit(&path, |m| {
+                m.insert(target_key.clone(), new_val.clone());
+            })
+            .unwrap();
+
+            let after = crate::jsonc::load(&path).unwrap();
+            assert_eq!(
+                after.get(&target_key),
+                Some(&new_val),
+                "target not updated at {iter}"
+            );
+            for k in keys {
+                if k == target_key {
+                    continue;
+                }
+                assert_eq!(
+                    map.get(&k),
+                    after.get(&k),
+                    "unrelated key {k} mutated at {iter}"
+                );
+            }
+            let before_unrelated: Vec<&String> = map.keys().filter(|k| **k != target_key).collect();
+            let after_unrelated: Vec<&String> =
+                after.keys().filter(|k| **k != target_key).collect();
+            assert_eq!(
+                before_unrelated, after_unrelated,
+                "order of unrelated keys changed at {iter}"
+            );
+
+            drop(std::fs::remove_dir_all(path.parent().unwrap()));
+        }
+    }
+
+    #[test]
+    fn pin_write_gate_strictness_divergence_as_is() {
+        use crate::document::DocumentKind;
+        // Trailing-comma JSONC draft: raw_editor validation strips comments
+        // AND trailing commas (accepts), while the staging gate strips
+        // comments only, so serde rejects the comma. Pinned as-is.
+        let trailing = b"{\n  \"a\": 1,\n}\n";
+        assert!(
+            crate::raw_editor::validate(trailing, DocumentKind::JsonC).is_empty(),
+            "raw_editor validation must keep accepting trailing-comma JSONC"
+        );
+        assert!(
+            crate::document::validate_bytes_for_kind(
+                trailing,
+                DocumentKind::JsonC,
+                std::path::Path::new("pin.jsonc")
+            )
+            .is_err(),
+            "staging gate must keep rejecting trailing-comma JSONC"
+        );
+
+        // Duplicate-key JSON: the editor's strict parse rejects, the staging
+        // parse (plain serde_json, last key wins) accepts.
+        let dup = b"{\"a\": 1, \"a\": 2}";
+        let dup_text = std::str::from_utf8(dup).unwrap_or_default();
+        assert!(
+            crate::json::parse_strict_raw(dup_text).is_err(),
+            "strict parse must keep rejecting duplicate keys"
+        );
+        assert!(
+            crate::document::validate_bytes_for_kind(
+                dup,
+                DocumentKind::StrictJson,
+                std::path::Path::new("pin.json")
+            )
+            .is_ok(),
+            "staging parse must keep accepting duplicate-key JSON"
+        );
+    }
+
+    #[test]
+    fn pin_strict_accept_implies_staging_accept_json() {
+        use crate::document::DocumentKind;
+        // Direction pin: everything the strict reader accepts, the staging
+        // gate accepts too; the divergence is laxness only, never strictness.
+        for iter in 0..150u64 {
+            let mut rng = Prng::new(iter + 0x0d_dd);
+            let value = random_value(&mut rng);
+            let text = serde_json::to_string(&value).unwrap();
+            let strict = crate::json::parse_strict_raw(&text).unwrap();
+            assert_eq!(strict, value, "strict parse must round-trip at {iter}");
+            assert!(
+                crate::document::validate_bytes_for_kind(
+                    text.as_bytes(),
+                    DocumentKind::StrictJson,
+                    std::path::Path::new("pin.json")
+                )
+                .is_ok(),
+                "staging gate rejected strict-accepted JSON at {iter}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn pin_bom_handling_as_is() {
+        // json/jsonc do not strip a leading U+FEFF, so those loads fail;
+        // yaml strips it and toml_edit tolerates it, so both load. Pinned
+        // as-is: closing this divergence is a behaviour change, not an
+        // optimization.
+        let bom = "\u{feff}";
+        let dir = temp_dir_unique("pin-bom");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let json_path = dir.join("settings.json");
+        std::fs::write(&json_path, format!("{bom}{{\"model\":\"opus\"}}")).unwrap();
+        assert!(
+            crate::json::load(&json_path).is_err(),
+            "BOM'd json load must keep failing"
+        );
+
+        let jsonc_path = dir.join("settings.jsonc");
+        std::fs::write(&jsonc_path, format!("{bom}{{\"model\":\"opus\"}}")).unwrap();
+        assert!(
+            crate::jsonc::load(&jsonc_path).is_err(),
+            "BOM'd jsonc load must keep failing"
+        );
+
+        let toml_path = dir.join("config.toml");
+        std::fs::write(&toml_path, format!("{bom}model = \"opus\"\n")).unwrap();
+        let toml_doc =
+            crate::toml_file::load(&toml_path).expect("BOM'd toml load must keep succeeding");
+        assert_eq!(
+            toml_doc
+                .get("model")
+                .and_then(|item| item.as_value())
+                .and_then(|value| value.as_str()),
+            Some("opus"),
+            "BOM'd toml must still expose the key"
+        );
+
+        let yaml_path = dir.join("config.yaml");
+        std::fs::write(&yaml_path, format!("{bom}model: opus\n")).unwrap();
+        let yaml_map = crate::yaml::load(&yaml_path).unwrap();
+        assert_eq!(
+            yaml_map.get("model"),
+            Some(&Value::String("opus".to_owned())),
+            "BOM'd yaml load must keep succeeding"
+        );
+
+        drop(std::fs::remove_dir_all(&dir));
+    }
 }

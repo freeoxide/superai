@@ -1,7 +1,7 @@
 //! Line-preserving env parser (DOC-07): comments, blank lines, export
 //! prefixes, quoting, spacing, and duplicates survive; last write wins.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use crate::error::{ConfigError, Result};
@@ -489,64 +489,105 @@ pub fn store(path: &Path, vars: &BTreeMap<String, String>) -> Result<()> {
     Ok(())
 }
 
-/// Read fresh, apply `edit`, write back only if the effective map changed;
-/// comments, quoting, spacing, duplicates, and CRLF/LF survive untouched.
-pub fn edit<F>(path: &Path, edit_fn: F) -> Result<()>
-where
-    F: FnOnce(&mut BTreeMap<String, String>),
-{
+#[derive(Debug)]
+pub(crate) struct FreshEnvFile {
+    lines: Vec<ParsedLine>,
+    map: BTreeMap<String, String>,
+    newline: &'static str,
+    lexical: bool,
+}
+
+impl FreshEnvFile {
+    pub(crate) fn effective_map(&self) -> &BTreeMap<String, String> {
+        &self.map
+    }
+}
+
+pub(crate) fn read_fresh(path: &Path) -> Result<FreshEnvFile> {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let mut map = BTreeMap::new();
-            edit_fn(&mut map);
-            if map.is_empty() {
-                return Ok(());
-            }
-            return store(path, &map);
+            return Ok(FreshEnvFile {
+                lines: Vec::new(),
+                map: BTreeMap::new(),
+                newline: "\n",
+                lexical: false,
+            });
         }
         Err(e) => return Err(ConfigError::io(path, e)),
     };
-
     let newline = detect_newline(&bytes);
     let text = String::from_utf8(bytes).map_err(|e| ConfigError::Env {
         path: path.to_path_buf(),
         message: format!("invalid utf-8: {e}"),
     })?;
-
     if text.trim().is_empty() {
-        let mut map = BTreeMap::new();
-        edit_fn(&mut map);
-        if map.is_empty() {
-            return Ok(());
-        }
-        return store(path, &map);
+        return Ok(FreshEnvFile {
+            lines: Vec::new(),
+            map: BTreeMap::new(),
+            newline,
+            lexical: false,
+        });
     }
-
-    let (mut lines, mut map) = parse_env_text(&text).map_err(|message| ConfigError::Env {
+    let (lines, map) = parse_env_text(&text).map_err(|message| ConfigError::Env {
         path: path.to_path_buf(),
         message,
     })?;
+    Ok(FreshEnvFile {
+        lines,
+        map,
+        newline,
+        lexical: true,
+    })
+}
 
-    let original_map = map.clone();
-    edit_fn(&mut map);
-    if map == original_map {
+pub(crate) fn commit_delta(
+    path: &Path,
+    fresh: FreshEnvFile,
+    final_map: &BTreeMap<String, String>,
+) -> Result<()> {
+    let FreshEnvFile {
+        mut lines,
+        map,
+        newline,
+        lexical,
+    } = fresh;
+    if map == *final_map {
         return Ok(());
     }
+    if !lexical {
+        return store(path, final_map);
+    }
+    apply_lexical(path, &mut lines, &map, final_map, newline)
+}
 
-    let removed_keys: Vec<String> = original_map
+fn apply_lexical(
+    path: &Path,
+    lines: &mut Vec<ParsedLine>,
+    original_map: &BTreeMap<String, String>,
+    final_map: &BTreeMap<String, String>,
+    newline: &str,
+) -> Result<()> {
+    let removed_keys: HashSet<&str> = original_map
         .keys()
-        .filter(|k| !map.contains_key(*k))
-        .cloned()
+        .filter(|k| !final_map.contains_key(*k))
+        .map(String::as_str)
         .collect();
     if !removed_keys.is_empty() {
         lines.retain(|line| match &line.kind {
-            LineKind::Entry(meta) => !removed_keys.contains(&meta.key),
+            LineKind::Entry(meta) => !removed_keys.contains(meta.key.as_str()),
             _ => true,
         });
     }
 
-    for (key, new_value) in &map {
+    let mut last_index: HashMap<String, usize> = HashMap::with_capacity(original_map.len());
+    for (idx, line) in lines.iter().enumerate() {
+        if let LineKind::Entry(meta) = &line.kind {
+            last_index.insert(meta.key.clone(), idx);
+        }
+    }
+
+    for (key, new_value) in final_map {
         let Some(old_value) = original_map.get(key) else {
             lines.push(new_entry_line(key, new_value));
             continue;
@@ -556,10 +597,7 @@ where
         }
         // Changed: update the last occurrence in place, keeping its
         // export prefix, spacing, quoting style, and trailing comment.
-        let Some(idx) = lines
-            .iter()
-            .rposition(|line| matches!(&line.kind, LineKind::Entry(m) if m.key == *key))
-        else {
+        let Some(&idx) = last_index.get(key) else {
             continue;
         };
         let Some(line) = lines.get(idx) else {
@@ -591,7 +629,7 @@ where
 
     // Serialize lines back; every line keeps a terminator.
     let mut out = String::new();
-    for line in &lines {
+    for line in lines {
         out.push_str(&line.raw);
         out.push_str(newline);
     }
@@ -603,6 +641,26 @@ where
         crate::document::DocumentKind::Env,
     )?;
     Ok(())
+}
+
+/// Read fresh, apply `edit`, write back only if the effective map changed;
+/// comments, quoting, spacing, duplicates, and CRLF/LF survive untouched.
+pub fn edit<F>(path: &Path, edit_fn: F) -> Result<()>
+where
+    F: FnOnce(&mut BTreeMap<String, String>),
+{
+    let fresh = read_fresh(path)?;
+    if !fresh.lexical {
+        let mut map = BTreeMap::new();
+        edit_fn(&mut map);
+        if map.is_empty() {
+            return Ok(());
+        }
+        return store(path, &map);
+    }
+    let mut final_map = fresh.map.clone();
+    edit_fn(&mut final_map);
+    commit_delta(path, fresh, &final_map)
 }
 
 /// A normalized `KEY=value` line for a key the file did not carry before.
@@ -650,6 +708,23 @@ mod tests {
         assert_eq!(map["A"], "single");
         assert_eq!(map["B"], "double");
         assert_eq!(map["C"], "unquoted");
+    }
+
+    #[test]
+    fn edit_removing_every_key_writes_the_skeleton_back() {
+        let path = scratch("remove-all.env");
+        std::fs::write(&path, "# header\nA=1\n\nB=2\n").unwrap();
+        edit(&path, |map| {
+            map.remove("A");
+            map.remove("B");
+        })
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "# header\n\n",
+            "remove-all keeps comments and blank lines, drops every entry"
+        );
+        drop(std::fs::remove_file(&path));
     }
 
     #[test]

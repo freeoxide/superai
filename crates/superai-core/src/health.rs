@@ -266,7 +266,6 @@ pub fn redact_url(url: &str) -> String {
             None => (pair, None),
         };
         let klower = k.to_ascii_lowercase();
-        // Keys in SECRET_QUERY_KEYS are already lowercase constants.
         let is_secret = SECRET_QUERY_KEYS.iter().any(|pat| klower.contains(*pat));
         if is_secret {
             out_parts.push(format!("{k}={}", RedactedString::placeholder()));
@@ -316,7 +315,6 @@ pub fn redact_headers(headers: &BTreeMap<String, String>) -> BTreeMap<String, St
 pub fn health_probe(provider: &ProviderDefinition, config: &HealthConfig) -> HealthCheckResult {
     let start = Instant::now();
     let redacted = redact_url(&provider.base_url);
-    // No-auth providers count as local intent.
     let effective_allow =
         config.allow_private_network || matches!(provider.auth_style, AuthStyle::None);
     let timeout_ok = validate_timeout(config.timeout).is_ok();
@@ -443,7 +441,6 @@ pub fn health_probe_url(url: &str, config: &HealthConfig) -> HealthCheckResult {
         crate::ids::ProviderId::new("url-probe").map(|id| ProviderDefinition::new(id, url));
     match fake_provider {
         Ok(provider) => health_probe(&provider, config),
-        // Unreachable for the static id above; kept panic-free regardless.
         Err(e) => HealthCheckResult {
             provider: "url-probe".to_owned(),
             base_url_redacted: redact_url(url),
@@ -501,7 +498,6 @@ pub fn derive_probe_url(base_url: &str, probe: &ProbeDefinition) -> Result<Strin
     Ok(format!("{base}{suffix}"))
 }
 
-/// Auth placeholder accepted in probe header/body templates.
 const AUTH_PLACEHOLDER: &str = "${AUTH}";
 
 /// Build the raw wire headers (secret-bearing). `${AUTH}` resolves; any
@@ -777,7 +773,6 @@ pub fn execute_probe(
             current_url = location;
             continue;
         }
-        // Content-Length, when advertised, is checked before reading.
         if let Some(len_str) = response.headers().get("Content-Length")
             && let Ok(len) = len_str.to_str().unwrap_or_default().parse::<usize>()
             && len > max_bytes
@@ -970,7 +965,6 @@ fn effective_allow_private(
         || matches!(provider.auth_style, AuthStyle::None)
 }
 
-/// Validate a URL for real execution: scheme policy + private-host policy.
 fn validate_execution_url(
     url: &str,
     provider: &ProviderDefinition,
@@ -998,8 +992,6 @@ fn validate_execution_url(
     validate_base_url_for_probe(url, allow_private)
 }
 
-/// Send one bounded request. `send_auth` false skips every auth header
-/// (cross-host redirect discipline).
 fn dispatch_request(
     agent: &ureq::Agent,
     method: &str,

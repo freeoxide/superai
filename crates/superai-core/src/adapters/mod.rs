@@ -85,10 +85,17 @@ pub(crate) fn find_in_path_within(path_var: &std::ffi::OsStr, names: &[&str]) ->
     None
 }
 
-/// First PATH hit for `names`, dir-major: the earliest directory holding any
-/// name wins.
+/// First PATH hit for `names`, dir-major: the earliest directory holding
+/// any name wins; a non-UTF8 `PATH` yields `None`, unlike lossy
+/// [`find_in_path`] — per-adapter contract, not duplication.
 pub(crate) fn find_in_path_dir_first(names: &[&str]) -> Option<PathBuf> {
     let path_var = std::env::var("PATH").ok()?;
+    find_in_path_dir_first_within(&path_var, names)
+}
+
+/// [`find_in_path_dir_first`] against an explicit PATH value; the caller owns
+/// the UTF-8 gate.
+pub(crate) fn find_in_path_dir_first_within(path_var: &str, names: &[&str]) -> Option<PathBuf> {
     let separator = if cfg!(windows) { ';' } else { ':' };
     for dir in path_var.split(separator) {
         for name in names {
@@ -164,7 +171,8 @@ pub(crate) fn parse_version_output(output: &str) -> Option<String> {
 }
 
 /// Run `<binary> args...` under `budget` and return the combined stdout and
-/// stderr; a child still running at the budget is killed and reaped.
+/// stderr; a child still running at the budget is killed and reaped, and a
+/// pipe held by an inherited grandchild is abandoned at the same bound.
 pub(crate) fn run_capturing(binary: &Path, args: &[&str], budget: Duration) -> Option<String> {
     let owned = binary.to_path_buf();
     let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
@@ -172,29 +180,87 @@ pub(crate) fn run_capturing(binary: &Path, args: &[&str], budget: Duration) -> O
     // The send Result is the closure's value: a timed-out caller has dropped
     // the receiver, and that failure is expected, not an error to log.
     thread::spawn(move || tx.send(run_probe(&owned, &args, budget)));
-    // A timeout here never leaves the probe running: the worker kills the
-    // child at its own identical deadline.
+    // A timeout here never leaves the child running: the worker kills it at
+    // the same deadline and itself exits within the reclaim grace after it.
     rx.recv_timeout(budget).unwrap_or_default()
 }
 
-/// Drain `pipe` into `buf`; a read error is logged, not silently dropped.
+const PIPE_RECLAIM_GRACE: Duration = Duration::from_millis(500);
+
+const MAX_PROBE_OUTPUT_BYTES: u64 = 1024 * 1024;
+
 fn drain_pipe(pipe: Option<impl Read>, buf: &mut Vec<u8>, binary: &Path, side: &str) {
     let Some(mut pipe) = pipe else {
         return;
     };
-    if let Err(err) = pipe.read_to_end(buf) {
+    if let Err(err) = (&mut pipe).take(MAX_PROBE_OUTPUT_BYTES).read_to_end(buf) {
         eprintln!(
             "superai-core: probe of {} lost {side} output: {err}",
             binary.display()
         );
+        return;
+    }
+    let mut scratch = [0u8; 8192];
+    loop {
+        match pipe.read(&mut scratch) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(err) => {
+                eprintln!(
+                    "superai-core: probe of {} lost {side} tail past the cap: {err}",
+                    binary.display()
+                );
+                break;
+            }
+        }
     }
 }
 
-/// Spawn, kill at the deadline, reap, and merge the captured output; `None`
-/// on spawn failure, timeout, or a failing probe with no output.
+fn drain_pipe_concurrently(
+    pipe: Option<impl Read + Send + 'static>,
+    binary: &Path,
+    side: &'static str,
+    tx: mpsc::Sender<Vec<u8>>,
+) {
+    let binary = binary.to_path_buf();
+    // The send Result is the thread's value: the worker departs at the
+    // reclaim deadline, and a send into a departed worker is expected.
+    thread::spawn(move || {
+        let mut buf = Vec::new();
+        drain_pipe(pipe, &mut buf, &binary, side);
+        tx.send(buf)
+    });
+}
+
+fn reclaim_pipe(
+    rx: &mpsc::Receiver<Vec<u8>>,
+    by: Instant,
+    binary: &Path,
+    side: &'static str,
+) -> Option<Vec<u8>> {
+    match rx.recv_timeout(by.saturating_duration_since(Instant::now())) {
+        Ok(buf) => Some(buf),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            eprintln!(
+                "superai-core: probe of {} {side} pipe held past the reclaim deadline",
+                binary.display()
+            );
+            None
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            eprintln!(
+                "superai-core: probe of {} {side} reader failed before delivering",
+                binary.display()
+            );
+            None
+        }
+    }
+}
+
 fn run_probe(binary: &Path, args: &[String], budget: Duration) -> Option<String> {
     let spawned = Command::new(binary)
         .args(args)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn();
@@ -209,6 +275,11 @@ fn run_probe(binary: &Path, args: &[String], budget: Duration) -> Option<String>
         }
     };
     let deadline = Instant::now() + budget;
+    let (out_tx, out_rx) = mpsc::channel();
+    let (err_tx, err_rx) = mpsc::channel();
+    drain_pipe_concurrently(child.stdout.take(), binary, "stdout", out_tx);
+    drain_pipe_concurrently(child.stderr.take(), binary, "stderr", err_tx);
+    let mut poll = Duration::from_micros(500);
     let status: ExitStatus = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -230,7 +301,10 @@ fn run_probe(binary: &Path, args: &[String], budget: Duration) -> Option<String>
                     }
                 };
             }
-            Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                thread::sleep(poll);
+                poll = (poll * 2).min(Duration::from_millis(10));
+            }
             Err(err) => {
                 eprintln!(
                     "superai-core: probe of {} wait failed: {err}",
@@ -240,10 +314,12 @@ fn run_probe(binary: &Path, args: &[String], budget: Duration) -> Option<String>
             }
         }
     };
-    let mut out = Vec::new();
-    let mut err = Vec::new();
-    drain_pipe(child.stdout.take(), &mut out, binary, "stdout");
-    drain_pipe(child.stderr.take(), &mut err, binary, "stderr");
+    let reclaim_by = Instant::now() + PIPE_RECLAIM_GRACE;
+    let out = reclaim_pipe(&out_rx, reclaim_by, binary, "stdout");
+    let err = reclaim_pipe(&err_rx, reclaim_by, binary, "stderr");
+    let (Some(out), Some(err)) = (out, err) else {
+        return None;
+    };
     if !status.success() && out.is_empty() && err.is_empty() {
         return None;
     }
@@ -387,13 +463,13 @@ pub(crate) fn detection_confidence(
 
 /// Map a probe outcome onto the resolution, naming `harness` in the notes.
 pub(crate) fn resolution_from_detection(
-    detection: crate::adapter::DetectionResult,
+    detection: &crate::adapter::DetectionResult,
     harness: &str,
     schema_version: &str,
 ) -> crate::adapter::VersionResolution {
-    let Some(version) = detection.version else {
+    let Some(version) = detection.version.clone() else {
         let mut res = crate::adapter::VersionResolution::unknown();
-        res.notes = detection.evidence;
+        res.notes.clone_from(&detection.evidence);
         return res;
     };
     let notes = vec![
@@ -484,7 +560,8 @@ mod decl_tests {
     }
 
     /// A probe past its budget returns None and the child is killed, not left
-    /// running: the /proc sweep fails while the bare `sleep` victim survives.
+    /// running. The sweep matches only our own child: this sandbox's worker
+    /// keeps an ambient `sleep 30` alive forever (distinct parent pid).
     #[test]
     #[cfg(unix)]
     fn run_capturing_kills_a_hung_child() {
@@ -505,18 +582,200 @@ mod decl_tests {
         }
     }
 
+    /// A probe whose output passes the OS pipe capacity must capture the
+    /// version at the stream's end — only an unblocked child that wrote
+    /// everything and exited can produce it; budget-paying failures fail.
+    #[test]
+    #[cfg(unix)]
+    fn probe_drains_output_past_pipe_capacity() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_util::temp_dir_unique("probe-chatty");
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("chatty");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s 9.9.9\\n' '{}'\n",
+                "x".repeat(96 * 1024)
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let budget = std::time::Duration::from_secs(2);
+        let mut version = None;
+        for _ in 0..3 {
+            let started = std::time::Instant::now();
+            version = super::probe_version(&script);
+            if version.is_some() || started.elapsed() >= budget {
+                break;
+            }
+        }
+        assert_eq!(
+            version.as_deref(),
+            Some("9.9.9"),
+            "version past the pipe capacity was lost"
+        );
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// A grandchild inheriting the pipe cannot hold the probe open: the
+    /// reclaim is abandoned inside the grace, so the caller gets None well
+    /// inside the budget instead of waiting out the grandchild's lifetime.
+    #[test]
+    #[cfg(unix)]
+    fn run_capturing_abandons_a_grandchild_held_pipe_inside_the_budget() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_util::temp_dir_unique("probe-orphan");
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("spawner");
+        std::fs::write(&script, "#!/bin/sh\n(sleep 10) &\nprintf 'tool 1.2.3\\n'\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let started = std::time::Instant::now();
+        let out = super::run_capturing(&script, &[], std::time::Duration::from_secs(2));
+        assert!(
+            out.is_none(),
+            "unreclaimable output must yield None, got {out:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "grandchild-held pipe outlived the reclaim grace: {:?}",
+            started.elapsed()
+        );
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// A probe's captured output is capped and the drain keeps discarding
+    /// past the cap, so a binary streaming far past it is neither buffered
+    /// whole nor left blocked on a full pipe.
+    #[test]
+    #[cfg(unix)]
+    fn run_capturing_caps_captured_output_and_keeps_draining() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_util::temp_dir_unique("probe-flood");
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("flooder");
+        let line = "x".repeat(4096);
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\nprintf 'tool 7.7.7\\n'\nyes '{line}' | head -c 8388608\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let started = std::time::Instant::now();
+        let out = super::run_capturing(&script, &[], std::time::Duration::from_secs(2));
+        let out = out.expect("flooder probe must return its leading output");
+        assert!(
+            out.starts_with("tool 7.7.7"),
+            "leading version line lost: {:?}",
+            out.chars().take(64).collect::<String>()
+        );
+        assert!(
+            out.len() <= 2 * 1024 * 1024,
+            "captured {} bytes, past the per-pipe cap",
+            out.len()
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "capped writer was left blocked: {:?}",
+            started.elapsed()
+        );
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// A probe child sees EOF on stdin, never the parent's terminal: `cat`
+    /// blocks on any inherited open stdin until the kill budget, and only a
+    /// terminated child prints at all; budget-paying failures do not retry.
+    #[test]
+    #[cfg(unix)]
+    fn probe_child_gets_null_stdin_and_prompts_end_inside_budget() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_util::temp_dir_unique("probe-stdin");
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("asker");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ncat >/dev/null\nprintf 'stdin=%s 1.0.0\\n' \"$(readlink /proc/self/fd/0)\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let budget = std::time::Duration::from_secs(2);
+        let mut out = None;
+        for _ in 0..3 {
+            let started = std::time::Instant::now();
+            out = super::run_capturing(&script, &[], budget);
+            if out.is_some() || started.elapsed() >= budget {
+                break;
+            }
+        }
+        let out = out.expect("stdin-reading probe child never produced output");
+        if cfg!(target_os = "linux") {
+            assert!(
+                out.contains("stdin=/dev/null"),
+                "probe child stdin was not /dev/null: {out:?}"
+            );
+        }
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// The two PATH lookup orders resolve different binaries when a later
+    /// name sits in an earlier directory: name-major keeps the first name,
+    /// dir-major keeps the first directory.
+    #[test]
+    fn path_lookup_orders_diverge_as_declared() {
+        let dir_a = crate::test_util::temp_dir_unique("path-order-a");
+        let dir_b = crate::test_util::temp_dir_unique("path-order-b");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+        std::fs::write(dir_a.join("beta"), b"#!bin\n").unwrap();
+        std::fs::write(dir_b.join("alpha"), b"#!bin\n").unwrap();
+        let separator = if cfg!(windows) { ';' } else { ':' };
+        let path_var = format!("{}{separator}{}", dir_a.display(), dir_b.display());
+        let name_major =
+            super::find_in_path_within(std::ffi::OsStr::new(&path_var), &["alpha", "beta"]);
+        let dir_major = super::find_in_path_dir_first_within(&path_var, &["alpha", "beta"]);
+        assert_eq!(
+            name_major.as_deref(),
+            Some(dir_b.join("alpha").as_path()),
+            "name-major must prefer the earlier name over the earlier directory"
+        );
+        assert_eq!(
+            dir_major.as_deref(),
+            Some(dir_a.join("beta").as_path()),
+            "dir-major must prefer the earlier directory over the earlier name"
+        );
+        drop(std::fs::remove_dir_all(&dir_a));
+        drop(std::fs::remove_dir_all(&dir_b));
+    }
+
     /// Whether any live process's argv is exactly `wanted`; /proc entries
     /// that vanish mid-scan or have unreadable cmdlines never match.
     #[cfg(all(test, unix))]
     fn argv_alive(wanted: &[&str]) -> bool {
-        let cmdline_matches = |entry: std::fs::DirEntry| {
-            std::fs::read_to_string(entry.path().join("cmdline")).is_ok_and(|cmd| {
-                cmd.split('\0')
-                    .filter(|a| !a.is_empty())
-                    .eq(wanted.iter().copied())
-            })
+        let parent = std::process::id();
+        std::fs::read_dir("/proc").is_ok_and(|entries| {
+            entries
+                .flatten()
+                .any(|entry| argv_entry_is_our_child(&entry, wanted, parent))
+        })
+    }
+
+    #[cfg(all(test, unix))]
+    fn argv_entry_is_our_child(entry: &std::fs::DirEntry, wanted: &[&str], parent: u32) -> bool {
+        let Ok(cmd) = std::fs::read_to_string(entry.path().join("cmdline")) else {
+            return false;
         };
-        std::fs::read_dir("/proc").is_ok_and(|entries| entries.flatten().any(cmdline_matches))
+        if !cmd
+            .split('\0')
+            .filter(|a| !a.is_empty())
+            .eq(wanted.iter().copied())
+        {
+            return false;
+        }
+        let Ok(status) = std::fs::read_to_string(entry.path().join("status")) else {
+            return false;
+        };
+        let ppid = format!("PPid:\t{parent}");
+        status.lines().any(|line| line == ppid)
     }
 
     /// Runtime backstop for `from_validated_const`: every adapter literal,
@@ -544,14 +803,200 @@ mod decl_tests {
             let id = adapter.id().as_str().to_owned();
             let first = adapter.detection();
             let second = adapter.detection();
-            assert_eq!(first.present, second.present, "{id}");
-            // Version probing runs the real binary under a wall-clock budget,
-            // so under load one call may time out where the other succeeds;
-            // confidence is only pinned when the two probes agree.
+            // A probe under a wall-clock budget can flap under load, flipping
+            // present between Present and UnknownVersion with the version;
+            // absence never depends on a probe and must always agree.
+            assert_eq!(
+                first.present == crate::state::InstallPresence::Absent,
+                second.present == crate::state::InstallPresence::Absent,
+                "{id}"
+            );
             if first.version == second.version {
+                assert_eq!(first.present, second.present, "{id}");
                 assert_eq!(first.confidence, second.confidence, "{id}");
             }
         }
+    }
+
+    /// `version_resolution()` equals deriving from a fresh detection, so a
+    /// caller holding one may substitute `version_resolution_from` and skip
+    /// the second probe cycle. Only pinned when two probes agree.
+    #[test]
+    fn version_resolution_matches_derivation_from_a_fresh_detection() {
+        for adapter in harness_catalog::all_adapters() {
+            let id = adapter.id().as_str().to_owned();
+            let first = adapter.detection();
+            let second = adapter.detection();
+            if first == second {
+                assert_eq!(
+                    adapter.version_resolution_from(&first),
+                    adapter.version_resolution(),
+                    "{id}: derivation diverged from the probing path"
+                );
+            }
+        }
+    }
+
+    /// An adapter overriding neither resolution method terminates in the
+    /// fail-safe `unknown()` refusal with the detection's evidence, never in
+    /// mutual recursion between the provided pair.
+    #[test]
+    fn unoverridden_resolution_methods_do_not_recurse() {
+        use crate::adapter::Adapter as _;
+        #[derive(Debug)]
+        struct BareAdapter;
+        impl crate::adapter::Adapter for BareAdapter {
+            fn id(&self) -> crate::ids::HarnessId {
+                crate::ids::HarnessId::new("bare-probe").unwrap()
+            }
+            fn display_name(&self) -> &'static str {
+                "bare"
+            }
+            fn product_status(&self) -> crate::adapter::ProductStatus {
+                crate::adapter::ProductStatus::Unknown
+            }
+            fn supported_platforms(&self) -> Vec<crate::adapter::Platform> {
+                Vec::new()
+            }
+            fn adapter_revision(&self) -> &'static str {
+                "0"
+            }
+            fn research_doc_link(&self) -> &'static str {
+                "about:blank"
+            }
+            fn last_verified_date(&self) -> &'static str {
+                "1970-01-01"
+            }
+            fn detection(&self) -> crate::adapter::DetectionResult {
+                crate::adapter::DetectionResult::new(
+                    crate::state::InstallPresence::UnknownVersion,
+                    None,
+                    vec!["bare evidence".to_owned()],
+                    crate::adapter::DetectionConfidence::Low,
+                )
+            }
+            fn config_surfaces(&self) -> Vec<crate::adapter::ConfigSurface> {
+                Vec::new()
+            }
+            fn supported_operations(&self) -> Vec<(String, crate::state::AdapterSupport)> {
+                Vec::new()
+            }
+            fn plan_mirror_exclusions(&self) -> Vec<String> {
+                Vec::new()
+            }
+            fn plan_wrapper(
+                &self,
+                _instance: &crate::instance::Instance,
+            ) -> Result<crate::adapter::WrapperPlan, crate::error::CoreError> {
+                Ok(crate::adapter::WrapperPlan::new("bare"))
+            }
+            fn scan_candidates(&self) -> Vec<String> {
+                Vec::new()
+            }
+            fn validate_instance(
+                &self,
+                _instance: &crate::instance::Instance,
+            ) -> Result<(), crate::error::CoreError> {
+                Ok(())
+            }
+        }
+        let adapter = BareAdapter;
+        let detection = adapter.detection();
+        let via_hook = adapter.version_resolution_from(&detection);
+        assert!(!via_hook.compatible, "default must refuse writes");
+        assert_eq!(via_hook.notes, detection.evidence);
+        let via_composition = adapter.version_resolution();
+        assert_eq!(
+            via_composition, via_hook,
+            "provided composition must terminate on the fail-safe default"
+        );
+    }
+
+    /// `version_resolution_from` never probes, and the provided
+    /// `version_resolution()` composition probes exactly once — pinned by a
+    /// counting detection, immune to probe flapping.
+    #[test]
+    fn version_resolution_from_never_probes() {
+        use crate::adapter::Adapter as _;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        #[derive(Debug)]
+        struct CountingAdapter {
+            probes: AtomicU32,
+        }
+        impl crate::adapter::Adapter for CountingAdapter {
+            fn id(&self) -> crate::ids::HarnessId {
+                crate::ids::HarnessId::new("counting-probe").unwrap()
+            }
+            fn display_name(&self) -> &'static str {
+                "counting"
+            }
+            fn product_status(&self) -> crate::adapter::ProductStatus {
+                crate::adapter::ProductStatus::Unknown
+            }
+            fn supported_platforms(&self) -> Vec<crate::adapter::Platform> {
+                Vec::new()
+            }
+            fn adapter_revision(&self) -> &'static str {
+                "0"
+            }
+            fn research_doc_link(&self) -> &'static str {
+                "about:blank"
+            }
+            fn last_verified_date(&self) -> &'static str {
+                "1970-01-01"
+            }
+            fn detection(&self) -> crate::adapter::DetectionResult {
+                self.probes.fetch_add(1, Ordering::SeqCst);
+                crate::adapter::DetectionResult::new(
+                    crate::state::InstallPresence::Present,
+                    Some("1.0.0".to_owned()),
+                    Vec::new(),
+                    crate::adapter::DetectionConfidence::High,
+                )
+            }
+            fn version_resolution_from(
+                &self,
+                detection: &crate::adapter::DetectionResult,
+            ) -> crate::adapter::VersionResolution {
+                super::resolution_from_detection(detection, "counting", "1")
+            }
+            fn config_surfaces(&self) -> Vec<crate::adapter::ConfigSurface> {
+                Vec::new()
+            }
+            fn supported_operations(&self) -> Vec<(String, crate::state::AdapterSupport)> {
+                Vec::new()
+            }
+            fn plan_mirror_exclusions(&self) -> Vec<String> {
+                Vec::new()
+            }
+            fn plan_wrapper(
+                &self,
+                _instance: &crate::instance::Instance,
+            ) -> Result<crate::adapter::WrapperPlan, crate::error::CoreError> {
+                Ok(crate::adapter::WrapperPlan::new("counting"))
+            }
+            fn scan_candidates(&self) -> Vec<String> {
+                Vec::new()
+            }
+            fn validate_instance(
+                &self,
+                _instance: &crate::instance::Instance,
+            ) -> Result<(), crate::error::CoreError> {
+                Ok(())
+            }
+        }
+        let adapter = CountingAdapter {
+            probes: AtomicU32::new(0),
+        };
+        let detection = adapter.detection();
+        assert_eq!(adapter.probes.load(Ordering::SeqCst), 1);
+        let derived = adapter.version_resolution_from(&detection);
+        let rederived = adapter.version_resolution_from(&detection);
+        assert_eq!(adapter.probes.load(Ordering::SeqCst), 1);
+        assert!(derived.compatible && rederived.compatible);
+        let via_composition = adapter.version_resolution();
+        assert_eq!(adapter.probes.load(Ordering::SeqCst), 2);
+        assert_eq!(via_composition, derived);
     }
 
     /// (harness id, expected dest file, expected dest key) for every adapter

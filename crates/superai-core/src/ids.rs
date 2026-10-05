@@ -15,7 +15,6 @@ const RESERVED: &[&str] = &[
     "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
 ];
 
-/// Validate an identifier string for the given `kind`.
 fn validate(kind: &str, value: &str) -> Result<(), CoreError> {
     if value.is_empty() {
         return Err(CoreError::InvalidIdentifier {

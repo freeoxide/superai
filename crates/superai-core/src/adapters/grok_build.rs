@@ -126,7 +126,6 @@ impl GrokBuildAdapter {
                 // GROK_CONFIG is an inline JSON overlay that can carry provider
                 // keys; only the path variable is safe to quote.
                 let preview = if var == CONFIG_PATH_ENV_VAR {
-                    // Chars, not bytes, so the cut cannot split UTF-8.
                     let truncated: String = val.chars().take(80).collect();
                     format!("{truncated}…")
                 } else {
@@ -222,8 +221,8 @@ impl Adapter for GrokBuildAdapter {
         DetectionResult::new(present, version, evidence, confidence)
     }
 
-    fn version_resolution(&self) -> VersionResolution {
-        super::resolution_from_detection(self.detection(), "grok-build", SCHEMA_VERSION_STR)
+    fn version_resolution_from(&self, detection: &DetectionResult) -> VersionResolution {
+        super::resolution_from_detection(detection, "grok-build", SCHEMA_VERSION_STR)
     }
 
     #[expect(clippy::too_many_lines, reason = "surfaces are declarative")]
@@ -440,7 +439,6 @@ impl Adapter for GrokBuildAdapter {
         ))
     }
 
-    /// Plugins install as directories: `~/.grok/plugins/` (user) or `.grok/plugins/` (project).
     fn plugin_decl(&self) -> Option<crate::adapter::PluginAdapterDecl> {
         Some(crate::adapter::PluginAdapterDecl::directory_bundle(
             "plugins",
@@ -489,8 +487,6 @@ mod tests {
     #[test]
     fn adapter_identity() {
         let a = adapter();
-        // Constructor wiring plus catalog registration: an id the catalog
-        // does not know can never reconcile with detection or instances.
         let entry = crate::harness_catalog::find_by_id(HARNESS_ID_STR).unwrap();
         assert_eq!(a.id().as_str(), HARNESS_ID_STR);
         assert_eq!(a.product_status(), entry.product_status);

@@ -1,14 +1,15 @@
 //! JSONC reads strip comments/trailing commas before the strict parse;
 //! changing writes on files carrying that material are refused (DOC-05).
 
+use std::borrow::Cow;
 use std::path::Path;
 
+use memchr::{memchr, memchr2_iter, memchr3_iter};
 use serde_json::{Map, Value};
 
 use crate::error::{ConfigError, Result};
 
-/// Strip commas followed only by whitespace and `}`/`]`, string-aware;
-/// JSON structure chars are ASCII so a byte scan never splits UTF-8.
+#[cfg(test)]
 fn strip_trailing_commas(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut output = String::with_capacity(input.len());
@@ -49,8 +50,183 @@ fn strip_trailing_commas(input: &str) -> String {
 }
 
 /// Strip JSONC extensions (comments + trailing commas) to produce strict JSON.
-pub(crate) fn strip_jsonc(input: &str) -> String {
-    strip_trailing_commas(&crate::document::strip_jsonc_comments(input))
+pub fn strip_jsonc(input: &str) -> String {
+    strip_jsonc_cow(input).into_owned()
+}
+
+pub(crate) fn strip_jsonc_cow(text: &str) -> Cow<'_, str> {
+    let bytes = text.as_bytes();
+    match (memchr(b'/', bytes).is_some(), memchr(b',', bytes).is_some()) {
+        (false, false) => Cow::Borrowed(text),
+        (false, true) => strip_trailing_commas_cow(text),
+        (true, _) => strip_fused_cow(text),
+    }
+}
+
+fn span(text: &str, start: usize, end: usize) -> &str {
+    text.get(start..end).unwrap_or_default()
+}
+
+fn escaped_at(bytes: &[u8], quote: usize) -> bool {
+    let mut i = quote;
+    let mut backslashes = 0u64;
+    while i > 0 && bytes.get(i - 1) == Some(&b'\\') {
+        backslashes += 1;
+        i -= 1;
+    }
+    backslashes % 2 == 1
+}
+
+fn block_comment_end(bytes: &[u8], from: usize) -> Option<usize> {
+    let mut i = from;
+    while let Some(rel) = memchr(b'*', bytes.get(i..).unwrap_or_default()) {
+        let star = i + rel;
+        if bytes.get(star + 1) == Some(&b'/') {
+            return Some(star + 2);
+        }
+        i = star + 1;
+    }
+    None
+}
+
+fn comment_end_at(bytes: &[u8], slash: usize) -> usize {
+    match bytes.get(slash + 1) {
+        Some(b'/') => memchr(b'\n', bytes.get(slash + 2..).unwrap_or_default())
+            .map_or(bytes.len(), |rel| slash + 2 + rel),
+        _ => block_comment_end(bytes, slash + 2).unwrap_or(bytes.len()),
+    }
+}
+
+fn comment_pair_at(bytes: &[u8], at: usize) -> bool {
+    bytes.get(at) == Some(&b'/') && matches!(bytes.get(at + 1), Some(b'/' | b'*'))
+}
+
+fn flush_span(out: &mut String, text: &str, run: usize, end: usize) {
+    if out.capacity() == 0 {
+        out.reserve(text.len() - run);
+    }
+    out.push_str(span(text, run, end));
+}
+
+pub(crate) fn strip_jsonc_comments_cow(text: &str) -> Cow<'_, str> {
+    let bytes = text.as_bytes();
+    if memchr(b'/', bytes).is_none() {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::new();
+    let mut run = 0usize;
+    let mut in_string = false;
+    let mut skip_until = 0usize;
+    for p in memchr2_iter(b'"', b'/', bytes) {
+        if p < skip_until {
+            continue;
+        }
+        if in_string {
+            if bytes.get(p) == Some(&b'"') && !escaped_at(bytes, p) {
+                in_string = false;
+            }
+            continue;
+        }
+        if bytes.get(p) == Some(&b'"') {
+            in_string = true;
+            continue;
+        }
+        if comment_pair_at(bytes, p) {
+            flush_span(&mut out, text, run, p);
+            let end = comment_end_at(bytes, p);
+            skip_until = end;
+            run = end;
+        }
+    }
+    if out.is_empty() && run == 0 {
+        return Cow::Borrowed(text);
+    }
+    flush_span(&mut out, text, run, bytes.len());
+    Cow::Owned(out)
+}
+
+fn strip_fused_cow(text: &str) -> Cow<'_, str> {
+    let bytes = text.as_bytes();
+    let mut out = String::new();
+    let mut run = 0usize;
+    let mut in_string = false;
+    let mut skip_until = 0usize;
+    for p in memchr3_iter(b'"', b'/', b',', bytes) {
+        if p < skip_until {
+            continue;
+        }
+        if in_string {
+            if bytes.get(p) == Some(&b'"') && !escaped_at(bytes, p) {
+                in_string = false;
+            }
+            continue;
+        }
+        if bytes.get(p) == Some(&b'"') {
+            in_string = true;
+            continue;
+        }
+        if comment_pair_at(bytes, p) {
+            flush_span(&mut out, text, run, p);
+            let end = comment_end_at(bytes, p);
+            skip_until = end;
+            run = end;
+            continue;
+        }
+        if bytes.get(p) != Some(&b',') {
+            continue;
+        }
+        let mut look = p + 1;
+        loop {
+            match bytes.get(look) {
+                Some(b' ' | b'\t' | b'\n' | b'\r') => look += 1,
+                Some(b'/') if comment_pair_at(bytes, look) => {
+                    look = comment_end_at(bytes, look);
+                }
+                _ => break,
+            }
+        }
+        if matches!(bytes.get(look), Some(b'}' | b']')) {
+            flush_span(&mut out, text, run, p);
+            run = p + 1;
+        }
+    }
+    if out.is_empty() && run == 0 {
+        return Cow::Borrowed(text);
+    }
+    flush_span(&mut out, text, run, bytes.len());
+    Cow::Owned(out)
+}
+
+fn strip_trailing_commas_cow(text: &str) -> Cow<'_, str> {
+    let bytes = text.as_bytes();
+    let mut out = String::new();
+    let mut run = 0usize;
+    let mut in_string = false;
+    for p in memchr2_iter(b',', b'"', bytes) {
+        if in_string {
+            if bytes.get(p) == Some(&b'"') && !escaped_at(bytes, p) {
+                in_string = false;
+            }
+            continue;
+        }
+        if bytes.get(p) == Some(&b'"') {
+            in_string = true;
+            continue;
+        }
+        let mut look = p + 1;
+        while matches!(bytes.get(look), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+            look += 1;
+        }
+        if matches!(bytes.get(look), Some(b'}' | b']')) {
+            flush_span(&mut out, text, run, p);
+            run = p + 1;
+        }
+    }
+    if out.is_empty() && run == 0 {
+        return Cow::Borrowed(text);
+    }
+    flush_span(&mut out, text, run, bytes.len());
+    Cow::Owned(out)
 }
 
 /// Read fresh; comments and trailing commas accepted, duplicates rejected.
@@ -66,7 +242,7 @@ pub fn load(path: &Path) -> Result<Map<String, Value>> {
         return Ok(Map::new());
     }
 
-    let value = crate::json::parse_strict(&strip_jsonc(&text), path)?;
+    let value = crate::json::parse_strict(&strip_jsonc_cow(&text), path)?;
     match value {
         Value::Object(map) => Ok(map),
         _ => Err(ConfigError::NotAnObject {
@@ -87,14 +263,14 @@ pub fn load_value(path: &Path) -> Result<Value> {
         return Ok(Value::Object(Map::new()));
     }
 
-    crate::json::parse_strict(&strip_jsonc(&text), path)
+    crate::json::parse_strict(&strip_jsonc_cow(&text), path)
 }
 
-/// Refuse writes that would destroy JSONC lexical material: only files whose
-/// bytes equal their stripped form (or are missing) are writable.
 fn ensure_lossless_write(path: &Path) -> Result<()> {
     match std::fs::read_to_string(path) {
-        Ok(text) if strip_jsonc(&text) != text => Err(ConfigError::lossy_write(path, "jsonc")),
+        Ok(text) if strip_jsonc_cow(&text).as_ref() != text => {
+            Err(ConfigError::lossy_write(path, "jsonc"))
+        }
         Ok(_) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(ConfigError::io(path, e)),
@@ -167,7 +343,7 @@ where
 /// DOC-10 disclosure; files carrying JSONC material never reformat (their
 /// writes are refused), extension-free files warn when not normalized.
 pub fn formatting_change_warning(text: &str) -> Option<&'static str> {
-    if text.trim().is_empty() || strip_jsonc(text) != text {
+    if text.trim().is_empty() || strip_jsonc_cow(text).as_ref() != text {
         return None;
     }
     crate::json::formatting_change_warning(text).map(|_| {
@@ -184,6 +360,226 @@ mod tests {
         let dir = crate::test_util::temp_dir_unique("config-jsonc");
         std::fs::create_dir_all(&dir).unwrap();
         dir.join(name)
+    }
+
+    fn scalar_strip_jsonc(text: &str) -> String {
+        strip_trailing_commas(&crate::document::strip_jsonc_comments(text))
+    }
+
+    #[test]
+    fn fast_strip_matches_scalar_on_fixed_corpus() {
+        let cases = [
+            "",
+            "/",
+            "//",
+            "/*",
+            "/**",
+            "/**/",
+            "/***/",
+            "/*/",
+            "{}",
+            "{,}",
+            "{\"a\":1,}",
+            "[1,2,]",
+            "[1,/*c*/2,]",
+            "{\"u\":\"a\\\"/*b*/\",}",
+            "{\"url\":\"http://x/y\",}",
+            "a // c\r\nb\n",
+            "// only comment, no newline",
+            "/* unterminated {\"a\":1,}",
+            "{\"k\":\"// not comment\", \"j\":/*c*/\"v\",}",
+            "{\"é\":1/*中文*/,}",
+            "{\"emoji\":\"\u{1F600}\",}",
+            "{\"a\": [1, 2 /* x */, ] }",
+            "{\"a\":1,,}",
+            "[,]",
+            "{\"a\":\"b\\\\\",}",
+            "{\"a\":\"b\\\"\",}",
+            "\r\n{\"a\":1,}\r\n",
+            "{\"a\" : 1 , }",
+            "\"\\uD83D\\uDE00\"",
+            "{\"a\":\"\\u0061\",}",
+        ];
+        for case in cases {
+            assert_eq!(strip_jsonc(case), scalar_strip_jsonc(case), "case {case:?}");
+            assert_eq!(
+                strip_jsonc_cow(case).as_ref(),
+                scalar_strip_jsonc(case),
+                "cow case {case:?}"
+            );
+            assert_eq!(
+                strip_jsonc_comments_cow(case).as_ref(),
+                crate::document::strip_jsonc_comments(case),
+                "comments-only cow case {case:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fast_strip_matches_scalar_on_generated_inputs() {
+        fn xorshift(state: &mut u64) -> u64 {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            *state
+        }
+        let tokens = [
+            "{",
+            "}",
+            "[",
+            "]",
+            ",",
+            ":",
+            "\"",
+            "\\",
+            "//c\n",
+            "/*c*/",
+            "/",
+            "x",
+            " ",
+            "\r\n",
+            "\"s\"",
+            "1",
+            "é",
+            "\u{1F600}",
+            "\"a\\\"b\"",
+            "\"/*n*/\"",
+            "//",
+            "*/",
+            "/*",
+        ];
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        for _ in 0..2000 {
+            let count = usize::try_from(xorshift(&mut state) % 12).unwrap() + 1;
+            let mut input = String::new();
+            for _ in 0..count {
+                let idx = usize::try_from(xorshift(&mut state) % tokens.len() as u64).unwrap();
+                input.push_str(tokens[idx]);
+            }
+            assert_eq!(
+                strip_jsonc_cow(&input).as_ref(),
+                scalar_strip_jsonc(&input),
+                "input {input:?}"
+            );
+            assert_eq!(
+                strip_jsonc_comments_cow(&input).as_ref(),
+                crate::document::strip_jsonc_comments(&input),
+                "comments-only input {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn line_comment_swallows_the_cr_of_crlf() {
+        let input = "{\"a\":1, // c\r\n\"b\":2}\n";
+        assert_eq!(strip_jsonc(input), "{\"a\":1, \n\"b\":2}\n");
+    }
+
+    #[test]
+    fn fast_strip_matches_scalar_on_pathological_inputs() {
+        let mut escaped_quotes = String::from("\"");
+        for _ in 0..2000 {
+            escaped_quotes.push('\\');
+            escaped_quotes.push('"');
+        }
+        escaped_quotes.push(',');
+        let mut comma_comment_pairs = String::from("[");
+        for i in 0..2000 {
+            std::fmt::Write::write_fmt(&mut comma_comment_pairs, format_args!("{i}, /* c{i} "))
+                .unwrap();
+        }
+        comma_comment_pairs.push_str("*/ ]");
+        let unterminated = "1, /* never closed, ".repeat(1000);
+        let star_storm = format!("/*{}*/ 1, ", "*".repeat(4000));
+        let crlf_comments = "a: 1, // c\r\n".repeat(1000);
+        let cases = [
+            escaped_quotes,
+            comma_comment_pairs,
+            unterminated,
+            star_storm,
+            crlf_comments,
+        ];
+        for case in &cases {
+            assert_eq!(
+                strip_jsonc_cow(case).as_ref(),
+                scalar_strip_jsonc(case),
+                "pathological input of len {}",
+                case.len()
+            );
+            assert_eq!(
+                strip_jsonc_comments_cow(case).as_ref(),
+                crate::document::strip_jsonc_comments(case),
+                "pathological comments-only input of len {}",
+                case.len()
+            );
+        }
+    }
+
+    #[test]
+    fn bom_is_not_stripped_in_jsonc() {
+        let path = scratch("bom.jsonc");
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(b"{\"a\": 1}");
+        std::fs::write(&path, bytes).unwrap();
+        match load(&path) {
+            Err(ConfigError::Json { .. }) => {}
+            other => panic!("expected Json error for BOM-prefixed jsonc, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn staging_gate_refuses_bom_jsonc_bytes() {
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(b"{\"a\": 1}");
+        let verdict = crate::document::validate_bytes_for_kind(
+            &bytes,
+            crate::document::DocumentKind::JsonC,
+            Path::new("bom.jsonc"),
+        );
+        assert!(verdict.is_err(), "staging gate must refuse BOM'd jsonc");
+    }
+
+    #[test]
+    fn staging_gate_strips_comments_but_not_trailing_commas() {
+        let trailing = "{\"a\": 1,}".as_bytes();
+        let editor_parse = serde_json::from_str::<Value>(&strip_jsonc("{\"a\": 1,}"));
+        assert!(
+            editor_parse.is_ok(),
+            "editor chain must strip trailing commas"
+        );
+        let verdict = crate::document::validate_bytes_for_kind(
+            trailing,
+            crate::document::DocumentKind::JsonC,
+            Path::new("trailing.jsonc"),
+        );
+        assert!(
+            verdict.is_err(),
+            "staging gate must refuse trailing commas it cannot strip"
+        );
+
+        let commented = "{\n  // c\n  \"a\": 1\n}".as_bytes();
+        let commented_verdict = crate::document::validate_bytes_for_kind(
+            commented,
+            crate::document::DocumentKind::JsonC,
+            Path::new("commented.jsonc"),
+        );
+        assert!(
+            commented_verdict.is_ok(),
+            "staging gate must strip comments it does strip"
+        );
+    }
+
+    #[test]
+    fn formatting_change_warning_edges() {
+        assert_eq!(formatting_change_warning(""), None);
+        assert_eq!(formatting_change_warning("{\n  \"a\": 1\n}\n"), None);
+        assert!(formatting_change_warning("{\"a\":1}").is_some());
+        assert_eq!(
+            formatting_change_warning("// header\n{\"a\": 1}\n"),
+            None,
+            "comment-carrying files never reformat: their writes are refused"
+        );
+        assert_eq!(formatting_change_warning("{\"a\": 1,}\n"), None);
     }
 
     #[test]

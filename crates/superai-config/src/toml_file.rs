@@ -1,9 +1,9 @@
+use std::fmt::Write as _;
 use std::path::Path;
 
 use toml_edit::DocumentMut;
 
 use crate::error::{ConfigError, Result};
-
 /// Read fresh; `toml_edit` keeps comments, order, whitespace, and layout,
 /// so writes touch only what changed (DOC-04).
 pub fn load(path: &Path) -> Result<DocumentMut> {
@@ -62,12 +62,38 @@ pub fn formatting_change_warning(text: &str) -> Option<&'static str> {
         );
     }
     match text.parse::<DocumentMut>() {
-        Ok(doc) if doc.to_string() == text => None,
-        Ok(_) => Some(
-            "toml codec cannot round-trip this document's decor byte-identically; \
-             surrounding formatting will change even where semantics do not",
-        ),
+        Ok(doc) => {
+            let mut rendered = RenderedEq {
+                expected: text,
+                pos: 0,
+            };
+            let matches = write!(rendered, "{doc}").is_ok() && rendered.pos == text.len();
+            if matches {
+                None
+            } else {
+                Some(
+                    "toml codec cannot round-trip this document's decor byte-identically; \
+                     surrounding formatting will change even where semantics do not",
+                )
+            }
+        }
         Err(_) => None,
+    }
+}
+
+struct RenderedEq<'a> {
+    expected: &'a str,
+    pos: usize,
+}
+
+impl std::fmt::Write for RenderedEq<'_> {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        let end = self.pos + s.len();
+        if self.expected.get(self.pos..end) != Some(s) {
+            return Err(std::fmt::Error);
+        }
+        self.pos = end;
+        Ok(())
     }
 }
 
@@ -79,6 +105,19 @@ mod tests {
         let dir = crate::test_util::temp_dir_unique("config-toml");
         std::fs::create_dir_all(&dir).unwrap();
         dir.join(name)
+    }
+
+    #[test]
+    fn formatting_change_warning_edges() {
+        assert_eq!(formatting_change_warning(""), None);
+        assert_eq!(formatting_change_warning("not toml at all"), None);
+        assert_eq!(formatting_change_warning("# c\na = 1\n"), None);
+        assert_eq!(formatting_change_warning("a  =  1\n"), None);
+        assert_eq!(formatting_change_warning("a = 1\n\n\n"), None);
+        assert_eq!(formatting_change_warning("\ta = 1\n"), None);
+        assert_eq!(formatting_change_warning("a = 1 \n"), None);
+        assert!(formatting_change_warning("a = 1\r\n").is_some());
+        assert!(formatting_change_warning("a = 1\r\nb = 2\n").is_some());
     }
 
     #[test]

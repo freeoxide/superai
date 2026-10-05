@@ -31,6 +31,11 @@ pub const MAX_OUTPUT_BYTES: usize = 1_048_576;
 /// Default wall-clock timeout for process execution.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
+// A killed or exited child that backgrounded a descendant still holds the
+// capture pipes; the post-kill reap is grace-bounded so the orphan's
+// lifetime never extends a probe past its budget.
+const REAP_GRACE: Duration = Duration::from_millis(500);
+
 /// Flags whose following value is redacted; long-form only, since short
 /// flags like `-p` alias to non-secret meanings across tools.
 pub const REDACT_FLAGS: &[&str] = &[
@@ -229,6 +234,24 @@ fn compose_child_env(opts: &ExecuteOpts) -> BTreeMap<OsString, OsString> {
     env
 }
 
+fn child_path_var(opts: &ExecuteOpts) -> Option<OsString> {
+    let path_key = env_map_key(OsStr::new("PATH"));
+    let removed = opts
+        .env_remove
+        .iter()
+        .any(|key| env_map_key(OsStr::new(key)) == path_key);
+    if !removed
+        && let Some((_, value)) = opts
+            .env
+            .iter()
+            .rev()
+            .find(|(key, _)| env_map_key(OsStr::new(key)) == path_key)
+    {
+        return Some(OsString::from(value));
+    }
+    std::env::var_os("PATH")
+}
+
 /// Whether `path` names an executable file (unix demands the execute bit;
 /// Windows tests existence only, matching the adapter PATH helpers).
 fn is_executable_file(path: &Path) -> bool {
@@ -265,12 +288,7 @@ fn first_path_match(path_var: &OsStr, name: &str) -> Option<PathBuf> {
     None
 }
 
-/// Resolve `executable` to what will be spawned: bare names take the first
-/// PATH match from the child's composed PATH; `.`/`..` is refused.
-fn resolve_executable(
-    executable: &str,
-    child_env: &BTreeMap<OsString, OsString>,
-) -> Result<PathBuf, CoreError> {
+fn resolve_executable(executable: &str, path_var: Option<&OsStr>) -> Result<PathBuf, CoreError> {
     let path = Path::new(executable);
     if path
         .components()
@@ -290,15 +308,11 @@ fn resolve_executable(
     if executable.contains('/') {
         return Ok(path.to_path_buf());
     }
-    let path_var = child_env
-        .get(&env_map_key(OsStr::new("PATH")))
-        .cloned()
-        .or_else(|| std::env::var_os("PATH"))
-        .ok_or_else(|| CoreError::BinaryDetection {
-            binary: executable.to_owned(),
-            reason: "PATH is not set; refusing to guess a search path for a bare name".to_owned(),
-        })?;
-    first_path_match(&path_var, executable).ok_or_else(|| CoreError::BinaryDetection {
+    let path_var = path_var.ok_or_else(|| CoreError::BinaryDetection {
+        binary: executable.to_owned(),
+        reason: "PATH is not set; refusing to guess a search path for a bare name".to_owned(),
+    })?;
+    first_path_match(path_var, executable).ok_or_else(|| CoreError::BinaryDetection {
         binary: executable.to_owned(),
         reason: format!(
             "`{executable}` not found on PATH (first match; the working directory is never searched)"
@@ -334,9 +348,10 @@ pub fn run_command(
         }
     }
 
-    // Compose the env first: bare names resolve against the child's PATH.
-    let child_env = compose_child_env(opts);
-    let resolved = resolve_executable(executable, &child_env)?;
+    // Bare names resolve against the child's PATH, which only differs from
+    // the ambient one when the opts touch it.
+    let path_var = child_path_var(opts);
+    let resolved = resolve_executable(executable, path_var.as_deref())?;
 
     let mut cmd = duct::cmd(resolved.as_os_str(), args);
 
@@ -346,9 +361,11 @@ pub fn run_command(
 
     // Duct's env wraps apply in reverse build order; one composed map is
     // its only env input so compose_child_env decides precedence.
-    cmd = cmd.full_env(child_env);
+    if opts.clear_env || !opts.env.is_empty() || !opts.env_remove.is_empty() {
+        cmd = cmd.full_env(compose_child_env(opts));
+    }
 
-    cmd = cmd.stdout_capture().stderr_capture();
+    cmd = cmd.stdin_null().stdout_capture().stderr_capture();
 
     let timeout = opts.timeout.unwrap_or(DEFAULT_TIMEOUT);
     let display = display_command(executable, args, opts.redact);
@@ -365,12 +382,27 @@ pub fn run_command(
         // wait_timeout borrows the handle; clone unhooks the captured bytes.
         Ok(Some(output)) => output.clone(),
         Ok(None) => {
-            let kill_note = handle
-                .kill()
-                .map_or_else(|e| format!(" (kill failed: {e})"), |()| String::new());
-            let wait_note = handle
-                .wait()
-                .map_or_else(|e| format!(" (wait failed: {e})"), |_| String::new());
+            let kill_err = handle.kill().err();
+            let (wait_note, include_kill_note) = match handle.wait_timeout(REAP_GRACE) {
+                Ok(Some(_)) => (String::new(), true),
+                Ok(None) => {
+                    // NotFound means the child already exited, so the pipe
+                    // holder is a descendant; any other kill failure leaves
+                    // the child itself alive and holding the pipe.
+                    let keep_kill_note = kill_err
+                        .as_ref()
+                        .is_some_and(|e| e.kind() != std::io::ErrorKind::NotFound);
+                    (
+                        " (descendant still holds the pipes; abandoned)".to_owned(),
+                        keep_kill_note,
+                    )
+                }
+                Err(e) => (format!(" (wait failed: {e})"), true),
+            };
+            let kill_note = match (&kill_err, include_kill_note) {
+                (Some(e), true) => format!(" (kill failed: {e})"),
+                _ => String::new(),
+            };
             let reason = format!(
                 "command timed out after {}s: `{display}`{kill_note}{wait_note}",
                 timeout.as_secs()
@@ -642,6 +674,59 @@ mod tests {
         };
         let err = run_command("sleep", &["2".to_owned()], &opts).unwrap_err();
         assert!(format!("{err}").contains("timed out"));
+    }
+
+    /// A child that backgrounds a descendant holds the capture pipes past
+    /// its own exit; the timeout must bound wall time at the orphan's
+    /// expense, not the other way around.
+    #[test]
+    #[cfg(unix)]
+    fn run_command_timeout_bounds_orphan_pipe_holders() {
+        let opts = ExecuteOpts {
+            timeout: Some(Duration::from_millis(300)),
+            ..Default::default()
+        };
+        let start = std::time::Instant::now();
+        let script = "sleep 5 & echo hi".to_owned();
+        let err = run_command("/bin/sh", &["-c".to_owned(), script], &opts).unwrap_err();
+        let text = format!("{err}");
+        let elapsed = start.elapsed();
+        assert!(
+            text.contains("timed out"),
+            "expected a timeout refusal, got: {err}"
+        );
+        assert!(
+            text.contains("abandoned"),
+            "the pipe-hold cause must lead the message, got: {err}"
+        );
+        // The child exits before the kill lands (NotFound), so the doomed
+        // kill must not be blamed ahead of the abandonment note.
+        assert!(
+            !text.contains("kill failed"),
+            "an already-dead child's kill failure is noise, got: {err}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "wall time must be bounded near the budget, took {elapsed:?}"
+        );
+    }
+
+    /// Probes never need stdin: a child that would prompt gets EOF instead of
+    /// the parent's terminal.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn run_command_gives_the_child_a_null_stdin() {
+        let opts = ExecuteOpts {
+            timeout: Some(Duration::from_secs(5)),
+            ..Default::default()
+        };
+        let script = "printf 'stdin=%s' \"$(readlink /proc/self/fd/0)\"".to_owned();
+        let out = run_command("/bin/sh", &["-c".to_owned(), script], &opts).unwrap();
+        assert!(
+            out.stdout.contains("stdin=/dev/null"),
+            "the child must observe a null stdin, got: {}",
+            out.stdout
+        );
     }
 
     #[test]

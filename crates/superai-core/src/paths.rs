@@ -42,7 +42,7 @@ fn validate_no_traversal(kind: &str, path: &Path, display: &str) -> Result<(), C
     Ok(())
 }
 
-fn normalize_absolute(path: &Path) -> PathBuf {
+pub(crate) fn normalize_absolute(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for comp in path.components() {
         match comp {

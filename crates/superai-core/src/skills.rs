@@ -277,8 +277,8 @@ pub struct Consumer {
 
 use crate::registry::now_iso8601;
 
-/// Shell metachars that must not appear in GitHub URLs: [`crate::process::SHELL_METACHARS`]
-/// plus a backslash, legitimate as a path separator only in native locators.
+// A backslash is a path separator only in native locators; in fetch URLs it
+// stays a quoting metachar.
 fn contains_shell_metachars(value: &str) -> bool {
     crate::process::SHELL_METACHARS
         .iter()
@@ -286,8 +286,6 @@ fn contains_shell_metachars(value: &str) -> bool {
         || value.contains('\\')
 }
 
-/// Unique staging root under the system temp dir, distinct across threads and
-/// processes.
 fn staging_root(tag: &str) -> PathBuf {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     std::thread::current().id().hash(&mut hasher);
@@ -302,12 +300,8 @@ fn staging_root(tag: &str) -> PathBuf {
     ))
 }
 
-/// Hint every symlink-privilege failure must carry: `CopySelected` is the
-/// explicit alternate, never a silent fallback.
 const COPY_SELECTED_HINT: &str = "Use CopySelected as explicit alternate";
 
-/// Whether a symlink error is the Windows privilege failure that must surface
-/// [`COPY_SELECTED_HINT`] instead of a generic error.
 fn is_link_privilege_error(msg: &str) -> bool {
     let lower = msg.to_lowercase();
     lower.contains("privilege")
@@ -316,8 +310,8 @@ fn is_link_privilege_error(msg: &str) -> bool {
         || msg.contains("requires elevation")
 }
 
-/// Remove a symlink regardless of directory-ness: Windows rejects
-/// `remove_file` on a dir symlink; `remove_dir` removes the link itself.
+// Windows rejects `remove_file` on a dir symlink; `remove_dir` removes the
+// link itself.
 fn remove_symlink_any(path: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
@@ -331,8 +325,8 @@ fn remove_symlink_any(path: &Path) -> std::io::Result<()> {
     std::fs::remove_file(path)
 }
 
-/// Move a tree into quarantine (recoverable). A cross-device quarantine
-/// target cannot be renamed into, so the tree is deleted there instead.
+// A cross-device quarantine target cannot be renamed into, so the tree is
+// deleted there instead.
 fn move_tree_to_quarantine(dir: &Path, op_id: &str) -> Result<()> {
     let quarantine_dest =
         superai_config::quarantine::quarantine_dir(op_id).map_err(|e| CoreError::InvalidPath {
@@ -431,7 +425,6 @@ pub fn validate_fetch_url(url: &str) -> Result<()> {
     Ok(())
 }
 
-/// Validate that a skill relative path does not escape boundaries.
 fn validate_relative_path(rel: &Path) -> Result<()> {
     let rel_str = rel.to_string_lossy();
     let s = rel_str.as_ref();
@@ -496,28 +489,24 @@ fn validate_relative_path(rel: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Byte-length as `usize`, saturating on 16-bit targets where `usize` is
-/// narrower than `u64` file sizes.
 fn len_as_usize(len: u64) -> usize {
     usize::try_from(len).unwrap_or(usize::MAX)
 }
 
-/// A walked path with its walk-time `symlink_metadata`.
 struct SkillFile {
     path: PathBuf,
     meta: std::fs::Metadata,
 }
 
-/// Best-effort staging/cleanup removal: error paths cannot propagate a second
-/// failure, so removal errors go to stderr instead of vanishing.
+// Error paths cannot propagate a second failure; removal errors are logged
+// to stderr instead of vanishing.
 fn cleanup_logged(action: &str, path: &Path, result: std::io::Result<()>) {
     if let Err(e) = result {
         eprintln!("superai-core: {action} failed for {}: {e}", path.display());
     }
 }
 
-/// Collect files recursively, with boundary checks, but do not yet validate
-/// content. The walk-time metadata rides along so callers never re-stat.
+// Walk-time metadata rides along so callers never re-stat.
 fn collect_files_recursive(root: &Path, out: &mut Vec<SkillFile>) -> Result<()> {
     let entries = std::fs::read_dir(root).map_err(|e| CoreError::InvalidPath {
         kind: "skill_tree".to_owned(),
@@ -531,7 +520,6 @@ fn collect_files_recursive(root: &Path, out: &mut Vec<SkillFile>) -> Result<()> 
             reason: format!("read_dir entry failed: {e}"),
         })?;
         let path = entry.path();
-        // Skip transaction temp files
         if let Some(file_name) = path.file_name().and_then(|n| n.to_str())
             && file_name.starts_with(".tmp.")
         {
@@ -632,7 +620,6 @@ pub fn parse_skill_metadata(skill_dir: &Path) -> Result<SkillMetadata> {
         field: "skill_frontmatter".to_owned(),
         reason: format!("{SKILL_MD_NAME} must be utf-8: {e}"),
     })?;
-    // Extract frontmatter between first two `---` delimiters.
     let mut lines = text.lines();
     let first = lines.next().unwrap_or_default().trim();
     if first != "---" {
@@ -865,8 +852,8 @@ pub fn registry_file_for_root(root: &Path) -> PathBuf {
     root.join(REGISTRY_FILE_NAME)
 }
 
-/// Unmodelled top-level keys from the on-disk registry, freshly read. An
-/// unreadable registry is fatal: rewriting it would destroy these keys.
+// An unreadable registry is fatal: rewriting it would destroy the foreign
+// keys.
 fn foreign_keys_from_disk(root: &Path) -> Result<Map<String, Value>> {
     let registry_file = registry_file_for_root(root);
     if !registry_file.exists() {
@@ -923,11 +910,8 @@ fn backup_before_write(path: &Path) -> Result<()> {
 /// Local skill registry rooted at `~/.superai/skills` (or custom root for tests).
 #[derive(Debug, Clone)]
 pub struct SkillRegistry {
-    /// Root directory containing one subdirectory per skill plus `registry.json`.
     root: PathBuf,
-    /// Records indexed by id.
     records: Vec<SkillRecord>,
-    /// Foreign top-level keys preserved verbatim.
     foreign: Map<String, Value>,
 }
 
@@ -1513,7 +1497,6 @@ impl SkillRegistry {
             existing.digest.clone()
         };
 
-        // Local edits: the on-disk digest drifted from the recorded one.
         let has_local_edits = existing_digest != existing.digest;
         let from_digest = existing_digest.clone();
         let to_digest = new_digest.clone();
@@ -1703,7 +1686,6 @@ impl SkillRegistry {
         new_record.license = source.license.or(new_metadata.license);
         new_record.validate()?;
         let final_skill_dir = self.root.join(skill_id.as_str());
-        // Files present on disk but absent from the new tree are removed.
         let mut steps: Vec<superai_config::transaction::FileAction> = Vec::new();
         let existing_files = {
             let mut list = Vec::new();
@@ -2415,8 +2397,7 @@ pub fn apply_skill_mode(
     }
 }
 
-/// Create a symlink; Windows picks `symlink_dir`/`symlink_file` by the
-/// target's kind.
+// Windows picks `symlink_dir`/`symlink_file` by the target's kind.
 fn create_symlink(target: &Path, link: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -2457,8 +2438,6 @@ fn create_symlink(target: &Path, link: &Path) -> Result<()> {
     }
 }
 
-/// Copy `src` into `dest` for staging: recreated symlinks stay links, files
-/// are copied by content. Callers own any transaction around the staging dir.
 fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
     std::fs::create_dir_all(dest).map_err(|e| CoreError::InvalidPath {
         kind: "copy_dir".to_owned(),
@@ -2521,8 +2500,6 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Fetch an HTTPS URL into staging (single GET). Returns a typed
-/// [`CoreError::SourceFetch`] on failure; content is never invented.
 fn fetch_https_to_staging(url: &str, staging_dir: &Path) -> Result<()> {
     validate_fetch_url(url)?;
     if url.starts_with("file://") {
@@ -2563,8 +2540,6 @@ fn fetch_https_to_staging(url: &str, staging_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Stage `source` (EXT-02): `LocalDir` copies; a pinned git source clones via
-/// argv tokens (HEAD verified, `.git` dropped); unpinned downloads over HTTPS.
 fn stage_skill_source(source: &SkillSource, staging_dir: &Path) -> Result<()> {
     match source.kind {
         SkillSourceKind::LocalDir => {
@@ -2592,7 +2567,6 @@ fn stage_skill_source(source: &SkillSource, staging_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Stage a `file://` locator (test path for the documented download route).
 fn stage_file_url(locator: &str, staging_dir: &Path) -> Result<()> {
     let path_str = locator.trim_start_matches("file://");
     let src = Path::new(path_str);
@@ -2634,7 +2608,6 @@ fn stage_file_url(locator: &str, staging_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Bounded timeout for each git command during staged checkout.
 const GIT_STAGE_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(1);
 
 fn git_stage_opts(cwd: Option<&Path>) -> crate::process::ExecuteOpts {
@@ -2653,8 +2626,6 @@ fn is_full_sha(rev: &str) -> bool {
     rev.len() == 40 && rev.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-/// Stage a git source at a pinned revision via argv-token `git` (EXT-02):
-/// branch/tag pins clone depth-1; a full sha shallow-fetches and checks out.
 fn stage_git_revision(url: &str, rev: &str, staging_dir: &Path) -> Result<()> {
     validate_fetch_url(url)?;
     if rev.contains('\0') || rev.chars().any(char::is_control) || contains_shell_metachars(rev) {
@@ -2766,7 +2737,6 @@ fn stage_git_revision(url: &str, rev: &str, staging_dir: &Path) -> Result<()> {
             )));
         }
     }
-    // Verify the staged tree is actually at the pinned revision.
     let resolved = crate::process::run_command(
         "git",
         &[
@@ -2792,7 +2762,6 @@ fn stage_git_revision(url: &str, rev: &str, staging_dir: &Path) -> Result<()> {
             reason: format!("staged tree resolved to {head}, not pinned {rev}"),
         });
     }
-    // Plain skill content in staging: drop the repository metadata.
     let git_dir = staging_dir.join(".git");
     cleanup_logged(
         "repo metadata cleanup",
@@ -3038,7 +3007,6 @@ pub fn set_skill_enabled_via_config(
         Some(node.clone())
     };
 
-    // Disable mechanism.
     if let Some(mechanism) = &decl.disable {
         match mechanism {
             SkillDisableMechanism::DenyList { selector } => {
@@ -3173,7 +3141,6 @@ pub fn set_skill_enabled_via_config(
     })
 }
 
-/// Read a surface's semantic value fresh for config-driven skill edits.
 fn load_surface_value_for_config(
     path: &Path,
     kind: superai_config::document::DocumentKind,
@@ -3200,8 +3167,6 @@ fn load_surface_value_for_config(
     }
 }
 
-/// Apply one dotted-selector Set through the engine executor with the decl's
-/// ownership and the fresh expected-old value (EXT-04).
 fn apply_config_set(
     path: &Path,
     kind: superai_config::document::DocumentKind,
@@ -3363,8 +3328,8 @@ pub fn provenance_path_for(
         .join(format!("{prov_instance_name}.json"))
 }
 
-/// Load the recorded provenance for `(skill, destination)`, if any (EXT-05).
-/// Unreadable or unparsable is an error: absence would skip the drift guard.
+// Unreadable or unparsable provenance is an error: absence would skip the
+// drift guard.
 fn load_provenance(
     registry_root: &Path,
     skill_id: &SkillId,

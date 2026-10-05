@@ -250,17 +250,125 @@ pub fn detect_all_with_options(harness: &HarnessId, opts: &DetectOptions) -> Vec
 }
 
 /// Core detection for a catalog entry with injected options.
-#[expect(
-    clippy::too_many_lines,
-    reason = "detection collects multiple probe sources"
-)]
 pub fn detect_all_for_entry(entry: &InstallCatalogEntry, opts: &DetectOptions) -> Vec<Detection> {
-    let mut detections: Vec<Detection> = Vec::new();
-    let mut seen_paths: HashSet<PathBuf> = HashSet::new();
-
     let path_dirs = opts.resolve_path_dirs();
     let home = opts.resolve_home();
 
+    // The eight families that never consult `seen_paths` run concurrently
+    // with everything below; the mise-shim probes wait for configured+PATH
+    // to seed `seen_paths`, then overlap those families from this thread.
+    let (detections, mut seen_paths, mise_shims, families) = std::thread::scope(|scope| {
+        let families = scope.spawn(|| manager_families(entry, &path_dirs, home.as_ref(), opts));
+        let (configured, path_hits) = std::thread::scope(|scope| {
+            let configured = scope.spawn(|| configured_binary_detections(entry, opts));
+            let path_hits = scope.spawn(|| path_detections(entry, &path_dirs, opts, home.as_ref()));
+            (join_probe(configured), join_probe(path_hits))
+        });
+
+        let mut detections: Vec<Detection> = Vec::new();
+        let mut seen_paths: HashSet<PathBuf> = HashSet::new();
+        for d in configured.detections {
+            detections.push(d);
+        }
+        for canon in configured.seen_canons {
+            seen_paths.insert(canon);
+        }
+        for d in path_hits {
+            seen_paths.insert(canonical_or_clone(&d.path));
+            detections.push(d);
+        }
+
+        let mise_shims = mise_shim_detections(entry, home.as_ref(), opts, &seen_paths);
+        (detections, seen_paths, mise_shims, join_probe(families))
+    });
+
+    let (mise_managed, brew, npm, cargo, pipx, uv, system, apps) = families;
+    let mut detections = detections;
+
+    for (canon, d) in mise_shims {
+        if !seen_paths.contains(&canon) {
+            seen_paths.insert(canon);
+            detections.push(d);
+        }
+    }
+    if let Some(mise_detections) = mise_managed {
+        for d in mise_detections {
+            let canon = canonical_or_clone(&d.path);
+            if !seen_paths.contains(&canon) {
+                seen_paths.insert(canon);
+                detections.push(d);
+            }
+        }
+    }
+
+    for d in brew
+        .into_iter()
+        .chain(npm)
+        .chain(cargo)
+        .chain(pipx)
+        .chain(uv)
+        .chain(system)
+        .chain(apps)
+    {
+        push_unique(&mut seen_paths, &mut detections, d);
+    }
+
+    // Insertion order: PATH hits first (PATH order), then shim and package probes.
+    detections
+}
+
+fn manager_families(
+    entry: &InstallCatalogEntry,
+    path_dirs: &[PathBuf],
+    home: Option<&PathBuf>,
+    opts: &DetectOptions,
+) -> (
+    Option<Vec<Detection>>,
+    Vec<Detection>,
+    Vec<Detection>,
+    Vec<Detection>,
+    Vec<Detection>,
+    Vec<Detection>,
+    Vec<Detection>,
+    Vec<Detection>,
+) {
+    std::thread::scope(|scope| {
+        let mise_managed = scope.spawn(|| mise_managed_detections(entry, home, opts));
+        let brew = scope.spawn(|| brew_detections(entry, opts));
+        let npm = scope.spawn(|| npm_detections(entry, opts));
+        let cargo = scope.spawn(|| cargo_detections(entry, home.map(PathBuf::as_path), opts));
+        let pipx =
+            scope.spawn(|| pipx_detections(entry, path_dirs, home.map(PathBuf::as_path), opts));
+        let uv = scope.spawn(|| uv_detections(entry, path_dirs, home.map(PathBuf::as_path), opts));
+        let system =
+            scope.spawn(|| system_detections(entry, path_dirs, home.map(PathBuf::as_path), opts));
+        let apps = scope.spawn(|| app_detections(entry, opts));
+        (
+            join_probe(mise_managed),
+            join_probe(brew),
+            join_probe(npm),
+            join_probe(cargo),
+            join_probe(pipx),
+            join_probe(uv),
+            join_probe(system),
+            join_probe(apps),
+        )
+    })
+}
+
+struct ConfiguredDetections {
+    detections: Vec<Detection>,
+    seen_canons: Vec<PathBuf>,
+}
+
+fn configured_binary_detections(
+    entry: &InstallCatalogEntry,
+    opts: &DetectOptions,
+) -> ConfiguredDetections {
+    let mut out = ConfiguredDetections {
+        detections: Vec::new(),
+        seen_canons: Vec::new(),
+    };
     if let Some(configured) = opts.configured_binary.as_ref() {
         if configured.exists() {
             let mut d = Detection::new(
@@ -278,8 +386,8 @@ pub fn detect_all_for_entry(entry: &InstallCatalogEntry, opts: &DetectOptions) -
             if let Some(v) = d.version.as_ref() {
                 d.evidence.push(format!("version: {v}"));
             }
-            seen_paths.insert(canonical_or_clone(configured));
-            detections.push(d);
+            out.seen_canons.push(canonical_or_clone(configured));
+            out.detections.push(d);
         } else if !configured.as_os_str().is_empty() {
             let mut d = Detection::new(
                 &entry.harness,
@@ -293,36 +401,64 @@ pub fn detect_all_for_entry(entry: &InstallCatalogEntry, opts: &DetectOptions) -
                 "configured_binary missing: {}",
                 configured.display()
             ));
-            detections.push(d);
+            out.detections.push(d);
         }
-    } else {
-        let env_key = format!(
-            "SUPERAI_CONFIGURED_BINARY_{}",
-            entry.harness.to_ascii_uppercase().replace('-', "_")
-        );
-        if let Some(val) = std::env::var_os(&env_key) {
-            let p = PathBuf::from(val);
-            if p.exists() {
-                let mut d = Detection::new(
-                    &entry.harness,
-                    entry.executables.first().map_or("", String::as_str),
-                    p.clone(),
-                    DetectionSource::ConfiguredBinary,
-                    DetectionConfidence::High,
-                );
-                d.version = probe_version_for_path(&p, entry, opts);
-                d.evidence
-                    .push(format!("env {env_key} exists: {}", p.display()));
-                seen_paths.insert(canonical_or_clone(&p));
-                detections.push(d);
-            }
+        return out;
+    }
+    let env_key = format!(
+        "SUPERAI_CONFIGURED_BINARY_{}",
+        entry.harness.to_ascii_uppercase().replace('-', "_")
+    );
+    if let Some(val) = std::env::var_os(&env_key) {
+        let p = PathBuf::from(val);
+        if p.exists() {
+            let mut d = Detection::new(
+                &entry.harness,
+                entry.executables.first().map_or("", String::as_str),
+                p.clone(),
+                DetectionSource::ConfiguredBinary,
+                DetectionConfidence::High,
+            );
+            d.version = probe_version_for_path(&p, entry, opts);
+            d.evidence
+                .push(format!("env {env_key} exists: {}", p.display()));
+            out.seen_canons.push(canonical_or_clone(&p));
+            out.detections.push(d);
         }
     }
+    out
+}
 
+fn path_detections(
+    entry: &InstallCatalogEntry,
+    path_dirs: &[PathBuf],
+    opts: &DetectOptions,
+    home: Option<&PathBuf>,
+) -> Vec<Detection> {
+    const MAX_CONCURRENT_HIT_PROBES: usize = 4;
+    let mut detections: Vec<Detection> = Vec::new();
     for exe in &entry.executables {
-        let hits = scan_path_for_executable(exe, &path_dirs);
-        for (rank, path) in hits.iter().enumerate() {
-            let canon = canonical_or_clone(path);
+        let hits = scan_path_for_executable(exe, path_dirs);
+        let mut all_probes: Vec<(Option<String>, bool)> = Vec::with_capacity(hits.len());
+        for chunk in hits.chunks(MAX_CONCURRENT_HIT_PROBES) {
+            let probes: Vec<(Option<String>, bool)> = std::thread::scope(|scope| {
+                let handles: Vec<_> = chunk
+                    .iter()
+                    .map(|path| {
+                        let version =
+                            scope.spawn(move || probe_version_for_path(path, entry, opts));
+                        let arch = scope.spawn(move || probe_arch_mismatch(path, opts));
+                        (version, arch)
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|(version, arch)| (join_probe(version), join_probe(arch)))
+                    .collect()
+            });
+            all_probes.extend(probes);
+        }
+        for (rank, (path, (version, arch_mismatch))) in hits.iter().zip(all_probes).enumerate() {
             let mut d = Detection::new(
                 &entry.harness,
                 exe,
@@ -336,9 +472,9 @@ pub fn detect_all_for_entry(entry: &InstallCatalogEntry, opts: &DetectOptions) -
             );
             d.path_rank = Some(rank);
             d.shadowed = rank > 0;
-            d.version = probe_version_for_path(path, entry, opts);
-            d.arch_mismatch = probe_arch_mismatch(path, opts);
-            d.broken_shim = is_broken_shim(path, &home);
+            d.version = version;
+            d.arch_mismatch = arch_mismatch;
+            d.broken_shim = is_broken_shim(path, home);
             d.evidence
                 .push(format!("PATH[{}] {} -> {}", rank, exe, path.display()));
             if d.shadowed {
@@ -350,172 +486,235 @@ pub fn detect_all_for_entry(entry: &InstallCatalogEntry, opts: &DetectOptions) -
             if let Some(v) = d.version.as_ref() {
                 d.evidence.push(format!("version: {v}"));
             }
-            seen_paths.insert(canon);
             detections.push(d);
         }
     }
+    detections
+}
 
-    if opts.probe_mise {
-        if let Some(home) = home.as_ref() {
-            for exe in &entry.executables {
-                let shim = home.join(".local/share/mise/shims").join(exe);
-                let canon = canonical_or_clone(&shim);
-                if shim.exists() && !seen_paths.contains(&canon) {
-                    let mut d = Detection::new(
-                        &entry.harness,
-                        exe,
-                        shim.clone(),
-                        DetectionSource::MiseShim,
-                        DetectionConfidence::Medium,
-                    );
-                    d.version = probe_version_for_path(&shim, entry, opts);
-                    d.broken_shim = d.version.is_none();
-                    d.evidence
-                        .push(format!("mise shim exists: {}", shim.display()));
-                    if let Some(v) = d.version.as_ref() {
-                        d.evidence.push(format!("version: {v}"));
-                    } else {
-                        d.evidence
-                            .push("mise shim version probe failed (broken shim?)".to_owned());
-                    }
-                    detections.push(d);
-                    seen_paths.insert(canon);
-                }
-            }
-            if let Some(mise_detections) = probe_mise_managed(entry, opts) {
-                for d in mise_detections {
-                    let canon = canonical_or_clone(&d.path);
-                    if !seen_paths.contains(&canon) {
-                        seen_paths.insert(canon);
-                        detections.push(d);
-                    }
-                }
-            }
-        }
+fn mise_shim_detections(
+    entry: &InstallCatalogEntry,
+    home: Option<&PathBuf>,
+    opts: &DetectOptions,
+    seen_paths: &HashSet<PathBuf>,
+) -> Vec<(PathBuf, Detection)> {
+    let mut out = Vec::new();
+    if !opts.probe_mise {
+        return out;
     }
-
-    if opts.probe_brew {
-        for method in entry.methods.iter().filter(|m| {
-            matches!(
-                m.kind,
-                crate::install_catalog::InstallMethodKind::Homebrew
-                    | crate::install_catalog::InstallMethodKind::HomebrewCask
-            )
-        }) {
-            if let Some(d) = probe_homebrew(&method.package_name, entry, opts) {
-                push_unique(&mut seen_paths, &mut detections, d);
-            }
-        }
-    }
-
-    if opts.probe_npm {
-        for method in entry
-            .methods
-            .iter()
-            .filter(|m| matches!(m.kind, crate::install_catalog::InstallMethodKind::Npm))
-        {
-            if let Some(d) = probe_npm(&method.package_name, entry, opts) {
-                push_unique(&mut seen_paths, &mut detections, d);
-            }
-        }
-    }
-
-    if opts.probe_cargo {
-        for method in entry
-            .methods
-            .iter()
-            .filter(|m| matches!(m.kind, crate::install_catalog::InstallMethodKind::Cargo))
-        {
-            if let Some(ds) = probe_cargo(&method.package_name, entry, opts) {
-                for d in ds {
-                    push_unique(&mut seen_paths, &mut detections, d);
-                }
-            }
-        }
-    }
-
-    if opts.probe_pipx {
-        for method in entry
-            .methods
-            .iter()
-            .filter(|m| matches!(m.kind, crate::install_catalog::InstallMethodKind::Pipx))
-        {
-            if let Some(ds) = probe_pipx(&method.package_name, entry, opts) {
-                for d in ds {
-                    push_unique(&mut seen_paths, &mut detections, d);
-                }
-            }
-        }
-    }
-
-    if opts.probe_uv {
-        for method in entry
-            .methods
-            .iter()
-            .filter(|m| matches!(m.kind, crate::install_catalog::InstallMethodKind::Uv))
-        {
-            if let Some(ds) = probe_uv(&method.package_name, entry, opts) {
-                for d in ds {
-                    push_unique(&mut seen_paths, &mut detections, d);
-                }
-            }
-        }
-    }
-
-    // Absent `dpkg` probes nothing; a hit is never fabricated (PKG-03).
-    if opts.probe_system {
-        for method in entry
-            .methods
-            .iter()
-            .filter(|m| m.kind == crate::install_catalog::InstallMethodKind::Direct)
-        {
-            if let Some(d) = probe_system_package(&method.package_name, entry, opts) {
-                push_unique(&mut seen_paths, &mut detections, d);
-            }
-        }
-    }
-
-    if opts.probe_apps {
-        for app_path in &entry.apps {
-            let p = PathBuf::from(app_path);
-            if !p.exists() {
-                continue;
-            }
+    let Some(home) = home else {
+        return out;
+    };
+    for exe in &entry.executables {
+        let shim = home.join(".local/share/mise/shims").join(exe);
+        let canon = canonical_or_clone(&shim);
+        if shim.exists() && !seen_paths.contains(&canon) {
             let mut d = Detection::new(
                 &entry.harness,
-                app_path,
-                p.clone(),
-                DetectionSource::AppBundle,
-                DetectionConfidence::High,
+                exe,
+                shim.clone(),
+                DetectionSource::MiseShim,
+                DetectionConfidence::Medium,
             );
+            d.version = probe_version_for_path(&shim, entry, opts);
+            d.broken_shim = d.version.is_none();
             d.evidence
-                .push(format!("app bundle exists: {}", p.display()));
-            if let Some(ver) = probe_app_bundle_version(&p) {
-                d.version = Some(ver.clone());
-                d.evidence.push(format!("bundle version: {ver}"));
+                .push(format!("mise shim exists: {}", shim.display()));
+            if let Some(v) = d.version.as_ref() {
+                d.evidence.push(format!("version: {v}"));
+            } else {
+                d.evidence
+                    .push("mise shim version probe failed (broken shim?)".to_owned());
             }
-            push_unique(&mut seen_paths, &mut detections, d);
-        }
-        for bundle_id in &entry.bundle_ids {
-            if let Some(path) = probe_bundle_id(bundle_id, opts) {
-                let mut d = Detection::new(
-                    &entry.harness,
-                    bundle_id,
-                    path.clone(),
-                    DetectionSource::AppBundle,
-                    DetectionConfidence::Medium,
-                );
-                d.evidence.push(format!(
-                    "bundle_id {bundle_id} resolved to {}",
-                    path.display()
-                ));
-                push_unique(&mut seen_paths, &mut detections, d);
-            }
+            out.push((canon, d));
         }
     }
+    out
+}
 
-    // Insertion order: PATH hits first (PATH order), then shim and package probes.
-    detections
+fn mise_managed_detections(
+    entry: &InstallCatalogEntry,
+    home: Option<&PathBuf>,
+    opts: &DetectOptions,
+) -> Option<Vec<Detection>> {
+    if !opts.probe_mise || home.is_none() {
+        return None;
+    }
+    probe_mise_managed(entry, opts)
+}
+
+fn brew_detections(entry: &InstallCatalogEntry, opts: &DetectOptions) -> Vec<Detection> {
+    let mut out = Vec::new();
+    if !opts.probe_brew {
+        return out;
+    }
+    for method in entry.methods.iter().filter(|m| {
+        matches!(
+            m.kind,
+            crate::install_catalog::InstallMethodKind::Homebrew
+                | crate::install_catalog::InstallMethodKind::HomebrewCask
+        )
+    }) {
+        if let Some(d) = probe_homebrew(&method.package_name, entry, opts) {
+            out.push(d);
+        }
+    }
+    out
+}
+
+fn npm_detections(entry: &InstallCatalogEntry, opts: &DetectOptions) -> Vec<Detection> {
+    let mut out = Vec::new();
+    if !opts.probe_npm {
+        return out;
+    }
+    for method in entry
+        .methods
+        .iter()
+        .filter(|m| matches!(m.kind, crate::install_catalog::InstallMethodKind::Npm))
+    {
+        if let Some(d) = probe_npm(&method.package_name, entry, opts) {
+            out.push(d);
+        }
+    }
+    out
+}
+
+fn cargo_detections(
+    entry: &InstallCatalogEntry,
+    home: Option<&Path>,
+    opts: &DetectOptions,
+) -> Vec<Detection> {
+    let mut out = Vec::new();
+    if !opts.probe_cargo {
+        return out;
+    }
+    for method in entry
+        .methods
+        .iter()
+        .filter(|m| matches!(m.kind, crate::install_catalog::InstallMethodKind::Cargo))
+    {
+        if let Some(ds) = probe_cargo(&method.package_name, entry, home, opts) {
+            out.extend(ds);
+        }
+    }
+    out
+}
+
+fn pipx_detections(
+    entry: &InstallCatalogEntry,
+    path_dirs: &[PathBuf],
+    home: Option<&Path>,
+    opts: &DetectOptions,
+) -> Vec<Detection> {
+    let mut out = Vec::new();
+    if !opts.probe_pipx {
+        return out;
+    }
+    for method in entry
+        .methods
+        .iter()
+        .filter(|m| matches!(m.kind, crate::install_catalog::InstallMethodKind::Pipx))
+    {
+        if let Some(ds) = probe_pipx(&method.package_name, entry, path_dirs, home, opts) {
+            out.extend(ds);
+        }
+    }
+    out
+}
+
+fn uv_detections(
+    entry: &InstallCatalogEntry,
+    path_dirs: &[PathBuf],
+    home: Option<&Path>,
+    opts: &DetectOptions,
+) -> Vec<Detection> {
+    let mut out = Vec::new();
+    if !opts.probe_uv {
+        return out;
+    }
+    for method in entry
+        .methods
+        .iter()
+        .filter(|m| matches!(m.kind, crate::install_catalog::InstallMethodKind::Uv))
+    {
+        if let Some(ds) = probe_uv(&method.package_name, entry, path_dirs, home, opts) {
+            out.extend(ds);
+        }
+    }
+    out
+}
+
+fn system_detections(
+    entry: &InstallCatalogEntry,
+    path_dirs: &[PathBuf],
+    home: Option<&Path>,
+    opts: &DetectOptions,
+) -> Vec<Detection> {
+    let mut out = Vec::new();
+    if !opts.probe_system {
+        return out;
+    }
+    for method in entry
+        .methods
+        .iter()
+        .filter(|m| m.kind == crate::install_catalog::InstallMethodKind::Direct)
+    {
+        if let Some(d) = probe_system_package(&method.package_name, entry, path_dirs, home, opts) {
+            out.push(d);
+        }
+    }
+    out
+}
+
+fn app_detections(entry: &InstallCatalogEntry, opts: &DetectOptions) -> Vec<Detection> {
+    let mut out = Vec::new();
+    if !opts.probe_apps {
+        return out;
+    }
+    for app_path in &entry.apps {
+        let p = PathBuf::from(app_path);
+        if !p.exists() {
+            continue;
+        }
+        let mut d = Detection::new(
+            &entry.harness,
+            app_path,
+            p.clone(),
+            DetectionSource::AppBundle,
+            DetectionConfidence::High,
+        );
+        d.evidence
+            .push(format!("app bundle exists: {}", p.display()));
+        if let Some(ver) = probe_app_bundle_version(&p) {
+            d.version = Some(ver.clone());
+            d.evidence.push(format!("bundle version: {ver}"));
+        }
+        out.push(d);
+    }
+    for bundle_id in &entry.bundle_ids {
+        if let Some(path) = probe_bundle_id(bundle_id, opts) {
+            let mut d = Detection::new(
+                &entry.harness,
+                bundle_id,
+                path.clone(),
+                DetectionSource::AppBundle,
+                DetectionConfidence::Medium,
+            );
+            d.evidence.push(format!(
+                "bundle_id {bundle_id} resolved to {}",
+                path.display()
+            ));
+            out.push(d);
+        }
+    }
+    out
+}
+
+fn join_probe<T>(handle: std::thread::ScopedJoinHandle<'_, T>) -> T {
+    match handle.join() {
+        Ok(value) => value,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
 }
 
 /// Scan each PATH dir for an executable file named `exe`, in PATH order.
@@ -570,10 +769,14 @@ fn probe_version_for_path(
         output_limit: Some(64 * 1024),
         ..Default::default()
     };
-    // Exact path first (versioned binaries); basename fallback lets shim
-    // wrappers that delegate to mise still resolve.
+    // Exact path first; the basename fallback resolves the first executable
+    // match among the injected dirs (ambient PATH when none) so shims that
+    // delegate to mise still answer. The child env itself stays ambient.
     let out = run_command(path.to_string_lossy().as_ref(), &probe_args, &exec_opts)
-        .or_else(|_| run_command(exe, &probe_args, &exec_opts))
+        .or_else(|_| {
+            let fallback = fallback_target(exe, opts);
+            run_command(&fallback, &probe_args, &exec_opts)
+        })
         .ok()?;
     if !out.success && out.stdout.trim().is_empty() && out.stderr.trim().is_empty() {
         return None;
@@ -584,6 +787,40 @@ fn probe_version_for_path(
         out.stdout
     };
     extract_version(&text)
+}
+
+fn fallback_target(exe: &str, opts: &DetectOptions) -> String {
+    let Some(dirs) = opts.path_dirs.as_ref() else {
+        return exe.to_owned();
+    };
+    for dir in dirs {
+        let candidate = dir.join(exe);
+        if is_executable_file(&candidate) {
+            return candidate.to_string_lossy().into_owned();
+        }
+    }
+    exe.to_owned()
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::metadata(path)
+        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(windows)]
+fn is_executable_file(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|meta| meta.is_file())
+        && path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|ext| {
+                matches!(
+                    ext.to_ascii_lowercase().as_str(),
+                    "exe" | "cmd" | "bat" | "com"
+                )
+            })
 }
 
 fn probe_arch_mismatch(path: &Path, opts: &DetectOptions) -> bool {
@@ -615,12 +852,7 @@ fn probe_arch_mismatch(path: &Path, opts: &DetectOptions) -> bool {
         && opts.probe_timeout.as_secs() > 0
 }
 
-#[expect(
-    clippy::ref_option,
-    reason = "home option is passed as borrowed Option for convenience"
-)]
-fn is_broken_shim(path: &Path, home: &Option<PathBuf>) -> bool {
-    // Only mise shims qualify; a shim with no execute bit cannot run.
+fn is_broken_shim(path: &Path, home: Option<&PathBuf>) -> bool {
     let Some(home) = home else {
         return false;
     };
@@ -881,6 +1113,7 @@ fn extract_npm_version(json: &str, package: &str) -> Option<String> {
 fn probe_cargo(
     package: &str,
     entry: &InstallCatalogEntry,
+    home: Option<&Path>,
     opts: &DetectOptions,
 ) -> Option<Vec<Detection>> {
     let exec_opts = ExecuteOpts {
@@ -937,7 +1170,6 @@ fn probe_cargo(
                     exe_candidate
                 };
                 if entry.executables.contains(&exe_name) || package.contains(&exe_name) {
-                    let home = opts.resolve_home();
                     let bin_path = home.map_or_else(
                         // Temp-dir anchor keeps the path absolute on Windows.
                         || std::env::temp_dir().join(format!(".cargo/bin/{exe_name}")),
@@ -970,9 +1202,9 @@ fn probe_cargo(
 }
 
 /// Exec opts for package-manager probes, scoped to the injected environment.
-fn package_probe_opts(opts: &DetectOptions) -> ExecuteOpts {
+fn package_probe_opts(opts: &DetectOptions, home: Option<&Path>) -> ExecuteOpts {
     let mut env = Vec::new();
-    if let Some(home) = opts.resolve_home() {
+    if let Some(home) = home {
         env.push(("HOME".to_owned(), home.to_string_lossy().into_owned()));
     }
     ExecuteOpts {
@@ -1032,16 +1264,18 @@ fn extract_pipx_version(json_text: &str, package: &str) -> Option<String> {
 fn probe_pipx(
     package: &str,
     entry: &InstallCatalogEntry,
+    path_dirs: &[PathBuf],
+    home: Option<&Path>,
     opts: &DetectOptions,
 ) -> Option<Vec<Detection>> {
-    let exec_opts = package_probe_opts(opts);
-    let pipx = resolve_manager(&opts.resolve_path_dirs(), "pipx");
+    let exec_opts = package_probe_opts(opts, home);
+    let pipx = resolve_manager(path_dirs, "pipx");
     let out = run_command(&pipx, &["list".to_owned(), "--json".to_owned()], &exec_opts).ok()?;
     if !out.success {
         return None;
     }
     let version = extract_pipx_version(&out.stdout, package)?;
-    let home = opts.resolve_home()?;
+    let home = home?;
     let exe = entry.executables.first().map_or(package, String::as_str);
     let bin_path = home
         .join(".local/pipx/venvs")
@@ -1085,16 +1319,18 @@ fn extract_uv_version(text: &str, package: &str) -> Option<String> {
 fn probe_uv(
     package: &str,
     entry: &InstallCatalogEntry,
+    path_dirs: &[PathBuf],
+    home: Option<&Path>,
     opts: &DetectOptions,
 ) -> Option<Vec<Detection>> {
-    let exec_opts = package_probe_opts(opts);
-    let uv = resolve_manager(&opts.resolve_path_dirs(), "uv");
+    let exec_opts = package_probe_opts(opts, home);
+    let uv = resolve_manager(path_dirs, "uv");
     let out = run_command(&uv, &["tool".to_owned(), "list".to_owned()], &exec_opts).ok()?;
     if !out.success {
         return None;
     }
     let version = extract_uv_version(&out.stdout, package)?;
-    let home = opts.resolve_home()?;
+    let home = home?;
     let exe = entry.executables.first().map_or(package, String::as_str);
     let bin_path = home.join(".local/bin").join(exe);
     let mut d = Detection::new(
@@ -1117,10 +1353,12 @@ fn probe_uv(
 fn probe_system_package(
     package: &str,
     entry: &InstallCatalogEntry,
+    path_dirs: &[PathBuf],
+    home: Option<&Path>,
     opts: &DetectOptions,
 ) -> Option<Detection> {
-    let exec_opts = package_probe_opts(opts);
-    let dpkg = resolve_manager(&opts.resolve_path_dirs(), "dpkg");
+    let exec_opts = package_probe_opts(opts, home);
+    let dpkg = resolve_manager(path_dirs, "dpkg");
     let out = run_command(&dpkg, &["-s".to_owned(), package.to_owned()], &exec_opts).ok()?;
     if !out.success {
         return None;
@@ -1385,6 +1623,16 @@ mod tests {
     }
 
     #[test]
+    fn extract_npm_version_absent_package_falls_back_to_first_dependency() {
+        let json =
+            r#"{"dependencies":{"renamed-tool":{"version":"9.9.9"},"other":{"version":"1.0.0"}}}"#;
+        assert_eq!(
+            extract_npm_version(json, "absent-pkg").as_deref(),
+            Some("9.9.9")
+        );
+    }
+
+    #[test]
     fn scan_path_preserves_order() {
         let d1 = PathBuf::from("/a/b");
         let d2 = PathBuf::from("/c/d");
@@ -1463,6 +1711,61 @@ mod tests {
         let mut perms = fs::metadata(&path).unwrap().permissions();
         perms.set_mode(0o755);
         fs::set_permissions(&path, perms).unwrap();
+    }
+
+    /// The basename fallback is deliberate and observable: when the detected
+    /// path cannot be spawned, the probe re-runs the bare name through the
+    /// child PATH, so the recorded version can come from a different
+    /// same-named binary in an earlier PATH directory.
+    #[cfg(unix)]
+    #[test]
+    fn probe_version_falls_back_to_a_path_binary_sharing_the_basename() {
+        use std::os::unix::fs::PermissionsExt;
+        let early = make_temp_dir("probe-fallback-early");
+        let late = make_temp_dir("probe-fallback-late");
+        write_fake_exe(&early, "my-exe", "my-exe 1.1.1");
+        let unspawnable = late.join("my-exe");
+        fs::write(&unspawnable, "#!/bin/sh\necho \"my-exe 9.9.9\"\n").unwrap();
+        fs::set_permissions(&unspawnable, fs::Permissions::from_mode(0o644)).unwrap();
+        let opts = DetectOptions {
+            path_dirs: Some(vec![early]),
+            ..Default::default()
+        };
+        let entry = pythonish_entry();
+        let version = probe_version_for_path(&unspawnable, &entry, &opts);
+        assert_eq!(
+            version.as_deref(),
+            Some("1.1.1"),
+            "the fallback must resolve the bare name through the child PATH"
+        );
+    }
+
+    /// A directory named like the executable carries the exec bit on unix
+    /// and must not satisfy the fallback resolution.
+    #[cfg(unix)]
+    #[test]
+    fn probe_version_fallback_skips_a_directory_named_like_the_exe() {
+        use std::os::unix::fs::PermissionsExt;
+        let decoy_dir = make_temp_dir("probe-fallback-decoy");
+        let real_dir = make_temp_dir("probe-fallback-real");
+        let probe_dir = make_temp_dir("probe-fallback-probe");
+        let impostor = decoy_dir.join("my-exe");
+        fs::create_dir(&impostor).unwrap();
+        write_fake_exe(&real_dir, "my-exe", "my-exe 2.2.2");
+        let unspawnable = probe_dir.join("my-exe");
+        fs::write(&unspawnable, "#!/bin/sh\necho nothing\n").unwrap();
+        fs::set_permissions(&unspawnable, fs::Permissions::from_mode(0o644)).unwrap();
+        let opts = DetectOptions {
+            path_dirs: Some(vec![decoy_dir, real_dir]),
+            ..Default::default()
+        };
+        let entry = pythonish_entry();
+        let version = probe_version_for_path(&unspawnable, &entry, &opts);
+        assert_eq!(
+            version.as_deref(),
+            Some("2.2.2"),
+            "the fallback must skip the impostor directory and resolve the real executable"
+        );
     }
 
     #[cfg(unix)]
@@ -1550,6 +1853,183 @@ mod tests {
             hits.iter()
                 .all(|d| d.source != DetectionSource::SystemPackage),
             "no manager present must yield no system-package hits: {hits:?}"
+        );
+        drop(fs::remove_dir_all(&bin_dir));
+        drop(fs::remove_dir_all(&home));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mise_shim_already_on_path_is_not_reported_twice() {
+        let home = make_temp_dir("home-shim-on-path");
+        let shim_dir = home.join(".local/share/mise/shims");
+        fs::create_dir_all(&shim_dir).unwrap();
+        write_fake_exe(&shim_dir, "claude", "3.1.0");
+
+        let catalog = InstallCatalog::embedded().unwrap();
+        let entry = catalog.get_str("claude-code").unwrap().clone();
+
+        let opts = DetectOptions {
+            path_dirs: Some(vec![shim_dir]),
+            home_dir: Some(home.clone()),
+            probe_mise: true,
+            probe_brew: false,
+            probe_npm: false,
+            probe_cargo: false,
+            probe_apps: false,
+            ..Default::default()
+        };
+        let hits = detect_all_for_entry(&entry, &opts);
+        assert_eq!(
+            hits.iter()
+                .filter(|d| d.source == DetectionSource::Path)
+                .count(),
+            1,
+            "{hits:?}"
+        );
+        assert_eq!(
+            hits.iter()
+                .filter(|d| d.source == DetectionSource::MiseShim)
+                .count(),
+            0,
+            "a shim already reported as a PATH hit must not be re-reported: {hits:?}"
+        );
+        drop(fs::remove_dir_all(&home));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn version_probe_fallback_resolves_first_executable_match() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir1 = make_temp_dir("fallback-shadow");
+        let dir2 = make_temp_dir("fallback-real");
+        let home = make_temp_dir("fallback-home");
+        let unspawnable = dir1.join("my-exe");
+        fs::write(&unspawnable, "#!/bin/sh\necho should-not-run\n").unwrap();
+        let real = dir2.join("my-exe");
+        fs::write(&real, "#!/bin/sh\necho \"9.9.9\"\n").unwrap();
+        let mut perms = fs::metadata(&real).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&real, perms).unwrap();
+
+        let entry = pythonish_entry();
+        let opts = DetectOptions {
+            path_dirs: Some(vec![dir1.clone(), dir2.clone()]),
+            home_dir: Some(home.clone()),
+            probe_mise: false,
+            probe_brew: false,
+            probe_npm: false,
+            probe_cargo: false,
+            probe_pipx: false,
+            probe_uv: false,
+            probe_system: false,
+            probe_apps: false,
+            ..Default::default()
+        };
+        let hits = detect_all_for_entry(&entry, &opts);
+        let path_hit = hits
+            .iter()
+            .find(|d| d.source == DetectionSource::Path)
+            .unwrap_or_else(|| panic!("PATH hit expected: {hits:?}"));
+        assert_eq!(path_hit.path, unspawnable);
+        assert_eq!(
+            path_hit.version.as_deref(),
+            Some("9.9.9"),
+            "the fallback must take the first executable match from the injected PATH dirs: {hits:?}"
+        );
+        drop(fs::remove_dir_all(&dir1));
+        drop(fs::remove_dir_all(&dir2));
+        drop(fs::remove_dir_all(&home));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn version_probe_fallback_skips_directories_named_like_the_exe() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir0 = make_temp_dir("fallback-dir0");
+        let dir1 = make_temp_dir("fallback-dir1");
+        let dir2 = make_temp_dir("fallback-dir2");
+        let home = make_temp_dir("fallback-dir-home");
+        let unspawnable = dir0.join("my-exe");
+        fs::write(&unspawnable, "#!/bin/sh\necho should-not-run\n").unwrap();
+        let exe_named_dir = dir1.join("my-exe");
+        fs::create_dir_all(&exe_named_dir).unwrap();
+        {
+            let mut perms = fs::metadata(&exe_named_dir).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&exe_named_dir, perms).unwrap();
+        }
+        write_fake_exe(&dir2, "my-exe", "8.8.8");
+
+        let entry = pythonish_entry();
+        let opts = DetectOptions {
+            path_dirs: Some(vec![dir0.clone(), dir1.clone(), dir2.clone()]),
+            home_dir: Some(home.clone()),
+            probe_mise: false,
+            probe_brew: false,
+            probe_npm: false,
+            probe_cargo: false,
+            probe_pipx: false,
+            probe_uv: false,
+            probe_system: false,
+            probe_apps: false,
+            ..Default::default()
+        };
+        let hits = detect_all_for_entry(&entry, &opts);
+        let path_hit = hits
+            .iter()
+            .find(|d| d.source == DetectionSource::Path)
+            .unwrap_or_else(|| panic!("PATH hit expected: {hits:?}"));
+        assert_eq!(path_hit.path, unspawnable);
+        assert_eq!(
+            path_hit.version.as_deref(),
+            Some("8.8.8"),
+            "the fallback must skip an exec-bit directory and take the next executable file: {hits:?}"
+        );
+        drop(fs::remove_dir_all(&dir0));
+        drop(fs::remove_dir_all(&dir1));
+        drop(fs::remove_dir_all(&dir2));
+        drop(fs::remove_dir_all(&home));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_hits_precede_package_probes_in_insertion_order() {
+        let bin_dir = make_temp_dir("order-bins");
+        let home = make_temp_dir("order-home");
+        write_fake_exe(&bin_dir, "my-exe", "9.9.9");
+        write_fake_manager(
+            &bin_dir,
+            "dpkg",
+            "#!/bin/sh\nprintf 'Package: my-pkg\\nStatus: install ok installed\\nVersion: 1.4.2\\n'\n",
+        );
+
+        let entry = pythonish_entry();
+        let opts = DetectOptions {
+            path_dirs: Some(vec![bin_dir.clone()]),
+            home_dir: Some(home.clone()),
+            probe_mise: false,
+            probe_brew: false,
+            probe_npm: false,
+            probe_cargo: false,
+            probe_pipx: false,
+            probe_uv: false,
+            probe_system: true,
+            probe_apps: false,
+            ..Default::default()
+        };
+        let hits = detect_all_for_entry(&entry, &opts);
+        let last_path = hits
+            .iter()
+            .rposition(|d| d.source == DetectionSource::Path)
+            .unwrap_or_else(|| panic!("no PATH hit: {hits:?}"));
+        let first_pkg = hits
+            .iter()
+            .position(|d| d.source == DetectionSource::SystemPackage)
+            .unwrap_or_else(|| panic!("no system-package hit: {hits:?}"));
+        assert!(
+            last_path < first_pkg,
+            "PATH hits must precede package probes: {hits:?}"
         );
         drop(fs::remove_dir_all(&bin_dir));
         drop(fs::remove_dir_all(&home));

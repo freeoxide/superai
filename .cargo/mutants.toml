@@ -38,8 +38,8 @@ minimum_test_timeout = 30
 # gets a fresh name and stays live. Extend only after per-mutant
 # adjudication.
 exclude_re = [
-    # Re-anchored 2026-09-30 after the audit-fix branch (warn_io, safe_paths,
-    # backup catalog) shifted lines; adjudication classes are unchanged.
+    # Re-anchored 2026-10-02 after the perf campaign (snapshot byte reuse,
+    # backup split, byte-parity verify rework) shifted lines; classes unchanged.
     # warn_io only writes a line to stderr; no in-process test observes the
     # log without capturing it — logging-only class.
     '^crates/superai-config/src/atomic\.rs:27:5: replace warn_io with \(\)$',
@@ -77,7 +77,8 @@ exclude_re = [
     '^crates/superai-config/src/backup\.rs:155:31: replace >= with < in write_backup_bytes$',
     '^crates/superai-config/src/backup\.rs:23:5: replace get_permissions_u32 -> Option<u32> with Some\(0\)$',
     '^crates/superai-config/src/backup\.rs:23:5: replace get_permissions_u32 -> Option<u32> with Some\(1\)$',
-    '^crates/superai-config/src/backup\.rs:682:42: replace && with \|\| in restore_verified$',
+    # restore_verified's digest&&size check became a byte-parity compare in
+    # the perf campaign; its && mutant no longer exists.
     # Platform-dead cfg(not(unix)) getters and the provably-equivalent
     # snapshot guards (is_modified's exists-mismatch check already covers
     # the !-deletions; is_symlink_loop's ELOOP message fallback covers the
@@ -89,10 +90,10 @@ exclude_re = [
     '^crates/superai-config/src/snapshot\.rs:28:5: replace get_owner_ids -> Option<\(u32, u32\)> with Some\(\(1, 0\)\)$',
     '^crates/superai-config/src/snapshot\.rs:28:5: replace get_owner_ids -> Option<\(u32, u32\)> with Some\(\(1, 1\)\)$',
     '^crates/superai-config/src/snapshot\.rs:42:5: replace get_ctime -> Option<SystemTime> with Some\(Default::default\(\)\)$',
-    '^crates/superai-config/src/snapshot\.rs:179:25: replace && with \|\| in is_modified$',
-    '^crates/superai-config/src/snapshot\.rs:179:8: delete ! in is_modified$',
-    '^crates/superai-config/src/snapshot\.rs:179:28: delete ! in is_modified$',
-    '^crates/superai-config/src/snapshot\.rs:201:37: replace \|\| with && in is_symlink_loop$',
+    '^crates/superai-config/src/snapshot\.rs:196:25: replace && with \|\| in is_modified$',
+    '^crates/superai-config/src/snapshot\.rs:196:8: delete ! in is_modified$',
+    '^crates/superai-config/src/snapshot\.rs:196:28: delete ! in is_modified$',
+    '^crates/superai-config/src/snapshot\.rs:218:37: replace \|\| with && in is_symlink_loop$',
     '^crates/superai-config/src/journal\.rs:104:16: delete ! in CrashJournal::write_to$',
     # remove_link_at's dir-link probe lives in the cfg(not(unix)) body;
     # on unix the function is a plain remove_file covered by tests above.
@@ -109,10 +110,10 @@ exclude_re = [
     '^crates/superai-config/src/transaction\.rs:455:23: replace match guard e\.kind\(\) == std::io::ErrorKind::AlreadyExists with true in stage_temp_file$',
     '^crates/superai-config/src/transaction\.rs:455:23: replace match guard e\.kind\(\) == std::io::ErrorKind::AlreadyExists with false in stage_temp_file$',
     '^crates/superai-config/src/transaction\.rs:455:32: replace == with != in stage_temp_file$',
-    '^crates/superai-config/src/transaction\.rs:555:16: replace match guard e\.kind\(\) == std::io::ErrorKind::CrossesDevices \|\| e\.raw_os_error\(\) == Some\(18\) with true in commit_staged_file$',
-    '^crates/superai-config/src/transaction\.rs:555:63: replace \|\| with && in commit_staged_file$',
-    '^crates/superai-config/src/transaction\.rs:555:25: replace == with != in commit_staged_file$',
-    '^crates/superai-config/src/transaction\.rs:555:83: replace == with != in commit_staged_file$',
-    '^crates/superai-config/src/transaction\.rs:733:69: replace \|\| with && in commit_file_expecting_with_roots$',
-    '^crates/superai-config/src/transaction\.rs:1999:70: replace \|\| with && in Transaction::verify$',
+    '^crates/superai-config/src/transaction\.rs:554:16: replace match guard e\.kind\(\) == std::io::ErrorKind::CrossesDevices \|\| e\.raw_os_error\(\) == Some\(18\) with true in commit_staged_file$',
+    '^crates/superai-config/src/transaction\.rs:554:63: replace \|\| with && in commit_staged_file$',
+    '^crates/superai-config/src/transaction\.rs:554:25: replace == with != in commit_staged_file$',
+    '^crates/superai-config/src/transaction\.rs:554:83: replace == with != in commit_staged_file$',
+    '^crates/superai-config/src/transaction\.rs:722:69: replace \|\| with && in commit_file_expecting_with_roots$',
+    '^crates/superai-config/src/transaction\.rs:2003:70: replace \|\| with && in Transaction::verify$',
 ]

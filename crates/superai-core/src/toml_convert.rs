@@ -9,6 +9,55 @@ pub(crate) fn document_to_value(doc: &toml_edit::DocumentMut) -> Value {
     table_to_value(doc.as_table())
 }
 
+/// Consuming twin of [`document_to_value`]: moves keys and strings out of
+/// the document instead of copying them, for callers that drop the parse.
+pub(crate) fn document_into_value(doc: toml_edit::DocumentMut) -> Value {
+    table_into_value(doc.into_table())
+}
+
+fn table_into_value(table: toml_edit::Table) -> Value {
+    let mut map = Map::new();
+    for (key, item) in table {
+        // Removals leave phantom `Item::None` keys behind; dropping them
+        // matches the borrowing walker.
+        if item.is_none() {
+            continue;
+        }
+        map.insert(key, item_into_value(item));
+    }
+    Value::Object(map)
+}
+
+fn item_into_value(item: toml_edit::Item) -> Value {
+    match item {
+        toml_edit::Item::Value(v) => toml_value_into_value(v),
+        toml_edit::Item::Table(t) => table_into_value(t),
+        toml_edit::Item::ArrayOfTables(a) => {
+            Value::Array(a.into_iter().map(table_into_value).collect())
+        }
+        toml_edit::Item::None => Value::Null,
+    }
+}
+
+fn toml_value_into_value(v: toml_edit::Value) -> Value {
+    use toml_edit::Value as Tv;
+    match v {
+        Tv::String(s) => Value::String(s.into_value()),
+        Tv::Integer(i) => Value::Number(i.into_value().into()),
+        Tv::Float(f) => Value::from(f.into_value()),
+        Tv::Boolean(b) => Value::Bool(b.into_value()),
+        Tv::Datetime(d) => Value::String(d.to_string()),
+        Tv::Array(a) => Value::Array(a.into_iter().map(toml_value_into_value).collect()),
+        Tv::InlineTable(t) => {
+            let mut map = Map::new();
+            for (key, value) in t {
+                map.insert(key, toml_value_into_value(value));
+            }
+            Value::Object(map)
+        }
+    }
+}
+
 fn table_to_value(table: &toml_edit::Table) -> Value {
     let mut map = Map::new();
     for (key, item) in table {
@@ -136,6 +185,18 @@ mod tests {
         assert_eq!(v["items"][0]["id"], json!("x"));
         assert_eq!(v["items"][1]["id"], json!("y"));
         assert_eq!(v["owner"]["sub"]["flag"], json!(true));
+    }
+
+    #[test]
+    fn consuming_walker_matches_borrowing_walker() {
+        let src = "[owner]\nname = \"a\"\nport = 1\npi = 3.5\ndead = nan\n\
+                   when = 1979-05-27T07:32:00Z\ninline = { b = true, c = [1, \"x\"] }\n\
+                   [[items]]\nid = \"x\"\n[[items]]\nid = \"y\"\n[owner.sub]\nflag = true\n";
+        let doc = src.parse::<toml_edit::DocumentMut>().unwrap();
+        assert_eq!(
+            document_to_value(&doc),
+            document_into_value(src.parse().unwrap())
+        );
     }
 
     #[test]
