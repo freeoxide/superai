@@ -728,7 +728,8 @@ mod decl_tests {
         std::fs::create_dir_all(&dir_b).unwrap();
         std::fs::write(dir_a.join("beta"), b"#!bin\n").unwrap();
         std::fs::write(dir_b.join("alpha"), b"#!bin\n").unwrap();
-        let path_var = format!("{}:{}", dir_a.display(), dir_b.display());
+        let separator = if cfg!(windows) { ';' } else { ':' };
+        let path_var = format!("{}{separator}{}", dir_a.display(), dir_b.display());
         let name_major =
             super::find_in_path_within(std::ffi::OsStr::new(&path_var), &["alpha", "beta"]);
         let dir_major = super::find_in_path_dir_first_within(&path_var, &["alpha", "beta"]);
