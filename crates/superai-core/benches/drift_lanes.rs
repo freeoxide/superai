@@ -23,9 +23,11 @@ use yaml_serde as _;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use superai_core::Registry;
+#[cfg(unix)]
 use superai_core::detect::{self, DetectOptions};
 use superai_core::discovery::{self, ScanOptions};
 use superai_core::harness_catalog;
+#[cfg(unix)]
 use superai_core::process;
 
 struct Scratch {
