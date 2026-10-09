@@ -18,6 +18,9 @@ use sha2 as _;
 use superai_config as _;
 use thiserror as _;
 use toml_edit as _;
+use toride_apps as _;
+use toride_registry as _;
+use toride_runner as _;
 use ureq as _;
 use yaml_serde as _;
 
@@ -309,8 +312,6 @@ fn bench_detect_fixtures(
             arch: vec!["any".to_owned()],
         },
         detect: DetectHints::default(),
-        update: None,
-        uninstall: None,
         requires_admin: false,
         checksum: None,
         conflicts: Vec::new(),
