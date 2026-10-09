@@ -1,8 +1,5 @@
-//! Toride backend adoption (PKG-05..08): a runner that forces superai's
-//! process posture onto every toride-executed child, plus the adapter
-//! mapping superai catalog methods for the six package-manager kinds onto
-//! toride-apps backend verbs. superai's gates, receipts, and probing stay
-//! in front; toride supplies argv and execution only.
+//! Toride backend adoption (PKG-05..08): a posture-forcing runner plus the
+//! catalog-method adapter for the six package-manager kinds.
 
 use std::fmt;
 use std::path::PathBuf;
@@ -36,12 +33,8 @@ use crate::process::{ProcessOutput, contains_shell_metachars, display_command, s
 /// the child's real output; backends swallow it inside their sync verbs.
 const OUTPUT_LOG_CAP: usize = 8;
 
-/// Runner wrapping an inner executor and rewriting every spec to superai's
-/// security posture before delegation: validated argv (full metachar list,
-/// NUL, shell pairs), cleared env plus the minimal allowlist with
-/// remove-wins, child-PATH resolution that never searches the working
-/// directory, a forced wall-clock timeout, an always-on output cap, null
-/// stdin, and redaction.
+/// Runner rewriting every spec to superai's posture before delegation:
+/// validated argv, the exact env allowlist, `ChildEnvNoCwd`, timeout, cap.
 pub struct SecRunner {
     inner: Arc<dyn Runner>,
     log: Mutex<Vec<(CommandSpec, CommandOutput)>>,
@@ -90,10 +83,8 @@ impl Runner for SecRunner {
     }
 }
 
-/// Superai's argv gate, run before any delegation: the full
-/// [`crate::process::SHELL_METACHARS`] list (a superset of what
-/// `CommandTokens::validate` rejects), NUL, and `sh -c`/`bash -c` pairs.
-/// Offenders are identified by position, never echoed.
+/// Superai's argv gate: the full `SHELL_METACHARS` list plus NUL and shell
+/// pairs; offenders are identified by position, never echoed.
 fn reject_unsafe_argv(spec: &CommandSpec) -> toride_runner::Result<()> {
     let reject = |detail: String| RunnerError::ArgvRejected {
         program: spec.program.clone(),
@@ -128,28 +119,14 @@ fn reject_unsafe_argv(spec: &CommandSpec) -> toride_runner::Result<()> {
     Ok(())
 }
 
-/// Rewrite `spec` with superai's process posture. Program and args pass
-/// through untouched; every policy knob is forced regardless of what the
-/// caller set.
+/// Rewrite `spec` with superai's posture; the child env is exactly the
+/// allowlist, so caller env entries and removals are dropped.
 fn force_posture(spec: &CommandSpec) -> CommandSpec {
-    let mut env = minimal_env_vars();
-    for (key, value) in &spec.env {
-        // Remove-wins applies at rewrite time too: a removed key's value
-        // never enters the forced spec, even before composition drops it.
-        if spec.env_remove.iter().any(|removed| removed == key) {
-            continue;
-        }
-        match env.iter_mut().find(|(kept, _)| kept == key) {
-            Some(slot) => slot.1.clone_from(value),
-            None => env.push((key.clone(), value.clone())),
-        }
-    }
     CommandSpec::new(spec.program.clone())
         .args(spec.args.iter().cloned())
         .stdin_null(true)
         .clear_env(true)
-        .envs(env)
-        .env_removes(spec.env_remove.iter().cloned())
+        .envs(minimal_env_vars())
         .env_precedence(EnvPrecedence::RemoveWins)
         .path_resolution(PathResolution::ChildEnvNoCwd)
         .argv_policy(ArgvPolicy::RejectShellMetachars)
@@ -449,8 +426,7 @@ fn map_plan_error(err: toride_apps::Error, verb: &str) -> CoreError {
 }
 
 /// Map a runner failure from a backend verb. Displays are rebuilt from the
-/// planned argv with superai's own redaction so toride's `***` placeholder
-/// never surfaces; stderr becomes `[REDACTED]` when `redact` is on.
+/// planned argv so toride's `***` placeholder never surfaces.
 fn map_runner_error(
     err: RunnerError,
     verb: &str,
@@ -566,8 +542,7 @@ fn to_process_output(output: &CommandOutput, redact: bool) -> ProcessOutput {
 }
 
 /// The toride execution surface for superai: plans through toride's pure
-/// planner, executes through the six backends, and returns superai's
-/// `ProcessOutput` on success. Every child runs under [`SecRunner`].
+/// planner, executes through the six backends, all under [`SecRunner`].
 #[derive(Debug)]
 pub struct TorideBridge {
     sec: Arc<SecRunner>,
@@ -639,9 +614,8 @@ impl TorideBridge {
         )
     }
 
-    /// Plan and execute an install through the mapped backend. Version
-    /// refusals (pipx/uv spelling rules, brew token collisions) fail at
-    /// plan time as `CoreError::Validation`; there is no fallback argv.
+    /// Plan and execute an install; version refusals fail at plan time as
+    /// `CoreError::Validation`, never a hand-built fallback argv.
     pub fn install(
         &self,
         entry: &InstallCatalogEntry,
@@ -864,14 +838,17 @@ mod tests {
         assert!(forced.cwd.is_none(), "backends never pick a cwd");
         assert!(forced.redact);
         assert_eq!(forced.output_mode, OutputMode::Capture);
-        let mut expected_env = minimal_env_vars();
-        expected_env.push(("SUPERAI_REQUEST_VAR".to_owned(), "1".to_owned()));
-        assert_eq!(forced.env, expected_env);
+        assert_eq!(forced.env, minimal_env_vars());
         assert!(
-            forced
+            forced.env_remove.is_empty(),
+            "the allowlist is forced whole; caller removals are dropped"
+        );
+        assert!(
+            !forced
                 .env
                 .iter()
-                .any(|(key, value)| key == "SUPERAI_REQUEST_VAR" && value == "1")
+                .any(|(key, _)| key == "SUPERAI_REQUEST_VAR"),
+            "a caller env addition must not reach the child"
         );
     }
 
@@ -1402,27 +1379,32 @@ mod tests {
     }
 
     #[test]
-    fn request_env_additions_merge_and_env_remove_wins() {
+    fn caller_env_never_overrides_the_allowlist() {
         let spy = SpyRunner::default();
         spy.enqueue(CommandOutput::from_stdout(""));
         sec_over(&spy)
             .run(
                 &CommandSpec::new("cargo")
+                    .env("PATH", "/hostile/bin")
                     .env("HOME", "/hostile")
                     .env_remove("HOME"),
             )
             .unwrap();
         let forced = &spy.recorded()[0];
-        assert!(
-            forced.env_remove.iter().any(|key| key == "HOME"),
-            "removals survive the rewrite"
+        // PATH drives ChildEnvNoCwd program resolution, so an override here
+        // would redirect both the child env and the spawned binary.
+        assert_eq!(
+            forced.env,
+            minimal_env_vars(),
+            "the forced env must be exactly the allowlist"
         );
+        assert!(forced.env_remove.is_empty());
         assert!(
             !forced
                 .env
                 .iter()
-                .any(|(key, value)| key == "HOME" && value == "/hostile"),
-            "a removed key must not be forced back in"
+                .any(|(_, value)| value.contains("/hostile")),
+            "no caller-supplied value may survive the rewrite"
         );
     }
 }
