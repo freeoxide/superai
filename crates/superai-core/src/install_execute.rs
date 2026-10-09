@@ -3067,8 +3067,10 @@ mod tests {
 
     /// Runner that always succeeds without spawning: proves the post-update
     /// check fails on its own, not because the command failed.
+    #[cfg(unix)]
     struct NoopSuccessRunner;
 
+    #[cfg(unix)]
     impl UpdateCommandRunner for NoopSuccessRunner {
         fn run(
             &self,
