@@ -23,6 +23,9 @@ sha2 = { version = "0.11" }
 hex = { version = "0.4" }
 ureq = { version = "3", default-features = false, features = ["rustls", "gzip"] }
 duct = { version = "1", features = ["timeout"] }
+toride-apps = { version = "=0.1.0", default-features = false }
+toride-runner = { version = "=0.1.0" }
+toride-registry = { version = "=0.1.0", default-features = false }
 
 [dev-dependencies]
 criterion = { workspace = true }

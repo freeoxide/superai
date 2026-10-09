@@ -18,6 +18,9 @@ use sha2 as _;
 use superai_config as _;
 use thiserror as _;
 use toml_edit as _;
+use toride_apps as _;
+use toride_registry as _;
+use toride_runner as _;
 use ureq as _;
 use yaml_serde as _;
 
