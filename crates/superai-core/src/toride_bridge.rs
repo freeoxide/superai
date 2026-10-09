@@ -344,26 +344,6 @@ fn update_operation(
     }
 }
 
-fn backend_id_for(method: &InstallMethod) -> Result<BackendId, CoreError> {
-    match method.kind {
-        InstallMethodKind::Npm => Ok(BackendId::Npm),
-        InstallMethodKind::Cargo => Ok(BackendId::Cargo),
-        InstallMethodKind::Pipx => Ok(BackendId::Pipx),
-        InstallMethodKind::Uv => Ok(BackendId::Uv),
-        InstallMethodKind::Homebrew | InstallMethodKind::HomebrewCask => Ok(BackendId::Homebrew),
-        InstallMethodKind::Mise | InstallMethodKind::Direct | InstallMethodKind::External => {
-            Err(typed_refusal_for_kind(&method.kind))
-        }
-    }
-}
-
-fn typed_refusal_for_kind(kind: &InstallMethodKind) -> CoreError {
-    CoreError::Validation {
-        field: "method".to_owned(),
-        reason: format!("method `{kind}` has no package-manager backend on this path"),
-    }
-}
-
 /// Map toride plan-stage refusals onto `CoreError::Validation`; the
 /// refusal text is carried verbatim, never replaced with a hand-built argv.
 fn map_plan_error(err: toride_apps::Error, verb: &str) -> CoreError {
@@ -635,34 +615,6 @@ impl TorideBridge {
         backend
             .install_sync(InstallRequest::new(&plan, &target))
             .map_err(|e| map_run_error(e, "install", program, args, redact))?;
-        self.captured(program, args, redact)
-    }
-
-    /// Plan and execute an update through the mapped backend. Updates never
-    /// target a version; the manager's current is the only destination.
-    pub fn update(
-        &self,
-        entry: &InstallCatalogEntry,
-        kind: &InstallMethodKind,
-        redact: bool,
-        platform: HostPlatform<'_>,
-    ) -> Result<ProcessOutput, CoreError> {
-        let method = catalog_method(entry, kind)?;
-        let operation = update_operation(entry, method)?;
-        let update_argv = operation.argv();
-        let (program, args) = split_argv(&update_argv)?;
-        let target = target_for(platform);
-        let plan = UpdatePlan {
-            app: TorideId::slugify(&entry.harness),
-            backend: backend_id_for(method)?,
-            operation,
-            dry_run: false,
-            requires_elevation: false,
-        };
-        let backend = self.backend_for(plan.backend)?;
-        backend
-            .update_sync(UpdateRequest::new(&plan, &target))
-            .map_err(|e| map_run_error(e, "update", program, args, redact))?;
         self.captured(program, args, redact)
     }
 
@@ -1361,22 +1313,22 @@ mod tests {
     }
 
     #[test]
-    fn bridge_update_and_uninstall_run_the_previewed_argv() {
+    fn bridge_runs_exactly_the_previewed_update_and_uninstall_argv() {
+        let uv = entry("ruff", InstallMethodKind::Uv, "ruff");
+        let update = preview_update(&uv, &InstallMethodKind::Uv).unwrap();
         let spy = SpyRunner::default();
         spy.enqueue(CommandOutput::from_stdout("updated"));
         let bridge = TorideBridge::with_runner(Arc::new(spy.clone()));
-        let uv = entry("ruff", InstallMethodKind::Uv, "ruff");
         let out = bridge
-            .update(
-                &uv,
-                &InstallMethodKind::Uv,
-                false,
-                platform("linux", "x86_64"),
-            )
+            .update_by_argv(&update.executable, &update.args, false)
+            .unwrap_or_else(|| panic!("`{}` must route", update.display()))
             .unwrap();
         assert_eq!(out.stdout, "updated");
+        assert_eq!(spy.recorded()[0].program, "uv");
         assert_eq!(spy.recorded()[0].args, ["tool", "upgrade", "ruff"]);
 
+        let uninstall =
+            preview_uninstall(&uv, &InstallMethodKind::Uv, platform("linux", "x86_64")).unwrap();
         let spy = SpyRunner::default();
         spy.enqueue(CommandOutput::from_stdout("removed"));
         let bridge = TorideBridge::with_runner(Arc::new(spy.clone()));
@@ -1389,27 +1341,11 @@ mod tests {
             )
             .unwrap();
         assert_eq!(out.stdout, "removed");
-        assert_eq!(spy.recorded()[0].args, ["tool", "uninstall", "ruff"]);
-    }
-
-    #[test]
-    fn bridge_refuses_mise_before_any_command_runs() {
-        let spy = SpyRunner::default();
-        let bridge = TorideBridge::with_runner(Arc::new(spy.clone()));
-        let mise = entry("opencode", InstallMethodKind::Mise, "opencode");
-        let err = bridge
-            .update(
-                &mise,
-                &InstallMethodKind::Mise,
-                false,
-                platform("linux", "x86_64"),
-            )
-            .unwrap_err();
-        assert!(
-            matches!(err, CoreError::ExternalInstallRequired { .. }),
-            "{err}"
+        assert_eq!(
+            spy.recorded()[0].args,
+            uninstall.args,
+            "the executed uninstall argv must be the previewed one"
         );
-        assert!(spy.recorded().is_empty());
     }
 
     #[test]
