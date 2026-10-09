@@ -15,12 +15,15 @@ use crate::detect::{DetectOptions, Detection, DetectionSource, detect_all_for_en
 use crate::error::CoreError;
 use crate::harness_catalog;
 use crate::ids::HarnessId;
-use crate::install_catalog::{CommandTokens, InstallCatalog, InstallMethodKind};
+use crate::install_catalog::{
+    CommandTokens, InstallCatalog, InstallCatalogEntry, InstallMethodKind,
+};
 use crate::install_plan::InstallPlan;
 use crate::process::{
     ExecuteOpts, MAX_OUTPUT_BYTES, ProcessOutput, display_command, extract_version, run_command,
 };
 use crate::registry::{Registry, now_iso8601};
+use crate::toride_bridge::{HostPlatform, TorideBridge, routed_install_version};
 
 /// Wall-clock timeout for install/update/uninstall commands (PKG-05).
 #[expect(
@@ -102,61 +105,6 @@ pub fn probe_opts(redact: bool) -> ExecuteOpts {
         output_limit: Some(64 * 1024),
         redact,
     }
-}
-
-/// Execute a structured command: explicit argv, minimal env, bounded capture,
-/// 120s timeout, redaction (PKG-05). No shell is ever invoked.
-pub fn run_structured_command(
-    executable: &str,
-    args: &[String],
-    redact: bool,
-) -> Result<ProcessOutput, CoreError> {
-    if executable.is_empty() {
-        return Err(CoreError::Validation {
-            field: "executable".to_owned(),
-            reason: "executable must not be empty".to_owned(),
-        });
-    }
-    if executable.contains('\0') {
-        return Err(CoreError::Validation {
-            field: "executable".to_owned(),
-            reason: "executable must not contain NUL".to_owned(),
-        });
-    }
-    for arg in args {
-        if arg.contains('\0') {
-            return Err(CoreError::Validation {
-                field: "arg".to_owned(),
-                reason: "arg must not contain NUL".to_owned(),
-            });
-        }
-    }
-    let opts = structured_opts(redact);
-    let display = display_command(executable, args, redact);
-    let out = run_command(executable, args, &opts)?;
-    if !out.success {
-        return Err(CoreError::Verification {
-            path: PathBuf::from(executable),
-            kind: "install_exit".to_owned(),
-            reason: format!(
-                "command `{display}` exited with {:?}: {}",
-                out.exit_code,
-                if redact {
-                    "[REDACTED]"
-                } else {
-                    out.stderr.trim()
-                }
-            ),
-        });
-    }
-    Ok(out)
-}
-
-/// Execute a command from `CommandTokens` (no shell, validated) with
-/// structured opts (PKG-05).
-pub fn run_token_command(tokens: &CommandTokens, redact: bool) -> Result<ProcessOutput, CoreError> {
-    tokens.validate()?;
-    run_structured_command(&tokens.executable, &tokens.args, redact)
 }
 
 fn method_id(method: &InstallMethodKind) -> &'static str {
@@ -357,18 +305,6 @@ pub fn find_receipt(
         return Ok(Some(receipt));
     }
     Ok(None)
-}
-
-fn executable_for_method(method: &InstallMethodKind) -> &'static str {
-    match method {
-        InstallMethodKind::Npm => "npm",
-        InstallMethodKind::Homebrew | InstallMethodKind::HomebrewCask => "brew",
-        InstallMethodKind::Cargo => "cargo",
-        InstallMethodKind::Mise => "mise",
-        InstallMethodKind::Pipx => "pipx",
-        InstallMethodKind::Uv => "uv",
-        InstallMethodKind::Direct | InstallMethodKind::External => "echo",
-    }
 }
 
 pub(crate) fn availability_argv(
@@ -698,6 +634,18 @@ pub fn execute_and_verify(
     redact: bool,
     home: &Path,
 ) -> Result<Option<InstallReceipt>, CoreError> {
+    execute_and_verify_with_bridge(plan, detect_opts, redact, home, &TorideBridge::new())
+}
+
+/// [`execute_and_verify`] over an injected bridge; tests route the six
+/// package-manager kinds through a recording runner, never a real child.
+fn execute_and_verify_with_bridge(
+    plan: &InstallPlan,
+    detect_opts: &DetectOptions,
+    redact: bool,
+    home: &Path,
+    bridge: &TorideBridge,
+) -> Result<Option<InstallReceipt>, CoreError> {
     let harness = HarnessId::new(&plan.harness).map_err(|e| CoreError::Validation {
         field: "harness".to_owned(),
         reason: format!("invalid harness in plan: {e}"),
@@ -731,37 +679,79 @@ pub fn execute_and_verify(
     }
 
     plan.command_preview.validate()?;
-    let out = run_command(
-        &plan.command_preview.executable,
-        &plan.command_preview.args,
-        &structured_opts(redact),
-    )?;
-    if !out.success {
-        let display = display_command(
-            &plan.command_preview.executable,
-            &plan.command_preview.args,
-            redact,
-        );
-        return Err(CoreError::Verification {
-            path: plan.expected_executable.clone(),
-            kind: "install_exit".to_owned(),
-            reason: format!(
-                "install command `{display}` failed with {:?}: {}",
-                out.exit_code,
-                if redact {
-                    "[REDACTED]"
-                } else {
-                    out.stderr.trim()
-                }
-            ),
-        });
-    }
+    run_install(entry, plan, requested, redact, bridge)?;
 
     let receipt = verify_install(&harness, requested, &plan.method, &pre, detect_opts)?;
     if let Some(receipt) = &receipt {
         persist_receipt(home, &harness, receipt)?;
     }
     Ok(receipt)
+}
+
+/// The install dispatch (PKG-05): the six package-manager kinds execute
+/// through the toride backend under the bridge's forced posture; mise stays
+/// native; Direct/External refuse typed.
+fn run_install(
+    entry: &InstallCatalogEntry,
+    plan: &InstallPlan,
+    requested: Option<&str>,
+    redact: bool,
+    bridge: &TorideBridge,
+) -> Result<ProcessOutput, CoreError> {
+    match plan.method {
+        InstallMethodKind::Npm
+        | InstallMethodKind::Homebrew
+        | InstallMethodKind::HomebrewCask
+        | InstallMethodKind::Cargo
+        | InstallMethodKind::Pipx
+        | InstallMethodKind::Uv => bridge.install(
+            entry,
+            &plan.method,
+            routed_install_version(requested),
+            redact,
+            HostPlatform {
+                os: &plan.platform_os,
+                arch: &plan.platform_arch,
+            },
+        ),
+        InstallMethodKind::Mise => {
+            let out = run_command(
+                &plan.command_preview.executable,
+                &plan.command_preview.args,
+                &structured_opts(redact),
+            )?;
+            if !out.success {
+                let display = display_command(
+                    &plan.command_preview.executable,
+                    &plan.command_preview.args,
+                    redact,
+                );
+                return Err(CoreError::Verification {
+                    path: plan.expected_executable.clone(),
+                    kind: "install_exit".to_owned(),
+                    reason: format!(
+                        "install command `{display}` failed with {:?}: {}",
+                        out.exit_code,
+                        if redact {
+                            "[REDACTED]"
+                        } else {
+                            out.stderr.trim()
+                        }
+                    ),
+                });
+            }
+            Ok(out)
+        }
+        InstallMethodKind::Direct | InstallMethodKind::External => {
+            Err(CoreError::ExternalInstallRequired {
+                harness: plan.harness.clone(),
+                instructions: format!(
+                    "manual install required for method `{}`; see {}",
+                    plan.method, plan.docs
+                ),
+            })
+        }
+    }
 }
 
 /// Compatibility impact of an update on a single instance (PKG-07).
@@ -865,7 +855,7 @@ fn update_compat_for_versions(current: Option<&str>, available: &str) -> (bool, 
 }
 
 fn fetch_available_version(
-    entry: &crate::install_catalog::InstallCatalogEntry,
+    entry: &InstallCatalogEntry,
     method: &InstallMethodKind,
     _detect_opts: &DetectOptions,
     injected_available: Option<&str>,
@@ -971,32 +961,22 @@ pub fn plan_update(
             field: "method".to_owned(),
             reason: format!("method `{method}` not in catalog for `{harness}`"),
         })?;
-    let command_preview = entry.update.clone().unwrap_or_else(|| CommandTokens {
-        executable: executable_for_method(&method).to_owned(),
-        args: {
-            let pkg = &method_entry.package_name;
-            match method {
-                InstallMethodKind::Npm => {
-                    vec!["update".to_owned(), "-g".to_owned(), pkg.clone()]
-                }
-                InstallMethodKind::Cargo => {
-                    vec!["install".to_owned(), pkg.clone()]
-                }
-                InstallMethodKind::Uv => {
-                    vec!["tool".to_owned(), "update".to_owned(), pkg.clone()]
-                }
-                InstallMethodKind::Direct | InstallMethodKind::External => {
-                    vec!["update".to_owned(), pkg.clone()]
-                }
-                InstallMethodKind::Homebrew
-                | InstallMethodKind::HomebrewCask
-                | InstallMethodKind::Mise
-                | InstallMethodKind::Pipx => {
-                    vec!["upgrade".to_owned(), pkg.clone()]
-                }
-            }
+    let command_preview = match method {
+        InstallMethodKind::Npm
+        | InstallMethodKind::Homebrew
+        | InstallMethodKind::HomebrewCask
+        | InstallMethodKind::Cargo
+        | InstallMethodKind::Pipx
+        | InstallMethodKind::Uv => crate::toride_bridge::preview_update(entry, &method)?,
+        InstallMethodKind::Mise => CommandTokens {
+            executable: "mise".to_owned(),
+            args: vec!["upgrade".to_owned(), method_entry.package_name.clone()],
         },
-    });
+        InstallMethodKind::Direct | InstallMethodKind::External => CommandTokens {
+            executable: "open".to_owned(),
+            args: vec![entry.docs.clone()],
+        },
+    };
     command_preview.validate()?;
 
     let available_version =
@@ -1038,7 +1018,7 @@ pub fn plan_update(
     }
     // With no recorded instances, surface harness-level compat so callers
     // still see the blocking signal.
-    if compat_impacts.is_empty() && available_version.is_some() {
+    if compat_impacts.is_empty() {
         compat_impacts.push(CompatImpact {
             instance: "<harness>".to_owned(),
             harness: harness.as_str().to_owned(),
@@ -1048,14 +1028,19 @@ pub fn plan_update(
         });
     }
 
-    let blocked = !explicit_accept
-        && compat_impacts.iter().any(|c| !c.new_compatible)
-        && available_version.is_some();
+    // Unknown availability is an unprovable update: it blocks exactly like a
+    // known-incompatible one unless the caller explicitly accepted.
+    let blocked = !explicit_accept && compat_impacts.iter().any(|c| !c.new_compatible);
     let blocked_reason = if blocked {
-        Some(format!(
-            "update to `{}` is outside adapter range (major bump or pre-stable); re-run with explicit accept to proceed",
-            available_version.as_deref().unwrap_or("<unknown>")
-        ))
+        Some(match available_version.as_deref() {
+            Some(avail) => format!(
+                "update to `{avail}` is outside adapter range (major bump or pre-stable); \
+                 re-run with explicit accept to proceed"
+            ),
+            None => "available version unknown, cannot assess compatibility; \
+                     re-run with explicit accept to proceed"
+                .to_owned(),
+        })
     } else {
         None
     };
@@ -1103,7 +1088,10 @@ pub trait UpdateCommandRunner {
     ) -> Result<ProcessOutput, CoreError>;
 }
 
-struct SystemUpdateRunner;
+#[derive(Default)]
+struct SystemUpdateRunner {
+    bridge: TorideBridge,
+}
 
 impl UpdateCommandRunner for SystemUpdateRunner {
     fn run(
@@ -1112,6 +1100,11 @@ impl UpdateCommandRunner for SystemUpdateRunner {
         args: &[String],
         redact: bool,
     ) -> Result<ProcessOutput, CoreError> {
+        // The previewed tokens for the six kinds are toride-generated argv;
+        // the bridge routes them through backend update under its posture.
+        if let Some(routed) = self.bridge.update_by_argv(executable, args, redact) {
+            return routed;
+        }
         run_command(executable, args, &structured_opts(redact))
     }
 }
@@ -1129,7 +1122,7 @@ pub fn execute_update(
         detect_opts,
         explicit_accept,
         redact,
-        &SystemUpdateRunner,
+        &SystemUpdateRunner::default(),
     )
 }
 
@@ -1198,44 +1191,75 @@ pub fn execute_update_with_runner(
         reason: format!("invalid harness id: {e}"),
     })?;
     let catalog = InstallCatalog::embedded()?;
-    if let Some(entry) = catalog.get(&harness_id) {
-        let post = detect_all_for_entry(entry, detect_opts);
-        if let Some(best) = select_best_detection(&post)
-            && let Some(expected) = plan.available_version.as_deref()
-        {
-            match best.version.as_deref() {
-                Some(detected) => {
-                    let det_clean =
-                        extract_version(detected).unwrap_or_else(|| detected.to_owned());
-                    if det_clean.is_empty() {
-                        return Err(CoreError::Verification {
-                            path: best.path.clone(),
-                            kind: "version".to_owned(),
-                            reason: format!("post-update version empty (expected {expected})"),
-                        });
-                    }
-                    if !version_satisfies(expected, &det_clean) {
-                        return Err(CoreError::Verification {
-                            path: best.path.clone(),
-                            kind: "version".to_owned(),
-                            reason: format!(
-                                "post-update version `{det_clean}` does not satisfy \
-                                 expected available `{expected}`"
-                            ),
-                        });
-                    }
-                }
-                None => {
-                    return Err(CoreError::Verification {
-                        path: best.path.clone(),
-                        kind: "version".to_owned(),
-                        reason: format!("post-update version probe failed (expected {expected})"),
-                    });
-                }
+    let entry = catalog
+        .get(&harness_id)
+        .ok_or_else(|| CoreError::Validation {
+            field: "harness".to_owned(),
+            reason: format!("harness `{harness_id}` not in install catalog"),
+        })?;
+    verify_post_update(plan, entry, detect_opts)?;
+    Ok(out)
+}
+
+/// The strict post-update check (PKG-07): fails when it cannot verify — no
+/// detection, no detected version, or no expected version are typed failures.
+fn verify_post_update(
+    plan: &UpdatePlan,
+    entry: &InstallCatalogEntry,
+    detect_opts: &DetectOptions,
+) -> Result<(), CoreError> {
+    let post = detect_all_for_entry(entry, detect_opts);
+    let best = select_best_detection(&post).ok_or_else(|| CoreError::Verification {
+        path: plan
+            .current_path
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(&plan.harness)),
+        kind: "version".to_owned(),
+        reason: format!(
+            "post-update detection found no executable for `{}`",
+            plan.harness
+        ),
+    })?;
+    let expected = plan
+        .available_version
+        .as_deref()
+        .ok_or_else(|| CoreError::Verification {
+            path: best.path.clone(),
+            kind: "version".to_owned(),
+            reason: "post-update expected version unknown; the update outcome cannot be \
+                     verified"
+                .to_owned(),
+        })?;
+    match best.version.as_deref() {
+        Some(detected) => {
+            let det_clean = extract_version(detected).unwrap_or_else(|| detected.to_owned());
+            if det_clean.is_empty() {
+                return Err(CoreError::Verification {
+                    path: best.path.clone(),
+                    kind: "version".to_owned(),
+                    reason: format!("post-update version empty (expected {expected})"),
+                });
+            }
+            if !version_satisfies(expected, &det_clean) {
+                return Err(CoreError::Verification {
+                    path: best.path.clone(),
+                    kind: "version".to_owned(),
+                    reason: format!(
+                        "post-update version `{det_clean}` does not satisfy \
+                         expected available `{expected}`"
+                    ),
+                });
             }
         }
+        None => {
+            return Err(CoreError::Verification {
+                path: best.path.clone(),
+                kind: "version".to_owned(),
+                reason: format!("post-update version probe failed (expected {expected})"),
+            });
+        }
     }
-    Ok(out)
+    Ok(())
 }
 
 /// Read-only instance revalidation after a binary update (PKG-07): per
@@ -1447,29 +1471,24 @@ pub fn plan_uninstall(
 
     let preserved = preserved_paths_for(registry, harness);
 
-    let command_preview = entry.uninstall.clone().unwrap_or_else(|| CommandTokens {
-        executable: executable_for_method(&method).to_owned(),
-        args: {
-            let pkg = package_id.clone();
-            match method {
-                InstallMethodKind::Npm => {
-                    vec!["uninstall".to_owned(), "-g".to_owned(), pkg]
-                }
-                InstallMethodKind::Uv => {
-                    vec!["tool".to_owned(), "uninstall".to_owned(), pkg]
-                }
-                InstallMethodKind::Homebrew
-                | InstallMethodKind::HomebrewCask
-                | InstallMethodKind::Cargo
-                | InstallMethodKind::Mise
-                | InstallMethodKind::Pipx
-                | InstallMethodKind::Direct
-                | InstallMethodKind::External => {
-                    vec!["uninstall".to_owned(), pkg]
-                }
-            }
+    let command_preview = match method {
+        InstallMethodKind::Npm
+        | InstallMethodKind::Homebrew
+        | InstallMethodKind::HomebrewCask
+        | InstallMethodKind::Cargo
+        | InstallMethodKind::Pipx
+        | InstallMethodKind::Uv => {
+            crate::toride_bridge::preview_uninstall(entry, &method, HostPlatform::current())?
+        }
+        InstallMethodKind::Mise => CommandTokens {
+            executable: "mise".to_owned(),
+            args: vec!["uninstall".to_owned(), package_id.clone()],
         },
-    });
+        InstallMethodKind::Direct | InstallMethodKind::External => CommandTokens {
+            executable: "open".to_owned(),
+            args: vec![entry.docs.clone()],
+        },
+    };
     command_preview.validate()?;
 
     let blocked = (foreign || !can_auto_delete) && !explicit_allow_foreign;
@@ -1521,6 +1540,89 @@ pub fn execute_uninstall(
     explicit_allow_foreign: bool,
     redact: bool,
 ) -> Result<ProcessOutput, CoreError> {
+    execute_uninstall_with_bridge(plan, explicit_allow_foreign, redact, &TorideBridge::new())
+}
+
+/// [`execute_uninstall`] over an injected bridge; tests route the six
+/// package-manager kinds through a recording runner, never a real child.
+fn execute_uninstall_with_bridge(
+    plan: &UninstallPlan,
+    explicit_allow_foreign: bool,
+    redact: bool,
+    bridge: &TorideBridge,
+) -> Result<ProcessOutput, CoreError> {
+    uninstall_preflight_guards(plan, explicit_allow_foreign)?;
+    plan.command_preview.validate()?;
+    match plan.preflight.method {
+        InstallMethodKind::Npm
+        | InstallMethodKind::Homebrew
+        | InstallMethodKind::HomebrewCask
+        | InstallMethodKind::Cargo
+        | InstallMethodKind::Pipx
+        | InstallMethodKind::Uv => {
+            let harness =
+                HarnessId::new(&plan.preflight.harness).map_err(|e| CoreError::Validation {
+                    field: "harness".to_owned(),
+                    reason: format!("invalid harness in preflight: {e}"),
+                })?;
+            let catalog = InstallCatalog::embedded()?;
+            let entry = catalog.get(&harness).ok_or_else(|| CoreError::Validation {
+                field: "harness".to_owned(),
+                reason: format!("harness `{harness}` not in install catalog"),
+            })?;
+            bridge.uninstall(
+                entry,
+                &plan.preflight.method,
+                redact,
+                HostPlatform::current(),
+            )
+        }
+        InstallMethodKind::Mise => {
+            let out = run_command(
+                &plan.command_preview.executable,
+                &plan.command_preview.args,
+                &structured_opts(redact),
+            )?;
+            if !out.success {
+                let display = display_command(
+                    &plan.command_preview.executable,
+                    &plan.command_preview.args,
+                    redact,
+                );
+                return Err(CoreError::Verification {
+                    path: plan.preflight.path.clone(),
+                    kind: "uninstall_exit".to_owned(),
+                    reason: format!(
+                        "uninstall command `{display}` failed with {:?}: {}",
+                        out.exit_code,
+                        if redact {
+                            "[REDACTED]"
+                        } else {
+                            out.stderr.trim()
+                        }
+                    ),
+                });
+            }
+            Ok(out)
+        }
+        InstallMethodKind::Direct | InstallMethodKind::External => {
+            Err(CoreError::ExternalInstallRequired {
+                harness: plan.preflight.harness.clone(),
+                instructions: format!(
+                    "manual uninstall required for method `{}`; see {}",
+                    plan.preflight.method, plan.docs
+                ),
+            })
+        }
+    }
+}
+
+/// Ownership and safety guards (PKG-08) policing the mapped argv before any
+/// dispatch: foreign without consent, non-deletable, `rm`, preserved paths.
+fn uninstall_preflight_guards(
+    plan: &UninstallPlan,
+    explicit_allow_foreign: bool,
+) -> Result<(), CoreError> {
     if plan.blocked && !explicit_allow_foreign {
         return Err(CoreError::ForeignOwnership {
             path: plan.preflight.path.clone(),
@@ -1536,8 +1638,6 @@ pub fn execute_uninstall(
             owner: "manual file not proven superai-owned; refusing to auto-delete".to_owned(),
         });
     }
-    // The plan's command is a package-manager uninstall; defensively reject
-    // an `rm` preview and any arg naming a preserved path.
     if plan.command_preview.executable == "rm" {
         return Err(CoreError::Validation {
             field: "uninstall".to_owned(),
@@ -1561,33 +1661,7 @@ pub fn execute_uninstall(
             });
         }
     }
-    plan.command_preview.validate()?;
-    let out = run_command(
-        &plan.command_preview.executable,
-        &plan.command_preview.args,
-        &structured_opts(redact),
-    )?;
-    if !out.success {
-        let display = display_command(
-            &plan.command_preview.executable,
-            &plan.command_preview.args,
-            redact,
-        );
-        return Err(CoreError::Verification {
-            path: plan.preflight.path.clone(),
-            kind: "uninstall_exit".to_owned(),
-            reason: format!(
-                "uninstall command `{display}` failed with {:?}: {}",
-                out.exit_code,
-                if redact {
-                    "[REDACTED]"
-                } else {
-                    out.stderr.trim()
-                }
-            ),
-        });
-    }
-    Ok(out)
+    Ok(())
 }
 
 /// PKG-08: mark affected instances binary-missing; stale absolute pins are
@@ -1757,7 +1831,12 @@ mod tests {
     #[test]
     fn run_structured_no_shell_interpolation() {
         let token = "$(whoami) && echo pwned | cat".to_owned();
-        let out = run_structured_command("echo", std::slice::from_ref(&token), false).unwrap();
+        let out = run_command(
+            "echo",
+            std::slice::from_ref(&token),
+            &structured_opts(false),
+        )
+        .expect("structured echo must succeed");
         assert!(out.success);
         assert_eq!(out.stdout.trim(), token);
     }
@@ -1773,7 +1852,8 @@ mod tests {
         let mut full_args = prefix;
         full_args.extend(args.iter().cloned());
         // run with redact=true, verify output still succeeds but display would redact
-        let out = run_structured_command(prog, &full_args, true).unwrap();
+        let out = run_command(prog, &full_args, &structured_opts(true))
+            .expect("structured echo must succeed");
         assert!(out.success);
         let display = display_command(prog, &full_args, true);
         assert!(display.contains("***"));
@@ -1810,7 +1890,8 @@ mod tests {
         let (prog, prefix) = echo_program();
         let mut args = prefix;
         args.push("hello".to_owned());
-        let out = run_structured_command(prog, &args, false).unwrap();
+        let out = run_command(prog, &args, &structured_opts(false))
+            .expect("structured echo must succeed");
         assert_eq!(out.stdout.trim(), "hello");
     }
 
@@ -1818,7 +1899,8 @@ mod tests {
     #[test]
     fn run_structured_child_sees_minimal_env_vars() {
         // minimal_env_vars must survive clear_env and reach the child.
-        let out = run_structured_command("printenv", &["PATH".to_owned()], false).unwrap();
+        let out = run_command("printenv", &["PATH".to_owned()], &structured_opts(false))
+            .expect("printenv must run under the structured env");
         assert!(
             !out.stdout.trim().is_empty(),
             "minimal PATH must reach the structured child"
@@ -2293,17 +2375,27 @@ mod tests {
                 .any(|p| p.ends_with("instances.json") || p.ends_with(".superai"))
         );
         assert_ne!(plan.command_preview.executable, "rm");
-        // Execute with a harmless echo override instead of real npm uninstall.
-        let mut echo_plan = plan;
-        echo_plan.command_preview = CommandTokens {
-            executable: "echo".to_owned(),
-            args: vec!["uninstall".to_owned(), "codex".to_owned()],
-        };
-        echo_plan.preflight.can_auto_delete = true;
-        echo_plan.blocked = false;
-        echo_plan.blocked_reason = None;
-        let out = execute_uninstall(&echo_plan, true, false).unwrap();
+        assert_eq!(plan.preflight.method, InstallMethodKind::Npm);
+        assert_eq!(
+            plan.command_preview.args,
+            vec![
+                "uninstall".to_owned(),
+                "-g".to_owned(),
+                "@openai/codex".to_owned()
+            ],
+            "uninstall preview must be the mapped toride argv"
+        );
+        // Execute through the spy-routed bridge: no real npm ever runs.
+        let spy = crate::toride_bridge::test_support::SpyRunner::default();
+        let bridge = TorideBridge::with_runner(std::sync::Arc::new(spy.clone()));
+        let mut exec_plan = plan;
+        exec_plan.preflight.can_auto_delete = true;
+        exec_plan.blocked = false;
+        exec_plan.blocked_reason = None;
+        let out = execute_uninstall_with_bridge(&exec_plan, true, false, &bridge).unwrap();
         assert!(out.success);
+        assert_eq!(spy.recorded()[0].program, "npm");
+        assert_eq!(spy.recorded()[0].args, ["uninstall", "-g", "@openai/codex"]);
         assert!(
             cfg_file.exists(),
             "config must be preserved after uninstall"
@@ -2357,17 +2449,16 @@ mod tests {
                 || format!("{err}").contains("not proven")
         );
 
-        // With explicit allow, it proceeds (using echo-override to avoid real uninstall)
+        // With explicit allow, it proceeds through the spy-routed bridge.
+        let spy = crate::toride_bridge::test_support::SpyRunner::default();
+        let bridge = TorideBridge::with_runner(std::sync::Arc::new(spy.clone()));
         let mut allowed = plan;
         allowed.preflight.can_auto_delete = true;
         allowed.blocked = false;
         allowed.blocked_reason = None;
-        allowed.command_preview = CommandTokens {
-            executable: "echo".to_owned(),
-            args: vec!["uninstall".to_owned()],
-        };
-        let out = execute_uninstall(&allowed, true, false).unwrap();
+        let out = execute_uninstall_with_bridge(&allowed, true, false, &bridge).unwrap();
         assert!(out.success);
+        assert!(!spy.recorded().is_empty());
 
         drop(fs::remove_dir_all(tmp));
         drop(fs::remove_dir_all(home));
@@ -2454,13 +2545,14 @@ mod tests {
     }
 
     /// Build an executable plan whose install command runs `marker_prog`,
-    /// writing a marker file so tests can prove whether it ran.
+    /// writing a marker file so tests can prove whether it ran. Method mise:
+    /// the native dispatch arm runs the plan's own preview tokens verbatim.
     #[cfg(unix)]
     fn marker_plan(tmp: &Path, marker: &Path) -> InstallPlan {
         InstallPlan {
             harness: "claude-code".to_owned(),
-            method: InstallMethodKind::Npm,
-            package_name: "@anthropic-ai/claude-code".to_owned(),
+            method: InstallMethodKind::Mise,
+            package_name: "claude-code".to_owned(),
             version: Some("1.2.3".to_owned()),
             channel: None,
             platform_os: "linux".to_owned(),
@@ -2542,7 +2634,7 @@ mod tests {
         let loaded = load_receipts(&home).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].version, "1.2.3");
-        let found = find_receipt(&home, &harness, Some(&InstallMethodKind::Npm)).unwrap();
+        let found = find_receipt(&home, &harness, Some(&InstallMethodKind::Mise)).unwrap();
         assert!(found.is_some());
         assert_eq!(
             found.unwrap().path,
@@ -2922,5 +3014,396 @@ mod tests {
         );
         drop(fs::remove_dir_all(&tmp));
         drop(fs::remove_dir_all(&home));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn update_blocks_when_availability_is_unknown() {
+        let tmp = make_temp_dir("update-unknown");
+        let home = make_temp_dir("home-update-unknown");
+        fs::write(
+            tmp.join("codex"),
+            "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then echo \"Usage: codex --help\"; exit 0; fi\necho \"1.2.3\"\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(tmp.join("codex")).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(tmp.join("codex"), perms).unwrap();
+        }
+        let opts = DetectOptions {
+            path_dirs: Some(vec![tmp.clone()]),
+            home_dir: Some(home.clone()),
+            probe_mise: false,
+            probe_brew: false,
+            probe_npm: false,
+            probe_cargo: false,
+            probe_apps: false,
+            probe_timeout: Duration::from_secs(30),
+            ..Default::default()
+        };
+        let harness = HarnessId::new("codex-cli").unwrap();
+        // An empty injected availability is an unknown: the probe never ran.
+        let plan = plan_update(&harness, &opts, None, false, Some("")).unwrap();
+        assert!(
+            plan.blocked,
+            "unknown availability must block without explicit accept"
+        );
+        let reason = plan.blocked_reason.as_deref().unwrap_or_default();
+        assert!(
+            reason.to_ascii_lowercase().contains("unknown"),
+            "blocked_reason must name the unknown availability: {reason}"
+        );
+        assert!(
+            !plan.compat_impacts.is_empty(),
+            "the harness-level impact must carry the blocking signal"
+        );
+        let accepted = plan_update(&harness, &opts, None, true, Some("")).unwrap();
+        assert!(!accepted.blocked, "explicit accept overrides the block");
+        drop(fs::remove_dir_all(&tmp));
+        drop(fs::remove_dir_all(&home));
+    }
+
+    /// Runner that always succeeds without spawning: proves the post-update
+    /// check fails on its own, not because the command failed.
+    struct NoopSuccessRunner;
+
+    impl UpdateCommandRunner for NoopSuccessRunner {
+        fn run(
+            &self,
+            _executable: &str,
+            _args: &[String],
+            _redact: bool,
+        ) -> Result<ProcessOutput, CoreError> {
+            Ok(ProcessOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: Some(0),
+                success: true,
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accepted_update_with_unknown_availability_fails_the_post_check() {
+        let tmp = make_temp_dir("update-unverifiable");
+        let home = make_temp_dir("home-update-unverifiable");
+        fs::write(
+            tmp.join("codex"),
+            "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then echo \"Usage: codex --help\"; exit 0; fi\necho \"2.0.0\"\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(tmp.join("codex")).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(tmp.join("codex"), perms).unwrap();
+        }
+        let opts = DetectOptions {
+            path_dirs: Some(vec![tmp.clone()]),
+            home_dir: Some(home.clone()),
+            probe_mise: false,
+            probe_brew: false,
+            probe_npm: false,
+            probe_cargo: false,
+            probe_apps: false,
+            ..Default::default()
+        };
+        // The update command "succeeded", but nothing can prove the outcome.
+        let plan = UpdatePlan {
+            harness: "codex-cli".to_owned(),
+            method: InstallMethodKind::Npm,
+            package_name: "@openai/codex".to_owned(),
+            current_version: Some("1.2.3".to_owned()),
+            current_path: Some(tmp.join("codex")),
+            available_version: None,
+            command_preview: CommandTokens {
+                executable: "npm".to_owned(),
+                args: vec![
+                    "update".to_owned(),
+                    "-g".to_owned(),
+                    "@openai/codex".to_owned(),
+                ],
+            },
+            requires_network: true,
+            requires_admin: false,
+            compat_impacts: Vec::new(),
+            blocked: false,
+            blocked_reason: None,
+            docs: "https://github.com/openai/codex".to_owned(),
+        };
+        let err =
+            execute_update_with_runner(&plan, &opts, true, false, &NoopSuccessRunner).unwrap_err();
+        match err {
+            CoreError::Verification { kind, reason, .. } => {
+                assert_eq!(kind, "version");
+                assert!(
+                    reason.to_ascii_lowercase().contains("cannot be verified"),
+                    "unknown expected version must fail the check: {reason}"
+                );
+            }
+            other => panic!("expected a verification failure, got {other}"),
+        }
+        drop(fs::remove_dir_all(&tmp));
+        drop(fs::remove_dir_all(&home));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_update_check_fails_when_nothing_is_detected() {
+        let empty = crate::test_util::temp_dir_unique("update-nodetect");
+        fs::create_dir_all(&empty).unwrap();
+        let opts = DetectOptions {
+            path_dirs: Some(vec![empty.clone()]),
+            home_dir: Some(empty.clone()),
+            probe_mise: false,
+            probe_brew: false,
+            probe_npm: false,
+            probe_cargo: false,
+            probe_apps: false,
+            ..Default::default()
+        };
+        let plan = UpdatePlan {
+            harness: "codex-cli".to_owned(),
+            method: InstallMethodKind::Npm,
+            package_name: "@openai/codex".to_owned(),
+            current_version: None,
+            current_path: None,
+            available_version: Some("2.0.0".to_owned()),
+            command_preview: CommandTokens {
+                executable: "npm".to_owned(),
+                args: vec![
+                    "update".to_owned(),
+                    "-g".to_owned(),
+                    "@openai/codex".to_owned(),
+                ],
+            },
+            requires_network: true,
+            requires_admin: false,
+            compat_impacts: Vec::new(),
+            blocked: false,
+            blocked_reason: None,
+            docs: "https://github.com/openai/codex".to_owned(),
+        };
+        let err =
+            execute_update_with_runner(&plan, &opts, true, false, &NoopSuccessRunner).unwrap_err();
+        match err {
+            CoreError::Verification { kind, reason, .. } => {
+                assert_eq!(kind, "version");
+                assert!(
+                    reason.contains("no executable"),
+                    "a missing post-update detection must fail: {reason}"
+                );
+            }
+            other => panic!("expected a verification failure, got {other}"),
+        }
+        drop(fs::remove_dir_all(&empty));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn update_routes_through_the_toride_backend_under_the_runner_seam() {
+        let tmp = make_temp_dir("update-routed");
+        let home = make_temp_dir("home-update-routed");
+        // Current and available agree on 2.0.0: no compat block, the routed
+        // update runs, and the strict post-check sees the same version.
+        fs::write(
+            tmp.join("codex"),
+            "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then echo \"Usage: codex --help\"; exit 0; fi\necho \"2.0.0\"\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(tmp.join("codex")).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(tmp.join("codex"), perms).unwrap();
+        }
+        let opts = DetectOptions {
+            path_dirs: Some(vec![tmp.clone()]),
+            home_dir: Some(home.clone()),
+            probe_mise: false,
+            probe_brew: false,
+            probe_npm: false,
+            probe_cargo: false,
+            probe_apps: false,
+            probe_timeout: Duration::from_secs(30),
+            ..Default::default()
+        };
+        let harness = HarnessId::new("codex-cli").unwrap();
+        let plan = plan_update(&harness, &opts, None, false, Some("2.0.0")).unwrap();
+        assert!(!plan.blocked);
+        assert_eq!(plan.command_preview.executable, "npm");
+        assert_eq!(
+            plan.command_preview.args,
+            [
+                "update".to_owned(),
+                "-g".to_owned(),
+                "@openai/codex".to_owned()
+            ]
+        );
+        let spy = crate::toride_bridge::test_support::SpyRunner::default();
+        let runner = SystemUpdateRunner {
+            bridge: TorideBridge::with_runner(std::sync::Arc::new(spy.clone())),
+        };
+        let out = execute_update_with_runner(&plan, &opts, false, false, &runner).unwrap();
+        assert!(out.success);
+        assert_eq!(spy.recorded().len(), 1, "npm update is one command");
+        assert_eq!(spy.recorded()[0].program, "npm");
+        assert_eq!(spy.recorded()[0].args, ["update", "-g", "@openai/codex"]);
+        assert!(spy.recorded()[0].clear_env, "the bridge posture is forced");
+        drop(fs::remove_dir_all(&tmp));
+        drop(fs::remove_dir_all(&home));
+    }
+
+    /// Toride runner standing in for `npm install`: records every spec and
+    /// lands the fake `claude` binary the post-install detection needs.
+    #[cfg(unix)]
+    struct InstallingSpyRunner {
+        specs: std::sync::Arc<std::sync::Mutex<Vec<toride_runner::CommandSpec>>>,
+        install_dir: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl toride_runner::Runner for InstallingSpyRunner {
+        fn run(
+            &self,
+            spec: &toride_runner::CommandSpec,
+        ) -> toride_runner::Result<toride_runner::CommandOutput> {
+            self.specs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(spec.clone());
+            let script = "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then echo \"Usage: claude --help\"; exit 0; fi\necho \"1.2.3\"\n";
+            let binary = self.install_dir.join("claude");
+            fs::write(&binary, script).map_err(|e| toride_runner::Error::Io(e.to_string()))?;
+            let mut perms = fs::metadata(&binary)
+                .map_err(|e| toride_runner::Error::Io(e.to_string()))?
+                .permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&binary, perms)
+                .map_err(|e| toride_runner::Error::Io(e.to_string()))?;
+            Ok(toride_runner::CommandOutput::from_stdout("installed"))
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn routed_install_runs_the_toride_backend_and_persists_a_receipt() {
+        let tmp = make_temp_dir("install-routed");
+        let home = make_temp_dir("home-install-routed");
+        let opts = DetectOptions {
+            path_dirs: Some(vec![tmp.clone()]),
+            home_dir: Some(home.clone()),
+            probe_mise: false,
+            probe_brew: false,
+            probe_npm: false,
+            probe_cargo: false,
+            probe_apps: false,
+            ..Default::default()
+        };
+        let plan = InstallPlan {
+            harness: "claude-code".to_owned(),
+            method: InstallMethodKind::Npm,
+            package_name: "@anthropic-ai/claude-code".to_owned(),
+            version: Some("1.2.3".to_owned()),
+            channel: None,
+            platform_os: "linux".to_owned(),
+            platform_arch: "x86_64".to_owned(),
+            command_preview: CommandTokens {
+                executable: "npm".to_owned(),
+                args: vec![
+                    "install".to_owned(),
+                    "-g".to_owned(),
+                    "@anthropic-ai/claude-code@1.2.3".to_owned(),
+                ],
+            },
+            requires_network: true,
+            requires_admin: false,
+            conflicts: Vec::new(),
+            expected_executable: PathBuf::from("/usr/local/bin/claude"),
+            docs: "https://code.claude.com/docs".to_owned(),
+            version_availability: crate::install_plan::VersionAvailability::Available {
+                resolved: Some("1.2.3".to_owned()),
+            },
+            external_install: None,
+            destination_writable: true,
+        };
+        let recorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let spy = InstallingSpyRunner {
+            specs: std::sync::Arc::clone(&recorded),
+            install_dir: tmp.clone(),
+        };
+        let bridge = TorideBridge::with_runner(std::sync::Arc::new(spy));
+        let receipt = execute_and_verify_with_bridge(&plan, &opts, false, &home, &bridge)
+            .unwrap()
+            .expect("a verified fresh install must claim a receipt");
+        assert_eq!(receipt.method, InstallMethodKind::Npm);
+        assert_eq!(receipt.version, "1.2.3");
+        let specs = recorded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert!(!specs.is_empty(), "the routed install must run a command");
+        assert_eq!(specs[0].program, "npm");
+        assert_eq!(
+            specs[0].args,
+            ["install", "-g", "@anthropic-ai/claude-code@1.2.3"]
+        );
+        assert!(specs[0].clear_env, "the bridge posture is forced");
+        assert!(
+            find_receipt(
+                &home,
+                &HarnessId::new("claude-code").unwrap(),
+                Some(&InstallMethodKind::Npm)
+            )
+            .unwrap()
+            .is_some(),
+            "the receipt must persist after verification"
+        );
+        drop(fs::remove_dir_all(&tmp));
+        drop(fs::remove_dir_all(&home));
+    }
+
+    #[test]
+    fn uninstall_refuses_external_methods_typed() {
+        let plan = UninstallPlan {
+            preflight: UninstallPreflight {
+                harness: "cline".to_owned(),
+                package_id: "cline-vscode-extension".to_owned(),
+                method: InstallMethodKind::Direct,
+                path: crate::test_util::tmp_abs("cline-direct"),
+                all_paths: Vec::new(),
+                referencing_instances: Vec::new(),
+                referencing_wrappers: Vec::new(),
+                shared: false,
+                foreign: false,
+                receipt_owned: false,
+                receipt: None,
+                can_auto_delete: true,
+                preserved: Vec::new(),
+            },
+            command_preview: CommandTokens {
+                executable: "open".to_owned(),
+                args: vec!["https://docs.cline.bot".to_owned()],
+            },
+            requires_network: false,
+            requires_admin: false,
+            blocked: false,
+            blocked_reason: None,
+            docs: "https://docs.cline.bot".to_owned(),
+        };
+        let err = execute_uninstall(&plan, true, false).unwrap_err();
+        match err {
+            CoreError::ExternalInstallRequired {
+                harness,
+                instructions,
+            } => {
+                assert_eq!(harness, "cline");
+                assert!(instructions.contains("manual uninstall"), "{instructions}");
+            }
+            other => panic!("expected ExternalInstallRequired, got {other}"),
+        }
     }
 }

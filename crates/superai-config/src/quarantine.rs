@@ -779,6 +779,9 @@ mod tests {
 
     #[cfg(unix)]
     fn cross_device_scratch() -> Option<PathBuf> {
+        // A per-call dir: tests clean their own scratch while siblings run
+        // in parallel; a shared dir would be deleted under their feet.
+        static CALL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let shm = PathBuf::from("/dev/shm");
         if !shm.is_dir() {
             return None;
@@ -788,7 +791,11 @@ mod tests {
             // Same filesystem: rename would succeed, nothing to probe.
             return None;
         }
-        let scratch = shm.join(format!("superai-quarantine-exdev-{}", std::process::id()));
+        let call = CALL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let scratch = shm.join(format!(
+            "superai-quarantine-exdev-{call}-{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&scratch).ok()?;
         Some(scratch)
     }

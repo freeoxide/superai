@@ -286,12 +286,6 @@ pub struct InstallCatalogEntry {
     /// Detection hints: commands and paths.
     #[serde(default)]
     pub detect: DetectHints,
-    /// Update command tokens (executable + argv, no shell pipeline).
-    #[serde(default)]
-    pub update: Option<CommandTokens>,
-    /// Uninstall command tokens (executable + argv).
-    #[serde(default)]
-    pub uninstall: Option<CommandTokens>,
     /// Whether installation requires admin/elevated privileges.
     #[serde(default)]
     pub requires_admin: bool,
@@ -348,12 +342,6 @@ impl InstallCatalogEntry {
         }
         self.constraints.validate()?;
         self.detect.validate()?;
-        if let Some(cmd) = self.update.as_ref() {
-            cmd.validate()?;
-        }
-        if let Some(cmd) = self.uninstall.as_ref() {
-            cmd.validate()?;
-        }
         if let Some(checksum) = self.checksum.as_deref() {
             let is_sha256 = checksum.trim().len() == 64
                 && checksum.trim().chars().all(|c| c.is_ascii_hexdigit());
@@ -545,18 +533,6 @@ mod tests {
                 }],
                 paths: vec!["/usr/local/bin/test-exe".to_owned()],
             },
-            update: Some(CommandTokens {
-                executable: "npm".to_owned(),
-                args: vec!["update".to_owned(), "-g".to_owned(), "@org/pkg".to_owned()],
-            }),
-            uninstall: Some(CommandTokens {
-                executable: "npm".to_owned(),
-                args: vec![
-                    "uninstall".to_owned(),
-                    "-g".to_owned(),
-                    "@org/pkg".to_owned(),
-                ],
-            }),
             requires_admin: false,
             checksum: None,
             conflicts: Vec::new(),

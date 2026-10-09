@@ -666,6 +666,35 @@ impl TorideBridge {
         self.captured(program, args, redact)
     }
 
+    /// Execute a six-kind update recognized from its toride-generated argv
+    /// (the `UpdateCommandRunner` seam hands over plain tokens). `None` when
+    /// the argv is not a routed update shape; the caller runs it natively.
+    pub fn update_by_argv(
+        &self,
+        executable: &str,
+        args: &[String],
+        redact: bool,
+    ) -> Option<Result<ProcessOutput, CoreError>> {
+        let (backend, operation) = update_operation_from_argv(executable, args)?;
+        let update_argv = operation.argv();
+        let (program, rest) = split_argv(&update_argv).ok()?;
+        let target = target_for(HostPlatform::current());
+        let plan = UpdatePlan {
+            app: TorideId::slugify(program),
+            backend,
+            operation,
+            dry_run: false,
+            requires_elevation: false,
+        };
+        let backend = self.backend_for(plan.backend).ok()?;
+        Some(
+            backend
+                .update_sync(UpdateRequest::new(&plan, &target))
+                .map_err(|e| map_run_error(e, "update", program, rest, redact))
+                .and_then(|()| self.captured(program, rest, redact)),
+        )
+    }
+
     /// Plan and execute an uninstall through the mapped backend; zap is
     /// hard-coded false so cask removal never touches collateral files.
     pub fn uninstall(
@@ -735,29 +764,99 @@ pub fn is_routed_kind(kind: &InstallMethodKind) -> bool {
     ROUTED_KINDS.contains(kind)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::install_catalog::{DetectHints, PlatformConstraints};
-    use std::time::Duration;
+/// The version operand a routed install may carry: a channel names no
+/// manager operand, so channels install at the manager's default.
+pub fn routed_install_version(requested: Option<&str>) -> Option<&str> {
+    requested.filter(|v| !crate::install_execute::is_channel(v))
+}
 
-    /// Inner runner recording every spec it receives and replaying queued
-    /// outputs (last one reused when the queue runs dry).
+/// Recognize the argv of a six-kind update verb toride's planner emits and
+/// rebuild the `(backend, operation)` pair it came from. `None` for anything
+/// else (mise, a foreign command) — the caller then runs natively.
+fn update_operation_from_argv(executable: &str, args: &[String]) -> Option<(BackendId, Operation)> {
+    let mut parts = vec![executable.to_owned()];
+    parts.extend(args.iter().cloned());
+    let joined = parts;
+    let matches = |shape: &[&str]| -> bool {
+        joined.len() == shape.len() && joined.iter().zip(shape).all(|(got, want)| got == want)
+    };
+    let last = args.last().map(String::as_str)?;
+    let operation = match (executable, args.first().map(String::as_str)) {
+        ("npm", Some("update")) if matches(&["npm", "update", "-g", last]) => {
+            Operation::NpmUpdate {
+                package: last.to_owned(),
+                global: true,
+            }
+        }
+        ("cargo", Some("install")) if matches(&["cargo", "install", "--force", last]) => {
+            Operation::CargoUpdate {
+                crate_: last.to_owned(),
+            }
+        }
+        ("pipx", Some("upgrade")) if matches(&["pipx", "upgrade", last]) => Operation::PipxUpdate {
+            package: last.to_owned(),
+        },
+        ("uv", Some("tool")) if matches(&["uv", "tool", "upgrade", last]) => Operation::UvUpdate {
+            package: last.to_owned(),
+        },
+        ("brew", Some("upgrade")) => {
+            if matches(&["brew", "upgrade", "--cask", last]) {
+                Operation::BrewUpgrade {
+                    cask: true,
+                    token: last.to_owned(),
+                }
+            } else if matches(&["brew", "upgrade", last]) {
+                Operation::BrewUpgrade {
+                    cask: false,
+                    token: last.to_owned(),
+                }
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+    // Round-trip: route only argv toride itself would render, so a foreign
+    // command can never be reinterpreted as a different toride operation.
+    if operation.argv() != joined {
+        return None;
+    }
+    Some((
+        match &operation {
+            Operation::NpmUpdate { .. } => BackendId::Npm,
+            Operation::CargoUpdate { .. } => BackendId::Cargo,
+            Operation::PipxUpdate { .. } => BackendId::Pipx,
+            Operation::UvUpdate { .. } => BackendId::Uv,
+            Operation::BrewUpgrade { .. } => BackendId::Homebrew,
+            _ => return None,
+        },
+        operation,
+    ))
+}
+
+/// Shared hermetic runner for crate tests: records every dispatched spec and
+/// replays queued outputs (an empty stdout when the queue runs dry).
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::{Arc, Mutex, PoisonError};
+
+    use toride_runner::{CommandOutput, CommandSpec, Runner};
+
     #[derive(Debug, Clone, Default)]
-    struct SpyRunner {
+    pub(crate) struct SpyRunner {
         specs: Arc<Mutex<Vec<CommandSpec>>>,
         outputs: Arc<Mutex<Vec<CommandOutput>>>,
     }
 
     impl SpyRunner {
-        fn enqueue(&self, output: CommandOutput) {
+        pub(crate) fn enqueue(&self, output: CommandOutput) {
             self.outputs
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .push(output);
         }
 
-        fn recorded(&self) -> Vec<CommandSpec> {
+        pub(crate) fn recorded(&self) -> Vec<CommandSpec> {
             self.specs
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -779,6 +878,14 @@ mod tests {
             })
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::SpyRunner;
+    use super::*;
+    use crate::install_catalog::{DetectHints, PlatformConstraints};
+    use std::time::Duration;
 
     fn entry(harness: &str, kind: InstallMethodKind, package: &str) -> InstallCatalogEntry {
         InstallCatalogEntry {
@@ -796,8 +903,6 @@ mod tests {
             version_source: String::new(),
             constraints: PlatformConstraints::default(),
             detect: DetectHints::default(),
-            update: None,
-            uninstall: None,
             requires_admin: false,
             checksum: None,
             conflicts: Vec::new(),
@@ -1406,5 +1511,110 @@ mod tests {
                 .any(|(_, value)| value.contains("/hostile")),
             "no caller-supplied value may survive the rewrite"
         );
+    }
+
+    #[test]
+    fn update_by_argv_routes_every_six_kind_update_verb() {
+        let cases = [
+            (
+                "npm",
+                vec!["update", "-g", "@openai/codex"],
+                CommandOutput::from_stdout("npm-updated"),
+            ),
+            (
+                "brew",
+                vec!["upgrade", "ripgrep"],
+                CommandOutput::from_stdout("brew-updated"),
+            ),
+            (
+                "brew",
+                vec!["upgrade", "--cask", "firefox"],
+                CommandOutput::from_stdout("cask-updated"),
+            ),
+            (
+                "cargo",
+                vec!["install", "--force", "ripgrep"],
+                CommandOutput::from_stdout("cargo-updated"),
+            ),
+            (
+                "pipx",
+                vec!["upgrade", "black"],
+                CommandOutput::from_stdout("pipx-updated"),
+            ),
+            (
+                "uv",
+                vec!["tool", "upgrade", "ruff"],
+                CommandOutput::from_stdout("uv-updated"),
+            ),
+        ];
+        for (program, args, output) in cases {
+            let spy = SpyRunner::default();
+            spy.enqueue(output.clone());
+            let bridge = TorideBridge::with_runner(Arc::new(spy.clone()));
+            let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
+            let out = bridge
+                .update_by_argv(program, &args, false)
+                .unwrap_or_else(|| panic!("`{program} {args:?}` must route"))
+                .expect("routed update must succeed");
+            assert_eq!(out.stdout, output.stdout, "argv `{program} {args:?}`");
+            assert_eq!(spy.recorded()[0].program, program, "{args:?}");
+            assert_eq!(spy.recorded()[0].args, args, "{program}");
+            assert!(spy.recorded()[0].clear_env, "{program}");
+        }
+    }
+
+    #[test]
+    fn update_by_argv_refuses_shapes_toride_would_not_render() {
+        let bridge = TorideBridge::with_runner(Arc::new(SpyRunner::default()));
+        // npm without -g, mise, a foreign program, and truncated brew argv
+        // are all native-path commands, never a toride operation.
+        let native = [
+            ("npm", vec!["update".to_owned(), "pkg".to_owned()]),
+            ("mise", vec!["upgrade".to_owned(), "pkg".to_owned()]),
+            ("curl", vec!["https://example.com".to_owned()]),
+            ("brew", vec!["upgrade".to_owned()]),
+            ("cargo", vec!["install".to_owned(), "ripgrep".to_owned()]),
+        ];
+        for (program, args) in native {
+            assert!(
+                bridge.update_by_argv(program, &args, false).is_none(),
+                "`{program} {args:?}` must not be reinterpreted as a toride update"
+            );
+        }
+    }
+
+    #[test]
+    fn update_by_argv_maps_a_failed_update_to_update_exit() {
+        let spy = SpyRunner::default();
+        spy.enqueue(CommandOutput::from_stderr("network unreachable", 1));
+        let bridge = TorideBridge::with_runner(Arc::new(spy));
+        let err = bridge
+            .update_by_argv(
+                "npm",
+                &[
+                    "update".to_owned(),
+                    "-g".to_owned(),
+                    "@openai/codex".to_owned(),
+                ],
+                true,
+            )
+            .expect("argv must route")
+            .unwrap_err();
+        match err {
+            CoreError::Verification { kind, reason, .. } => {
+                assert_eq!(kind, "update_exit");
+                assert!(reason.contains("npm update -g @openai/codex"), "{reason}");
+                assert!(reason.contains("[REDACTED]"), "{reason}");
+            }
+            other => panic!("expected update_exit verification, got {other}"),
+        }
+    }
+
+    #[test]
+    fn routed_install_version_drops_channels() {
+        assert_eq!(routed_install_version(Some("1.2.3")), Some("1.2.3"));
+        assert_eq!(routed_install_version(Some("latest")), None);
+        assert_eq!(routed_install_version(Some("stable")), None);
+        assert_eq!(routed_install_version(None), None);
     }
 }

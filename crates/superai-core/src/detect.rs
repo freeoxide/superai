@@ -1693,8 +1693,6 @@ mod tests {
                 commands: vec![],
                 paths: vec![],
             },
-            update: None,
-            uninstall: None,
             requires_admin: false,
             checksum: None,
             conflicts: Vec::new(),

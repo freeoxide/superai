@@ -312,8 +312,6 @@ fn bench_detect_fixtures(
             arch: vec!["any".to_owned()],
         },
         detect: DetectHints::default(),
-        update: None,
-        uninstall: None,
         requires_admin: false,
         checksum: None,
         conflicts: Vec::new(),

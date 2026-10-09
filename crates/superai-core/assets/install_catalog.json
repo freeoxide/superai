@@ -19,8 +19,6 @@
       "commands": [{"executable": "claude", "args": ["--version"]}],
       "paths": ["/usr/local/bin/claude", "/opt/homebrew/bin/claude", "/home/linuxbrew/.linuxbrew/bin/claude"]
     },
-    "update": {"executable": "npm", "args": ["update", "-g", "@anthropic-ai/claude-code"]},
-    "uninstall": {"executable": "npm", "args": ["uninstall", "-g", "@anthropic-ai/claude-code"]},
     "requires_admin": false,
     "checksum": null,
     "conflicts": [],
@@ -47,8 +45,6 @@
       "commands": [{"executable": "codex", "args": ["--version"]}],
       "paths": ["/usr/local/bin/codex", "/opt/homebrew/bin/codex"]
     },
-    "update": {"executable": "npm", "args": ["update", "-g", "@openai/codex"]},
-    "uninstall": {"executable": "npm", "args": ["uninstall", "-g", "@openai/codex"]},
     "requires_admin": false,
     "checksum": null,
     "conflicts": [],
@@ -74,8 +70,6 @@
       "commands": [{"executable": "aider", "args": ["--version"]}],
       "paths": ["/usr/local/bin/aider"]
     },
-    "update": {"executable": "pipx", "args": ["upgrade", "aider-chat"]},
-    "uninstall": {"executable": "pipx", "args": ["uninstall", "aider-chat"]},
     "requires_admin": false,
     "checksum": null,
     "conflicts": [],
@@ -101,8 +95,6 @@
       "commands": [{"executable": "opencode", "args": ["--version"]}],
       "paths": ["/usr/local/bin/opencode"]
     },
-    "update": {"executable": "npm", "args": ["update", "-g", "opencode-ai"]},
-    "uninstall": {"executable": "npm", "args": ["uninstall", "-g", "opencode-ai"]},
     "requires_admin": false,
     "checksum": null,
     "conflicts": [],
@@ -126,8 +118,6 @@
       "commands": [{"executable": "code", "args": ["--list-extensions"]}],
       "paths": ["/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code", "/usr/local/bin/code"]
     },
-    "update": {"executable": "code", "args": ["--install-extension", "saoudrizwan.claude-dev"]},
-    "uninstall": {"executable": "code", "args": ["--uninstall-extension", "saoudrizwan.claude-dev"]},
     "requires_admin": false,
     "checksum": null,
     "conflicts": [],
