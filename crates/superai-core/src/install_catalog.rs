@@ -1,10 +1,6 @@
 //! Installation catalog: data-driven harness package registry (PKG-02).
 //! All data lives in assets/install_catalog.json; commands are argv tokens, never shell pipelines.
 
-#![expect(
-    clippy::excessive_nesting,
-    reason = "intentional deep validation branching"
-)]
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -70,8 +66,9 @@ pub struct CommandTokens {
 }
 
 impl CommandTokens {
-    /// Validate that the command contains no shell metacharacters and no empty
-    /// executable.
+    /// Validate against the one metachar list in [`crate::process`] (the
+    /// same list the runner bridge enforces), plus NUL, shell pairs, and an
+    /// empty executable.
     pub fn validate(&self) -> Result<(), CoreError> {
         if self.executable.is_empty() {
             return Err(CoreError::Validation {
@@ -86,24 +83,10 @@ impl CommandTokens {
                     reason: "must not contain NUL".to_owned(),
                 });
             }
-            if value == "|" {
+            if let Some(pat) = crate::process::shell_metachar_in(value) {
                 return Err(CoreError::Validation {
                     field: field.to_owned(),
-                    reason: "arg must not be shell pipeline token `|`".to_owned(),
-                });
-            }
-            for pat in ["$(", "${", "`", "&&", "||", ";", ">>", "<<"] {
-                if value.contains(pat) {
-                    return Err(CoreError::Validation {
-                        field: field.to_owned(),
-                        reason: format!("must not contain shell pattern `{pat}`"),
-                    });
-                }
-            }
-            if value == ">" || value == "<" {
-                return Err(CoreError::Validation {
-                    field: field.to_owned(),
-                    reason: format!("arg must not be shell redirect `{value}`"),
+                    reason: format!("must not contain shell metacharacter `{pat}`"),
                 });
             }
             Ok(())
@@ -630,6 +613,47 @@ mod tests {
             args: vec!["install".to_owned(), "-g".to_owned(), "@org/pkg".to_owned()],
         };
         good.validate().unwrap();
+    }
+
+    /// Every pattern of the one list (process.rs) is refused as executable
+    /// and as arg, embedded or exact; legal manager tokens still pass.
+    #[test]
+    fn command_tokens_refuse_every_pattern_of_the_shared_metachar_list() {
+        for pat in crate::process::SHELL_METACHARS {
+            for value in [format!("a{pat}b"), (*pat).to_owned()] {
+                let arg_case = CommandTokens {
+                    executable: "npm".to_owned(),
+                    args: vec![value.clone()],
+                };
+                let err = arg_case.validate().unwrap_err().to_string();
+                assert!(
+                    err.contains("shell metacharacter"),
+                    "`{value}` as arg must be refused: {err}"
+                );
+                let exe_case = CommandTokens {
+                    executable: value.clone(),
+                    args: Vec::new(),
+                };
+                assert!(
+                    exe_case.validate().is_err(),
+                    "`{value}` as executable must be refused"
+                );
+            }
+        }
+        for still_fine in ["@org/pkg@1.2.3", "--version", "ruff==0.6.0"] {
+            CommandTokens {
+                executable: "npm".to_owned(),
+                args: vec![still_fine.to_owned()],
+            }
+            .validate()
+            .unwrap_or_else(|e| panic!("`{still_fine}` is a legal token: {e}"));
+        }
+        CommandTokens {
+            executable: "npm\u{0}".to_owned(),
+            args: Vec::new(),
+        }
+        .validate()
+        .unwrap_err();
     }
 
     #[test]

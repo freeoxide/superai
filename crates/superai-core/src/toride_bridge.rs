@@ -27,7 +27,7 @@ use crate::install_catalog::{
     CommandTokens, InstallCatalogEntry, InstallMethod, InstallMethodKind,
 };
 use crate::install_execute::{EXEC_TIMEOUT, OUTPUT_LIMIT, minimal_env_vars};
-use crate::process::{ProcessOutput, contains_shell_metachars, display_command, scrub_stderr};
+use crate::process::{ProcessOutput, display_command, scrub_stderr, shell_metachar_in};
 
 /// `(spec, output)` pairs retained per bridge so verb callers can recover
 /// the child's real output; backends swallow it inside their sync verbs.
@@ -101,8 +101,10 @@ fn reject_unsafe_argv(spec: &CommandSpec) -> toride_runner::Result<()> {
             "must not invoke a shell via `sh -c` / `bash -c`".to_owned(),
         ));
     }
-    if contains_shell_metachars(&spec.program) {
-        return Err(reject("program contains a shell metacharacter".to_owned()));
+    if let Some(pat) = shell_metachar_in(&spec.program) {
+        return Err(reject(format!(
+            "program contains shell metacharacter `{pat}`"
+        )));
     }
     for (index, arg) in spec.args.iter().enumerate() {
         if arg.contains('\0') {
@@ -110,9 +112,9 @@ fn reject_unsafe_argv(spec: &CommandSpec) -> toride_runner::Result<()> {
                 "argument at index {index} must not contain NUL"
             )));
         }
-        if contains_shell_metachars(arg) {
+        if let Some(pat) = shell_metachar_in(arg) {
             return Err(reject(format!(
-                "argument at index {index} contains a shell metacharacter"
+                "argument at index {index} contains shell metacharacter `{pat}`"
             )));
         }
     }
@@ -911,14 +913,11 @@ mod tests {
 
     #[test]
     fn argv_gate_rejects_the_full_metachar_list_before_delegation() {
-        // Every one of these passes CommandTokens::validate's shorter list
-        // today (install_catalog.rs); the bridge must still refuse it.
-        for bad in [
-            "a&b", "a!b", "a\"b", "a'b", "a\nb", "a\rb", "a|b", "a>b", "a<b", "a;b",
-        ] {
+        for pat in crate::process::SHELL_METACHARS {
+            let bad = format!("a{pat}b");
             let spy = SpyRunner::default();
             let err = sec_over(&spy)
-                .run(&CommandSpec::new("npm").arg(bad))
+                .run(&CommandSpec::new("npm").arg(bad.clone()))
                 .unwrap_err();
             assert!(
                 matches!(err, RunnerError::ArgvRejected { .. }),
@@ -1103,21 +1102,61 @@ mod tests {
     }
 
     #[test]
-    fn preview_uninstall_never_spells_zap() {
-        let cask = entry("warp", InstallMethodKind::HomebrewCask, "warp");
-        let tokens = preview_uninstall(
-            &cask,
-            &InstallMethodKind::HomebrewCask,
-            platform("macos", "aarch64"),
-        )
-        .unwrap();
-        assert_eq!(tokens.executable, "brew");
-        assert_eq!(tokens.args, ["uninstall", "--cask", "warp"]);
-        let npm = entry("codex-cli", InstallMethodKind::Npm, "@openai/codex");
-        let tokens =
-            preview_uninstall(&npm, &InstallMethodKind::Npm, platform("linux", "x86_64")).unwrap();
-        assert_eq!(tokens.executable, "npm");
-        assert_eq!(tokens.args, ["uninstall", "-g", "@openai/codex"]);
+    fn preview_uninstall_pins_argv_for_the_six_kinds() {
+        let cases = [
+            (
+                InstallMethodKind::Npm,
+                "@openai/codex",
+                "linux",
+                "npm",
+                vec!["uninstall", "-g", "@openai/codex"],
+            ),
+            (
+                InstallMethodKind::Homebrew,
+                "ripgrep",
+                "linux",
+                "brew",
+                vec!["uninstall", "ripgrep"],
+            ),
+            (
+                InstallMethodKind::HomebrewCask,
+                "warp",
+                "macos",
+                "brew",
+                vec!["uninstall", "--cask", "warp"],
+            ),
+            (
+                InstallMethodKind::Cargo,
+                "ripgrep",
+                "linux",
+                "cargo",
+                vec!["uninstall", "ripgrep"],
+            ),
+            (
+                InstallMethodKind::Pipx,
+                "black",
+                "linux",
+                "pipx",
+                vec!["uninstall", "black"],
+            ),
+            (
+                InstallMethodKind::Uv,
+                "ruff",
+                "linux",
+                "uv",
+                vec!["tool", "uninstall", "ruff"],
+            ),
+        ];
+        for (kind, package, os, executable, args) in cases {
+            let harness = entry("argv-harness", kind.clone(), package);
+            let tokens = preview_uninstall(&harness, &kind, platform(os, "x86_64")).unwrap();
+            assert_eq!(tokens.executable, executable, "executable for {kind}");
+            assert_eq!(tokens.args, args, "uninstall argv for {kind}");
+            assert!(
+                !tokens.args.iter().any(|a| a == "--zap"),
+                "zap must never be spelled: {kind}"
+            );
+        }
     }
 
     #[test]
