@@ -1,5 +1,10 @@
 # toride-swap-decision
 
+Status: implemented. The partial-adoption ruling below landed as PR #8
+(commits 15d7b8a through ea69693): the six userland backends run through the
+bridge, receipts and gating stayed native, and the update-gating bug the
+verification round surfaced was fixed in the same change.
+
 Answer to the question: why not replace superai's own install stack with toride?
 
 ## Verdict
