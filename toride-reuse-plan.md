@@ -1,5 +1,10 @@
 # toride reuse plan
 
+Status: implemented in part. The adopt verdicts deferred here were acted on
+in PR #8 (backend execution for the six userland kinds, behind the SecRunner
+bridge); the ports in the build order remain open work. Read this as the
+2026-10-08 analysis snapshot, not the current plan.
+
 This report compares superai's crates against toride's to decide which components superai could replace with a toride piece, where it should copy a design instead, and where its own code is the better fit. The repos are /home/axent/fo/superai and /home/axent/fo/toride. Written 2026-10-08. Each section records its own crates.io publish checks from that day.
 
 ## TL;DR

@@ -8,8 +8,11 @@ Status: backend implemented through master-plan milestones A through H
 discovery, wrappers, providers, templates, capabilities, skills/plugins/MCP,
 install, raw editor, verification harness, platform gates). The filesystem
 layer beneath it is boring, as intended: atomic commits, backups, rollback,
-and conflict detection are all in place. 1480+ tests, strict lints, fixtures,
-verification harness. The GPUI interface is still planned.
+and conflict detection are all in place. Install execution for the userland
+package managers (npm, cargo, pipx, uv, Homebrew) runs through the
+first-party toride-apps backends behind a bridge that holds this repo's
+process posture. 2400+ tests, strict lints, fixtures, verification harness.
+The GPUI interface is still planned.
 
 - [docs/goal.md](docs/goal.md): what this is and why
 - [docs/plans/master-plan.md](docs/plans/master-plan.md): non-UI implementation index and subplans

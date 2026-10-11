@@ -46,15 +46,24 @@ plus:
 | hex | 0.4 | digest rendering | crates.io `hex` | no | trivial, stable |
 | ureq | 3.x (rustls, gzip; default-features off) | bounded HTTPS template fetch (PRV-07/TPL-03) | crates.io `ureq` (algesten) | no | default features disabled to avoid TLS implementation choice; rustls only; usage mirrors template_fetch.rs discipline (timeouts, size caps, redirect policy) |
 | duct | 1.x (timeout) | bounded subprocess execution (install/exec, git checkout) | crates.io `duct` (oconnor663) | no | timeout feature required for bounded probes; all call sites go through process.rs limits |
+| toride-apps | 0.1 (default-features off) | backend execution for npm, cargo, pipx, uv, Homebrew installs (toride_bridge.rs) | crates.io `toride-apps` (freeoxide, first-party: same owner as this repo) | no | sync twins only; no tokio feature; argv pinned by toride's own tests; bridge forces this repo's process posture on every spec |
+| toride-runner | 0.1 | runner seam the bridge implements to enforce env/PATH/cap/timeout policy | crates.io `toride-runner` (freeoxide, first-party) | no | default features; no tokio-runner/stream |
+| toride-registry | 0.1 (default-features off) | source model behind toride-apps planning | crates.io `toride-registry` (freeoxide, first-party) | no | no http feature; no network at runtime |
 
 Transitive participants that warrant standing attention (from `Cargo.lock`,
-97 packages total):
+168 packages total):
 
 | Package | Via | Attention |
 |---|---|---|
 | ring | ureq→rustls | **ships build.rs and compiles C code**; pinned by rustls; audited by the rustls project; acceptable because the TLS surface is confined to template fetch |
 | zeroize | ring/rustls | no build script; memory zeroing |
 | libyaml-rs | yaml-serde | pure-Rust safe-libyaml port; no unsafe exposed to this workspace (`unsafe_code = "forbid"` holds in our crates) |
+| async-trait | toride-apps | compile-time desugaring only; no runtime, no executor; the sync twins are the only path this repo calls |
+| option-ext (MPL-2.0) | toride-apps→dirs→dirs-sys | license added to deny.toml allowlist in dba6694; OSI-approved weak copyleft, used as a library |
+| dirs / dirs-sys / libredox / redox_users | toride-apps | path resolution inside toride; no build scripts beyond libredox (pure Rust) |
+| tracing / tracing-core / tracing-attributes | toride-runner | log framework compiled in; no subscriber installed here, so nothing is emitted |
+| which | toride-runner | binary discovery for runner defaults; the bridge supplies explicit argv, so this path is not exercised |
+| camino / serde_yaml / unsafe-libyaml | toride-registry | camino is a UTF-8 path wrapper; serde_yaml is upstream-archived, enters only through first-party toride-registry with no network feature, candidate to drop in a toride-side cleanup |
 
 ## superai-cli (L3 — the one binary)
 
@@ -69,4 +78,5 @@ Transitive participants that warrant standing attention (from `Cargo.lock`,
 | cargo-mutants 27.1.0 | `cargo install cargo-mutants --locked`, CI `mutation-testing` job | installed from crates.io with `--locked`; scope pinned by `.cargo/mutants.toml` |
 | cargo-hack / cargo-shear / cargo-deny | CI supply-chain job, `--locked` installs | same discipline; deny.toml policy in-repo |
 
-Review date: 2026-09-01 (area 8, QAL-12). Re-verify on every lockfile diff.
+Review date: 2026-09-01 (area 8, QAL-12); re-reviewed 2026-10-11 for the
+toride participants added by PR #8. Re-verify on every lockfile diff.
