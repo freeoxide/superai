@@ -12,10 +12,18 @@ pub(crate) const SHELL_METACHARS: &[&str] = &[
     "`", "$(", "${", "&&", "||", ";", "|", ">", "<", "&", "!", "\"", "'", "\n", "\r",
 ];
 
+/// The first metachar `value` contains, if any.
+pub(crate) fn shell_metachar_in(value: &str) -> Option<&'static str> {
+    SHELL_METACHARS
+        .iter()
+        .copied()
+        .find(|pat| value.contains(*pat))
+}
+
 /// True when `value` contains any shell metachar. Windows treats a backslash
 /// as a path separator, so native-locator callers check it themselves.
 pub(crate) fn contains_shell_metachars(value: &str) -> bool {
-    SHELL_METACHARS.iter().any(|pat| value.contains(pat))
+    shell_metachar_in(value).is_some()
 }
 
 use std::collections::BTreeMap;

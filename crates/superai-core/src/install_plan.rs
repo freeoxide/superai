@@ -498,7 +498,14 @@ pub fn plan_install_for_entry_with_probe(
         _ => None,
     };
 
-    let command_preview = build_command_preview(entry, method, request)?;
+    let command_preview = plan_command_preview(
+        entry,
+        method,
+        request,
+        requested_version,
+        platform_os,
+        platform_arch,
+    )?;
     command_preview.validate()?;
 
     Ok(InstallPlan {
@@ -675,73 +682,50 @@ fn derive_expected_executable(
     }
 }
 
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "preview returns Result for validation"
-)]
-fn build_command_preview(
+/// Preview argv per method: the six package-manager kinds come from toride's
+/// planner; mise keeps its native arm; External/Direct carry open-docs tokens
+/// for a state that only ever refuses typed at execution.
+fn plan_command_preview(
     entry: &InstallCatalogEntry,
     method: &InstallMethod,
     request: &InstallRequest,
+    requested_version: Option<&str>,
+    platform_os: &str,
+    platform_arch: &str,
 ) -> Result<CommandTokens, CoreError> {
-    let version_suffix =
-        |ver: Option<&String>| -> String { ver.map_or_else(String::new, |v| format!("@{v}")) };
-    let ver = request.version.as_ref().or(request.channel.as_ref());
-    let pkg_with_ver = if ver.is_some() {
-        format!("{}{}", method.package_name, version_suffix(ver))
-    } else {
-        method.package_name.clone()
-    };
-
-    if matches!(
-        method.kind,
-        InstallMethodKind::External | InstallMethodKind::Direct
-    ) {
-        return Ok(CommandTokens {
+    match request.method {
+        InstallMethodKind::External | InstallMethodKind::Direct => Ok(CommandTokens {
             executable: "open".to_owned(),
             args: vec![entry.docs.clone()],
-        });
-    }
-
-    let tokens = match method.kind {
-        InstallMethodKind::Mise => CommandTokens {
+        }),
+        InstallMethodKind::Mise => Ok(CommandTokens {
             executable: "mise".to_owned(),
-            args: {
-                let mut a = vec!["use".to_owned(), "-g".to_owned(), pkg_with_ver];
-                if let Some(dest) = request.destination.as_ref() {
-                    a.push("--prefix".to_owned());
-                    a.push(dest.display().to_string());
-                }
-                a
+            args: mise_use_args(method, request),
+        }),
+        _ => crate::toride_bridge::preview_install(
+            entry,
+            &request.method,
+            crate::toride_bridge::routed_install_version(requested_version),
+            crate::toride_bridge::HostPlatform {
+                os: platform_os,
+                arch: platform_arch,
             },
-        },
-        InstallMethodKind::Homebrew | InstallMethodKind::HomebrewCask => CommandTokens {
-            executable: "brew".to_owned(),
-            args: vec!["install".to_owned(), pkg_with_ver],
-        },
-        InstallMethodKind::Npm => CommandTokens {
-            executable: "npm".to_owned(),
-            args: vec!["install".to_owned(), "-g".to_owned(), pkg_with_ver],
-        },
-        InstallMethodKind::Cargo => CommandTokens {
-            executable: "cargo".to_owned(),
-            args: vec!["install".to_owned(), pkg_with_ver],
-        },
-        InstallMethodKind::Pipx => CommandTokens {
-            executable: "pipx".to_owned(),
-            args: vec!["install".to_owned(), pkg_with_ver],
-        },
-        InstallMethodKind::Uv => CommandTokens {
-            executable: "uv".to_owned(),
-            args: vec!["tool".to_owned(), "install".to_owned(), pkg_with_ver],
-        },
-        // Handled by the early return above; kept for exhaustiveness.
-        InstallMethodKind::Direct | InstallMethodKind::External => CommandTokens {
-            executable: "open".to_owned(),
-            args: vec![entry.docs.clone()],
-        },
-    };
-    Ok(tokens)
+        ),
+    }
+}
+
+fn mise_use_args(method: &InstallMethod, request: &InstallRequest) -> Vec<String> {
+    let ver = request.version.as_ref().or(request.channel.as_ref());
+    let pkg = ver.map_or_else(
+        || method.package_name.clone(),
+        |v| format!("{}@{v}", method.package_name),
+    );
+    let mut args = vec!["use".to_owned(), "-g".to_owned(), pkg];
+    if let Some(dest) = request.destination.as_ref() {
+        args.push("--prefix".to_owned());
+        args.push(dest.display().to_string());
+    }
+    args
 }
 
 #[cfg(test)]
@@ -830,22 +814,6 @@ mod tests {
                 }],
                 paths: vec!["/usr/local/bin/my-exe".to_owned()],
             },
-            update: Some(CommandTokens {
-                executable: "npm".to_owned(),
-                args: vec![
-                    "update".to_owned(),
-                    "-g".to_owned(),
-                    "@org/my-exe".to_owned(),
-                ],
-            }),
-            uninstall: Some(CommandTokens {
-                executable: "npm".to_owned(),
-                args: vec![
-                    "uninstall".to_owned(),
-                    "-g".to_owned(),
-                    "@org/my-exe".to_owned(),
-                ],
-            }),
             requires_admin: false,
             checksum: None,
             conflicts: vec!["other-harness".to_owned()],
@@ -989,6 +957,162 @@ mod tests {
                     .iter()
                     .any(|a| a.contains("@org/my-exe"))
         );
+    }
+
+    /// Argv-diff pin across the six toride-routed kinds: the plan preview is
+    /// exactly the argv toride's planner emits (toride-swap-decision.md:75).
+    #[test]
+    fn plan_preview_pins_toride_argv_for_every_routed_kind() {
+        struct Case {
+            kind: InstallMethodKind,
+            package: &'static str,
+            version: Option<&'static str>,
+            os: &'static str,
+            executable: &'static str,
+            args: Vec<&'static str>,
+        }
+        let cases = [
+            Case {
+                kind: InstallMethodKind::Npm,
+                package: "@org/pkg",
+                version: Some("1.2.3"),
+                os: "linux",
+                executable: "npm",
+                args: vec!["install", "-g", "@org/pkg@1.2.3"],
+            },
+            Case {
+                kind: InstallMethodKind::Npm,
+                package: "@org/pkg",
+                version: None,
+                os: "linux",
+                executable: "npm",
+                args: vec!["install", "-g", "@org/pkg"],
+            },
+            Case {
+                kind: InstallMethodKind::Homebrew,
+                package: "ripgrep",
+                version: Some("14.1.0"),
+                os: "linux",
+                executable: "brew",
+                args: vec!["install", "ripgrep@14.1.0"],
+            },
+            // Cask previews gain --cask: the plain `brew install name` shape
+            // resolved the formula, not the cask.
+            Case {
+                kind: InstallMethodKind::HomebrewCask,
+                package: "firefox",
+                version: None,
+                os: "macos",
+                executable: "brew",
+                args: vec!["install", "--cask", "firefox"],
+            },
+            Case {
+                kind: InstallMethodKind::Cargo,
+                package: "ripgrep",
+                version: Some("14.1.0"),
+                os: "linux",
+                executable: "cargo",
+                args: vec!["install", "--version", "14.1.0", "ripgrep"],
+            },
+            Case {
+                kind: InstallMethodKind::Pipx,
+                package: "black",
+                version: None,
+                os: "linux",
+                executable: "pipx",
+                args: vec!["install", "black"],
+            },
+            // uv pins with ==ver, not the @ver superai used to append.
+            Case {
+                kind: InstallMethodKind::Uv,
+                package: "ruff",
+                version: Some("0.6.0"),
+                os: "linux",
+                executable: "uv",
+                args: vec!["tool", "install", "ruff==0.6.0"],
+            },
+        ];
+        for case in cases {
+            let entry = kind_entry("argv-harness", &case.kind, case.package);
+            let harness = HarnessId::new("argv-harness").unwrap();
+            let mut request = InstallRequest::new(harness, case.kind.clone());
+            if let Some(v) = case.version {
+                request = request.with_version(v);
+            }
+            let plan = plan_install_for_entry_with_probe(
+                &request,
+                &entry,
+                case.os,
+                "x86_64",
+                &available_probe(),
+            )
+            .unwrap_or_else(|e| panic!("{:?} preview must plan: {e}", case.kind));
+            assert_eq!(
+                plan.command_preview.executable, case.executable,
+                "{:?}",
+                case.kind
+            );
+            assert_eq!(plan.command_preview.args, case.args, "{:?}", case.kind);
+            plan.command_preview.validate().unwrap();
+        }
+    }
+
+    /// pipx cannot express a version; the refusal is toride's own plan-time
+    /// one, never a hand-built pkg@version pass-through.
+    #[test]
+    fn plan_refuses_versioned_pipx_at_plan_time() {
+        let entry = kind_entry("pipx-harness", &InstallMethodKind::Pipx, "black");
+        let harness = HarnessId::new("pipx-harness").unwrap();
+        let req = InstallRequest::new(harness, InstallMethodKind::Pipx).with_version("0.1.0");
+        let err =
+            plan_install_for_entry_with_probe(&req, &entry, "linux", "x86_64", &available_probe())
+                .unwrap_err();
+        match err {
+            CoreError::Validation { field, reason } => {
+                assert_eq!(field, "version");
+                assert!(
+                    reason.contains("no version operand"),
+                    "the toride refusal must be carried verbatim: {reason}"
+                );
+            }
+            other => panic!("expected a typed validation refusal, got {other}"),
+        }
+    }
+
+    /// Cask installs off macOS are a plan-time refusal.
+    #[test]
+    fn plan_refuses_cask_off_macos() {
+        let entry = kind_entry("cask-harness", &InstallMethodKind::HomebrewCask, "firefox");
+        let harness = HarnessId::new("cask-harness").unwrap();
+        let req = InstallRequest::new(harness, InstallMethodKind::HomebrewCask);
+        let err =
+            plan_install_for_entry_with_probe(&req, &entry, "linux", "x86_64", &available_probe())
+                .unwrap_err();
+        assert!(matches!(err, CoreError::Validation { .. }), "{err}");
+    }
+
+    fn kind_entry(harness: &str, kind: &InstallMethodKind, package: &str) -> InstallCatalogEntry {
+        InstallCatalogEntry {
+            harness: harness.to_owned(),
+            executables: vec!["tool".to_owned()],
+            bundle_ids: Vec::new(),
+            apps: Vec::new(),
+            methods: vec![InstallMethod {
+                kind: kind.clone(),
+                package_name: package.to_owned(),
+                tap: None,
+                repo: None,
+                registry: None,
+            }],
+            version_source: String::new(),
+            constraints: PlatformConstraints::default(),
+            detect: DetectHints::default(),
+            requires_admin: false,
+            checksum: None,
+            conflicts: Vec::new(),
+            docs: "https://example.com".to_owned(),
+            last_verified: "2026-08-26".to_owned(),
+        }
     }
 
     #[test]

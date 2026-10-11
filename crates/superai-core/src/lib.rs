@@ -64,6 +64,10 @@ pub mod install_catalog;
 /// Install detection: collects all harness matches (PKG-03).
 pub mod detect;
 
+/// Toride backend bridge: posture-forcing runner plus the catalog-method
+/// adapter for the six package-manager kinds (PKG-05..08 partial adoption).
+pub mod toride_bridge;
+
 /// Install planning: validates and previews harness installs (PKG-04).
 pub mod install_plan;
 
