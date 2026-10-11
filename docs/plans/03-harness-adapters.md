@@ -2,113 +2,11 @@
 
 Parent: [master plan](master-plan.md)  
 Task prefix: HAD  
-Estimate: 50–70 reviewable change sets
 
-## Outcome
+Status: complete. Run 3 closed every exit-gate item over the 48 registered catalog rows.
 
-Every product surface documented under harness-configs has a registered support record and a
-fixture-backed adapter. Adapters resolve paths, versions, config precedence, writable fields,
-isolation, discovery, and extension mechanisms without guessing.
-
-One adapter is normally one independently reviewable implementation plus fixtures. Closely
-related version variants may share pure mapping code, but keep distinct compatibility fixtures.
-
-## Adapter contract
-
-### HAD-01 — identity and metadata
-
-Each adapter declares:
-
-- HarnessId, display name, product family, executable names, desktop bundle IDs where relevant.
-- Research document link and last verified date.
-- Product status: active, preview, EAP, retired, archived, sunset, acquired, or unknown.
-- Supported OS/architectures.
-- Adapter revision.
-- Known harness version ranges and schema variants.
-- Default support state and reason.
-
-No adapter is selected by fuzzy display-name matching.
-
-### HAD-02 — detection and version resolution
-
-Read-only probes:
-
-- PATH lookup and configured absolute binary.
-- Standard install locations and package-manager metadata.
-- Version command with timeout and accepted output parser.
-- Desktop application/bundle/extension detection.
-- Default and candidate config roots.
-- Schema/version markers inside config or path.
-
-Detection returns evidence and confidence. It never creates first-run config as a side effect.
-If a version command launches onboarding or mutates state, use package metadata or mark version
-unknown.
-
-### HAD-03 — config surfaces and precedence
-
-Each surface declares:
-
-- Path resolver per OS, instance, project, and harness version.
-- Kind: JSON, JSONC, TOML, YAML, env, text fragment, executable, SQLite, keychain, or opaque.
-- Scope: system/managed, user, instance, project/workspace, session/inline, internal.
-- Ownership: user-editable, harness-managed, external secret store, superai-created.
-- Precedence and merge behavior.
-- Root shape and semantic validator.
-- Owned selectors and edit rules.
-- Backup requirement and restart/reload behavior.
-
-Auto-managed DBs, token caches, keychains, OAuth stores, and opaque internal state are detectable
-but not writable.
-
-### HAD-04 — supported operations
-
-Adapter provides plans, not direct writes:
-
-- Inspect effective provider/model/key sink.
-- Set/remove provider endpoint, auth reference/key, model list/defaults.
-- Inspect/manage skill, plugin, and MCP locations.
-- Resolve default install as an instance target.
-- Plan mirror exclusions and relocation.
-- Plan wrapper invocation/environment/args.
-- Scan candidate unmanaged roots and ownership markers.
-- Validate an instance after mutation.
-- Describe external auth/restart/manual steps.
-
-Every absent operation returns a typed support state and reason.
-
-### HAD-05 — version selection and migrations
-
-Resolution:
-
-1. Detect installed harness version.
-2. Resolve exact adapter schema range.
-3. Detect config-era markers if product version alone is insufficient.
-4. Parse using that schema.
-5. Refuse writes on conflicting or unknown era.
-
-Harness migration support is explicit:
-
-- Read legacy and current forms.
-- Preview harness-owned migration where documented.
-- Preserve deprecated fields unless migration owns them.
-- Never auto-migrate just because a file was inspected.
-
-### HAD-06 — conformance suite
-
-Every writable adapter passes:
-
-- Missing/default/populated/malformed config fixtures.
-- Unknown-key and lexical-preservation fixtures.
-- Version boundary fixtures.
-- Provider/model mutation plus removal.
-- Skill/plugin/MCP coexistence where supported.
-- Default and isolated path resolution on supported OSes.
-- Wrapper plan and command quoting.
-- External-edit conflict and backup/restore.
-- Secret redaction.
-- Unsupported-operation behavior.
-
-Every read-only/research-blocked adapter passes detection, explanation, and no-write tests.
+What shipped: fixture-backed adapters for every surface documented under harness-configs,
+resolving paths, versions, precedence, writable fields, isolation, and discovery.
 
 ## Provisional support ledger
 
@@ -169,60 +67,6 @@ gaps from source docs keep a surface read-only or research-blocked until closed.
 | Conductor | [orchestrators.md](../harness-configs/orchestrators.md) | user/repo TOML, env, scripts | macOS worktrees/profiles | Constrained |
 | Sculptor | [orchestrators.md](../harness-configs/orchestrators.md) | env, harness settings, containers | workspace/container | Constrained |
 
-## Adapter delivery waves
-
-### HAD-07 — representative spine
-
-Implement in this order:
-
-1. Claude Code.
-2. Codex CLI.
-3. Aider.
-4. OpenCode.
-5. Cline.
-6. ZCode read/single-instance.
-7. OpenClaw read/daemon model.
-8. Crush read plus safe write research outcome.
-
-This spans JSON, TOML, YAML/env, JSONC, IDE storage, fixed paths, daemons, and executable config.
-
-### HAD-08 — relocated-root CLI wave
-
-Copilot CLI, Goose, Qwen, Kimi Code, Grok Build, Mistral Vibe, Forge, Kode, Pi, Nanocoder,
-Hermes, MiMo, Junie, then DeepSeek/Kiro/OpenClaw after gates close.
-
-### HAD-09 — explicit/project/env wave
-
-Amp, Continue, Factory Droid, gptme, Plandex, SWE-agent, Trae, OpenHands, Letta Code.
-
-### HAD-10 — IDE/orchestrator/constrained wave
-
-Antigravity, Cursor, Kilo, Warp, Windsurf, Zed, Auggie, Conductor, Sculptor.
-
-### HAD-11 — migration-only wave
-
-Gemini CLI, Amazon Q, iFlow, Roo Code, legacy Kimi, Vibe Kanban.
-
-Migration-only support includes:
-
-- Detect and inspect.
-- Back up/export relevant user-editable config.
-- Point to successor and show source-to-target mapping where documented.
-- Never create new instances by default.
-- Never delete predecessor data during successor setup.
-
-## Research closure protocol
-
-For each source-marked gap:
-
-1. Recheck official docs/repository/schema for installed version.
-2. Capture sanitized real fixtures on every relevant OS.
-3. Record verified path, precedence, mutation surface, and isolation behavior.
-4. Test concurrent launches where wrapper isolation is uncertain.
-5. Update harness research doc.
-6. Move support state only after conformance tests exist.
-
-Community/inferred claims may guide a probe but cannot authorize a write.
 
 Priority gaps:
 
@@ -237,19 +81,6 @@ Priority gaps:
 - Warp XDG behavior outside documented Linux path.
 - IDE credential/global-storage relocation on each OS.
 
-## Per-adapter change-set template
-
-1. Metadata/detection/version parser.
-2. Sanitized fixtures: minimal, realistic, foreign keys, malformed, old/new.
-3. Path/surface/precedence resolver.
-4. Read/effective-state mapping.
-5. Owned mutation mappings.
-6. Isolation/wrapper/discovery plan.
-7. Skill/plugin/MCP mappings.
-8. Conformance and failure tests.
-9. Support ledger/research-doc update.
-
-Small adapters may combine these; never combine unrelated harnesses merely to reduce change count.
 
 ## Exit gate
 
@@ -260,6 +91,8 @@ Small adapters may combine these; never combine unrelated harnesses merely to re
 - [x] Auto-managed/keychain/opaque files cannot enter mutation plans.
 - [x] All path/version/precedence claims have fixtures or official evidence.
 - [x] No harness is dropped because it lacks full isolation or custom endpoints.
+
+## Residuals
 
 > Completion record (run 3): all 48 catalog rows registered and fixture-corpus-covered
 > (`all_adapters_span_catalog`, `ledger_coverage_has_known_harnesses` — now enforced over
@@ -274,4 +107,3 @@ Small adapters may combine these; never combine unrelated harnesses merely to re
 > exercised at the mutation layer all adapter writes share (per-step-kind §4.2 tests, area
 > 2); the `conflict_detection_placeholder_no_panic` adapter tests remain as smoke coverage
 > by area-3 decision.
-
