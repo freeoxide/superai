@@ -74,7 +74,36 @@ boxes are completion records.
 > the platform CI runners); mutation-score uplift and coverage-guided
 > fuzz budget are recorded follow-ups.
 
-## Non-UI definition of done
+## 9. Cross-plan coverage of goal.md
+
+| Goal requirement | Owning subplans |
+|---|---|
+| Existing/default installs are managed targets | 03, 04, 05 |
+| Instance records store only superai-owned facts | 00, 04 |
+| Template version per instance | 00, 08 |
+| Drift scan, adopt/remove, foreign-manager coexistence | 05 |
+| Mirror existing then isolate | 04, 06 |
+| Remote versioned templates; diff; manual updates | 08 |
+| Native/substituted/absent capability matrix | 09 |
+| Per-harness version-aware config | 01–03 |
+| Fresh disk read; preserve unmodelled keys | 01, 02 |
+| Backup before every foreign-file write | 02 |
+| Wrapper generation; arbitrary user names | 06 |
+| Every researched harness, including awkward ones | 03 |
+| Provider endpoints/models/health/API keys, data-driven | 07 |
+| Skill registry; whole/specific symlink or copy | 10 |
+| Plugins and MCP servers from instance definition | 10 |
+| Install/uninstall; existing-install detection | 11 |
+| Raw TOML/JSON editors with validation | 12 |
+| No vault and no OAuth | 00, 07, 13 |
+| claude-multi coexistence; no import | 05 |
+| Config → Core → Interface dependency direction | 00, 13 |
+| Filesystem first, interface last | roadmap milestones A–H |
+| No proxy/routing implementation | 00, 07, 13 |
+| Rust/local/one binary | 00, 11, 13 |
+
+
+## 10. Non-UI definition of done
 
 - [x] Every goal.md non-interface sentence maps to implemented behavior or explicit unsupported
       state in the coverage ledger.
