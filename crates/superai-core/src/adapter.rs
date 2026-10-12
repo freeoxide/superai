@@ -1463,10 +1463,6 @@ impl Adapter for GenericAdapter {
         }
     }
 
-    fn version_resolution(&self) -> VersionResolution {
-        VersionResolution::unknown()
-    }
-
     fn config_surfaces(&self) -> Vec<ConfigSurface> {
         // Placeholder single surface; real adapters enumerate every surface.
         let resolver = PathResolver::fallback_only(&self.source);

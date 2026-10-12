@@ -11,34 +11,49 @@ use crate::adapter::DetectionConfidence;
 use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence};
 
+pub mod agentty;
 pub mod aider;
 pub mod amazon_q;
 pub mod amp;
 pub mod antigravity;
 pub mod auggie;
+pub mod avante_nvim;
+pub mod bb_app;
 pub mod chatgpt_desktop;
 pub mod claude_code;
 pub mod claude_desktop;
+pub mod claw_code;
 pub mod cline;
 pub mod coco;
+pub mod codecompanion_nvim;
+pub mod codegeex;
 pub mod codex_cli;
+pub mod command_code;
 pub mod conductor;
 pub mod continue_dev;
 pub mod copilot_cli;
 pub mod copilot_coding_agent;
+pub mod copilot_vscode;
 pub mod crush;
 pub mod cursor;
 pub mod cursor_agent;
 pub mod deepseek;
+pub mod devin;
+pub mod eca;
+pub mod every_code;
 pub mod factory_droid;
 pub mod forge;
+pub mod freebuff;
 pub mod fx;
 pub mod gemini_cli;
+pub mod gitclaw;
 pub mod goose;
 pub mod gptme;
 pub mod grok_build;
+pub mod hax;
 pub mod hermes;
 pub mod iflow;
+pub mod jcode;
 pub mod jules;
 pub mod junie;
 pub mod kilo;
@@ -53,21 +68,37 @@ pub mod minimax_code;
 pub mod mistral_vibe;
 pub mod muse_code;
 pub mod nanocoder;
+pub mod oh_my_codex;
+pub mod oh_my_opencode;
+pub mod omo_ai;
+pub mod omp;
 pub mod openclaw;
 pub mod opencode;
+pub mod openfang;
 pub mod openhands;
+pub mod orca;
+pub mod ori;
 pub mod pi;
 pub mod plandex;
+pub mod prime_agent;
 pub mod qoder_cli;
+pub mod qoder_ide;
 pub mod qwen_code;
+pub mod reasonix;
+pub mod replit_agent;
 pub mod roo_code;
 pub mod sculptor;
 pub mod swe_agent;
+pub mod t3code;
+pub mod terminus;
 pub mod trae_agent;
+pub mod unreal_agent;
 pub mod vibe_kanban;
+pub mod vix;
 pub mod warp;
 pub mod windsurf;
 pub mod workbuddy;
+pub mod zaly;
 pub mod zcode;
 pub mod zed_acp;
 pub mod zulu_cli;
@@ -409,9 +440,9 @@ pub(crate) fn desktop_platforms() -> Vec<crate::adapter::Platform> {
     ]
 }
 
-/// The 11-operation row, every op [`AdapterSupport::Full`], shared by
-/// adapters that support the whole catalog surface.
-pub(crate) fn all_operations_full() -> Vec<(String, AdapterSupport)> {
+/// The 11-operation row, every op at `support`, shared by adapters whose
+/// whole surface sits at one support level.
+pub(crate) fn operations_at(support: AdapterSupport) -> Vec<(String, AdapterSupport)> {
     [
         "detect",
         "read_config",
@@ -426,8 +457,14 @@ pub(crate) fn all_operations_full() -> Vec<(String, AdapterSupport)> {
         "validate_instance",
     ]
     .into_iter()
-    .map(|op| (op.to_owned(), AdapterSupport::Full))
+    .map(|op| (op.to_owned(), support))
     .collect()
+}
+
+/// The 11-operation row, every op [`AdapterSupport::Full`], shared by
+/// adapters that support the whole catalog surface.
+pub(crate) fn all_operations_full() -> Vec<(String, AdapterSupport)> {
+    operations_at(AdapterSupport::Full)
 }
 
 /// Skill modes, link-first: `relink_skills` takes the first mode.
@@ -1011,28 +1048,36 @@ mod decl_tests {
     /// (harness id, expected dest file, expected dest key) for every adapter
     /// that declares an MCP destination, per docs/harness-configs/<doc>.md.
     const MCP_DESTS: &[(&str, &str, &str)] = &[
+        ("agentty", "mcp.json", "mcpServers"),
         ("amazon-q-cli", "settings.json", "mcpServers"),
         ("amp", "settings.json", "amp.mcpServers"),
         ("antigravity-cli", "mcp_config.json", "mcpServers"),
         ("auggie", "settings.json", "mcpServers"),
         ("claude-code", ".mcp.json", "mcpServers"),
         ("claude-desktop", "claude_desktop_config.json", "mcpServers"),
+        ("claw-code", "settings.json", "mcpServers"),
         ("cline", "cline_mcp_settings.json", "mcpServers"),
         ("coco", "cortex/mcp.json", "mcpServers"),
         ("codex-cli", "config.toml", "mcp_servers"),
+        ("command-code", "mcp.json", "mcpServers"),
         ("continue-dev", "config.yaml", "mcpServers"),
         ("copilot-cli", "mcp-config.json", "mcpServers"),
+        ("copilot-vscode", ".vscode/mcp.json", "servers"),
         ("crush", "crush.json (global)", "mcp"),
         ("cursor", "mcp.json", "mcpServers"),
         ("cursor-agent", "mcp.json", "mcpServers"),
+        ("devin", ".devin/mcp_config.json", "mcpServers"),
+        ("every-code", "config.toml", "mcp_servers"),
         ("factory-droid", ".factory/mcp.json", "mcpServers"),
         ("forge", ".mcp.json", "mcpServers"),
         ("fx", "mcp.json", "mcp"),
         ("gemini-cli", "settings.json", "mcpServers"),
+        ("gitclaw", "agent.yaml", "mcp_servers"),
         ("goose", "config.yaml", "extensions"),
         ("grok-build", "config.toml", "mcp_servers"),
         ("hermes-agent", "config.yaml", "mcp_servers"),
         ("iflow-cli", "settings.json (user)", "mcpServers"),
+        ("jcode", "mcp.json", "mcpServers"),
         ("junie-cli", "mcp/mcp.json", "mcpServers"),
         ("kilo-code", "global kilo.jsonc", "mcp"),
         ("kilocode-cli", "kilo.jsonc", "mcp"),
@@ -1045,7 +1090,10 @@ mod decl_tests {
         ("mistral-vibe", "config.toml", "mcp_servers"),
         ("muse-code", "settings.json", "mcp_servers"),
         ("nanocoder", ".mcp.json", "mcpServers"),
+        ("omo-ai", "omo.jsonc", "mcp"),
+        ("omp", ".mcp.json", "mcpServers"),
         ("opencode", "opencode.json", "mcp"),
+        ("openfang", "config.toml", "mcp_servers"),
         ("openhands", "mcp.json", "mcpServers"),
         ("qoder-cli", "settings.json", "mcpServers"),
         ("qwen-code", "settings.json", "mcpServers"),
@@ -1061,19 +1109,39 @@ mod decl_tests {
     /// Harnesses whose corpus documents NO MCP mechanism (explicit absence).
     const MCP_ABSENT: &[&str] = &[
         "aider",
+        "avante-nvim",
+        "bb-app",
         "chatgpt-desktop",
+        "codecompanion-nvim",
+        "codegeex",
         "conductor",
         "copilot-coding-agent",
         "deepseek-harness",
+        "eca",
+        "freebuff",
         "gptme",
+        "hax",
         "jules",
         "letta-code",
+        "oh-my-codex",
+        "oh-my-opencode",
         "openclaw",
+        "orca",
+        "ori",
         "pi",
         "plandex",
+        "prime-agent",
+        "qoder-ide",
+        "reasonix",
+        "replit-agent",
         "sculptor",
         "swe-agent",
+        "t3code",
+        "terminus",
+        "unreal-agent",
         "vibe-kanban",
+        "vix",
+        "zaly",
         "zcode",
     ];
 
@@ -1083,6 +1151,7 @@ mod decl_tests {
         ("amp", "directory_bundle", false),
         ("claude-code", "directory_bundle", false),
         ("coco", "directory_bundle", false),
+        ("gitclaw", "directory_bundle", false),
         ("grok-build", "directory_bundle", false),
         ("hermes-agent", "npm_ref", true),
         ("junie-cli", "directory_bundle", false),
@@ -1093,9 +1162,16 @@ mod decl_tests {
     ];
 
     /// Expected document kind for a declared MCP destination: JSONC configs
-    /// are not always named `*.jsonc` (amp/kilo/mimo/opencode).
+    /// are not always named `*.jsonc` (amp/kilo/mimo/omo-ai/opencode).
     fn expected_dest_kind(harness_id: &str, dest_file: &str) -> DocumentKind {
-        const JSONC_DESTS: &[&str] = &["amp", "kilo-code", "kilocode-cli", "mimo-code", "opencode"];
+        const JSONC_DESTS: &[&str] = &[
+            "amp",
+            "kilo-code",
+            "kilocode-cli",
+            "mimo-code",
+            "omo-ai",
+            "opencode",
+        ];
         let ext = std::path::Path::new(dest_file)
             .extension()
             .map(|e| e.to_string_lossy().to_ascii_lowercase())
@@ -1200,9 +1276,9 @@ mod decl_tests {
 
     /// Verified corpus partition of the MCP declarations: any drift in the
     /// writable/read-only/absence split fails with the real numbers.
-    const EXPECTED_MCP_WRITABLE: usize = 26;
-    const EXPECTED_MCP_READ_ONLY: usize = 19;
-    const EXPECTED_MCP_ABSENT: usize = 15;
+    const EXPECTED_MCP_WRITABLE: usize = 34;
+    const EXPECTED_MCP_READ_ONLY: usize = 22;
+    const EXPECTED_MCP_ABSENT: usize = 35;
 
     #[test]
     fn every_adapter_declares_mcp_dest_or_explicit_absence() {
