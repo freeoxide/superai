@@ -1,6 +1,6 @@
 # Agent Harness Configuration Bible — Master Index
 
-Research catalog of known harness config surfaces — config files, env vars, provider integration, and multi-instance wrapper techniques — compiled 2026-08-25 by parallel research agents against official docs and repos at that date (claude-desktop + chatgpt-desktop added 2026-09-18; muse-code, qoder-cli, zulu-cli, minimax-code, coco, fx, jules, cursor-agent, kilocode-cli added 2026-10-12, plus the missing letta-code row). Each file cites its sources inline; where docs are thin or a surface could not be verified, the file flags the gap explicitly rather than inferring. Where a capability is absent (e.g., no BYO endpoint), the file states that explicitly. Ledger support states and last-verified dates live in [03-harness-adapters.md](../plans/03-harness-adapters.md) and `crates/superai-core/src/harness_catalog.rs` (60 surfaces: 24 Full, 22 Constrained, 1 SingleInstance, 6 MigrationOnly, 4 ResearchBlocked, 1 Unsupported, 2 ReadOnly; last_verified spans 2026-08-25 to 2026-09-18, the ledger freshness anchor).
+Research catalog of known harness config surfaces — config files, env vars, provider integration, and multi-instance wrapper techniques — compiled 2026-08-25 by parallel research agents against official docs and repos at that date (claude-desktop + chatgpt-desktop added 2026-09-18; muse-code, qoder-cli, zulu-cli, minimax-code, coco, fx, jules, cursor-agent, kilocode-cli added 2026-10-12, plus the missing letta-code row; 13 tier-2 docs added 2026-10-12: devin, replit-agent, copilot-vscode, oh-my-opencode, oh-my-codex, t3code, orca, bb-app, avante-nvim, codecompanion-nvim, codegeex, terminus, qoder-ide; 18 tier-3 docs added 2026-10-12: every-code, claw-code, agentty, command-code, eca, freebuff, gitclaw, hax, jcode, omo-ai, omp, openfang, ori, prime-agent, reasonix, unreal-agent, vix, zaly). Each file cites its sources inline; where docs are thin or a surface could not be verified, the file flags the gap explicitly rather than inferring. Where a capability is absent (e.g., no BYO endpoint), the file states that explicitly. Ledger support states and last-verified dates live in [03-harness-adapters.md](../plans/03-harness-adapters.md) and `crates/superai-core/src/harness_catalog.rs` (91 surfaces: 26 Full, 46 Constrained, 1 SingleInstance, 7 MigrationOnly, 7 ResearchBlocked, 2 Unsupported, 2 ReadOnly; last_verified spans 2026-08-25 to 2026-09-18, the ledger freshness anchor).
 
 ## The Documents
 
@@ -45,6 +45,27 @@ Research catalog of known harness config surfaces — config files, env vars, pr
 | Cursor Agent CLI | [cursor-agent.md](cursor-agent.md) | `CURSOR_CONFIG_DIR` (cli-config.json only; mcp.json stays under `~/.cursor`) — CLI half of [cursor.md](cursor.md) |
 | Kilo CLI | [kilocode-cli.md](kilocode-cli.md) | `KILO_CONFIG_CONTENT` / HOME or XDG relocation (no dedicated dir var) — CLI half of [kilo-code.md](kilo-code.md) |
 | Letta Code | [letta-code.md](letta-code.md) | `LETTA_LOCAL_BACKEND_DIR` + `LETTA_BASE_URL` per instance |
+| Devin CLI (Cognition) | [devin.md](devin.md) | `--config <PATH>` + `DEVIN_MODEL`/`DEVIN_PERMISSION_MODE`; no config-dir env var documented |
+| oh-my-codex (`omx`) | [oh-my-codex.md](oh-my-codex.md) | inherits `CODEX_HOME`; per-project `.omx/` state and worktrees; writes `.codex/config.toml` |
+| Oh My OpenCode (plugin) | [oh-my-opencode.md](oh-my-opencode.md) | inherits OpenCode levers; upstream renamed to oh-my-openagent (OmO), plugin fork dormant |
+| T3 Code (`t3`) | [t3code.md](t3code.md) | `--base-dir` independent server root; agents keep their own config trees |
+| Every Code (`code`/`coder`) | [every-code.md](every-code.md) | `CODE_HOME`; reads legacy `~/.codex` (writes only `~/.code`) — Codex-fork half of [codex-cli.md](codex-cli.md) |
+| Claw Code (`claw`) | [claw-code.md](claw-code.md) | `CLAW_CONFIG_HOME`; build-from-source only, crates.io `claw-code` is a stub |
+| agentty | [agentty.md](agentty.md) | `AGENTTY_HOME` + per-dir `AGENTTY_*_DIR` vars; MCP trust model (project needs user-side approval) |
+| Command Code (`cmd`/`cmdc`) | [command-code.md](command-code.md) | none documented — fixed `~/.commandcode`; `cmd -p --output-format json` headless |
+| Freebuff CLI | [freebuff.md](freebuff.md) | `FREEBUFF_CONFIG_DIR` (absolute only); default root `~/.config/manicode`; BYOK via OS secret service |
+| Gitagent (ledger `gitclaw`) | [gitclaw.md](gitclaw.md) | agent-dir isolation via `--dir`; config IS a git repo (`agent.yaml`, `SOUL.md`, `memory/`) |
+| hax | [hax.md](hax.md) | XDG dirs (`XDG_CONFIG_HOME`/`XDG_STATE_HOME`); no MCP/plugins by design |
+| jcode | [jcode.md](jcode.md) | none documented — `~/.jcode/config.toml`; cross-reads `~/.claude.json` and Codex MCP |
+| OmO (`omo`) | [omo-ai.md](omo-ai.md) | `~/.omo/omo.jsonc` layer walk + `OMO_PROFILE` — CLI rename target of [oh-my-opencode.md](oh-my-opencode.md) |
+| omp (oh-my-pi) | [omp.md](omp.md) | `~/.omp/agent/{config,models}.yml`; inherits `.claude`/`.codex`/`.cursor` rules+MCP on first run |
+| OpenFang | [openfang.md](openfang.md) | `OPENFANG_HOME` (+ `--config <PATH>` per run); agent-OS daemon, secrets by env-name only |
+| Ori (OpenRouter) | [ori.md](ori.md) | `ORI_INSTALL_DIR` (install only); wraps other harnesses via `ori claude/codex/hermes` |
+| Prime Agent | [prime-agent.md](prime-agent.md) | `PRIME_AGENT_CODING_AGENT_DIR` (root `~/.prime/agent`); daemon-backed sessions |
+| Reasonix | [reasonix.md](reasonix.md) | none documented — `~/.reasonix/config.json` + project `.reasonix/`; DeepSeek-only, Go v2 line |
+| Unreal Agent (`uat`) | [unreal-agent.md](unreal-agent.md) | `UNREAL_HARNESS_LLM_*` per launch; prefs at `~/.config/unreal-agent/preferences.json`; reads Codex login |
+| vix | [vix.md](vix.md) | `~/.vix` / `./.vix` `providers.json`; `vixd` daemon + isolated `vix` instances |
+| zaly | [zaly.md](zaly.md) | `ZALY_ROOT` (or per-key `ZALY_*`) — alpha; no MCP yet |
 
 ### IDE / editor-integrated agents
 | Harness | File | Wrapper notes |
@@ -60,12 +81,20 @@ Research catalog of known harness config surfaces — config files, env vars, pr
 | Auggie (Augment) | [auggie.md](auggie.md) | proprietary context engine; headless `--print` |
 | Hermes Agent (Nous) | [hermes-agent.md](hermes-agent.md) | `HERMES_HOME` + `--profile`; local-install-verified `[L]` tags |
 | OpenClaw | [openclaw.md](openclaw.md) | `OPENCLAW_HOME` / `OPENCLAW_CONFIG_PATH`. Daemon, so instances mean running services |
+| VS Code Copilot Agent Mode | [copilot-vscode.md](copilot-vscode.md) | `code --user-data-dir` + profiles; writable mcp.json at three scopes — IDE half of [copilot-cli.md](copilot-cli.md) |
+| avante.nvim | [avante-nvim.md](avante-nvim.md) | Lua-only config (setup/plugin spec); no config file; MCP via mcphub.nvim |
+| codecompanion.nvim | [codecompanion-nvim.md](codecompanion-nvim.md) | Lua `setup()` only; native MCP under `mcp` key; built-in ACP client |
+| CodeGeeX (Zhipu AI) | [codegeex.md](codegeex.md) | none documented — host-IDE settings; completion/chat plugin, no MCP |
+| Qoder IDE and Desktop | [qoder-ide.md](qoder-ide.md) | UI settings + MCP JSON editor, no documented paths — IDE half of [qoder-cli.md](qoder-cli.md) |
+| ECA (Editor Code Assistant) | [eca.md](eca.md) | `~/.config/eca/config.json` + `.eca/` project + `ECA_CONFIG` inline; one config for every editor plugin |
 
 ### Desktop apps
 | Harness | File | Wrapper notes |
 |---|---|---|
 | Claude Desktop (Anthropic) | [claude-desktop.md](claude-desktop.md) | **no relocation knob (verified-absent)** — writable `mcpServers` at the fixed per-OS default root; aliasing honestly refused; Linux beta |
 | ChatGPT Desktop (Chat + Work + Codex) | [chatgpt-desktop.md](chatgpt-desktop.md) | **no app-level relocation**; read-only on `~/.codex` which belongs to [codex-cli.md](codex-cli.md) — alias via `CODEX_HOME` there; Linux preview |
+| Orca (Stably AI) | [orca.md](orca.md) | ADE for agent fleets; per-agent binary/env overrides; `~/.orca/` + repo `orca.yaml` |
+| bb (get-bb) | [bb-app.md](bb-app.md) | `BB_DATA_DIR` data-root override + `BB_SERVER_PORT`; ACP agents auto-register |
 
 ### Self-hosted / cloud platforms & frameworks
 | Harness | File | Wrapper notes |
@@ -74,6 +103,8 @@ Research catalog of known harness config surfaces — config files, env vars, pr
 | SWE-agent (Princeton) | [swe-agent.md](swe-agent.md) | YAML config files + batch instances w/ different settings |
 | Factory Droid | [factory-droid.md](factory-droid.md) | `~/.factory/settings.json` + `customModels` OpenAI-compatible blocks |
 | Copilot Coding Agent | [copilot-cli.md](copilot-cli.md) | cloud side has NO BYO endpoint (documented) |
+| Replit Agent | [replit-agent.md](replit-agent.md) | cloud workspace; skills at `/.agents/skills/`, MCP via replit.com/integrations (HTTPS only); nothing local |
+| Terminus (Terminal-Bench) | [terminus.md](terminus.md) | benchmark agent; runs via Harbor (`--ak`/`--ae` per run); no user config surface |
 | Orchestrators: Vibe Kanban · Conductor · Sculptor | [orchestrators.md](orchestrators.md) | THE meta-wrapper doc: how each GUI injects env/creds into spawned harnesses |
 
 ## Universal patterns (the cheat-sheet)
