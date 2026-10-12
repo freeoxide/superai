@@ -49,23 +49,23 @@ Research catalog of known harness config surfaces — config files, env vars, pr
 | oh-my-codex (`omx`) | [oh-my-codex.md](oh-my-codex.md) | inherits `CODEX_HOME`; per-project `.omx/` state and worktrees; writes `.codex/config.toml` |
 | Oh My OpenCode (plugin) | [oh-my-opencode.md](oh-my-opencode.md) | inherits OpenCode levers; upstream renamed to oh-my-openagent (OmO), plugin fork dormant |
 | T3 Code (`t3`) | [t3code.md](t3code.md) | `--base-dir` independent server root; agents keep their own config trees |
-| Every Code (`code`/`coder`) | [every-code.md](every-code.md) | `CODE_HOME`; reads legacy `~/.codex` (writes only `~/.code`) — Codex-fork half of [codex-cli.md](codex-cli.md) |
+| Every Code (`code`/`coder`) | [every-code.md](every-code.md) | `CODE_HOME`; reads legacy `~/.codex` (writes only `~/.code`); Codex-fork half of [codex-cli.md](codex-cli.md) |
 | Claw Code (`claw`) | [claw-code.md](claw-code.md) | `CLAW_CONFIG_HOME`; build-from-source only, crates.io `claw-code` is a stub |
 | agentty | [agentty.md](agentty.md) | `AGENTTY_HOME` + per-dir `AGENTTY_*_DIR` vars; MCP trust model (project needs user-side approval) |
-| Command Code (`cmd`/`cmdc`) | [command-code.md](command-code.md) | none documented — fixed `~/.commandcode`; `cmd -p --output-format json` headless |
+| Command Code (`cmd`/`cmdc`) | [command-code.md](command-code.md) | none documented; fixed `~/.commandcode`, `cmd -p --output-format json` headless |
 | Freebuff CLI | [freebuff.md](freebuff.md) | `FREEBUFF_CONFIG_DIR` (absolute only); default root `~/.config/manicode`; BYOK via OS secret service |
 | Gitagent (ledger `gitclaw`) | [gitclaw.md](gitclaw.md) | agent-dir isolation via `--dir`; config IS a git repo (`agent.yaml`, `SOUL.md`, `memory/`) |
 | hax | [hax.md](hax.md) | XDG dirs (`XDG_CONFIG_HOME`/`XDG_STATE_HOME`); no MCP/plugins by design |
-| jcode | [jcode.md](jcode.md) | none documented — `~/.jcode/config.toml`; cross-reads `~/.claude.json` and Codex MCP |
-| OmO (`omo`) | [omo-ai.md](omo-ai.md) | `~/.omo/omo.jsonc` layer walk + `OMO_PROFILE` — CLI rename target of [oh-my-opencode.md](oh-my-opencode.md) |
+| jcode | [jcode.md](jcode.md) | none documented; `~/.jcode/config.toml`, cross-reads `~/.claude.json` and Codex MCP |
+| OmO (`omo`) | [omo-ai.md](omo-ai.md) | `~/.omo/omo.jsonc` layer walk + `OMO_PROFILE`; CLI rename target of [oh-my-opencode.md](oh-my-opencode.md) |
 | omp (oh-my-pi) | [omp.md](omp.md) | `~/.omp/agent/{config,models}.yml`; inherits `.claude`/`.codex`/`.cursor` rules+MCP on first run |
 | OpenFang | [openfang.md](openfang.md) | `OPENFANG_HOME` (+ `--config <PATH>` per run); agent-OS daemon, secrets by env-name only |
 | Ori (OpenRouter) | [ori.md](ori.md) | `ORI_INSTALL_DIR` (install only); wraps other harnesses via `ori claude/codex/hermes` |
 | Prime Agent | [prime-agent.md](prime-agent.md) | `PRIME_AGENT_CODING_AGENT_DIR` (root `~/.prime/agent`); daemon-backed sessions |
-| Reasonix | [reasonix.md](reasonix.md) | none documented — `~/.reasonix/config.json` + project `.reasonix/`; DeepSeek-only, Go v2 line |
+| Reasonix | [reasonix.md](reasonix.md) | none documented; `~/.reasonix/config.json` + project `.reasonix/`, DeepSeek-only, Go v2 line |
 | Unreal Agent (`uat`) | [unreal-agent.md](unreal-agent.md) | `UNREAL_HARNESS_LLM_*` per launch; prefs at `~/.config/unreal-agent/preferences.json`; reads Codex login |
 | vix | [vix.md](vix.md) | `~/.vix` / `./.vix` `providers.json`; `vixd` daemon + isolated `vix` instances |
-| zaly | [zaly.md](zaly.md) | `ZALY_ROOT` (or per-key `ZALY_*`) — alpha; no MCP yet |
+| zaly | [zaly.md](zaly.md) | `ZALY_ROOT` (or per-key `ZALY_*`); alpha, no MCP yet |
 
 ### IDE / editor-integrated agents
 | Harness | File | Wrapper notes |
@@ -81,11 +81,11 @@ Research catalog of known harness config surfaces — config files, env vars, pr
 | Auggie (Augment) | [auggie.md](auggie.md) | proprietary context engine; headless `--print` |
 | Hermes Agent (Nous) | [hermes-agent.md](hermes-agent.md) | `HERMES_HOME` + `--profile`; local-install-verified `[L]` tags |
 | OpenClaw | [openclaw.md](openclaw.md) | `OPENCLAW_HOME` / `OPENCLAW_CONFIG_PATH`. Daemon, so instances mean running services |
-| VS Code Copilot Agent Mode | [copilot-vscode.md](copilot-vscode.md) | `code --user-data-dir` + profiles; writable mcp.json at three scopes — IDE half of [copilot-cli.md](copilot-cli.md) |
+| VS Code Copilot Agent Mode | [copilot-vscode.md](copilot-vscode.md) | `code --user-data-dir` + profiles; writable mcp.json at three scopes; IDE half of [copilot-cli.md](copilot-cli.md) |
 | avante.nvim | [avante-nvim.md](avante-nvim.md) | Lua-only config (setup/plugin spec); no config file; MCP via mcphub.nvim |
 | codecompanion.nvim | [codecompanion-nvim.md](codecompanion-nvim.md) | Lua `setup()` only; native MCP under `mcp` key; built-in ACP client |
-| CodeGeeX (Zhipu AI) | [codegeex.md](codegeex.md) | none documented — host-IDE settings; completion/chat plugin, no MCP |
-| Qoder IDE and Desktop | [qoder-ide.md](qoder-ide.md) | UI settings + MCP JSON editor, no documented paths — IDE half of [qoder-cli.md](qoder-cli.md) |
+| CodeGeeX (Zhipu AI) | [codegeex.md](codegeex.md) | none documented; host-IDE settings, completion/chat plugin, no MCP |
+| Qoder IDE and Desktop | [qoder-ide.md](qoder-ide.md) | UI settings + MCP JSON editor, no documented paths; IDE half of [qoder-cli.md](qoder-cli.md) |
 | ECA (Editor Code Assistant) | [eca.md](eca.md) | `~/.config/eca/config.json` + `.eca/` project + `ECA_CONFIG` inline; one config for every editor plugin |
 
 ### Desktop apps

@@ -132,18 +132,23 @@ impl Adapter for CodecompanionNvimAdapter {
         let mut plan = WrapperPlan::new("neovim config-root isolation");
         plan.description = format!(
             " codecompanion.nvim configuration lives in the Neovim init files (setup() table, \
-             including the native mcp key with stdio servers); isolate per instance with a \
-             separate NVIM_APPNAME or XDG_CONFIG_HOME pointing at config_root {}; adapter API \
-             keys are per-process env vars (codecompanion-nvim.md sections 3, 6-7)",
+             including the native mcp key with stdio servers); isolate per instance with \
+             XDG_CONFIG_HOME pointing at config_root {}, so nvim resolves its config at \
+             config_root/nvim whatever the root's basename is; an inherited NVIM_APPNAME is \
+             unset to keep that location fixed; adapter API keys are per-process env vars \
+             (codecompanion-nvim.md sections 3, 6-7)",
             instance.config_root
         );
         plan.env_vars.push((
-            "NVIM_APPNAME".to_owned(),
-            instance.config_root.as_path().file_name().map_or_else(
-                || "codecompanion-work".to_owned(),
-                |n| n.to_string_lossy().into_owned(),
-            ),
+            "XDG_CONFIG_HOME".to_owned(),
+            instance.config_root.to_string(),
         ));
+        plan.env_unset.push("NVIM_APPNAME".to_owned());
+        plan.shared_state_warnings.push(
+            "only the Neovim config root is isolated; nvim data, state, and cache stay in the \
+             user's XDG tree (the fetched pages discuss config roots only)"
+                .to_owned(),
+        );
         Ok(plan)
     }
 
@@ -236,9 +241,56 @@ mod tests {
     }
 
     #[test]
-    fn wrapper_keeps_env_vars_to_the_host_editor() {
-        let plan = adapter().plan_wrapper(&sample_instance()).unwrap();
-        assert!(plan.env_vars.iter().all(|(k, _)| k == "NVIM_APPNAME"));
+    fn wrapper_relocates_the_nvim_config_root() {
+        let inst = sample_instance();
+        let plan = adapter().plan_wrapper(&inst).unwrap();
+        let xdg = plan
+            .env_vars
+            .iter()
+            .find(|(k, _)| k == "XDG_CONFIG_HOME")
+            .expect("XDG_CONFIG_HOME must be set");
+        assert_eq!(xdg.1, inst.config_root.to_string());
+        assert!(
+            plan.env_vars.iter().all(|(k, _)| k != "NVIM_APPNAME"),
+            "NVIM_APPNAME must not be derived from the root basename"
+        );
+        assert!(plan.env_unset.contains(&"NVIM_APPNAME".to_owned()));
+    }
+
+    #[test]
+    fn same_basename_config_roots_resolve_apart() {
+        let mut a = sample_instance();
+        a.config_root = AbsolutePath::new(
+            &crate::test_util::tmp_abs("cc-nvim-collide-a")
+                .join("work")
+                .to_string_lossy(),
+        )
+        .unwrap();
+        let mut b = sample_instance();
+        b.config_root = AbsolutePath::new(
+            &crate::test_util::tmp_abs("cc-nvim-collide-b")
+                .join("work")
+                .to_string_lossy(),
+        )
+        .unwrap();
+        assert_eq!(
+            a.config_root.as_path().file_name(),
+            b.config_root.as_path().file_name(),
+            "the fixture must exercise the basename collision"
+        );
+        let resolved = |inst: &Instance| {
+            let plan = adapter().plan_wrapper(inst).unwrap();
+            let xdg = plan
+                .env_vars
+                .iter()
+                .find(|(k, _)| k == "XDG_CONFIG_HOME")
+                .expect("XDG_CONFIG_HOME must be set");
+            std::path::Path::new(&xdg.1).join("nvim")
+        };
+        let (ra, rb) = (resolved(&a), resolved(&b));
+        assert!(ra.starts_with(a.config_root.as_path()));
+        assert!(rb.starts_with(b.config_root.as_path()));
+        assert_ne!(ra, rb, "distinct roots must resolve to distinct configs");
     }
 
     #[test]

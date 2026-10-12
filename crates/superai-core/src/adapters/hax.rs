@@ -189,10 +189,12 @@ impl Adapter for HaxAdapter {
         instance.validate()?;
         let mut plan = WrapperPlan::new("XDG trio wholesale relocation");
         plan.description = format!(
-            " hax moves config, state, and cache wholesale with the XDG trio: point \
-             XDG_CONFIG_HOME/XDG_STATE_HOME/XDG_CACHE_HOME at subdirs of config_root {}; \
-             credentials are env vars only, so per-instance is clean; state.json and the model \
-             catalog stay machine-local (hax.md sections 2-3)",
+            " hax moves config, state, and cache wholesale with the XDG trio: \
+             XDG_CONFIG_HOME/XDG_STATE_HOME/XDG_CACHE_HOME all point at config_root {}, and \
+             hax appends its own hax dir under each root, so config.json, state.json, and \
+             catalog.json land at config_root/hax; credentials are env vars only, so \
+             per-instance is clean; state.json and the model catalog stay machine-local \
+             (hax.md sections 2-3)",
             instance.config_root
         );
         let root = instance.config_root.to_string();
@@ -278,11 +280,30 @@ mod tests {
 
     #[test]
     fn wrapper_relocates_the_whole_xdg_trio() {
-        let plan = adapter().plan_wrapper(&sample_instance()).unwrap();
+        let inst = sample_instance();
+        let plan = adapter().plan_wrapper(&inst).unwrap();
         let vars: Vec<&str> = plan.env_vars.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(
             vars,
             vec!["XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"]
+        );
+        assert!(
+            plan.env_vars
+                .iter()
+                .all(|(_, v)| v == &inst.config_root.to_string()),
+            "the trio gets config_root itself; hax appends its own hax dir"
+        );
+        let config = plan
+            .env_vars
+            .iter()
+            .find(|(k, _)| k == "XDG_CONFIG_HOME")
+            .expect("XDG_CONFIG_HOME must be set");
+        assert_eq!(
+            std::path::Path::new(&config.1)
+                .join("hax")
+                .join("config.json"),
+            inst.config_root.as_path().join("hax").join("config.json"),
+            "the doc's default layout must resolve inside config_root"
         );
     }
 
