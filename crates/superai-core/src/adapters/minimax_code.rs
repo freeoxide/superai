@@ -100,10 +100,6 @@ impl MiniMaxCodeAdapter {
                     } else {
                         evidence.push(format!("config.yaml missing at {}", cfg.display()));
                     }
-                    let skills = root.join("skills");
-                    if skills.exists() {
-                        evidence.push(format!("skills dir present at {}", skills.display()));
-                    }
                 } else {
                     evidence.push(format!("data dir missing at {}", root.display()));
                 }
@@ -243,7 +239,11 @@ impl Adapter for MiniMaxCodeAdapter {
         surfaces.push(mcp);
 
         for (id, hint, precedence) in [
-            ("skills (.minimax)", "~/.minimax/skills/<name>/SKILL.md", 7),
+            (
+                "skills (.minimax)",
+                ".minimax/skills/<name>/SKILL.md (workspace)",
+                12,
+            ),
             (
                 "skills (.agents)",
                 ".agents/skills/<name>/SKILL.md (project)",
@@ -369,7 +369,7 @@ impl Adapter for MiniMaxCodeAdapter {
     fn plugin_decl(&self) -> Option<crate::adapter::PluginAdapterDecl> {
         Some(crate::adapter::PluginAdapterDecl::requires_execution(
             "mcode plugin marketplace (mcode plugin add <name>@official)",
-            ".minimax",
+            "mcode-managed plugin state (persistence path undocumented)",
             crate::adapter::PluginKind::MarketplaceRecord,
             RestartBehavior::Reload,
         ))
@@ -496,6 +496,21 @@ mod tests {
         assert_eq!(mcp.kind, DocumentKind::Json);
         assert_eq!(mcp.scope, ConfigScope::ProjectWorkspace);
         assert!(mcp.owned_selectors.contains(&"mcpServers".to_owned()));
+
+        let skills = surfaces
+            .iter()
+            .find(|s| s.id == "skills (.minimax)")
+            .expect("skills (.minimax)");
+        assert_eq!(
+            skills.scope,
+            ConfigScope::ProjectWorkspace,
+            "minimax-code.md section 5 lists .minimax/skills as a workspace root"
+        );
+        assert!(
+            !skills.path_resolver.fallback.starts_with('~'),
+            "no user-home skills root: {}",
+            skills.path_resolver.fallback
+        );
     }
 
     #[test]

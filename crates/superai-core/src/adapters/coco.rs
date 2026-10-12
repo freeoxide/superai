@@ -42,18 +42,6 @@ pub const SETTINGS_OWNED_SELECTORS: &[&str] = &["compactMode", "autoUpdate", "th
 pub const PERMISSIONS_OWNED_SELECTORS: &[&str] =
     &["onlyAllow", "defaultMode", "dangerouslyAllowAll"];
 
-/// Documented env var names; superai stores references only, never values.
-pub const KNOWN_ENV_VARS: &[&str] = &[
-    "SNOWFLAKE_HOME",
-    "CORTEX_AGENT_MODEL",
-    "CORTEX_ENABLE_MEMORY",
-    "COCO_DANGEROUS_MODE_REQUIRE_SQL_WRITE_PERMISSION",
-    "COCO_LOG_LEVEL",
-    "COCO_DEBUG",
-    "COCO_LOG_DIR",
-    "COCO_MCP_TOOL_TIMEOUT_MS",
-];
-
 /// Constrained note: no BYO endpoint; auth is a paid Snowflake account.
 pub const CONSTRAINED_NOTE: &str = "requires a paid Snowflake account (or CoCo CLI trial) plus the SNOWFLAKE.CORTEX_USER database role; no BYO provider endpoint; connections.toml is shared with the Snowflake CLI";
 

@@ -282,15 +282,23 @@ impl Adapter for FxAdapter {
         project_mcp.backup_required = false;
         surfaces.push(project_mcp);
 
-        for (id, hint) in [
-            ("skills (~/.fx)", "~/.fx/skills/<name>/SKILL.md"),
-            ("skills (.fx)", ".fx/skills/<name>/SKILL.md (project)"),
+        for (id, hint, scope) in [
+            (
+                "skills (~/.fx)",
+                "~/.fx/skills/<name>/SKILL.md",
+                ConfigScope::User,
+            ),
+            (
+                "skills (.fx)",
+                ".fx/skills/<name>/SKILL.md (project)",
+                ConfigScope::ProjectWorkspace,
+            ),
         ] {
             let mut surface = ConfigSurface::new(
                 id,
                 PathResolver::fallback_only(hint),
                 DocumentKind::TextFragment,
-                ConfigScope::User,
+                scope,
                 SurfaceOwnership::UserEditable,
             );
             surface.precedence = 7;
@@ -526,6 +534,21 @@ mod tests {
             .find(|s| s.id == "project .mcp.json")
             .expect("project .mcp.json");
         assert_eq!(project_mcp.owned_selectors, vec!["mcpServers".to_owned()]);
+
+        let project_skills = surfaces
+            .iter()
+            .find(|s| s.id == "skills (.fx)")
+            .expect("skills (.fx)");
+        assert_eq!(
+            project_skills.scope,
+            ConfigScope::ProjectWorkspace,
+            "fx.md section 5 scopes .fx/skills to the workspace"
+        );
+        let home_skills = surfaces
+            .iter()
+            .find(|s| s.id == "skills (~/.fx)")
+            .expect("skills (~/.fx)");
+        assert_eq!(home_skills.scope, ConfigScope::User);
     }
 
     #[test]
