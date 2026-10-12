@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "permissions": {"default_profile": "on_request"},
+  "tui": {"terminal_background": "dark"},
+  "mcp_servers": {
+    "git-tools": {"transport": "stdio", "command": "mcp-server-git", "args": []}
+  }
+}

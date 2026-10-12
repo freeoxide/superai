@@ -1,5 +1,5 @@
-//! Registered harness catalog: the 51 planned product surfaces.
-//! Every ledger row from `docs/plans/03-harness-adapters.md` is registered here.
+//! Registered harness catalog: 60 product surfaces — the 51 plan rows plus
+//! 9 research-verified additions (see each entry's source doc).
 
 use serde::{Deserialize, Serialize};
 
@@ -13,6 +13,7 @@ use crate::adapters::chatgpt_desktop::ChatGptDesktopAdapter;
 use crate::adapters::claude_code::ClaudeCodeAdapter;
 use crate::adapters::claude_desktop::ClaudeDesktopAdapter;
 use crate::adapters::cline::ClineAdapter;
+use crate::adapters::coco::CocoAdapter;
 use crate::adapters::codex_cli::CodexCliAdapter;
 use crate::adapters::conductor::ConductorAdapter;
 use crate::adapters::continue_dev::ContinueDevAdapter;
@@ -20,30 +21,37 @@ use crate::adapters::copilot_cli::CopilotCliAdapter;
 use crate::adapters::copilot_coding_agent::CopilotCodingAgentAdapter;
 use crate::adapters::crush::CrushAdapter;
 use crate::adapters::cursor::CursorAdapter;
+use crate::adapters::cursor_agent::CursorAgentAdapter;
 use crate::adapters::deepseek::DeepSeekAdapter;
 use crate::adapters::factory_droid::FactoryDroidAdapter;
 use crate::adapters::forge::ForgeAdapter;
+use crate::adapters::fx::FxAdapter;
 use crate::adapters::gemini_cli::GeminiCliAdapter;
 use crate::adapters::goose::GooseAdapter;
 use crate::adapters::gptme::GptmeAdapter;
 use crate::adapters::grok_build::GrokBuildAdapter;
 use crate::adapters::hermes::HermesAdapter;
 use crate::adapters::iflow::IflowAdapter;
+use crate::adapters::jules::JulesAdapter;
 use crate::adapters::junie::JunieAdapter;
 use crate::adapters::kilo::KiloAdapter;
+use crate::adapters::kilocode_cli::KilocodeCliAdapter;
 use crate::adapters::kimi_code::KimiCodeAdapter;
 use crate::adapters::kiro::KiroAdapter;
 use crate::adapters::kode::KodeAdapter;
 use crate::adapters::legacy_kimi::LegacyKimiAdapter;
 use crate::adapters::letta::LettaAdapter;
 use crate::adapters::mimo::MimoAdapter;
+use crate::adapters::minimax_code::MiniMaxCodeAdapter;
 use crate::adapters::mistral_vibe::MistralVibeAdapter;
+use crate::adapters::muse_code::MuseCodeAdapter;
 use crate::adapters::nanocoder::NanocoderAdapter;
 use crate::adapters::openclaw::OpenClawAdapter;
 use crate::adapters::opencode::OpenCodeAdapter;
 use crate::adapters::openhands::OpenHandsAdapter;
 use crate::adapters::pi::PiAdapter;
 use crate::adapters::plandex::PlandexAdapter;
+use crate::adapters::qoder_cli::QoderCliAdapter;
 use crate::adapters::qwen_code::QwenCodeAdapter;
 use crate::adapters::roo_code::RooCodeAdapter;
 use crate::adapters::sculptor::SculptorAdapter;
@@ -55,6 +63,7 @@ use crate::adapters::windsurf::WindsurfAdapter;
 use crate::adapters::workbuddy::WorkBuddyAdapter;
 use crate::adapters::zcode::ZcodeAdapter;
 use crate::adapters::zed_acp::ZedAcpAdapter;
+use crate::adapters::zulu_cli::ZuluCliAdapter;
 use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::state::{AdapterSupport, Isolation};
@@ -89,7 +98,7 @@ impl CatalogEntry {
     }
 }
 
-/// All 51 provisional ledger rows.
+/// All 60 provisional ledger rows.
 /// Order follows the plan table; every surface has a source and reason.
 pub const ENTRIES: &[CatalogEntry] = &[
     CatalogEntry {
@@ -192,6 +201,17 @@ pub const ENTRIES: &[CatalogEntry] = &[
         last_verified: "2026-08-25",
     },
     CatalogEntry {
+        id: "coco",
+        display_name: "Cortex Code (CoCo)",
+        source: "docs/harness-configs/coco.md",
+        support: AdapterSupport::Constrained,
+        reason: "SNOWFLAKE_HOME root relocation but paid-account-tied, no BYO endpoint",
+        isolation: Isolation::RelocatedRoot,
+        product_status: ProductStatus::Active,
+        research_doc: "docs/harness-configs/coco.md",
+        last_verified: "2026-09-18",
+    },
+    CatalogEntry {
         id: "codex-cli",
         display_name: "Codex CLI",
         source: "docs/harness-configs/codex-cli.md",
@@ -258,6 +278,17 @@ pub const ENTRIES: &[CatalogEntry] = &[
         last_verified: "2026-08-25",
     },
     CatalogEntry {
+        id: "cursor-agent",
+        display_name: "Cursor Agent CLI",
+        source: "docs/harness-configs/cursor-agent.md",
+        support: AdapterSupport::Constrained,
+        reason: "CURSOR_CONFIG_DIR relocates cli-config.json only; Cursor-backend-only auth",
+        isolation: Isolation::RelocatedRoot,
+        product_status: ProductStatus::Active,
+        research_doc: "docs/harness-configs/cursor-agent.md",
+        last_verified: "2026-09-18",
+    },
+    CatalogEntry {
         id: "deepseek-harness",
         display_name: "DeepSeek Harness",
         source: "docs/harness-configs/deepseek-harness.md",
@@ -289,6 +320,17 @@ pub const ENTRIES: &[CatalogEntry] = &[
         product_status: ProductStatus::Active,
         research_doc: "docs/harness-configs/forge.md",
         last_verified: "2026-08-25",
+    },
+    CatalogEntry {
+        id: "fx",
+        display_name: "fx (Vercel Labs)",
+        source: "docs/harness-configs/fx.md",
+        support: AdapterSupport::Full,
+        reason: "writable JSON at fixed ~/.fx root, any OpenAI-compatible endpoint",
+        isolation: Isolation::FixedPathSingle,
+        product_status: ProductStatus::Preview,
+        research_doc: "docs/harness-configs/fx.md",
+        last_verified: "2026-09-18",
     },
     CatalogEntry {
         id: "gemini-cli",
@@ -357,6 +399,17 @@ pub const ENTRIES: &[CatalogEntry] = &[
         last_verified: "2026-08-25",
     },
     CatalogEntry {
+        id: "jules",
+        display_name: "Jules CLI",
+        source: "docs/harness-configs/jules.md",
+        support: AdapterSupport::Constrained,
+        reason: "thin cloud-session client; no local config or MCP surface, server-side work",
+        isolation: Isolation::DaemonService,
+        product_status: ProductStatus::Active,
+        research_doc: "docs/harness-configs/jules.md",
+        last_verified: "2026-09-18",
+    },
+    CatalogEntry {
         id: "junie-cli",
         display_name: "Junie CLI",
         source: "docs/harness-configs/junie-cli.md",
@@ -377,6 +430,17 @@ pub const ENTRIES: &[CatalogEntry] = &[
         product_status: ProductStatus::Active,
         research_doc: "docs/harness-configs/kilo-code.md",
         last_verified: "2026-08-25",
+    },
+    CatalogEntry {
+        id: "kilocode-cli",
+        display_name: "Kilo CLI",
+        source: "docs/harness-configs/kilocode-cli.md",
+        support: AdapterSupport::Full,
+        reason: "OpenCode-fork JSONC, XDG/HOME root relocation: full candidate",
+        isolation: Isolation::RelocatedRoot,
+        product_status: ProductStatus::Active,
+        research_doc: "docs/harness-configs/kilocode-cli.md",
+        last_verified: "2026-09-18",
     },
     CatalogEntry {
         id: "kimi-code-cli",
@@ -445,6 +509,17 @@ pub const ENTRIES: &[CatalogEntry] = &[
         last_verified: "2026-08-25",
     },
     CatalogEntry {
+        id: "minimax-code",
+        display_name: "MiniMax Code",
+        source: "docs/harness-configs/minimax-code.md",
+        support: AdapterSupport::Full,
+        reason: "MINIMAX_DATA_DIR relocation, config.yaml BYOK: full candidate",
+        isolation: Isolation::RelocatedRoot,
+        product_status: ProductStatus::Active,
+        research_doc: "docs/harness-configs/minimax-code.md",
+        last_verified: "2026-09-18",
+    },
+    CatalogEntry {
         id: "mistral-vibe",
         display_name: "Mistral Vibe",
         source: "docs/harness-configs/mistral-vibe.md",
@@ -454,6 +529,17 @@ pub const ENTRIES: &[CatalogEntry] = &[
         product_status: ProductStatus::Active,
         research_doc: "docs/harness-configs/mistral-vibe.md",
         last_verified: "2026-08-25",
+    },
+    CatalogEntry {
+        id: "muse-code",
+        display_name: "Muse Code",
+        source: "docs/harness-configs/muse-code.md",
+        support: AdapterSupport::Constrained,
+        reason: "writable settings.json but Meta-backend-only auth, no relocation var",
+        isolation: Isolation::FixedPathSingle,
+        product_status: ProductStatus::Preview,
+        research_doc: "docs/harness-configs/muse-code.md",
+        last_verified: "2026-09-18",
     },
     CatalogEntry {
         id: "nanocoder",
@@ -520,6 +606,17 @@ pub const ENTRIES: &[CatalogEntry] = &[
         product_status: ProductStatus::Active,
         research_doc: "docs/harness-configs/plandex.md",
         last_verified: "2026-08-25",
+    },
+    CatalogEntry {
+        id: "qoder-cli",
+        display_name: "Qoder CLI",
+        source: "docs/harness-configs/qoder-cli.md",
+        support: AdapterSupport::Full,
+        reason: "QODER_CONFIG_DIR relocation, layered JSON settings: full candidate",
+        isolation: Isolation::RelocatedRoot,
+        product_status: ProductStatus::Active,
+        research_doc: "docs/harness-configs/qoder-cli.md",
+        last_verified: "2026-09-18",
     },
     CatalogEntry {
         id: "qwen-code",
@@ -621,6 +718,17 @@ pub const ENTRIES: &[CatalogEntry] = &[
         last_verified: "2026-08-25",
     },
     CatalogEntry {
+        id: "zulu-cli",
+        display_name: "Zulu CLI (Baidu Comate)",
+        source: "docs/harness-configs/zulu-cli.md",
+        support: AdapterSupport::Constrained,
+        reason: "license-key SaaS, no relocation var; .comate project files writable",
+        isolation: Isolation::ProjectScope,
+        product_status: ProductStatus::Active,
+        research_doc: "docs/harness-configs/zulu-cli.md",
+        last_verified: "2026-09-18",
+    },
+    CatalogEntry {
         id: "vibe-kanban",
         display_name: "Vibe Kanban",
         source: "docs/harness-configs/orchestrators.md",
@@ -669,7 +777,7 @@ pub fn find_by_id(id: &str) -> Option<&'static CatalogEntry> {
 /// fall back to a [`GenericAdapter`] built from the catalog row.
 #[expect(
     clippy::too_many_lines,
-    reason = "catalog has 51 entries with per-adapter branching"
+    reason = "catalog has 60 entries with per-adapter branching"
 )]
 pub(crate) fn concrete_adapter_for(id: &str) -> Option<Box<dyn Adapter>> {
     if id == crate::adapters::claude_code::HARNESS_ID_STR
@@ -927,6 +1035,51 @@ pub(crate) fn concrete_adapter_for(id: &str) -> Option<Box<dyn Adapter>> {
     {
         return Some(Box::new(adapter) as Box<dyn Adapter>);
     }
+    if id == crate::adapters::muse_code::HARNESS_ID_STR
+        && let Ok(adapter) = MuseCodeAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::qoder_cli::HARNESS_ID_STR
+        && let Ok(adapter) = QoderCliAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::zulu_cli::HARNESS_ID_STR
+        && let Ok(adapter) = ZuluCliAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::minimax_code::HARNESS_ID_STR
+        && let Ok(adapter) = MiniMaxCodeAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::coco::HARNESS_ID_STR
+        && let Ok(adapter) = CocoAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::fx::HARNESS_ID_STR
+        && let Ok(adapter) = FxAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::jules::HARNESS_ID_STR
+        && let Ok(adapter) = JulesAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::cursor_agent::HARNESS_ID_STR
+        && let Ok(adapter) = CursorAgentAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::kilocode_cli::HARNESS_ID_STR
+        && let Ok(adapter) = KilocodeCliAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
     // Ledger alias: the catalog row is kimi-code-cli; the adapter is kimi-code.
     if id == crate::adapters::kimi_code::HARNESS_ID_LEDGER_ALIAS
         && let Ok(ledger_id) = HarnessId::new(id)
@@ -985,10 +1138,10 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    fn catalog_has_51_entries() {
-        // The plan commits to exactly 51 product surfaces; this pin fails
-        // loudly if a row is added or dropped without a plan change.
-        assert_eq!(all_entries().len(), 51);
+    fn catalog_has_60_entries() {
+        // 51 plan rows plus the 9 research-verified additions; this pin fails
+        // loudly if a row is added or dropped without a ledger change.
+        assert_eq!(all_entries().len(), 60);
     }
 
     #[test]
@@ -1017,7 +1170,7 @@ mod tests {
                 entry.id
             );
         }
-        assert_eq!(seen.len(), 51);
+        assert_eq!(seen.len(), 60);
     }
 
     #[test]
@@ -1116,7 +1269,7 @@ mod tests {
         let adapters = all_adapters();
         assert_eq!(
             adapters.len(),
-            51,
+            60,
             "all_adapters must return an adapter for each catalog row"
         );
         let mut ids: Vec<String> = adapters
@@ -1171,8 +1324,8 @@ mod tests {
                 AdapterSupport::ReadOnly => read_only += 1,
             }
         }
-        assert_eq!(full, 20, "expected 20 Full per ledger");
-        assert_eq!(constrained, 17, "expected 17 Constrained per ledger");
+        assert_eq!(full, 24, "expected 24 Full per ledger");
+        assert_eq!(constrained, 22, "expected 22 Constrained per ledger");
         assert_eq!(single, 1, "expected 1 SingleInstance per ledger");
         assert_eq!(migration_only, 6, "expected 6 MigrationOnly per ledger");
         assert_eq!(research_blocked, 4, "expected 4 ResearchBlocked per ledger");
@@ -1185,7 +1338,7 @@ mod tests {
                 + research_blocked
                 + unsupported
                 + read_only,
-            51
+            60
         );
     }
 
@@ -1196,7 +1349,7 @@ mod tests {
     )]
     #[expect(
         clippy::too_many_lines,
-        reason = "test exercises every trait method for 51 adapters"
+        reason = "test exercises every trait method for 60 adapters"
     )]
     fn adapters_are_object_safe_and_usable_as_trait_objects() {
         let adapters = all_adapters();

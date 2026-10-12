@@ -20,6 +20,7 @@ pub mod chatgpt_desktop;
 pub mod claude_code;
 pub mod claude_desktop;
 pub mod cline;
+pub mod coco;
 pub mod codex_cli;
 pub mod conductor;
 pub mod continue_dev;
@@ -27,30 +28,37 @@ pub mod copilot_cli;
 pub mod copilot_coding_agent;
 pub mod crush;
 pub mod cursor;
+pub mod cursor_agent;
 pub mod deepseek;
 pub mod factory_droid;
 pub mod forge;
+pub mod fx;
 pub mod gemini_cli;
 pub mod goose;
 pub mod gptme;
 pub mod grok_build;
 pub mod hermes;
 pub mod iflow;
+pub mod jules;
 pub mod junie;
 pub mod kilo;
+pub mod kilocode_cli;
 pub mod kimi_code;
 pub mod kiro;
 pub mod kode;
 pub mod legacy_kimi;
 pub mod letta;
 pub mod mimo;
+pub mod minimax_code;
 pub mod mistral_vibe;
+pub mod muse_code;
 pub mod nanocoder;
 pub mod openclaw;
 pub mod opencode;
 pub mod openhands;
 pub mod pi;
 pub mod plandex;
+pub mod qoder_cli;
 pub mod qwen_code;
 pub mod roo_code;
 pub mod sculptor;
@@ -62,6 +70,7 @@ pub mod windsurf;
 pub mod workbuddy;
 pub mod zcode;
 pub mod zed_acp;
+pub mod zulu_cli;
 
 /// First PATH hit for `names`, name-major: an earlier name wins over an
 /// earlier directory.
@@ -1009,13 +1018,16 @@ mod decl_tests {
         ("claude-code", ".mcp.json", "mcpServers"),
         ("claude-desktop", "claude_desktop_config.json", "mcpServers"),
         ("cline", "cline_mcp_settings.json", "mcpServers"),
+        ("coco", "cortex/mcp.json", "mcpServers"),
         ("codex-cli", "config.toml", "mcp_servers"),
         ("continue-dev", "config.yaml", "mcpServers"),
         ("copilot-cli", "mcp-config.json", "mcpServers"),
         ("crush", "crush.json (global)", "mcp"),
         ("cursor", "mcp.json", "mcpServers"),
+        ("cursor-agent", "mcp.json", "mcpServers"),
         ("factory-droid", ".factory/mcp.json", "mcpServers"),
         ("forge", ".mcp.json", "mcpServers"),
+        ("fx", "mcp.json", "mcp"),
         ("gemini-cli", "settings.json", "mcpServers"),
         ("goose", "config.yaml", "extensions"),
         ("grok-build", "config.toml", "mcp_servers"),
@@ -1023,15 +1035,19 @@ mod decl_tests {
         ("iflow-cli", "settings.json (user)", "mcpServers"),
         ("junie-cli", "mcp/mcp.json", "mcpServers"),
         ("kilo-code", "global kilo.jsonc", "mcp"),
+        ("kilocode-cli", "kilo.jsonc", "mcp"),
         ("kimi-code-cli", "mcp.json", "mcpServers"),
         ("kiro", "settings/mcp.json", "mcpServers"),
         ("kode", "config.json", "mcpServers"),
         ("legacy-kimi-cli", "mcp.json", "mcpServers"),
         ("mimo-code", "mimocode.jsonc", "mcp"),
+        ("minimax-code", ".mcp.json", "mcpServers"),
         ("mistral-vibe", "config.toml", "mcp_servers"),
+        ("muse-code", "settings.json", "mcp_servers"),
         ("nanocoder", ".mcp.json", "mcpServers"),
         ("opencode", "opencode.json", "mcp"),
         ("openhands", "mcp.json", "mcpServers"),
+        ("qoder-cli", "settings.json", "mcpServers"),
         ("qwen-code", "settings.json", "mcpServers"),
         ("roo-code", ".roo/mcp.json", "mcpServers"),
         ("trae-agent", "trae_config.yaml", "mcp_servers"),
@@ -1039,6 +1055,7 @@ mod decl_tests {
         ("windsurf", "mcp_config.json", "mcpServers"),
         ("workbuddy", ".mcp.json", "mcpServers"),
         ("zed-acp", "settings.json", "context_servers"),
+        ("zulu-cli", "mcp.json", "mcpServers"),
     ];
 
     /// Harnesses whose corpus documents NO MCP mechanism (explicit absence).
@@ -1049,6 +1066,7 @@ mod decl_tests {
         "copilot-coding-agent",
         "deepseek-harness",
         "gptme",
+        "jules",
         "letta-code",
         "openclaw",
         "pi",
@@ -1064,17 +1082,20 @@ mod decl_tests {
     const PLUGIN_DECLS: &[(&str, &str, bool)] = &[
         ("amp", "directory_bundle", false),
         ("claude-code", "directory_bundle", false),
+        ("coco", "directory_bundle", false),
         ("grok-build", "directory_bundle", false),
         ("hermes-agent", "npm_ref", true),
         ("junie-cli", "directory_bundle", false),
         ("kimi-code-cli", "marketplace_record", true),
+        ("minimax-code", "marketplace_record", true),
         ("opencode", "directory_bundle", false),
+        ("qoder-cli", "marketplace_record", true),
     ];
 
     /// Expected document kind for a declared MCP destination: JSONC configs
     /// are not always named `*.jsonc` (amp/kilo/mimo/opencode).
     fn expected_dest_kind(harness_id: &str, dest_file: &str) -> DocumentKind {
-        const JSONC_DESTS: &[&str] = &["amp", "kilo-code", "mimo-code", "opencode"];
+        const JSONC_DESTS: &[&str] = &["amp", "kilo-code", "kilocode-cli", "mimo-code", "opencode"];
         let ext = std::path::Path::new(dest_file)
             .extension()
             .map(|e| e.to_string_lossy().to_ascii_lowercase())
@@ -1177,16 +1198,16 @@ mod decl_tests {
         }
     }
 
-    /// Verified corpus partition of the 51 MCP declarations: any drift in the
+    /// Verified corpus partition of the 60 MCP declarations: any drift in the
     /// writable/read-only/absence split fails with the real numbers.
-    const EXPECTED_MCP_WRITABLE: usize = 19;
-    const EXPECTED_MCP_READ_ONLY: usize = 18;
-    const EXPECTED_MCP_ABSENT: usize = 14;
+    const EXPECTED_MCP_WRITABLE: usize = 26;
+    const EXPECTED_MCP_READ_ONLY: usize = 19;
+    const EXPECTED_MCP_ABSENT: usize = 15;
 
     #[test]
     fn every_adapter_declares_mcp_dest_or_explicit_absence() {
         let adapters = harness_catalog::all_adapters();
-        assert_eq!(adapters.len(), 51, "catalog must list 51 adapters");
+        assert_eq!(adapters.len(), 60, "catalog must list 60 adapters");
         let mut writable = 0;
         let mut read_only = 0;
         let mut absent = 0;
@@ -1221,8 +1242,8 @@ mod decl_tests {
         }
         assert_eq!(
             writable + read_only + absent,
-            51,
-            "writable {writable} + read-only {read_only} + absence {absent} must cover all 51"
+            60,
+            "writable {writable} + read-only {read_only} + absence {absent} must cover all 60"
         );
         assert_eq!(
             writable, EXPECTED_MCP_WRITABLE,
@@ -1295,7 +1316,7 @@ mod decl_tests {
             }
         }
         assert_eq!(declared, PLUGIN_DECLS.len());
-        assert_eq!(absent, 51 - PLUGIN_DECLS.len());
+        assert_eq!(absent, 60 - PLUGIN_DECLS.len());
     }
 
     #[test]
@@ -1429,6 +1450,9 @@ mod decl_tests {
             let source_dir = dir.join("bundle");
             std::fs::create_dir_all(source_dir.join("skills")).unwrap();
             std::fs::write(source_dir.join("skills").join("s.md"), b"# skill\n").unwrap();
+            if let Some(manifest) = &decl.discovery_manifest {
+                std::fs::write(source_dir.join(manifest), b"{}\n").unwrap();
+            }
             let mut registry = crate::plugin::PluginRegistry::load(&dir.join("registry")).unwrap();
             let source = crate::plugin::PluginSource {
                 id: crate::ids::PluginId::new("smoke-plugin").unwrap(),
