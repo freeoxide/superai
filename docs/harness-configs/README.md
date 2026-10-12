@@ -1,6 +1,6 @@
 # Agent Harness Configuration Bible — Master Index
 
-Research catalog of known harness config surfaces — config files, env vars, provider integration, and multi-instance wrapper techniques — compiled 2026-08-25 by parallel research agents against official docs and repos at that date (claude-desktop + chatgpt-desktop added 2026-09-18). Each file cites its sources inline; where docs are thin or a surface could not be verified, the file flags the gap explicitly rather than inferring. Where a capability is absent (e.g., no BYO endpoint), the file states that explicitly. Ledger support states and last-verified dates live in [03-harness-adapters.md](../plans/03-harness-adapters.md) and `crates/superai-core/src/harness_catalog.rs` (51 surfaces: 20 Full, 17 Constrained, 1 SingleInstance, 6 MigrationOnly, 4 ResearchBlocked, 1 Unsupported, 2 ReadOnly; last_verified 2026-08-25 except workbuddy 2026-09-01 and the two desktop apps 2026-09-18).
+Research catalog of known harness config surfaces — config files, env vars, provider integration, and multi-instance wrapper techniques — compiled 2026-08-25 by parallel research agents against official docs and repos at that date (claude-desktop + chatgpt-desktop added 2026-09-18; muse-code, qoder-cli, zulu-cli, minimax-code, coco, fx, jules, cursor-agent, kilocode-cli added 2026-10-12, plus the missing letta-code row). Each file cites its sources inline; where docs are thin or a surface could not be verified, the file flags the gap explicitly rather than inferring. Where a capability is absent (e.g., no BYO endpoint), the file states that explicitly. Ledger support states and last-verified dates live in [03-harness-adapters.md](../plans/03-harness-adapters.md) and `crates/superai-core/src/harness_catalog.rs` (60 surfaces: 24 Full, 22 Constrained, 1 SingleInstance, 6 MigrationOnly, 4 ResearchBlocked, 1 Unsupported, 2 ReadOnly; last_verified spans 2026-08-25 to 2026-09-18, the ledger freshness anchor).
 
 ## The Documents
 
@@ -35,6 +35,16 @@ Research catalog of known harness config surfaces — config files, env vars, pr
 | Trae Agent (ByteDance) | [trae-agent.md](trae-agent.md) | `--config-file` + `TRAE_CONFIG_FILE` |
 | Plandex 2 | [plandex.md](plandex.md) | env-driven provider switching; per-server `PLANDEX_API_HOST` |
 | WorkBuddy / CodeBuddy CLI (cbc) | [workbuddy.md](workbuddy.md) | `CODEBUDDY_CONFIG_DIR`; desktop app GUI-only (documented, not mutated) |
+| Muse Code (Meta) | [muse-code.md](muse-code.md) | none documented — settings at `~/.config/muse/settings.json`; `META_API_KEY` per instance |
+| Qoder CLI (Alibaba) | [qoder-cli.md](qoder-cli.md) | `QODER_CONFIG_DIR` |
+| Zulu CLI (Baidu Comate) | [zulu-cli.md](zulu-cli.md) | none — license-key SaaS; state at `~/.comate-engine`, MCP at `~/.comate/mcp.json` |
+| MiniMax Code (`mcode`) | [minimax-code.md](minimax-code.md) | `MINIMAX_DATA_DIR` (user data) / `MCODE_INSTALL_DIR` (install dir) |
+| Cortex Code / CoCo (Snowflake) | [coco.md](coco.md) | `SNOWFLAKE_HOME` (whole `~/.snowflake` root, shared with Snowflake CLI) |
+| fx (Vercel Labs) | [fx.md](fx.md) | none documented — fixed `~/.fx`; `FX_*` per-process overrides |
+| Jules CLI (Google) | [jules.md](jules.md) | none — cloud sessions; separate Google accounts only |
+| Cursor Agent CLI | [cursor-agent.md](cursor-agent.md) | `CURSOR_CONFIG_DIR` (cli-config.json only; mcp.json stays under `~/.cursor`) — CLI half of [cursor.md](cursor.md) |
+| Kilo CLI | [kilocode-cli.md](kilocode-cli.md) | `KILO_CONFIG_CONTENT` / HOME or XDG relocation (no dedicated dir var) — CLI half of [kilo-code.md](kilo-code.md) |
+| Letta Code | [letta-code.md](letta-code.md) | `LETTA_LOCAL_BACKEND_DIR` + `LETTA_BASE_URL` per instance |
 
 ### IDE / editor-integrated agents
 | Harness | File | Wrapper notes |
@@ -68,7 +78,7 @@ Research catalog of known harness config surfaces — config files, env vars, pr
 
 ## Universal patterns (the cheat-sheet)
 
-1. **Config-dir relocation** is the standard isolation mechanism: `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GEMINI_CLI_HOME`, `KIMI_CODE_HOME`, `JUNIE_HOME`, `GROK_HOME`, `GOOSE_PATH_ROOT`, `FORGE_CONFIG`, `KODE_CONFIG_DIR`, `NANOCODER_CONFIG_DIR`, `VIBE_HOME`, `COPILOT_HOME`, `HERMES_HOME`, `PI_CODING_AGENT_DIR`, `CURSOR_CONFIG_DIR`, `OPENCLAW_HOME`, `KIRO_HOME`, `DSH_HOME`, `CODEBUDDY_CONFIG_DIR`. Relocate → run its auth flow once → you have an independent instance.
+1. **Config-dir relocation** is the standard isolation mechanism: `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GEMINI_CLI_HOME`, `KIMI_CODE_HOME`, `JUNIE_HOME`, `GROK_HOME`, `GOOSE_PATH_ROOT`, `FORGE_CONFIG`, `KODE_CONFIG_DIR`, `NANOCODER_CONFIG_DIR`, `VIBE_HOME`, `COPILOT_HOME`, `HERMES_HOME`, `PI_CODING_AGENT_DIR`, `CURSOR_CONFIG_DIR`, `OPENCLAW_HOME`, `KIRO_HOME`, `DSH_HOME`, `CODEBUDDY_CONFIG_DIR`, `QODER_CONFIG_DIR`, `SNOWFLAKE_HOME`, `MINIMAX_DATA_DIR`. Relocate → run its auth flow once → you have an independent instance.
 2. **Env beats config for providers** almost everywhere: every harness that speaks OpenAI-compatible takes `<PROVIDER>_API_KEY` + some base-URL override (`ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`, `GOOGLE_GEMINI_BASE_URL`, `GROK_CLI_CHAT_PROXY_BASE_URL`, `COPILOT_PROVIDER_BASE_URL`, `OPENROUTER_API_KEY`…). Wrappers just export different values before `exec`.
 3. **Anthropic-compatible endpoints are a de-facto standard too** — Claude Code (`ANTHROPIC_BASE_URL`+`ANTHROPIC_AUTH_TOKEN`), Kimi Code (`anthropic` provider with custom `base_url`), Crush/Kilo/Cline ("anthropic" provider type) all repoint at GLM/OpenRouter-style Anthropic-format gateways.
 4. **Inline config injection** where supported: Codex `CODEX_CONFIG`, Grok `GROK_CONFIG` (JSON deep-merge), OpenCode `OPENCODE_CONFIG_CONTENT`, Amp `AMP_SETTINGS_FILE`, Nanocoder `NANOCODER_PROVIDERS_FILE`.
