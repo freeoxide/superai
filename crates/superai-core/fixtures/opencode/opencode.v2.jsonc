@@ -1,0 +1,26 @@
+// Provenance: source=docs/harness-configs/opencode.md last_verified=2026-10-12 sanitized fake sk-fake- v2-line keys jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "anthropic/claude-sonnet-4-5",
+  // v2 renames autoupdate to update and takes disable/notify/auto strings.
+  "update": "disable",
+  "snapshots": false,
+  "permissions": [
+    { "action": "edit", "resource": "*", "effect": "ask" },
+  ],
+  "mcp": {
+    "servers": {
+      "local-server": {
+        "type": "local",
+        "command": ["npx", "-y", "@modelcontextprotocol/server-everything"], // trailing comma,
+      },
+    },
+  },
+  "providers": {
+    "lmstudio": {
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": { "baseURL": "http://127.0.0.1:1234/v1" },
+    },
+  },
+  "plugins": ["./plugins/local", { "package": "@acme/opencode-plugin", "options": { "strict": true } }],
+}

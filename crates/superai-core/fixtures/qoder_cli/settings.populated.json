@@ -1,0 +1,7 @@
+{
+  "general": {"enableAutoUpdate": true, "defaultPermissionMode": "default"},
+  "mcpServers": {
+    "git-server": {"command": "mcp-server-git", "args": []}
+  },
+  "enabledPlugins": {"review-pack@local": true}
+}

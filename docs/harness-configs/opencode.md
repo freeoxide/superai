@@ -1,6 +1,6 @@
-# OpenCode (sst/opencode → anomalyco) — Complete Configuration Reference
+# OpenCode (anomalyco/opencode) — Complete Configuration Reference
 
-> Compiled 2026-08-25 from official docs: [config](https://opencode.ai/docs/config/), [providers](https://opencode.ai/docs/providers/), [models](https://opencode.ai/docs/models/), [permissions](https://opencode.ai/docs/permissions/), [agents](https://opencode.ai/docs/agents/), [keybinds](https://opencode.ai/docs/keybinds/), [mcp-servers](https://opencode.ai/docs/mcp-servers/). Repo: `sst/opencode` (now under `anomalyco`; install `npm i -g opencode-ai@latest` or `brew install anomalyco/tap/opencode`). Note: a v2 docs preview exists at https://opencode.ai/v2/docs/providers/ with renamed keys (`provider(s)`, `settings.baseURL`, `package`, `env`, `headers`, `body`) — this doc covers the current stable v1 schema.
+> Compiled 2026-08-25 from official docs, re-verified 2026-10-12 against the v2 line: [config](https://opencode.ai/docs/config/), [providers](https://opencode.ai/docs/providers/), [models](https://opencode.ai/docs/models/), [permissions](https://opencode.ai/docs/permissions/), [agents](https://opencode.ai/docs/agents/), [keybinds](https://opencode.ai/docs/keybinds/), [mcp-servers](https://opencode.ai/docs/mcp-servers/), plus every `/v2/docs/` page named in §6. Repo: `anomalyco/opencode` (moved out of `sst`; install `npm i -g opencode-ai@latest` or `brew install anomalyco/tap/opencode` for the v1 line). This doc covers the v1 schema as primary because `opencode-ai@latest` still ships it; §6 records what changes on the v2 line, which is stable and installs side by side under the same `opencode` binary name.
 
 ---
 
@@ -126,14 +126,16 @@ There is **no dedicated env-var docs page** (the old `/docs/env-vars-and-secrets
 | Var | Effect |
 |---|---|
 | `<PROVIDER>_API_KEY` pattern | Auto-detection: each provider in the [models.dev](https://models.dev/) catalog declares its env var (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `GROQ_API_KEY`, `CEREBRAS_API_KEY`, …). Setting it makes that provider appear without `/connect`. Custom providers can declare their own via the provider's `env` field (see v2 preview: `"env": ["ACME_API_KEY"]`, [v2 docs/providers](https://opencode.ai/v2/docs/providers/)). Quirk: setting an unrelated var does nothing — only the exact declared names count; disable unwanted ones with `disabled_providers`. |
-| `OPENCODE_CONFIG` | Path to an extra config file, layered between global and project ([docs/config#custom-path](https://opencode.ai/docs/config/#custom-path)) |
-| `OPENCODE_CONFIG_CONTENT` | Inline JSON config string — highest app-level precedence (runtime override) |
-| `OPENCODE_CONFIG_DIR` | Extra directory scanned like `.opencode/` (agents/commands/plugins) |
-| `OPENCODE_TUI_CONFIG` | Custom path to `tui.json` ([docs/config#tui](https://opencode.ai/docs/config/#tui)) |
-| `XDG_CONFIG_HOME` | Moves the whole global config dir (`$XDG_CONFIG_HOME/opencode/opencode.json` instead of `~/.config/...`) |
+| `OPENCODE_CONFIG` | Path to an extra config file, layered between global and project; works the same on both lines ([docs/config#custom-path](https://opencode.ai/docs/config/#custom-path), v2 source at v2.0.27) |
+| `OPENCODE_CONFIG_CONTENT` | Inline JSON config string, highest app-level precedence (runtime override); works the same on both lines |
+| `OPENCODE_CONFIG_DIR` | Extra directory scanned like `.opencode/` (agents/commands/plugins); in current v1 (1.19.0) and v2 releases it also **relocates the global config root** (`$OPENCODE_CONFIG_DIR` replaces `~/.config/opencode` outright), so an inherited value overrides `XDG_CONFIG_HOME` |
+| `OPENCODE_TUI_CONFIG` | Custom path to `tui.json` ([docs/config#tui](https://opencode.ai/docs/config/#tui)); still read by the 1.x line |
+| `OPENCODE_CLI_CONFIG_CONTENT` | v2 only: inline JSON merged over `cli.json` for terminal settings ([v2 cli config](https://opencode.ai/v2/docs/cli/config/)) |
+| `OPENCODE_DB` | v2 only: overrides the credential database path (default `$XDG_DATA_HOME/opencode/opencode.db`, channel-suffixed on non-default channels) |
+| `XDG_CONFIG_HOME` | Moves the whole global config dir (`$XDG_CONFIG_HOME/opencode/opencode.json` instead of `~/.config/...`); both lines also honor `XDG_DATA_HOME`/`XDG_CACHE_HOME`/`XDG_STATE_HOME` for data, cache, and state |
 | AWS: `AWS_ACCESS_KEY_ID`+`AWS_SECRET_ACCESS_KEY`, `AWS_PROFILE`, `AWS_BEARER_TOKEN_BEDROCK`, `AWS_REGION`, `AWS_WEB_IDENTITY_TOKEN_FILE`/`AWS_ROLE_ARN` (EKS IRSA) | Bedrock auth; precedence: bearer token → credential chain ([docs/providers#amazon-bedrock](https://opencode.ai/docs/providers/#amazon-bedrock)) |
 | `AZURE_RESOURCE_NAME` | Required for Azure OpenAI (endpoint derives from resource name) |
-| Credentials store | `/connect` saves keys to `~/.local/share/opencode/auth.json` ([docs/providers#credentials](https://opencode.ai/docs/providers/#credentials)) |
+| Credentials store | v1: `/connect` saves keys to `~/.local/share/opencode/auth.json` ([docs/providers#credentials](https://opencode.ai/docs/providers/#credentials)). v2: same flow writes to `opencode.db` (SQLite) in that directory, importing a legacy `auth.json` once |
 
 ---
 
@@ -275,11 +277,42 @@ Each rule resolves to `"allow"` / `"ask"` / `"deny"`. Whole config may be a sing
 ```
 Wildcards: `*` (any chars) and `?` (one char); `~`/`$HOME` expand at pattern start. Ask prompts offer once / always (session-scoped pattern approval) / reject. CLI/TUI auto mode: `opencode --auto`, `opencode run --auto` — approves everything except explicit `deny`.
 
+## 6. The v2 line (`@opencode/cli` 2.x)
+
+Re-verified 2026-10-12. OpenCode now ships two stable lines that install side by side; both binaries are named `opencode` and answer `opencode --version` (1.x vs 2.x tells them apart):
+
+| Line | Install | Docs | Notes |
+|---|---|---|---|
+| v1 (1.x) | `npm i -g opencode-ai@latest` (1.19.0), `brew install anomalyco/tap/opencode`, `curl -fsSL https://opencode.ai/install \| bash` (tracks GitHub `releases/latest`), scoop/choco/pacman | https://opencode.ai/docs/ | The schema in §1–§5. 1.19.0 also reads v2 keys through a compat layer (see below). |
+| v2 (2.x) | `npm i -g @opencode/cli@latest` (2.0.27), `brew install anomalyco/tap/opencode-v2`, AUR `opencode-beta`; a desktop client (beta: macOS/Windows/Linux installers, `brew install --cask opencode-desktop`, also attached to GitHub releases) exists alongside both lines | https://opencode.ai/v2/docs/ | Renamed keys, `cli.json`, SQLite credential store. |
+
+### What v2 keeps from v1
+- Global config stays `$XDG_CONFIG_HOME/opencode/opencode.json(c)` (default `~/.config/opencode/`); file names, JSONC format, and the `$schema` URL are unchanged. `XDG_CONFIG_HOME`/`XDG_DATA_HOME`/`XDG_CACHE_HOME`/`XDG_STATE_HOME` all still root the global paths (source: `packages/util/src/global-roots.ts` at tag v2.0.27).
+- `OPENCODE_CONFIG` (file layered between global and project) and `OPENCODE_CONFIG_CONTENT` (inline, highest) work unchanged (source: `packages/cli/src/server-process.ts` at v2.0.27 wires both into the config service).
+- MCP still lives under `mcp` in `opencode.json`; plugins still auto-load from `.opencode/plugins/` and `~/.config/opencode/plugins/`.
+
+### What v2 changes
+- **Key renames** ([v2 config](https://opencode.ai/v2/docs/config/), verified against `packages/schema/src/config.ts` at v2.0.27): `provider` → `providers` (per-provider `npm`/`options` → `package`/`settings`; `settings.baseURL` replaces `options.baseURL`; a provider's credential env vars are declared in `env`), `agent` → `agents`, `command` → `commands`, `plugin` → `plugins` (array entries may be `package`+`options` objects; arrays from multiple files merge instead of override), `permission` → `permissions` (a map of tool rules becomes an ordered array of `{action, resource, effect}` rules), `autoupdate` → `update` (`true|false|"notify"` becomes `"auto"|"disable"|"notify"`), `snapshot` → `snapshots`, `attachment.image` → `media`. Dropped: `small_model`, `disabled_providers`, `enabled_providers`, `keybinds`, `theme` (TUI settings move to `cli.json`). New keys: `username`, `skills`, `references`, `websearch`, `warming`, `worktree`, `tool_output`.
+- **MCP nesting** ([v2 mcp-servers](https://opencode.ai/v2/docs/mcp-servers/)): servers sit under `mcp.servers.<name>`, not directly under `mcp`; the per-server `enabled: false` flag becomes `disabled: true`; `mcp.timeout` (`startup`/`request`) is new. The docs state it outright: "V2 does not place server names directly under mcp."
+- **Terminal settings file**: v1 `tui.json` becomes `cli.json` in the same config dir (`$XDG_CONFIG_HOME/opencode/cli.json`, JSONC, written 0600 with a lock and atomic rename), with `OPENCODE_CLI_CONFIG_CONTENT` as its inline override; schema at `https://opencode.ai/v2/cli.json`. v2 auto-migrates an existing `tui.json` (plus state `kv.json`) into `cli.json` on first run ([v2 cli config](https://opencode.ai/v2/docs/cli/config/)).
+- **Credential storage**: v1's `~/.local/share/opencode/auth.json` becomes a SQLite database at `$XDG_DATA_HOME/opencode/opencode.db` (channel-suffixed names like `opencode-beta.db` on non-default channels; `OPENCODE_DB` overrides the path). A one-time database migration imports a legacy `auth.json` when present (source at v2.0.27: `packages/core/src/database/migration/20260805200742_import_legacy_credentials.ts`).
+- **Project layering** ([v2 config](https://opencode.ai/v2/docs/config/)): v2 walks from cwd to the filesystem root, merging every direct `opencode.json(c)` and every `.opencode/opencode.json(c)` it passes; `.opencode` files override direct ones, nearer overrides farther, global stays lowest. `OPENCODE_CONFIG_CONTENT` remains highest. v2 also discovers `.claude/` and `.agents/` directories during the same walk (global `~/.claude` and `~/.agents` included), so a Claude Code installation can feed an OpenCode v2 run; v1 never reads those.
+- **`OPENCODE_CONFIG_DIR` now relocates the global config root** in both current lines (v1.19.0 `Global` service and v2.0.27 `Global.layerWith` both resolve `OPENCODE_CONFIG_DIR ?? XDG_CONFIG_HOME/opencode`). It still doubles as the extra scanned directory from §1. Wrappers that isolate via `XDG_CONFIG_HOME` must clear this variable or the relocation is bypassed.
+
+### Cross-era compat (verified in source, both directions)
+- v2 binaries read v1 keys by normalizing them up, with diagnostics (`packages/core/src/config/normalize.ts` at v2.0.27). A v1-era config file keeps working under v2.
+- v1 binaries (1.19.0) read v2 keys by lowering them down, with one hard failure: a top-level `permissions` key (or `permissions` inside an `agent`/`agents`/`mode` entry) throws "V2 permissions are not supported by OpenCode V1. Use V1 permission rules or run opencode2" and the config fails to load. `plugins`, `providers`, `websearch`, and `warming` are dropped with diagnostics (silently ignored); `agents`, `commands`, `snapshots`, `media`, and `mcp.servers` lower to their v1 equivalents (source: `packages/opencode/src/config/v2-compat.ts` at v1.19.0).
+
+Not verified upstream: whether v2 keeps the v1 managed-config dirs (`/etc/opencode/`, `/Library/Application Support/opencode/`, `%ProgramData%\opencode`) and the `.well-known/opencode` remote layer (the wellknown loader is present in v2 source but the admin dirs are not documented on `/v2/docs/`); where the desktop client stores its own Electron state beyond the shared server config.
+
 ---
 
 ## Quick gotchas
-- `theme`, `keybinds`, TUI toggles belong in `tui.json` now; leaving them in `opencode.json` works only until migration fails.
+
+- `theme`, `keybinds`, TUI toggles belong in `tui.json` now; leaving them in `opencode.json` works only until migration fails. On the v2 line the same settings live in `cli.json` and migrate automatically.
 - `share` is the sharing key (not "autoshare"); values manual/auto/disabled.
 - `formatter` and `lsp` are **opt-in**: omitted = disabled; `true` = enable all built-ins.
 - Custom provider IDs must match exactly between `/connect` and `opencode.json`, or credentials won't bind.
-- Wrong npm package is the top custom-provider failure: OpenAI-compatible chat → `@ai-sdk/openai-compatible`; responses-API models → `@ai-sdk/openai` (per-model npm override possible).
+- Wrong npm package is the top custom-provider failure: OpenAI-compatible chat → `@ai-sdk/openai-compatible`; responses-API models → `@ai-sdk/openai` (per-model npm override possible). On v2 the package names change to `@opencode/ai/providers/*`.
+- Under a 1.x binary, a v2 `permissions` key makes the whole config fail to load; superai refuses that write (era gate). Everything else cross-loads with diagnostics.
+- `OPENCODE_TUI_CONFIG` (v1) and `OPENCODE_CLI_CONFIG_CONTENT` (v2) redirect terminal settings; isolation wrappers must also clear `OPENCODE_CONFIG_DIR` or it overrides the config root on both lines.

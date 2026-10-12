@@ -1,0 +1,8 @@
+{
+  "provider": "gateway",
+  "permission_mode": "auto",
+  "effort": "high",
+  "workspaces": {
+    "/home/user/project": {"provider": "custom"}
+  }
+}

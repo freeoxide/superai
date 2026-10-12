@@ -11,57 +11,97 @@ use crate::adapter::DetectionConfidence;
 use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence};
 
+pub mod agentty;
 pub mod aider;
 pub mod amazon_q;
 pub mod amp;
 pub mod antigravity;
 pub mod auggie;
+pub mod avante_nvim;
+pub mod bb_app;
 pub mod chatgpt_desktop;
 pub mod claude_code;
 pub mod claude_desktop;
+pub mod claw_code;
 pub mod cline;
+pub mod coco;
+pub mod codecompanion_nvim;
+pub mod codegeex;
 pub mod codex_cli;
+pub mod command_code;
 pub mod conductor;
 pub mod continue_dev;
 pub mod copilot_cli;
 pub mod copilot_coding_agent;
+pub mod copilot_vscode;
 pub mod crush;
 pub mod cursor;
+pub mod cursor_agent;
 pub mod deepseek;
+pub mod devin;
+pub mod eca;
+pub mod every_code;
 pub mod factory_droid;
 pub mod forge;
+pub mod freebuff;
+pub mod fx;
 pub mod gemini_cli;
+pub mod gitclaw;
 pub mod goose;
 pub mod gptme;
 pub mod grok_build;
+pub mod hax;
 pub mod hermes;
 pub mod iflow;
+pub mod jcode;
+pub mod jules;
 pub mod junie;
 pub mod kilo;
+pub mod kilocode_cli;
 pub mod kimi_code;
 pub mod kiro;
 pub mod kode;
 pub mod legacy_kimi;
 pub mod letta;
 pub mod mimo;
+pub mod minimax_code;
 pub mod mistral_vibe;
+pub mod muse_code;
 pub mod nanocoder;
+pub mod oh_my_codex;
+pub mod oh_my_opencode;
+pub mod omo_ai;
+pub mod omp;
 pub mod openclaw;
 pub mod opencode;
+pub mod openfang;
 pub mod openhands;
+pub mod orca;
+pub mod ori;
 pub mod pi;
 pub mod plandex;
+pub mod prime_agent;
+pub mod qoder_cli;
+pub mod qoder_ide;
 pub mod qwen_code;
+pub mod reasonix;
+pub mod replit_agent;
 pub mod roo_code;
 pub mod sculptor;
 pub mod swe_agent;
+pub mod t3code;
+pub mod terminus;
 pub mod trae_agent;
+pub mod unreal_agent;
 pub mod vibe_kanban;
+pub mod vix;
 pub mod warp;
 pub mod windsurf;
 pub mod workbuddy;
+pub mod zaly;
 pub mod zcode;
 pub mod zed_acp;
+pub mod zulu_cli;
 
 /// First PATH hit for `names`, name-major: an earlier name wins over an
 /// earlier directory.
@@ -400,9 +440,9 @@ pub(crate) fn desktop_platforms() -> Vec<crate::adapter::Platform> {
     ]
 }
 
-/// The 11-operation row, every op [`AdapterSupport::Full`], shared by
-/// adapters that support the whole catalog surface.
-pub(crate) fn all_operations_full() -> Vec<(String, AdapterSupport)> {
+/// The 11-operation row, every op at `support`, shared by adapters whose
+/// whole surface sits at one support level.
+pub(crate) fn operations_at(support: AdapterSupport) -> Vec<(String, AdapterSupport)> {
     [
         "detect",
         "read_config",
@@ -417,8 +457,14 @@ pub(crate) fn all_operations_full() -> Vec<(String, AdapterSupport)> {
         "validate_instance",
     ]
     .into_iter()
-    .map(|op| (op.to_owned(), AdapterSupport::Full))
+    .map(|op| (op.to_owned(), support))
     .collect()
+}
+
+/// The 11-operation row, every op [`AdapterSupport::Full`], shared by
+/// adapters that support the whole catalog surface.
+pub(crate) fn all_operations_full() -> Vec<(String, AdapterSupport)> {
+    operations_at(AdapterSupport::Full)
 }
 
 /// Skill modes, link-first: `relink_skills` takes the first mode.
@@ -1002,36 +1048,54 @@ mod decl_tests {
     /// (harness id, expected dest file, expected dest key) for every adapter
     /// that declares an MCP destination, per docs/harness-configs/<doc>.md.
     const MCP_DESTS: &[(&str, &str, &str)] = &[
+        ("agentty", "mcp.json", "mcpServers"),
         ("amazon-q-cli", "settings.json", "mcpServers"),
         ("amp", "settings.json", "amp.mcpServers"),
         ("antigravity-cli", "mcp_config.json", "mcpServers"),
         ("auggie", "settings.json", "mcpServers"),
         ("claude-code", ".mcp.json", "mcpServers"),
         ("claude-desktop", "claude_desktop_config.json", "mcpServers"),
+        ("claw-code", "settings.json", "mcpServers"),
         ("cline", "cline_mcp_settings.json", "mcpServers"),
+        ("coco", "cortex/mcp.json", "mcpServers"),
         ("codex-cli", "config.toml", "mcp_servers"),
+        ("command-code", "mcp.json", "mcpServers"),
         ("continue-dev", "config.yaml", "mcpServers"),
         ("copilot-cli", "mcp-config.json", "mcpServers"),
+        ("copilot-vscode", ".vscode/mcp.json", "servers"),
         ("crush", "crush.json (global)", "mcp"),
         ("cursor", "mcp.json", "mcpServers"),
+        ("cursor-agent", "mcp.json", "mcpServers"),
+        ("devin", ".devin/mcp_config.json", "mcpServers"),
+        ("every-code", "config.toml", "mcp_servers"),
         ("factory-droid", ".factory/mcp.json", "mcpServers"),
         ("forge", ".mcp.json", "mcpServers"),
+        ("fx", "mcp.json", "mcp"),
         ("gemini-cli", "settings.json", "mcpServers"),
+        ("gitclaw", "agent.yaml", "mcp_servers"),
         ("goose", "config.yaml", "extensions"),
         ("grok-build", "config.toml", "mcp_servers"),
         ("hermes-agent", "config.yaml", "mcp_servers"),
         ("iflow-cli", "settings.json (user)", "mcpServers"),
+        ("jcode", "mcp.json", "mcpServers"),
         ("junie-cli", "mcp/mcp.json", "mcpServers"),
         ("kilo-code", "global kilo.jsonc", "mcp"),
+        ("kilocode-cli", "kilo.jsonc", "mcp"),
         ("kimi-code-cli", "mcp.json", "mcpServers"),
         ("kiro", "settings/mcp.json", "mcpServers"),
         ("kode", "config.json", "mcpServers"),
         ("legacy-kimi-cli", "mcp.json", "mcpServers"),
         ("mimo-code", "mimocode.jsonc", "mcp"),
+        ("minimax-code", ".mcp.json", "mcpServers"),
         ("mistral-vibe", "config.toml", "mcp_servers"),
+        ("muse-code", "settings.json", "mcp_servers"),
         ("nanocoder", ".mcp.json", "mcpServers"),
+        ("omo-ai", "omo.jsonc", "mcp"),
+        ("omp", ".mcp.json", "mcpServers"),
         ("opencode", "opencode.json", "mcp"),
+        ("openfang", "config.toml", "mcp_servers"),
         ("openhands", "mcp.json", "mcpServers"),
+        ("qoder-cli", "settings.json", "mcpServers"),
         ("qwen-code", "settings.json", "mcpServers"),
         ("roo-code", ".roo/mcp.json", "mcpServers"),
         ("trae-agent", "trae_config.yaml", "mcp_servers"),
@@ -1039,23 +1103,45 @@ mod decl_tests {
         ("windsurf", "mcp_config.json", "mcpServers"),
         ("workbuddy", ".mcp.json", "mcpServers"),
         ("zed-acp", "settings.json", "context_servers"),
+        ("zulu-cli", "mcp.json", "mcpServers"),
     ];
 
     /// Harnesses whose corpus documents NO MCP mechanism (explicit absence).
     const MCP_ABSENT: &[&str] = &[
         "aider",
+        "avante-nvim",
+        "bb-app",
         "chatgpt-desktop",
+        "codecompanion-nvim",
+        "codegeex",
         "conductor",
         "copilot-coding-agent",
         "deepseek-harness",
+        "eca",
+        "freebuff",
         "gptme",
+        "hax",
+        "jules",
         "letta-code",
+        "oh-my-codex",
+        "oh-my-opencode",
         "openclaw",
+        "orca",
+        "ori",
         "pi",
         "plandex",
+        "prime-agent",
+        "qoder-ide",
+        "reasonix",
+        "replit-agent",
         "sculptor",
         "swe-agent",
+        "t3code",
+        "terminus",
+        "unreal-agent",
         "vibe-kanban",
+        "vix",
+        "zaly",
         "zcode",
     ];
 
@@ -1064,17 +1150,28 @@ mod decl_tests {
     const PLUGIN_DECLS: &[(&str, &str, bool)] = &[
         ("amp", "directory_bundle", false),
         ("claude-code", "directory_bundle", false),
+        ("coco", "directory_bundle", false),
+        ("gitclaw", "directory_bundle", false),
         ("grok-build", "directory_bundle", false),
         ("hermes-agent", "npm_ref", true),
         ("junie-cli", "directory_bundle", false),
         ("kimi-code-cli", "marketplace_record", true),
+        ("minimax-code", "marketplace_record", true),
         ("opencode", "directory_bundle", false),
+        ("qoder-cli", "marketplace_record", true),
     ];
 
     /// Expected document kind for a declared MCP destination: JSONC configs
-    /// are not always named `*.jsonc` (amp/kilo/mimo/opencode).
+    /// are not always named `*.jsonc` (amp/kilo/mimo/omo-ai/opencode).
     fn expected_dest_kind(harness_id: &str, dest_file: &str) -> DocumentKind {
-        const JSONC_DESTS: &[&str] = &["amp", "kilo-code", "mimo-code", "opencode"];
+        const JSONC_DESTS: &[&str] = &[
+            "amp",
+            "kilo-code",
+            "kilocode-cli",
+            "mimo-code",
+            "omo-ai",
+            "opencode",
+        ];
         let ext = std::path::Path::new(dest_file)
             .extension()
             .map(|e| e.to_string_lossy().to_ascii_lowercase())
@@ -1177,16 +1274,15 @@ mod decl_tests {
         }
     }
 
-    /// Verified corpus partition of the 51 MCP declarations: any drift in the
+    /// Verified corpus partition of the MCP declarations: any drift in the
     /// writable/read-only/absence split fails with the real numbers.
-    const EXPECTED_MCP_WRITABLE: usize = 19;
-    const EXPECTED_MCP_READ_ONLY: usize = 18;
-    const EXPECTED_MCP_ABSENT: usize = 14;
+    const EXPECTED_MCP_WRITABLE: usize = 34;
+    const EXPECTED_MCP_READ_ONLY: usize = 22;
+    const EXPECTED_MCP_ABSENT: usize = 35;
 
     #[test]
     fn every_adapter_declares_mcp_dest_or_explicit_absence() {
         let adapters = harness_catalog::all_adapters();
-        assert_eq!(adapters.len(), 51, "catalog must list 51 adapters");
         let mut writable = 0;
         let mut read_only = 0;
         let mut absent = 0;
@@ -1221,8 +1317,9 @@ mod decl_tests {
         }
         assert_eq!(
             writable + read_only + absent,
-            51,
-            "writable {writable} + read-only {read_only} + absence {absent} must cover all 51"
+            adapters.len(),
+            "writable {writable} + read-only {read_only} + absence {absent} must exactly \
+             partition the adapter set"
         );
         assert_eq!(
             writable, EXPECTED_MCP_WRITABLE,
@@ -1236,12 +1333,22 @@ mod decl_tests {
             absent, EXPECTED_MCP_ABSENT,
             "explicit-absence count drifted (was {absent}, expected {EXPECTED_MCP_ABSENT})"
         );
-        assert_eq!(
-            writable + read_only,
-            MCP_DESTS.len(),
-            "MCP_DESTS rows must all match"
-        );
-        assert_eq!(absent, MCP_ABSENT.len(), "MCP_ABSENT rows must all match");
+        for (hid, _, _) in MCP_DESTS {
+            assert!(
+                adapters
+                    .iter()
+                    .any(|a| a.id().as_str() == *hid && a.mcp_decl().is_some()),
+                "MCP_DESTS row {hid} has no adapter declaring that destination"
+            );
+        }
+        for hid in MCP_ABSENT {
+            assert!(
+                adapters
+                    .iter()
+                    .any(|a| a.id().as_str() == *hid && a.mcp_absence_reason().is_some()),
+                "MCP_ABSENT row {hid} has no adapter declaring that absence"
+            );
+        }
     }
 
     #[test]
@@ -1276,9 +1383,10 @@ mod decl_tests {
 
     #[test]
     fn every_adapter_declares_plugin_mechanism_or_explicit_absence() {
+        let adapters = harness_catalog::all_adapters();
         let mut declared = 0;
         let mut absent = 0;
-        for adapter in harness_catalog::all_adapters() {
+        for adapter in &adapters {
             let id = adapter.id().as_str().to_owned();
             let decl = adapter.plugin_decl();
             let absence = adapter.plugin_absence_reason();
@@ -1294,8 +1402,24 @@ mod decl_tests {
                 declared += 1;
             }
         }
-        assert_eq!(declared, PLUGIN_DECLS.len());
-        assert_eq!(absent, 51 - PLUGIN_DECLS.len());
+        assert_eq!(
+            declared + absent,
+            adapters.len(),
+            "plugin decl/absence must exactly partition the adapter set"
+        );
+        assert_eq!(
+            declared,
+            PLUGIN_DECLS.len(),
+            "PLUGIN_DECLS rows must match the declaring adapters one-to-one"
+        );
+        for (hid, _, _) in PLUGIN_DECLS {
+            assert!(
+                adapters
+                    .iter()
+                    .any(|a| a.id().as_str() == *hid && a.plugin_decl().is_some()),
+                "PLUGIN_DECLS row {hid} has no adapter declaring that plugin mechanism"
+            );
+        }
     }
 
     #[test]
@@ -1429,6 +1553,9 @@ mod decl_tests {
             let source_dir = dir.join("bundle");
             std::fs::create_dir_all(source_dir.join("skills")).unwrap();
             std::fs::write(source_dir.join("skills").join("s.md"), b"# skill\n").unwrap();
+            if let Some(manifest) = &decl.discovery_manifest {
+                std::fs::write(source_dir.join(manifest), b"{}\n").unwrap();
+            }
             let mut registry = crate::plugin::PluginRegistry::load(&dir.join("registry")).unwrap();
             let source = crate::plugin::PluginSource {
                 id: crate::ids::PluginId::new("smoke-plugin").unwrap(),
@@ -1456,6 +1583,186 @@ mod decl_tests {
             );
             assert!(record.staged_files.is_some_and(|f| !f.is_empty()));
             drop(std::fs::remove_dir_all(&dir));
+        }
+    }
+
+    /// Fixture for one execution-requiring decl: temp home with a seeded
+    /// marketplace record, an instance config root, and an instance registry.
+    /// The record is seeded by hand because `install` refuses these kinds.
+    struct ExecutionDeclFixture {
+        root: std::path::PathBuf,
+        home: std::path::PathBuf,
+        plugin_root: std::path::PathBuf,
+        config_root: std::path::PathBuf,
+        registry_file: std::path::PathBuf,
+        registry_path: std::path::PathBuf,
+    }
+
+    fn execution_decl_fixture(
+        id: &str,
+        decl: &crate::adapter::PluginAdapterDecl,
+    ) -> ExecutionDeclFixture {
+        let dir = crate::test_util::temp_dir_unique(&format!("plug-preview-{id}"));
+        let home = dir.join("home");
+        let plugin_root = home.join(".superai").join("plugins");
+        std::fs::create_dir_all(&plugin_root).unwrap();
+        let config_root = dir.join("instance");
+        std::fs::create_dir_all(&config_root).unwrap();
+
+        let mut plugins = crate::plugin::PluginRegistry::load(&plugin_root).unwrap();
+        plugins.records.push(crate::plugin::PluginRecord {
+            id: crate::ids::PluginId::new("market").unwrap(),
+            kind: decl.kind,
+            version: None,
+            digest: None,
+            source_locator: "marketplace://example".to_owned(),
+            installed_at: "2026-10-12T00:00:00Z".to_owned(),
+            enabled: true,
+            dependency_key: None,
+            staged_files: None,
+        });
+        plugins.store().unwrap();
+
+        let registry_file = plugin_root.join(crate::plugin::REGISTRY_FILE_NAME);
+        let registry_path = dir.join("instances.json");
+        ExecutionDeclFixture {
+            root: dir,
+            home,
+            plugin_root,
+            config_root,
+            registry_file,
+            registry_path,
+        }
+    }
+
+    /// Decls whose commit path is `RequiresApproval` (qoder/kimi/minimax
+    /// marketplace records today) must preview as a refusal: conflict raised,
+    /// no directory-creation action planned, nothing written to disk.
+    #[test]
+    fn execution_requiring_plugin_decls_preview_refuses_without_mutation() {
+        for adapter in harness_catalog::all_adapters() {
+            let Some(decl) = adapter.plugin_decl() else {
+                continue;
+            };
+            if !decl.requires_execution {
+                continue;
+            }
+            let id = adapter.id().as_str().to_owned();
+            let fx = execution_decl_fixture(&id, &decl);
+            let registry_bytes_before = std::fs::read(&fx.registry_file).unwrap();
+
+            let mut registry = crate::registry::Registry::load(&fx.registry_path).unwrap();
+            registry
+                .insert(crate::instance::Instance {
+                    id: crate::ids::InstanceId::new(&format!("id-{id}")).unwrap(),
+                    name: crate::ids::InstanceName::new("work").unwrap(),
+                    harness: adapter.id(),
+                    config_root: crate::paths::AbsolutePath::from_path(&fx.config_root).unwrap(),
+                    binary: None,
+                    wrapper: None,
+                    isolation: crate::state::Isolation::RelocatedRoot,
+                    origin: crate::state::InstanceOrigin::Created,
+                    ownership: crate::state::Ownership::SuperaiCreated,
+                    template: None,
+                    created_at: "2026-10-12T00:00:00Z".to_owned(),
+                    adapter_revision: crate::adapter::ADAPTER_REVISION.to_owned(),
+                })
+                .unwrap();
+            registry.store(&fx.registry_path).unwrap();
+
+            let request = crate::lifecycle::ReconfigureRequest::new(vec![
+                crate::lifecycle::ReconfigureAction::SetPluginEnabled {
+                    plugin: "market".to_owned(),
+                    enabled: false,
+                },
+            ]);
+            let preview = crate::lifecycle::preview_reconfigure_with_home(
+                &registry,
+                "work",
+                adapter.as_ref(),
+                &request,
+                Some(&fx.home),
+            )
+            .unwrap();
+            assert!(
+                preview
+                    .conflicts
+                    .iter()
+                    .any(|c| c.code == "plugin_requires_approval"),
+                "{id}: preview must refuse execution-requiring plugins with a conflict, got {:?}",
+                preview.conflicts
+            );
+            assert!(
+                preview
+                    .actions
+                    .iter()
+                    .all(|a| a.kind != crate::operation::ActionKind::CreateDir),
+                "{id}: preview must plan no directory creation where commit refuses, got {:?}",
+                preview.actions
+            );
+            let created: Vec<std::ffi::OsString> = std::fs::read_dir(&fx.config_root)
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|e| e.file_name())
+                .collect();
+            assert!(
+                created.is_empty(),
+                "{id}: preview created entries in the config root: {created:?}"
+            );
+            assert_eq!(
+                std::fs::read(&fx.registry_file).unwrap(),
+                registry_bytes_before,
+                "{id}: preview must not touch the plugin registry"
+            );
+            drop(std::fs::remove_dir_all(&fx.root));
+        }
+    }
+
+    /// The commit side of the same property: `set_plugin_enabled` refuses
+    /// with `RequiresApproval` and leaves the registry flag, registry.json,
+    /// and the destination exactly as they were.
+    #[test]
+    fn execution_requiring_plugin_decls_commit_refuses_without_mutation() {
+        for adapter in harness_catalog::all_adapters() {
+            let Some(decl) = adapter.plugin_decl() else {
+                continue;
+            };
+            if !decl.requires_execution {
+                continue;
+            }
+            let id = adapter.id().as_str().to_owned();
+            let fx = execution_decl_fixture(&id, &decl);
+            let registry_bytes_before = std::fs::read(&fx.registry_file).unwrap();
+
+            let source = crate::plugin::PluginSource {
+                id: crate::ids::PluginId::new("market").unwrap(),
+                kind: decl.kind,
+                locator: "marketplace://example".to_owned(),
+                version: None,
+                digest: None,
+            };
+            let dest = fx.config_root.join(&decl.dest_file);
+            let mut plugins = crate::plugin::PluginRegistry::load(&fx.plugin_root).unwrap();
+            let err = crate::plugin::set_plugin_enabled(&mut plugins, &decl, &dest, &source, false)
+                .unwrap_err();
+            assert!(
+                matches!(err, crate::error::CoreError::RequiresApproval { .. }),
+                "{id}: expected RequiresApproval, got {err:?}"
+            );
+            assert!(
+                plugins.get(&source.id).is_some_and(|r| r.enabled),
+                "{id}: the enabled flag must survive the refusal"
+            );
+            assert_eq!(
+                std::fs::read(&fx.registry_file).unwrap(),
+                registry_bytes_before,
+                "{id}: the refusal must leave registry.json untouched"
+            );
+            assert!(
+                !dest.exists(),
+                "{id}: no destination may materialize where commit refuses"
+            );
+            drop(std::fs::remove_dir_all(&fx.root));
         }
     }
 }

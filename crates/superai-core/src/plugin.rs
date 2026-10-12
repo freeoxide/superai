@@ -405,6 +405,17 @@ impl PluginRegistry {
         let existing = self.get(&source.id).cloned();
         let is_update = existing.is_some();
         let mut conflicts: Vec<String> = Vec::new();
+        if matches!(
+            source.kind,
+            PluginKind::NpmRef | PluginKind::MarketplaceRecord
+        ) {
+            // `install` refuses these without approval; a preview claiming
+            // auto-apply would promise a commit that cannot run.
+            conflicts.push(format!(
+                "kind {} needs an approved harness/package command execution; install refuses without one",
+                source.kind
+            ));
+        }
         let norm = source.id.normalized();
         for rec in &self.records {
             if rec.id.normalized() == norm && rec.id != source.id {
@@ -1094,11 +1105,18 @@ pub fn set_plugin_enabled(
     source: &PluginSource,
     enabled: bool,
 ) -> Result<PluginRecord> {
-    let record = if enabled {
-        registry.enable(&source.id)?
-    } else {
-        registry.disable(&source.id)?
-    };
+    if decl.requires_execution {
+        // Refuse before any registry mutation: the refusal must leave the
+        // enabled flag and registry.json exactly as they were.
+        return Err(CoreError::RequiresApproval {
+            plugin: source.id.to_string(),
+            operation: if enabled { "enable" } else { "disable" }.to_owned(),
+            reason: format!(
+                "adapter decl `{}` marks this plugin kind as requiring harness command execution",
+                decl.source_hint
+            ),
+        });
+    }
     match decl.kind {
         PluginKind::ConfigEntry => {
             let Some(dest_key) = decl.dest_key.as_deref() else {
@@ -1107,53 +1125,60 @@ pub fn set_plugin_enabled(
                     reason: "config-entry decl declares no destination key".to_owned(),
                 });
             };
+            let record = if enabled {
+                registry.enable(&source.id)?
+            } else {
+                registry.disable(&source.id)?
+            };
             if enabled {
                 install_config_entry(dest_path, dest_key, source)?;
             } else {
                 remove_config_entry(dest_path, dest_key, &source.id)?;
             }
+            Ok(registry.get(&source.id).cloned().unwrap_or(record))
         }
         PluginKind::DirectoryBundle => {
             let instance_root = dest_path.parent().unwrap_or_else(|| Path::new("."));
+            let record = if enabled {
+                registry.enable(&source.id)?
+            } else {
+                registry.disable(&source.id)?
+            };
             if enabled {
                 let mut restore_source = source.clone();
                 record
                     .source_locator
                     .clone_into(&mut restore_source.locator);
                 install_directory_bundle(registry, &restore_source, decl, instance_root)?;
-            } else {
-                let mut reg =
-                    std::mem::replace(registry, PluginRegistry::new(registry.root.clone()));
-                let outcome = remove_directory_bundle(&mut reg, &source.id, decl, instance_root)?;
-                *registry = reg;
-                let Some(removal) = outcome else {
-                    return Ok(record);
-                };
-                // Keep the (disabled) record: disable is reversible, the
-                // removal report's retained deps still apply.
-                let mut kept = removal.record;
-                kept.enabled = false;
-                let disabled_record = kept.clone();
-                registry.records.push(kept);
-                registry
-                    .records
-                    .sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
-                registry.store()?;
-                return Ok(registry.get(&source.id).cloned().unwrap_or(disabled_record));
+                return Ok(registry.get(&source.id).cloned().unwrap_or(record));
             }
+            let mut reg = std::mem::replace(registry, PluginRegistry::new(registry.root.clone()));
+            let outcome = remove_directory_bundle(&mut reg, &source.id, decl, instance_root)?;
+            *registry = reg;
+            let Some(removal) = outcome else {
+                return Ok(record);
+            };
+            // Keep the (disabled) record: disable is reversible, the
+            // removal report's retained deps still apply.
+            let mut kept = removal.record;
+            kept.enabled = false;
+            let disabled_record = kept.clone();
+            registry.records.push(kept);
+            registry
+                .records
+                .sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
+            registry.store()?;
+            Ok(registry.get(&source.id).cloned().unwrap_or(disabled_record))
         }
-        _ => {
-            return Err(CoreError::RequiresApproval {
-                plugin: source.id.to_string(),
-                operation: if enabled { "enable" } else { "disable" }.to_owned(),
-                reason: format!(
-                    "enable/disable for kind {} requires harness command execution per adapter decl",
-                    source.kind
-                ),
-            });
-        }
+        _ => Err(CoreError::RequiresApproval {
+            plugin: source.id.to_string(),
+            operation: if enabled { "enable" } else { "disable" }.to_owned(),
+            reason: format!(
+                "enable/disable for kind {} requires harness command execution per adapter decl",
+                source.kind
+            ),
+        }),
     }
-    Ok(registry.get(&source.id).cloned().unwrap_or(record))
 }
 
 /// Read a JSON config fresh: outer map plus inner plugin map under `key`;

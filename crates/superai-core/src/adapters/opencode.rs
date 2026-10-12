@@ -1,5 +1,7 @@
 //! `OpenCode` adapter: layered JSONC `opencode.json`/`.jsonc`, relocated via
 //! `XDG_CONFIG_HOME` plus `OPENCODE_CONFIG`/`OPENCODE_CONFIG_CONTENT` overrides.
+//! Two live lines share the `opencode` binary name: v1 (`opencode-ai` 1.x)
+//! and v2 (`@opencode/cli` 2.x), so the surfaces below model both eras.
 
 use std::path::{Path, PathBuf};
 
@@ -33,20 +35,23 @@ pub const CUSTOM_CONFIG_ENV_VAR: &str = "OPENCODE_CONFIG";
 /// Environment variable for inline JSON overrides (highest precedence).
 pub const INLINE_CONFIG_ENV_VAR: &str = "OPENCODE_CONFIG_CONTENT";
 
-/// Environment variable for extra directory scanned like `.opencode/`.
+/// Environment variable for extra directory scanned like `.opencode/`; in
+/// current v1 and v2 releases it also relocates the global config root.
 pub const CONFIG_DIR_ENV_VAR: &str = "OPENCODE_CONFIG_DIR";
 
 /// Research doc whose findings the constants in this file encode.
 pub const RESEARCH_DOC: &str = "docs/harness-configs/opencode.md";
 
-/// Date the research doc was last checked against the harness.
+/// Date the research doc was last checked against the harness; the catalog
+/// freshness gate caps how far this may advance past its ledger epoch.
 pub const LAST_VERIFIED: &str = "2026-08-25";
 
 /// Schema version this adapter maps detected versions to.
 pub const SCHEMA_VERSION_STR: &str = "1";
 
 /// Owned top-level keys inside `opencode.json`; everything else round-trips
-/// untouched via `superai-config::jsonc`.
+/// untouched via `superai-config::jsonc`. Writes use the v1 spellings, which
+/// v2 binaries normalize up, so the v2-only keys stay unowned and preserved.
 pub const OWNED_SELECTORS: &[&str] = &[
     "model",
     "small_model",
@@ -58,6 +63,16 @@ pub const OWNED_SELECTORS: &[&str] = &[
     "disabled_providers",
     "enabled_providers",
     "agent",
+];
+
+/// v2-only keys a v1-line binary cannot honor: upstream `v2-compat.ts` throws
+/// on `permissions` and drops the rest with diagnostics.
+pub const V2_ONLY_SELECTORS: &[&str] = &[
+    "permissions",
+    "providers",
+    "plugins",
+    "websearch",
+    "warming",
 ];
 
 /// Concrete adapter for `OpenCode`: `relocated-root` via `XDG_CONFIG_HOME`
@@ -126,11 +141,20 @@ impl OpenCodeAdapter {
                     if tui.exists() || tui_jc.exists() {
                         evidence.push(format!("tui config present at {}", root.display()));
                     }
+                    let cli_jc = root.join("cli.json").exists() || root.join("cli.jsonc").exists();
+                    if cli_jc {
+                        evidence.push(format!("cli.json (v2 line) present at {}", root.display()));
+                    }
                     let auth = dirs_auth_path();
                     if let Some(auth_path) = auth
                         && auth_path.exists()
                     {
                         evidence.push(format!("auth.json present at {}", auth_path.display()));
+                    }
+                    if let Some(db) = dirs_db_path()
+                        && db.exists()
+                    {
+                        evidence.push(format!("opencode.db (v2 line) present at {}", db.display()));
                     }
                 } else {
                     evidence.push(format!("config root missing at {}", root.display()));
@@ -197,6 +221,58 @@ fn dirs_auth_path() -> Option<PathBuf> {
             .join("opencode")
             .join("auth.json"),
     )
+}
+
+fn dirs_db_path() -> Option<PathBuf> {
+    dirs_auth_path()?
+        .parent()
+        .map(|dir| dir.join("opencode.db"))
+}
+
+/// v1 line: 0.x and 1.x binaries. 2.x is the v2 line; anything unparseable
+/// is treated as unknown and never conflicts.
+fn is_v1_line(version: &str) -> bool {
+    let major = version
+        .split('.')
+        .next()
+        .and_then(|s| s.parse::<u64>().ok());
+    matches!(major, Some(0 | 1))
+}
+
+fn present_v2_keys(content: &[u8]) -> Vec<&'static str> {
+    let Ok(text) = std::str::from_utf8(content) else {
+        return Vec::new();
+    };
+    let Ok(value) =
+        serde_json::from_str::<serde_json::Value>(&superai_config::jsonc::strip_jsonc(text))
+    else {
+        return Vec::new();
+    };
+    let Some(obj) = value.as_object() else {
+        return Vec::new();
+    };
+    V2_ONLY_SELECTORS
+        .iter()
+        .filter(|key| obj.contains_key(**key))
+        .copied()
+        .collect()
+}
+
+/// Refuse v2-only keys under a detected v1-line binary: v1 hard-errors on
+/// `permissions` and silently drops the others, while v2 normalizes v1 keys,
+/// so only this direction breaks the harness.
+pub fn v2_key_era_conflict(version: &str, content: &[u8]) -> Option<String> {
+    if !is_v1_line(version) {
+        return None;
+    }
+    let present = present_v2_keys(content);
+    if present.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "detected opencode {version} is the v1 line but the config carries v2-only keys ({}); v1 refuses `permissions` and ignores the rest while v2 accepts v1 keys, so migrate the file before writing",
+        present.join(", ")
+    ))
 }
 
 impl Default for OpenCodeAdapter {
@@ -339,6 +415,42 @@ impl Adapter for OpenCodeAdapter {
         tui_surface.backup_required = true;
         surfaces.push(tui_surface);
 
+        let cli_resolver = PathResolver::new(
+            Some("$XDG_CONFIG_HOME/opencode/cli.json"),
+            Some("$XDG_CONFIG_HOME/opencode/cli.json"),
+            Some("%XDG_CONFIG_HOME%\\opencode\\cli.json"),
+            "~/.config/opencode/cli.json",
+        );
+        let mut cli_surface = ConfigSurface::new(
+            "cli.json",
+            cli_resolver,
+            DocumentKind::Jsonc,
+            ConfigScope::User,
+            SurfaceOwnership::UserEditable,
+        );
+        cli_surface.precedence = 5;
+        cli_surface.backup_required = true;
+        cli_surface.restart_behavior = RestartBehavior::Reload;
+        surfaces.push(cli_surface);
+
+        let db_resolver = PathResolver::new(
+            Some("$XDG_DATA_HOME/opencode/opencode.db"),
+            Some("$XDG_DATA_HOME/opencode/opencode.db"),
+            Some("%APPDATA%\\opencode\\opencode.db"),
+            "~/.local/share/opencode/opencode.db",
+        );
+        let mut db = ConfigSurface::new(
+            "opencode.db",
+            db_resolver,
+            DocumentKind::Sqlite,
+            ConfigScope::User,
+            SurfaceOwnership::ExternalSecretStore,
+        );
+        db.precedence = 0;
+        db.backup_required = false;
+        db.restart_behavior = RestartBehavior::ReLogin;
+        surfaces.push(db);
+
         let auth_resolver = PathResolver::new(
             Some("$XDG_DATA_HOME/opencode/auth.json"),
             Some("$XDG_DATA_HOME/opencode/auth.json"),
@@ -422,6 +534,7 @@ impl Adapter for OpenCodeAdapter {
             ".git/*".to_owned(),
             "tmp/*".to_owned(),
             "auth.json".to_owned(),
+            "*.db".to_owned(),
         ]
     }
 
@@ -436,6 +549,9 @@ impl Adapter for OpenCodeAdapter {
             CUSTOM_CONFIG_ENV_VAR.to_owned(),
             cfg_path.display().to_string(),
         ));
+        // Current v1 and v2 releases let this var override the config root,
+        // so an inherited value would bypass the XDG relocation entirely.
+        plan.env_unset.push(CONFIG_DIR_ENV_VAR.to_owned());
         plan.description = format!(
             " Wrapper sets {}={} and {}={} and execs `{}`",
             CONFIG_ENV_VAR,
@@ -452,11 +568,13 @@ impl Adapter for OpenCodeAdapter {
             "~/.config/opencode".to_owned(),
             "~/.config/opencode/opencode.json".to_owned(),
             "~/.config/opencode/opencode.jsonc".to_owned(),
+            "~/.config/opencode/cli.json".to_owned(),
             "$XDG_CONFIG_HOME/opencode".to_owned(),
             "$OPENCODE_CONFIG".to_owned(),
             "$OPENCODE_CONFIG_CONTENT".to_owned(),
             "./opencode.json".to_owned(),
             "./opencode.jsonc".to_owned(),
+            "./.opencode/opencode.json".to_owned(),
         ]
     }
 
@@ -485,14 +603,32 @@ impl Adapter for OpenCodeAdapter {
                 SurfaceSchema::new()
                     .with_root_shape(RootShape::Object)
                     .with_owned_key("provider", ValueType::Object)
+                    .with_owned_key("providers", ValueType::Object)
                     .with_owned_key("mcp", ValueType::Object)
                     .with_owned_key("agent", ValueType::Object)
+                    .with_owned_key("agents", ValueType::Object)
                     .with_owned_key("command", ValueType::Object)
+                    .with_owned_key("commands", ValueType::Object)
+                    .with_owned_key("permissions", ValueType::Array)
+                    .with_owned_key("update", ValueType::String)
                     .with_owned_key("small_model", ValueType::String),
             ),
-            "tui.json" => Some(SurfaceSchema::new().with_root_shape(RootShape::Object)),
+            "tui.json" | "cli.json" => {
+                Some(SurfaceSchema::new().with_root_shape(RootShape::Object))
+            }
             _ => None,
         }
+    }
+
+    fn era_conflict_reason(&self, surface_id: &str, content: &[u8]) -> Option<String> {
+        if !matches!(
+            surface_id,
+            "opencode.json" | "opencode.jsonc" | "project opencode.json"
+        ) {
+            return None;
+        }
+        let version = self.version_resolution().detected_version?;
+        v2_key_era_conflict(&version, content)
     }
 
     fn capability_declarations(&self) -> Vec<crate::adapter::AdapterCapabilityDecl> {
@@ -531,7 +667,7 @@ impl Adapter for OpenCodeAdapter {
             DocumentKind::Jsonc,
             ConfigScope::User,
             RestartBehavior::Reload,
-        ).with_read_only("jsonc writes refuse (LossyWrite) until a preserving codec exists; inspect/diff only"))
+        ).with_read_only("jsonc writes refuse (LossyWrite) until a preserving codec exists; inspect/diff only; v2 nests servers under mcp.servers while v1 keys them under mcp directly"))
     }
 
     /// npm `plugin` list entries plus files in `.opencode/plugins/` or `~/.config/opencode/plugins/`.
@@ -549,8 +685,13 @@ mod tests {
     use std::collections::HashSet;
     use std::path::PathBuf;
 
-    use super::{CONFIG_ENV_VAR, CUSTOM_CONFIG_ENV_VAR, HARNESS_ID_STR, OWNED_SELECTORS};
-    use crate::adapter::{Adapter, ConfigScope, DocumentKind, SurfaceOwnership};
+    use super::{
+        CONFIG_DIR_ENV_VAR, CONFIG_ENV_VAR, CUSTOM_CONFIG_ENV_VAR, HARNESS_ID_STR, OWNED_SELECTORS,
+        V2_ONLY_SELECTORS,
+    };
+    use crate::adapter::{
+        Adapter, ConfigScope, DocumentKind, ProductStatus, SurfaceOwnership, WrapperPlan,
+    };
     use crate::error::CoreError;
     use crate::ids::{HarnessId, InstanceId, InstanceName};
     use crate::instance::Instance;
@@ -636,6 +777,133 @@ mod tests {
     }
 
     #[test]
+    fn v2_key_era_conflict_refuses_only_v1_line_with_v2_keys() {
+        let v2_content = br#"{"providers": {"acme": {}}, "permissions": []}"#;
+        let conflict = super::v2_key_era_conflict("1.19.0", v2_content).unwrap();
+        assert!(conflict.contains("permissions"), "{conflict}");
+        assert!(conflict.contains("providers"), "{conflict}");
+
+        assert!(super::v2_key_era_conflict("2.0.27", v2_content).is_none());
+        assert!(super::v2_key_era_conflict("1.19.0", br#"{"provider": {}}"#).is_none());
+        assert!(super::v2_key_era_conflict("0.12.0", br#"{"plugins": ["x"]}"#).is_some());
+        assert!(super::v2_key_era_conflict("garbage", v2_content).is_none());
+        assert!(super::v2_key_era_conflict("1.19.0", b"[1]").is_none());
+        assert!(super::v2_key_era_conflict("1.19.0", b"not json").is_none());
+    }
+
+    #[test]
+    fn v2_key_era_conflict_reads_jsonc_comments_and_trailing_commas() {
+        let jsonc = b"{ // providers block\n \"providers\": {}, }";
+        assert!(super::v2_key_era_conflict("1.19.0", jsonc).is_some());
+    }
+
+    #[test]
+    fn v2_only_selectors_disjoint_from_v1_only_era_keys() {
+        let v1_only = [
+            "provider",
+            "agent",
+            "command",
+            "plugin",
+            "permission",
+            "autoupdate",
+        ];
+        for key in V2_ONLY_SELECTORS {
+            assert!(!v1_only.contains(key));
+        }
+    }
+
+    #[derive(Debug)]
+    struct V1EraOpenCode;
+
+    impl Adapter for V1EraOpenCode {
+        fn id(&self) -> HarnessId {
+            HarnessId::from_validated_const(HARNESS_ID_STR)
+        }
+        fn display_name(&self) -> &str {
+            super::DISPLAY_NAME
+        }
+        fn product_status(&self) -> ProductStatus {
+            ProductStatus::Active
+        }
+        fn supported_platforms(&self) -> Vec<crate::adapter::Platform> {
+            Vec::new()
+        }
+        fn adapter_revision(&self) -> &str {
+            crate::adapter::ADAPTER_REVISION
+        }
+        fn research_doc_link(&self) -> &str {
+            super::RESEARCH_DOC
+        }
+        fn last_verified_date(&self) -> &str {
+            super::LAST_VERIFIED
+        }
+        fn detection(&self) -> crate::adapter::DetectionResult {
+            crate::adapter::DetectionResult::absent(vec!["test".to_owned()])
+        }
+        fn version_resolution(&self) -> crate::adapter::VersionResolution {
+            crate::adapter::VersionResolution::new(
+                Some("1.19.0".to_owned()),
+                Some(super::SCHEMA_VERSION_STR.to_owned()),
+                true,
+            )
+        }
+        fn config_surfaces(&self) -> Vec<crate::adapter::ConfigSurface> {
+            vec![crate::adapter::ConfigSurface::new(
+                "opencode.json",
+                crate::adapter::PathResolver::fallback_only("~/.config/opencode/opencode.json"),
+                DocumentKind::Jsonc,
+                ConfigScope::User,
+                SurfaceOwnership::UserEditable,
+            )]
+        }
+        fn supported_operations(&self) -> Vec<(String, AdapterSupport)> {
+            Vec::new()
+        }
+        fn plan_mirror_exclusions(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn plan_wrapper(&self, _instance: &Instance) -> Result<WrapperPlan, CoreError> {
+            Ok(WrapperPlan::new("test"))
+        }
+        fn scan_candidates(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn validate_instance(&self, _instance: &Instance) -> Result<(), CoreError> {
+            Ok(())
+        }
+        fn era_conflict_reason(&self, surface_id: &str, content: &[u8]) -> Option<String> {
+            (surface_id == "opencode.json")
+                .then(|| super::v2_key_era_conflict("1.19.0", content))
+                .flatten()
+        }
+    }
+
+    #[test]
+    fn raw_editor_refuses_v2_keys_under_v1_line_and_keeps_file() {
+        let dir = crate::test_util::temp_dir_unique("opencode-era");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("opencode.json");
+        let original: &[u8] = br#"{"model": "anthropic/claude-sonnet-4-5"}"#;
+        std::fs::write(&path, original).unwrap();
+        let adapter = V1EraOpenCode;
+        let v2_bytes = std::fs::read(fixture_path("opencode.v2.json")).unwrap();
+        let err =
+            crate::raw_editor::commit_for_adapter(&path, &v2_bytes, None, &adapter).unwrap_err();
+        match err {
+            CoreError::UnsupportedVersion { reason, .. } => {
+                assert!(reason.contains("v1 line"), "{reason}");
+                assert!(reason.contains("permissions"), "{reason}");
+            }
+            other => panic!("expected UnsupportedVersion, got {other:?}"),
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        let v1_bytes = std::fs::read(fixture_path("opencode.populated.json")).unwrap();
+        crate::raw_editor::commit_for_adapter(&path, &v1_bytes, None, &adapter).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), v1_bytes);
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
     fn config_surfaces_include_writable_jsonc() {
         let a = adapter();
         let surfaces = a.config_surfaces();
@@ -673,6 +941,23 @@ mod tests {
             .expect("auth surface");
         assert_eq!(auth.ownership, SurfaceOwnership::ExternalSecretStore);
         assert!(!auth.backup_required);
+
+        let cli = surfaces
+            .iter()
+            .find(|s| s.id == "cli.json")
+            .expect("cli.json surface");
+        assert_eq!(cli.kind, DocumentKind::Jsonc);
+        assert_eq!(cli.scope, ConfigScope::User);
+        assert_eq!(cli.ownership, SurfaceOwnership::UserEditable);
+        assert!(cli.backup_required);
+
+        let db = surfaces
+            .iter()
+            .find(|s| s.id == "opencode.db")
+            .expect("opencode.db surface");
+        assert_eq!(db.kind, DocumentKind::Sqlite);
+        assert_eq!(db.ownership, SurfaceOwnership::ExternalSecretStore);
+        assert!(!db.backup_required);
 
         let project = surfaces
             .iter()
@@ -731,9 +1016,12 @@ mod tests {
         assert!(!is_excluded("opencode.json"));
         assert!(!is_excluded("opencode.jsonc"));
         assert!(!is_excluded("tui.json"));
+        assert!(!is_excluded("cli.json"));
         assert!(is_excluded("cache/data.bin"));
         assert!(is_excluded("logs/opencode.log"));
         assert!(is_excluded("node_modules/foo/index.js"));
+        assert!(is_excluded("opencode.db"));
+        assert!(is_excluded("opencode-beta.db"));
     }
 
     #[test]
@@ -755,6 +1043,10 @@ mod tests {
         assert!(!plan.description.is_empty());
         assert!(plan.description.contains(CONFIG_ENV_VAR));
         assert!(plan.description.contains(CUSTOM_CONFIG_ENV_VAR));
+        assert!(
+            plan.env_unset.contains(&CONFIG_DIR_ENV_VAR.to_owned()),
+            "wrapper must clear {CONFIG_DIR_ENV_VAR} so it cannot bypass the relocation"
+        );
     }
 
     #[test]
@@ -802,6 +1094,12 @@ mod tests {
         assert!(candidates.iter().any(|c| c.contains("opencode")));
         assert!(candidates.iter().any(|c| c.contains(CONFIG_ENV_VAR)));
         assert!(candidates.iter().any(|c| c.contains(CUSTOM_CONFIG_ENV_VAR)));
+        assert!(
+            candidates
+                .iter()
+                .any(|c| c.contains("./.opencode/opencode.json"))
+        );
+        assert!(candidates.iter().any(|c| c.contains("cli.json")));
     }
 
     #[test]
@@ -910,6 +1208,33 @@ mod tests {
             "foreign keys must be preserved, got {after:?}"
         );
         drop(std::fs::remove_file(&tmp));
+    }
+
+    #[test]
+    fn fixture_v2_parses_and_keeps_era_keys_side_by_side() {
+        let path = fixture_path("opencode.v2.json");
+        assert!(path.exists(), "fixture missing: {}", path.display());
+        let map = superai_config::jsonc::load(&path).unwrap();
+        assert!(map.contains_key("providers"));
+        assert!(map.contains_key("permissions"));
+        assert!(map["mcp"]["servers"]["local-server"]["command"].is_array());
+        assert!(map["permissions"].is_array());
+
+        let jc = fixture_path("opencode.v2.jsonc");
+        let jc_map = superai_config::jsonc::load(&jc).unwrap();
+        assert!(jc_map.contains_key("providers"));
+        assert!(jc_map.contains_key("update"));
+
+        let cli = fixture_path("cli.json");
+        let cli_map = superai_config::jsonc::load(&cli).unwrap();
+        assert!(cli_map.contains_key("tabs") && cli_map.contains_key("theme"));
+    }
+
+    #[test]
+    fn fixture_v2_conflicts_under_v1_line_not_v2() {
+        let v2_bytes = std::fs::read(fixture_path("opencode.v2.json")).unwrap();
+        assert!(super::v2_key_era_conflict("1.19.0", &v2_bytes).is_some());
+        assert!(super::v2_key_era_conflict("2.0.27", &v2_bytes).is_none());
     }
 
     #[test]
@@ -1084,7 +1409,14 @@ mod tests {
             .surface_schema("opencode.json")
             .expect("opencode.json schema");
         assert_eq!(schema.root_shape, Some(crate::adapter::RootShape::Object));
-        for path in ["provider", "mcp", "agent"] {
+        for path in [
+            "provider",
+            "providers",
+            "mcp",
+            "agent",
+            "agents",
+            "permissions",
+        ] {
             assert!(
                 schema.owned_key_rules.iter().any(|r| r.path == path),
                 "missing rule for {path}"
@@ -1092,7 +1424,38 @@ mod tests {
         }
         assert!(a.surface_schema("opencode.jsonc").is_some());
         assert!(a.surface_schema("tui.json").is_some());
+        assert!(a.surface_schema("cli.json").is_some());
         assert!(a.surface_schema("unknown").is_none());
+    }
+
+    #[test]
+    fn schema_types_v2_keys_according_to_upstream_shapes() {
+        let a = adapter();
+        let diags = crate::adapter::validate_surface_content(
+            &a,
+            "opencode.json",
+            br#"{"providers": ["acme"], "permissions": "ask", "update": true}"#,
+            superai_config::document::DocumentKind::StrictJson,
+        );
+        assert_eq!(
+            diags
+                .iter()
+                .filter(|d| d.severity == superai_config::document::DiagnosticSeverity::Error)
+                .count(),
+            3,
+            "diags: {diags:?}"
+        );
+        let ok = crate::adapter::validate_surface_content(
+            &a,
+            "opencode.json",
+            br#"{"providers": {"acme": {}}, "permissions": [{"action": "bash", "resource": "*", "effect": "ask"}], "update": "notify"}"#,
+            superai_config::document::DocumentKind::StrictJson,
+        );
+        assert!(
+            ok.iter()
+                .all(|d| d.severity != superai_config::document::DiagnosticSeverity::Error),
+            "diags: {ok:?}"
+        );
     }
 
     #[test]

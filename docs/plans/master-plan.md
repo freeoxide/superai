@@ -24,6 +24,9 @@ All 14 subplans are complete through commit c164204 plus the final-gate-fix roun
 | 11 | [Harness installation](11-harness-installation.md) | Detect/install/update/uninstall with mise/duct-backed execution | 00, 03–06 | 8–12 | 6/6 |
 | 12 | [Raw editor backend](12-raw-editor-backend.md) | Read/validate/diff/commit API for future editors | 01–03 | 4–6 | 6/6 |
 | 13 | [Verification and release](13-verification-and-release.md) | Fixtures, fault tests, platform gates, non-UI release criteria | all | 10–16 | 7/7 |
+| 14 | [Usage core](14-usage-and-proxy.md) | UsageSurface, superai-usage crate, local readers, window/cost engines, `usage` CLI | 00–03, 07 | 11–15 | 0/5 |
+| 15 | [Usage sources](15-usage-sources.md) | llmproxy ledger client, provider-native API-key pollers, onboarding pattern | 14 | 16–22 | 0/3 |
+| 16 | [VPS deploy](16-vps-deploy.md) | `vps deploy/status llmproxy` via toride services, TLS or tunnel-only | 14, 15 | 6–9 | 0/3 |
 
 Exit-gate column = subplan exit-gate checkboxes closed as of run 3 (commit c164204) plus the
 final-gate-fix round; each plan's Exit gate section carries the evidence citations and the
@@ -31,6 +34,18 @@ residual notes (plan 02's single-transaction-boundary fold and plan 13's macOS/W
 adversarial platform cases were closed by c164204; remaining residuals are disclosed inline
 per plan, e.g. plan 10's unimplemented EXT-10 diagnostic-validation sub-step). Subplan task
 boxes are completion records.
+
+## External companion plans
+
+Two export documents under `docs/plans/export/` carry the non-superai halves of the
+usage work split out of subplan 14. Their canonical homes are the llmproxy and toride
+repositories; the copies here are exports.
+
+- [llmproxy-usage-ledger.md](export/llmproxy-usage-ledger.md): PRX-01..06, the
+  proxy-side usage ledger (client keys, SQLite EventBus backend, /usage admin API,
+  per-provider egress, release artifacts).
+- [toride-vps-services.md](export/toride-vps-services.md): VPS-01, toride's remote
+  exec/upload, systemd unit install, and the 0.2 publishes subplan 16 consumes.
 
 ## Milestone completion records
 

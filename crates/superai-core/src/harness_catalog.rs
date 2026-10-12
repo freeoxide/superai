@@ -1,60 +1,100 @@
-//! Registered harness catalog: the 51 planned product surfaces.
-//! Every ledger row from `docs/plans/03-harness-adapters.md` is registered here.
+//! Registered harness catalog: 91 product surfaces — the 51 plan rows plus
+//! 40 research-verified additions (see each entry's source doc).
 
 use serde::{Deserialize, Serialize};
 
 use crate::adapter::{Adapter, GenericAdapter, ProductStatus};
+use crate::adapters::agentty::AgenttyAdapter;
 use crate::adapters::aider::AiderAdapter;
 use crate::adapters::amazon_q::AmazonQAdapter;
 use crate::adapters::amp::AmpAdapter;
 use crate::adapters::antigravity::AntigravityAdapter;
 use crate::adapters::auggie::AuggieAdapter;
+use crate::adapters::avante_nvim::AvanteNvimAdapter;
+use crate::adapters::bb_app::BbAppAdapter;
 use crate::adapters::chatgpt_desktop::ChatGptDesktopAdapter;
 use crate::adapters::claude_code::ClaudeCodeAdapter;
 use crate::adapters::claude_desktop::ClaudeDesktopAdapter;
+use crate::adapters::claw_code::ClawCodeAdapter;
 use crate::adapters::cline::ClineAdapter;
+use crate::adapters::coco::CocoAdapter;
+use crate::adapters::codecompanion_nvim::CodecompanionNvimAdapter;
+use crate::adapters::codegeex::CodegeexAdapter;
 use crate::adapters::codex_cli::CodexCliAdapter;
+use crate::adapters::command_code::CommandCodeAdapter;
 use crate::adapters::conductor::ConductorAdapter;
 use crate::adapters::continue_dev::ContinueDevAdapter;
 use crate::adapters::copilot_cli::CopilotCliAdapter;
 use crate::adapters::copilot_coding_agent::CopilotCodingAgentAdapter;
+use crate::adapters::copilot_vscode::CopilotVscodeAdapter;
 use crate::adapters::crush::CrushAdapter;
 use crate::adapters::cursor::CursorAdapter;
+use crate::adapters::cursor_agent::CursorAgentAdapter;
 use crate::adapters::deepseek::DeepSeekAdapter;
+use crate::adapters::devin::DevinAdapter;
+use crate::adapters::eca::EcaAdapter;
+use crate::adapters::every_code::EveryCodeAdapter;
 use crate::adapters::factory_droid::FactoryDroidAdapter;
 use crate::adapters::forge::ForgeAdapter;
+use crate::adapters::freebuff::FreebuffAdapter;
+use crate::adapters::fx::FxAdapter;
 use crate::adapters::gemini_cli::GeminiCliAdapter;
+use crate::adapters::gitclaw::GitclawAdapter;
 use crate::adapters::goose::GooseAdapter;
 use crate::adapters::gptme::GptmeAdapter;
 use crate::adapters::grok_build::GrokBuildAdapter;
+use crate::adapters::hax::HaxAdapter;
 use crate::adapters::hermes::HermesAdapter;
 use crate::adapters::iflow::IflowAdapter;
+use crate::adapters::jcode::JcodeAdapter;
+use crate::adapters::jules::JulesAdapter;
 use crate::adapters::junie::JunieAdapter;
 use crate::adapters::kilo::KiloAdapter;
+use crate::adapters::kilocode_cli::KilocodeCliAdapter;
 use crate::adapters::kimi_code::KimiCodeAdapter;
 use crate::adapters::kiro::KiroAdapter;
 use crate::adapters::kode::KodeAdapter;
 use crate::adapters::legacy_kimi::LegacyKimiAdapter;
 use crate::adapters::letta::LettaAdapter;
 use crate::adapters::mimo::MimoAdapter;
+use crate::adapters::minimax_code::MiniMaxCodeAdapter;
 use crate::adapters::mistral_vibe::MistralVibeAdapter;
+use crate::adapters::muse_code::MuseCodeAdapter;
 use crate::adapters::nanocoder::NanocoderAdapter;
+use crate::adapters::oh_my_codex::OhMyCodexAdapter;
+use crate::adapters::oh_my_opencode::OhMyOpencodeAdapter;
+use crate::adapters::omo_ai::OmoAiAdapter;
+use crate::adapters::omp::OmpAdapter;
 use crate::adapters::openclaw::OpenClawAdapter;
 use crate::adapters::opencode::OpenCodeAdapter;
+use crate::adapters::openfang::OpenfangAdapter;
 use crate::adapters::openhands::OpenHandsAdapter;
+use crate::adapters::orca::OrcaAdapter;
+use crate::adapters::ori::OriAdapter;
 use crate::adapters::pi::PiAdapter;
 use crate::adapters::plandex::PlandexAdapter;
+use crate::adapters::prime_agent::PrimeAgentAdapter;
+use crate::adapters::qoder_cli::QoderCliAdapter;
+use crate::adapters::qoder_ide::QoderIdeAdapter;
 use crate::adapters::qwen_code::QwenCodeAdapter;
+use crate::adapters::reasonix::ReasonixAdapter;
+use crate::adapters::replit_agent::ReplitAgentAdapter;
 use crate::adapters::roo_code::RooCodeAdapter;
 use crate::adapters::sculptor::SculptorAdapter;
 use crate::adapters::swe_agent::SweAgentAdapter;
+use crate::adapters::t3code::T3codeAdapter;
+use crate::adapters::terminus::TerminusAdapter;
 use crate::adapters::trae_agent::TraeAgentAdapter;
+use crate::adapters::unreal_agent::UnrealAgentAdapter;
 use crate::adapters::vibe_kanban::VibeKanbanAdapter;
+use crate::adapters::vix::VixAdapter;
 use crate::adapters::warp::WarpAdapter;
 use crate::adapters::windsurf::WindsurfAdapter;
 use crate::adapters::workbuddy::WorkBuddyAdapter;
+use crate::adapters::zaly::ZalyAdapter;
 use crate::adapters::zcode::ZcodeAdapter;
 use crate::adapters::zed_acp::ZedAcpAdapter;
+use crate::adapters::zulu_cli::ZuluCliAdapter;
 use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::state::{AdapterSupport, Isolation};
@@ -89,9 +129,20 @@ impl CatalogEntry {
     }
 }
 
-/// All 51 provisional ledger rows.
+/// All 91 provisional ledger rows.
 /// Order follows the plan table; every surface has a source and reason.
 pub const ENTRIES: &[CatalogEntry] = &[
+    CatalogEntry {
+        id: "agentty",
+        display_name: "agentty",
+        source: "docs/harness-configs/agentty.md",
+        support: AdapterSupport::Full,
+        reason: "AGENTTY_HOME plus per-dir AGENTTY_*_DIR overrides, JSON settings/MCP/hooks: full candidate",
+        isolation: Isolation::RelocatedRoot,
+        product_status: ProductStatus::Active,
+        research_doc: "docs/harness-configs/agentty.md",
+        last_verified: "2026-09-18",
+    },
     CatalogEntry {
         id: "aider",
         display_name: "Aider",
@@ -148,6 +199,28 @@ pub const ENTRIES: &[CatalogEntry] = &[
         last_verified: "2026-08-25",
     },
     CatalogEntry {
+        id: "avante-nvim",
+        display_name: "avante.nvim",
+        source: "docs/harness-configs/avante-nvim.md",
+        support: AdapterSupport::Constrained,
+        reason: "Lua-only setup(), no config files; MCP via mcphub.nvim; Neovim config-root isolation",
+        isolation: Isolation::IdeUserData,
+        product_status: ProductStatus::Active,
+        research_doc: "docs/harness-configs/avante-nvim.md",
+        last_verified: "2026-09-18",
+    },
+    CatalogEntry {
+        id: "bb-app",
+        display_name: "bb (get-bb)",
+        source: "docs/harness-configs/bb-app.md",
+        support: AdapterSupport::Constrained,
+        reason: "BB_DATA_DIR whole-root relocation, but MCP unverified and plugin state lives in SQLite",
+        isolation: Isolation::RelocatedRoot,
+        product_status: ProductStatus::Active,
+        research_doc: "docs/harness-configs/bb-app.md",
+        last_verified: "2026-09-18",
+    },
+    CatalogEntry {
         id: "chatgpt-desktop",
         display_name: "ChatGPT Desktop (Codex)",
         source: "docs/harness-configs/chatgpt-desktop.md",
@@ -181,6 +254,17 @@ pub const ENTRIES: &[CatalogEntry] = &[
         last_verified: "2026-09-18",
     },
     CatalogEntry {
+        id: "claw-code",
+        display_name: "Claw Code",
+        source: "docs/harness-configs/claw-code.md",
+        support: AdapterSupport::Constrained,
+        reason: "five-layer JSON settings chain with CLAW_CONFIG_HOME, but museum-exhibit status, no release channel",
+        isolation: Isolation::RelocatedRoot,
+        product_status: ProductStatus::Active,
+        research_doc: "docs/harness-configs/claw-code.md",
+        last_verified: "2026-09-18",
+    },
+    CatalogEntry {
         id: "cline",
         display_name: "Cline",
         source: "docs/harness-configs/cline.md",
@@ -192,6 +276,39 @@ pub const ENTRIES: &[CatalogEntry] = &[
         last_verified: "2026-08-25",
     },
     CatalogEntry {
+        id: "coco",
+        display_name: "Cortex Code (CoCo)",
+        source: "docs/harness-configs/coco.md",
+        support: AdapterSupport::Constrained,
+        reason: "SNOWFLAKE_HOME root relocation but paid-account-tied, no BYO endpoint",
+        isolation: Isolation::RelocatedRoot,
+        product_status: ProductStatus::Active,
+        research_doc: "docs/harness-configs/coco.md",
+        last_verified: "2026-09-18",
+    },
+    CatalogEntry {
+        id: "codecompanion-nvim",
+        display_name: "codecompanion.nvim",
+        source: "docs/harness-configs/codecompanion-nvim.md",
+        support: AdapterSupport::Constrained,
+        reason: "Lua setup() table is the only surface; native stdio MCP under the mcp key",
+        isolation: Isolation::IdeUserData,
+        product_status: ProductStatus::Active,
+        research_doc: "docs/harness-configs/codecompanion-nvim.md",
+        last_verified: "2026-09-18",
+    },
+    CatalogEntry {
+        id: "codegeex",
+        display_name: "CodeGeeX",
+        source: "docs/harness-configs/codegeex.md",
+        support: AdapterSupport::ResearchBlocked,
+        reason: "host-IDE settings with no published key list; no MCP, env vars, or local files",
+        isolation: Isolation::IdeUserData,
+        product_status: ProductStatus::Active,
+        research_doc: "docs/harness-configs/codegeex.md",
+        last_verified: "2026-09-18",
+    },
+    CatalogEntry {
         id: "codex-cli",
         display_name: "Codex CLI",
         source: "docs/harness-configs/codex-cli.md",
@@ -201,6 +318,17 @@ pub const ENTRIES: &[CatalogEntry] = &[
         product_status: ProductStatus::Active,
         research_doc: "docs/harness-configs/codex-cli.md",
         last_verified: "2026-08-25",
+    },
+    CatalogEntry {
+        id: "command-code",
+        display_name: "Command Code (cmd)",
+        source: "docs/harness-configs/command-code.md",
+        support: AdapterSupport::Constrained,
+        reason: "fixed ~/.commandcode root with 3-scope MCP and BYOK; no relocation var",
+        isolation: Isolation::FixedPathSingle,
+        product_status: ProductStatus::Active,
+        research_doc: "docs/harness-configs/command-code.md",
+        last_verified: "2026-09-18",
     },
     CatalogEntry {
         id: "continue-dev",
@@ -236,6 +364,17 @@ pub const ENTRIES: &[CatalogEntry] = &[
         last_verified: "2026-08-25",
     },
     CatalogEntry {
+        id: "copilot-vscode",
+        display_name: "VS Code Copilot Agent Mode",
+        source: "docs/harness-configs/copilot-vscode.md",
+        support: AdapterSupport::Constrained,
+        reason: "IDE settings and workspace MCP JSON writable; shares ~/.copilot read-only with copilot-cli",
+        isolation: Isolation::IdeUserData,
+        product_status: ProductStatus::Active,
+        research_doc: "docs/harness-configs/copilot-vscode.md",
+        last_verified: "2026-09-18",
+    },
+    CatalogEntry {
         id: "crush",
         display_name: "Crush",
         source: "docs/harness-configs/crush.md",
@@ -258,6 +397,17 @@ pub const ENTRIES: &[CatalogEntry] = &[
         last_verified: "2026-08-25",
     },
     CatalogEntry {
+        id: "cursor-agent",
+        display_name: "Cursor Agent CLI",
+        source: "docs/harness-configs/cursor-agent.md",
+        support: AdapterSupport::Constrained,
+        reason: "CURSOR_CONFIG_DIR relocates cli-config.json only; Cursor-backend-only auth",
+        isolation: Isolation::RelocatedRoot,
+        product_status: ProductStatus::Active,
+        research_doc: "docs/harness-configs/cursor-agent.md",
+        last_verified: "2026-09-18",
+    },
+    CatalogEntry {
         id: "deepseek-harness",
         display_name: "DeepSeek Harness",
         source: "docs/harness-configs/deepseek-harness.md",
@@ -267,6 +417,39 @@ pub const ENTRIES: &[CatalogEntry] = &[
         product_status: ProductStatus::Preview,
         research_doc: "docs/harness-configs/deepseek-harness.md",
         last_verified: "2026-08-25",
+    },
+    CatalogEntry {
+        id: "devin",
+        display_name: "Devin CLI",
+        source: "docs/harness-configs/devin.md",
+        support: AdapterSupport::Constrained,
+        reason: "JSONC config plus dedicated MCP files, but no config-dir var and org settings outrank user config",
+        isolation: Isolation::ExplicitConfig,
+        product_status: ProductStatus::Active,
+        research_doc: "docs/harness-configs/devin.md",
+        last_verified: "2026-09-18",
+    },
+    CatalogEntry {
+        id: "eca",
+        display_name: "ECA (Editor Code Assistant)",
+        source: "docs/harness-configs/eca.md",
+        support: AdapterSupport::Constrained,
+        reason: "layered JSON with --config-file and ECA_CONFIG inline, but key schema unpublished",
+        isolation: Isolation::ExplicitConfig,
+        product_status: ProductStatus::Active,
+        research_doc: "docs/harness-configs/eca.md",
+        last_verified: "2026-09-18",
+    },
+    CatalogEntry {
+        id: "every-code",
+        display_name: "Every Code",
+        source: "docs/harness-configs/every-code.md",
+        support: AdapterSupport::Constrained,
+        reason: "CODE_HOME relocation but auth/session scope unverified; reads foreign ~/.codex",
+        isolation: Isolation::RelocatedRoot,
+        product_status: ProductStatus::Active,
+        research_doc: "docs/harness-configs/every-code.md",
+        last_verified: "2026-09-18",
     },
     CatalogEntry {
         id: "factory-droid",
@@ -291,6 +474,28 @@ pub const ENTRIES: &[CatalogEntry] = &[
         last_verified: "2026-08-25",
     },
     CatalogEntry {
+        id: "freebuff",
+        display_name: "Freebuff",
+        source: "docs/harness-configs/freebuff.md",
+        support: AdapterSupport::Constrained,
+        reason: "FREEBUFF_CONFIG_DIR root (absolute-only), but settings schema and MCP unpublished",
+        isolation: Isolation::RelocatedRoot,
+        product_status: ProductStatus::Active,
+        research_doc: "docs/harness-configs/freebuff.md",
+        last_verified: "2026-09-18",
+    },
+    CatalogEntry {
+        id: "fx",
+        display_name: "fx (Vercel Labs)",
+        source: "docs/harness-configs/fx.md",
+        support: AdapterSupport::Full,
+        reason: "writable JSON at fixed ~/.fx root, any OpenAI-compatible endpoint",
+        isolation: Isolation::FixedPathSingle,
+        product_status: ProductStatus::Preview,
+        research_doc: "docs/harness-configs/fx.md",
+        last_verified: "2026-09-18",
+    },
+    CatalogEntry {
         id: "gemini-cli",
         display_name: "Gemini CLI",
         source: "docs/harness-configs/gemini-cli.md",
@@ -300,6 +505,17 @@ pub const ENTRIES: &[CatalogEntry] = &[
         product_status: ProductStatus::Retired,
         research_doc: "docs/harness-configs/gemini-cli.md",
         last_verified: "2026-08-25",
+    },
+    CatalogEntry {
+        id: "gitclaw",
+        display_name: "Gitagent",
+        source: "docs/harness-configs/gitclaw.md",
+        support: AdapterSupport::Constrained,
+        reason: "agent dir is a git repo isolated via --dir; agent.yaml schema only partly documented",
+        isolation: Isolation::ExplicitConfig,
+        product_status: ProductStatus::Active,
+        research_doc: "docs/harness-configs/gitclaw.md",
+        last_verified: "2026-09-18",
     },
     CatalogEntry {
         id: "goose",
@@ -335,6 +551,17 @@ pub const ENTRIES: &[CatalogEntry] = &[
         last_verified: "2026-08-25",
     },
     CatalogEntry {
+        id: "hax",
+        display_name: "hax",
+        source: "docs/harness-configs/hax.md",
+        support: AdapterSupport::Full,
+        reason: "XDG-relocatable config/state/cache, env-only credentials, clean headless stdout",
+        isolation: Isolation::RelocatedRoot,
+        product_status: ProductStatus::Active,
+        research_doc: "docs/harness-configs/hax.md",
+        last_verified: "2026-09-18",
+    },
+    CatalogEntry {
         id: "hermes-agent",
         display_name: "Hermes Agent",
         source: "docs/harness-configs/hermes-agent.md",
@@ -357,6 +584,28 @@ pub const ENTRIES: &[CatalogEntry] = &[
         last_verified: "2026-08-25",
     },
     CatalogEntry {
+        id: "jcode",
+        display_name: "jcode",
+        source: "docs/harness-configs/jcode.md",
+        support: AdapterSupport::Constrained,
+        reason: "fixed ~/.jcode TOML and MCP; cross-reads ~/.claude.json and imports Codex MCP; no relocation var",
+        isolation: Isolation::FixedPathSingle,
+        product_status: ProductStatus::Active,
+        research_doc: "docs/harness-configs/jcode.md",
+        last_verified: "2026-09-18",
+    },
+    CatalogEntry {
+        id: "jules",
+        display_name: "Jules CLI",
+        source: "docs/harness-configs/jules.md",
+        support: AdapterSupport::Constrained,
+        reason: "thin cloud-session client; no local config or MCP surface, server-side work",
+        isolation: Isolation::DaemonService,
+        product_status: ProductStatus::Active,
+        research_doc: "docs/harness-configs/jules.md",
+        last_verified: "2026-09-18",
+    },
+    CatalogEntry {
         id: "junie-cli",
         display_name: "Junie CLI",
         source: "docs/harness-configs/junie-cli.md",
@@ -377,6 +626,17 @@ pub const ENTRIES: &[CatalogEntry] = &[
         product_status: ProductStatus::Active,
         research_doc: "docs/harness-configs/kilo-code.md",
         last_verified: "2026-08-25",
+    },
+    CatalogEntry {
+        id: "kilocode-cli",
+        display_name: "Kilo CLI",
+        source: "docs/harness-configs/kilocode-cli.md",
+        support: AdapterSupport::Full,
+        reason: "OpenCode-fork JSONC, XDG/HOME root relocation: full candidate",
+        isolation: Isolation::RelocatedRoot,
+        product_status: ProductStatus::Active,
+        research_doc: "docs/harness-configs/kilocode-cli.md",
+        last_verified: "2026-09-18",
     },
     CatalogEntry {
         id: "kimi-code-cli",
@@ -445,6 +705,17 @@ pub const ENTRIES: &[CatalogEntry] = &[
         last_verified: "2026-08-25",
     },
     CatalogEntry {
+        id: "minimax-code",
+        display_name: "MiniMax Code",
+        source: "docs/harness-configs/minimax-code.md",
+        support: AdapterSupport::Full,
+        reason: "MINIMAX_DATA_DIR relocation, config.yaml BYOK: full candidate",
+        isolation: Isolation::RelocatedRoot,
+        product_status: ProductStatus::Active,
+        research_doc: "docs/harness-configs/minimax-code.md",
+        last_verified: "2026-09-18",
+    },
+    CatalogEntry {
         id: "mistral-vibe",
         display_name: "Mistral Vibe",
         source: "docs/harness-configs/mistral-vibe.md",
@@ -456,6 +727,17 @@ pub const ENTRIES: &[CatalogEntry] = &[
         last_verified: "2026-08-25",
     },
     CatalogEntry {
+        id: "muse-code",
+        display_name: "Muse Code",
+        source: "docs/harness-configs/muse-code.md",
+        support: AdapterSupport::Constrained,
+        reason: "writable settings.json but Meta-backend-only auth, no relocation var",
+        isolation: Isolation::FixedPathSingle,
+        product_status: ProductStatus::Preview,
+        research_doc: "docs/harness-configs/muse-code.md",
+        last_verified: "2026-09-18",
+    },
+    CatalogEntry {
         id: "nanocoder",
         display_name: "Nanocoder",
         source: "docs/harness-configs/nanocoder.md",
@@ -465,6 +747,50 @@ pub const ENTRIES: &[CatalogEntry] = &[
         product_status: ProductStatus::Active,
         research_doc: "docs/harness-configs/nanocoder.md",
         last_verified: "2026-08-25",
+    },
+    CatalogEntry {
+        id: "oh-my-codex",
+        display_name: "oh-my-codex (omx)",
+        source: "docs/harness-configs/oh-my-codex.md",
+        support: AdapterSupport::Constrained,
+        reason: "workflow layer over codex; writes .codex/config.toml, state under .omx/ and CODEX_HOME cache",
+        isolation: Isolation::RelocatedRoot,
+        product_status: ProductStatus::Active,
+        research_doc: "docs/harness-configs/oh-my-codex.md",
+        last_verified: "2026-09-18",
+    },
+    CatalogEntry {
+        id: "oh-my-opencode",
+        display_name: "Oh My OpenCode (plugin)",
+        source: "docs/harness-configs/oh-my-opencode.md",
+        support: AdapterSupport::MigrationOnly,
+        reason: "upstream renamed to oh-my-openagent; plugin lineage a dormant fork: migration only",
+        isolation: Isolation::RelocatedRoot,
+        product_status: ProductStatus::Retired,
+        research_doc: "docs/harness-configs/oh-my-opencode.md",
+        last_verified: "2026-09-18",
+    },
+    CatalogEntry {
+        id: "omo-ai",
+        display_name: "OmO",
+        source: "docs/harness-configs/omo-ai.md",
+        support: AdapterSupport::Constrained,
+        reason: "~/.omo/omo.jsonc layer walk with OMO_PROFILE; the [codex] block writes Codex settings",
+        isolation: Isolation::ProjectScope,
+        product_status: ProductStatus::Active,
+        research_doc: "docs/harness-configs/omo-ai.md",
+        last_verified: "2026-09-18",
+    },
+    CatalogEntry {
+        id: "omp",
+        display_name: "omp (oh-my-pi)",
+        source: "docs/harness-configs/omp.md",
+        support: AdapterSupport::Constrained,
+        reason: "config/models.yml plus --config overlay; first-run inheritance reads .claude/.codex/.cursor",
+        isolation: Isolation::ExplicitConfig,
+        product_status: ProductStatus::Active,
+        research_doc: "docs/harness-configs/omp.md",
+        last_verified: "2026-09-18",
     },
     CatalogEntry {
         id: "openclaw",
@@ -489,6 +815,17 @@ pub const ENTRIES: &[CatalogEntry] = &[
         last_verified: "2026-08-25",
     },
     CatalogEntry {
+        id: "openfang",
+        display_name: "OpenFang",
+        source: "docs/harness-configs/openfang.md",
+        support: AdapterSupport::Constrained,
+        reason: "OPENFANG_HOME-relocatable TOML, env-name secrets, stdio/sse MCP; pre-1.0 daemon",
+        isolation: Isolation::RelocatedRoot,
+        product_status: ProductStatus::Active,
+        research_doc: "docs/harness-configs/openfang.md",
+        last_verified: "2026-09-18",
+    },
+    CatalogEntry {
         id: "openhands",
         display_name: "OpenHands",
         source: "docs/harness-configs/openhands.md",
@@ -498,6 +835,28 @@ pub const ENTRIES: &[CatalogEntry] = &[
         product_status: ProductStatus::Active,
         research_doc: "docs/harness-configs/openhands.md",
         last_verified: "2026-08-25",
+    },
+    CatalogEntry {
+        id: "orca",
+        display_name: "Orca (Stably AI)",
+        source: "docs/harness-configs/orca.md",
+        support: AdapterSupport::Constrained,
+        reason: "ADE over BYO agent fleets; per-agent command/env overrides, settings storage path undocumented",
+        isolation: Isolation::ProjectScope,
+        product_status: ProductStatus::Active,
+        research_doc: "docs/harness-configs/orca.md",
+        last_verified: "2026-09-18",
+    },
+    CatalogEntry {
+        id: "ori",
+        display_name: "Ori (OpenRouter)",
+        source: "docs/harness-configs/ori.md",
+        support: AdapterSupport::ResearchBlocked,
+        reason: "binary-only distribution with private source; only the install surface is documented",
+        isolation: Isolation::Unknown,
+        product_status: ProductStatus::Active,
+        research_doc: "docs/harness-configs/ori.md",
+        last_verified: "2026-09-18",
     },
     CatalogEntry {
         id: "pi",
@@ -522,6 +881,39 @@ pub const ENTRIES: &[CatalogEntry] = &[
         last_verified: "2026-08-25",
     },
     CatalogEntry {
+        id: "prime-agent",
+        display_name: "Prime Agent",
+        source: "docs/harness-configs/prime-agent.md",
+        support: AdapterSupport::Constrained,
+        reason: "PRIME_AGENT_CODING_AGENT_DIR-relocatable settings; daemon sessions, MCP undocumented",
+        isolation: Isolation::RelocatedRoot,
+        product_status: ProductStatus::Active,
+        research_doc: "docs/harness-configs/prime-agent.md",
+        last_verified: "2026-09-18",
+    },
+    CatalogEntry {
+        id: "qoder-cli",
+        display_name: "Qoder CLI",
+        source: "docs/harness-configs/qoder-cli.md",
+        support: AdapterSupport::Full,
+        reason: "QODER_CONFIG_DIR relocation, layered JSON settings: full candidate",
+        isolation: Isolation::RelocatedRoot,
+        product_status: ProductStatus::Active,
+        research_doc: "docs/harness-configs/qoder-cli.md",
+        last_verified: "2026-09-18",
+    },
+    CatalogEntry {
+        id: "qoder-ide",
+        display_name: "Qoder IDE and Desktop",
+        source: "docs/harness-configs/qoder-ide.md",
+        support: AdapterSupport::Constrained,
+        reason: "UI-driven settings with undocumented storage paths; only the MCP JSON editor is file-backed",
+        isolation: Isolation::Unknown,
+        product_status: ProductStatus::Active,
+        research_doc: "docs/harness-configs/qoder-ide.md",
+        last_verified: "2026-09-18",
+    },
+    CatalogEntry {
         id: "qwen-code",
         display_name: "Qwen Code",
         source: "docs/harness-configs/qwen-code.md",
@@ -531,6 +923,28 @@ pub const ENTRIES: &[CatalogEntry] = &[
         product_status: ProductStatus::Active,
         research_doc: "docs/harness-configs/qwen-code.md",
         last_verified: "2026-08-25",
+    },
+    CatalogEntry {
+        id: "reasonix",
+        display_name: "Reasonix",
+        source: "docs/harness-configs/reasonix.md",
+        support: AdapterSupport::Constrained,
+        reason: "DeepSeek-only by design; fixed ~/.reasonix root with project overrides; reads .claude/skills",
+        isolation: Isolation::FixedPathSingle,
+        product_status: ProductStatus::Active,
+        research_doc: "docs/harness-configs/reasonix.md",
+        last_verified: "2026-09-18",
+    },
+    CatalogEntry {
+        id: "replit-agent",
+        display_name: "Replit Agent",
+        source: "docs/harness-configs/replit-agent.md",
+        support: AdapterSupport::Unsupported,
+        reason: "cloud workspace agent; no executable, local files, or env surface",
+        isolation: Isolation::Unsupported,
+        product_status: ProductStatus::Active,
+        research_doc: "docs/harness-configs/replit-agent.md",
+        last_verified: "2026-09-18",
     },
     CatalogEntry {
         id: "roo-code",
@@ -555,6 +969,28 @@ pub const ENTRIES: &[CatalogEntry] = &[
         last_verified: "2026-08-25",
     },
     CatalogEntry {
+        id: "t3code",
+        display_name: "T3 Code",
+        source: "docs/harness-configs/t3code.md",
+        support: AdapterSupport::Constrained,
+        reason: "control surface over external CLIs; --base-dir server root, settings store path undocumented",
+        isolation: Isolation::RelocatedRoot,
+        product_status: ProductStatus::Active,
+        research_doc: "docs/harness-configs/t3code.md",
+        last_verified: "2026-09-18",
+    },
+    CatalogEntry {
+        id: "terminus",
+        display_name: "Terminus (Terminal-Bench)",
+        source: "docs/harness-configs/terminus.md",
+        support: AdapterSupport::ResearchBlocked,
+        reason: "benchmark agent pre-integrated into Harbor; no standalone install or user config files",
+        isolation: Isolation::OsBound,
+        product_status: ProductStatus::Preview,
+        research_doc: "docs/harness-configs/terminus.md",
+        last_verified: "2026-09-18",
+    },
+    CatalogEntry {
         id: "trae-agent",
         display_name: "Trae Agent",
         source: "docs/harness-configs/trae-agent.md",
@@ -564,6 +1000,28 @@ pub const ENTRIES: &[CatalogEntry] = &[
         product_status: ProductStatus::Active,
         research_doc: "docs/harness-configs/trae-agent.md",
         last_verified: "2026-08-25",
+    },
+    CatalogEntry {
+        id: "unreal-agent",
+        display_name: "Unreal Agent",
+        source: "docs/harness-configs/unreal-agent.md",
+        support: AdapterSupport::Constrained,
+        reason: "thin surface: one XDG preferences.json and per-launch UNREAL_HARNESS_LLM_*; reads Codex login",
+        isolation: Isolation::FixedPathSingle,
+        product_status: ProductStatus::Active,
+        research_doc: "docs/harness-configs/unreal-agent.md",
+        last_verified: "2026-09-18",
+    },
+    CatalogEntry {
+        id: "vix",
+        display_name: "vix",
+        source: "docs/harness-configs/vix.md",
+        support: AdapterSupport::Constrained,
+        reason: "vixd daemon plus isolated instances; providers.json merge, workflow schema deferred upstream",
+        isolation: Isolation::DaemonService,
+        product_status: ProductStatus::Active,
+        research_doc: "docs/harness-configs/vix.md",
+        last_verified: "2026-09-18",
     },
     CatalogEntry {
         id: "warp",
@@ -599,6 +1057,17 @@ pub const ENTRIES: &[CatalogEntry] = &[
         last_verified: "2026-09-01",
     },
     CatalogEntry {
+        id: "zaly",
+        display_name: "zaly",
+        source: "docs/harness-configs/zaly.md",
+        support: AdapterSupport::Constrained,
+        reason: "ZALY_ROOT whole-root override but alpha: settings schema unpublished, no MCP yet",
+        isolation: Isolation::RelocatedRoot,
+        product_status: ProductStatus::Preview,
+        research_doc: "docs/harness-configs/zaly.md",
+        last_verified: "2026-09-18",
+    },
+    CatalogEntry {
         id: "zcode",
         display_name: "ZCode",
         source: "docs/harness-configs/zcode.md",
@@ -619,6 +1088,17 @@ pub const ENTRIES: &[CatalogEntry] = &[
         product_status: ProductStatus::Active,
         research_doc: "docs/harness-configs/zed-acp.md",
         last_verified: "2026-08-25",
+    },
+    CatalogEntry {
+        id: "zulu-cli",
+        display_name: "Zulu CLI (Baidu Comate)",
+        source: "docs/harness-configs/zulu-cli.md",
+        support: AdapterSupport::Constrained,
+        reason: "license-key SaaS, no relocation var; .comate project files writable",
+        isolation: Isolation::ProjectScope,
+        product_status: ProductStatus::Active,
+        research_doc: "docs/harness-configs/zulu-cli.md",
+        last_verified: "2026-09-18",
     },
     CatalogEntry {
         id: "vibe-kanban",
@@ -669,7 +1149,7 @@ pub fn find_by_id(id: &str) -> Option<&'static CatalogEntry> {
 /// fall back to a [`GenericAdapter`] built from the catalog row.
 #[expect(
     clippy::too_many_lines,
-    reason = "catalog has 51 entries with per-adapter branching"
+    reason = "one branch per concrete adapter; the generic fallback covers the rest"
 )]
 pub(crate) fn concrete_adapter_for(id: &str) -> Option<Box<dyn Adapter>> {
     if id == crate::adapters::claude_code::HARNESS_ID_STR
@@ -927,6 +1407,236 @@ pub(crate) fn concrete_adapter_for(id: &str) -> Option<Box<dyn Adapter>> {
     {
         return Some(Box::new(adapter) as Box<dyn Adapter>);
     }
+    if id == crate::adapters::muse_code::HARNESS_ID_STR
+        && let Ok(adapter) = MuseCodeAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::qoder_cli::HARNESS_ID_STR
+        && let Ok(adapter) = QoderCliAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::zulu_cli::HARNESS_ID_STR
+        && let Ok(adapter) = ZuluCliAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::minimax_code::HARNESS_ID_STR
+        && let Ok(adapter) = MiniMaxCodeAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::coco::HARNESS_ID_STR
+        && let Ok(adapter) = CocoAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::fx::HARNESS_ID_STR
+        && let Ok(adapter) = FxAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::jules::HARNESS_ID_STR
+        && let Ok(adapter) = JulesAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::cursor_agent::HARNESS_ID_STR
+        && let Ok(adapter) = CursorAgentAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::kilocode_cli::HARNESS_ID_STR
+        && let Ok(adapter) = KilocodeCliAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::agentty::HARNESS_ID_STR
+        && let Ok(adapter) = AgenttyAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+
+    if id == crate::adapters::avante_nvim::HARNESS_ID_STR
+        && let Ok(adapter) = AvanteNvimAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+
+    if id == crate::adapters::bb_app::HARNESS_ID_STR
+        && let Ok(adapter) = BbAppAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+
+    if id == crate::adapters::claw_code::HARNESS_ID_STR
+        && let Ok(adapter) = ClawCodeAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+
+    if id == crate::adapters::codecompanion_nvim::HARNESS_ID_STR
+        && let Ok(adapter) = CodecompanionNvimAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+
+    if id == crate::adapters::codegeex::HARNESS_ID_STR
+        && let Ok(adapter) = CodegeexAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+
+    if id == crate::adapters::command_code::HARNESS_ID_STR
+        && let Ok(adapter) = CommandCodeAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+
+    if id == crate::adapters::copilot_vscode::HARNESS_ID_STR
+        && let Ok(adapter) = CopilotVscodeAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+
+    if id == crate::adapters::devin::HARNESS_ID_STR
+        && let Ok(adapter) = DevinAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+
+    if id == crate::adapters::eca::HARNESS_ID_STR
+        && let Ok(adapter) = EcaAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+
+    if id == crate::adapters::every_code::HARNESS_ID_STR
+        && let Ok(adapter) = EveryCodeAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+
+    if id == crate::adapters::freebuff::HARNESS_ID_STR
+        && let Ok(adapter) = FreebuffAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+
+    if id == crate::adapters::gitclaw::HARNESS_ID_STR
+        && let Ok(adapter) = GitclawAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+
+    if id == crate::adapters::hax::HARNESS_ID_STR
+        && let Ok(adapter) = HaxAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+
+    if id == crate::adapters::jcode::HARNESS_ID_STR
+        && let Ok(adapter) = JcodeAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+
+    if id == crate::adapters::oh_my_codex::HARNESS_ID_STR
+        && let Ok(adapter) = OhMyCodexAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+
+    if id == crate::adapters::oh_my_opencode::HARNESS_ID_STR
+        && let Ok(adapter) = OhMyOpencodeAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+
+    if id == crate::adapters::omo_ai::HARNESS_ID_STR
+        && let Ok(adapter) = OmoAiAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+
+    if id == crate::adapters::omp::HARNESS_ID_STR
+        && let Ok(adapter) = OmpAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+
+    if id == crate::adapters::openfang::HARNESS_ID_STR
+        && let Ok(adapter) = OpenfangAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+
+    if id == crate::adapters::orca::HARNESS_ID_STR
+        && let Ok(adapter) = OrcaAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+
+    if id == crate::adapters::ori::HARNESS_ID_STR
+        && let Ok(adapter) = OriAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+
+    if id == crate::adapters::prime_agent::HARNESS_ID_STR
+        && let Ok(adapter) = PrimeAgentAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+
+    if id == crate::adapters::qoder_ide::HARNESS_ID_STR
+        && let Ok(adapter) = QoderIdeAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+
+    if id == crate::adapters::reasonix::HARNESS_ID_STR
+        && let Ok(adapter) = ReasonixAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+
+    if id == crate::adapters::replit_agent::HARNESS_ID_STR
+        && let Ok(adapter) = ReplitAgentAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+
+    if id == crate::adapters::t3code::HARNESS_ID_STR
+        && let Ok(adapter) = T3codeAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+
+    if id == crate::adapters::terminus::HARNESS_ID_STR
+        && let Ok(adapter) = TerminusAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+
+    if id == crate::adapters::unreal_agent::HARNESS_ID_STR
+        && let Ok(adapter) = UnrealAgentAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+
+    if id == crate::adapters::vix::HARNESS_ID_STR
+        && let Ok(adapter) = VixAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+
+    if id == crate::adapters::zaly::HARNESS_ID_STR
+        && let Ok(adapter) = ZalyAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
     // Ledger alias: the catalog row is kimi-code-cli; the adapter is kimi-code.
     if id == crate::adapters::kimi_code::HARNESS_ID_LEDGER_ALIAS
         && let Ok(ledger_id) = HarnessId::new(id)
@@ -984,11 +1694,30 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
+    /// Ledger tripwire: a row added or dropped without touching the ledger
+    /// constants fails the build (compare against the derived values below).
+    const LEDGER_ENTRY_COUNT: usize = 91;
+    const LEDGER_SUPPORT_COUNTS: &[(AdapterSupport, usize)] = &[
+        (AdapterSupport::Full, 26),
+        (AdapterSupport::Constrained, 46),
+        (AdapterSupport::SingleInstance, 1),
+        (AdapterSupport::MigrationOnly, 7),
+        (AdapterSupport::ResearchBlocked, 7),
+        (AdapterSupport::Unsupported, 2),
+        (AdapterSupport::ReadOnly, 2),
+    ];
+
+    fn count_support(want: AdapterSupport) -> usize {
+        ENTRIES.iter().filter(|entry| entry.support == want).count()
+    }
+
     #[test]
-    fn catalog_has_51_entries() {
-        // The plan commits to exactly 51 product surfaces; this pin fails
-        // loudly if a row is added or dropped without a plan change.
-        assert_eq!(all_entries().len(), 51);
+    fn catalog_size_matches_ledger() {
+        assert_eq!(
+            all_entries().len(),
+            LEDGER_ENTRY_COUNT,
+            "catalog drifted from the ledger; add the row's doc, entry, and bump the ledger constants"
+        );
     }
 
     #[test]
@@ -1017,7 +1746,20 @@ mod tests {
                 entry.id
             );
         }
-        assert_eq!(seen.len(), 51);
+    }
+
+    #[test]
+    fn every_source_doc_exists() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for entry in ENTRIES {
+            let doc = repo_root.join(entry.source);
+            assert!(
+                doc.is_file(),
+                "entry `{}` sources `{}` but that doc is missing",
+                entry.id,
+                doc.display()
+            );
+        }
     }
 
     #[test]
@@ -1114,11 +1856,6 @@ mod tests {
     #[test]
     fn all_adapters_span_catalog() {
         let adapters = all_adapters();
-        assert_eq!(
-            adapters.len(),
-            51,
-            "all_adapters must return an adapter for each catalog row"
-        );
         let mut ids: Vec<String> = adapters
             .iter()
             .map(|adapter| adapter.id().to_string())
@@ -1126,6 +1863,11 @@ mod tests {
         ids.sort();
         let mut expected: Vec<String> = ENTRIES.iter().map(|entry| entry.id.to_owned()).collect();
         expected.sort();
+        assert_eq!(
+            ids.len(),
+            expected.len(),
+            "all_adapters must return an adapter for each catalog row"
+        );
         assert_eq!(ids, expected, "adapter ids must match catalog ids");
 
         // Check that each adapter's research link matches catalog source.
@@ -1151,41 +1893,28 @@ mod tests {
     }
 
     #[test]
-    fn catalog_support_counts_match_ledger() {
-        // Counts derived from the provisional ledger table.
-        let mut full = 0;
-        let mut constrained = 0;
-        let mut single = 0;
-        let mut migration_only = 0;
-        let mut research_blocked = 0;
-        let mut unsupported = 0;
-        let mut read_only = 0;
-        for entry in ENTRIES {
-            match entry.support {
-                AdapterSupport::Full => full += 1,
-                AdapterSupport::Constrained => constrained += 1,
-                AdapterSupport::SingleInstance => single += 1,
-                AdapterSupport::MigrationOnly => migration_only += 1,
-                AdapterSupport::ResearchBlocked => research_blocked += 1,
-                AdapterSupport::Unsupported => unsupported += 1,
-                AdapterSupport::ReadOnly => read_only += 1,
-            }
-        }
-        assert_eq!(full, 20, "expected 20 Full per ledger");
-        assert_eq!(constrained, 17, "expected 17 Constrained per ledger");
-        assert_eq!(single, 1, "expected 1 SingleInstance per ledger");
-        assert_eq!(migration_only, 6, "expected 6 MigrationOnly per ledger");
-        assert_eq!(research_blocked, 4, "expected 4 ResearchBlocked per ledger");
-        assert_eq!(unsupported, 1, "expected 1 Unsupported per ledger");
-        assert_eq!(read_only, 2, "expected 2 ReadOnly per ledger");
+    fn support_partition_covers_every_entry_and_matches_ledger() {
+        let derived_total: usize = LEDGER_SUPPORT_COUNTS
+            .iter()
+            .map(|(variant, _)| count_support(*variant))
+            .sum();
         assert_eq!(
-            full + constrained
-                + single
-                + migration_only
-                + research_blocked
-                + unsupported
-                + read_only,
-            51
+            derived_total,
+            ENTRIES.len(),
+            "the support ledger table must partition every entry; a support \
+             variant missing from the table leaves rows uncounted"
+        );
+        for (variant, expected) in LEDGER_SUPPORT_COUNTS {
+            assert_eq!(
+                count_support(*variant),
+                *expected,
+                "ledger support count drifted for {variant}"
+            );
+        }
+        let ledger_total: usize = LEDGER_SUPPORT_COUNTS.iter().map(|(_, n)| n).sum();
+        assert_eq!(
+            ledger_total, LEDGER_ENTRY_COUNT,
+            "the support ledger must sum to the catalog ledger total"
         );
     }
 
@@ -1196,7 +1925,7 @@ mod tests {
     )]
     #[expect(
         clippy::too_many_lines,
-        reason = "test exercises every trait method for 51 adapters"
+        reason = "test exercises every trait method for 60 adapters"
     )]
     fn adapters_are_object_safe_and_usable_as_trait_objects() {
         let adapters = all_adapters();

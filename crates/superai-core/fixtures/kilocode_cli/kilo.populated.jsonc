@@ -1,0 +1,17 @@
+{
+  "$schema": "https://app.kilo.ai/config.json",
+  "model": "kilocode/my-model",
+  "provider": {
+    "my-provider": {
+      "options": {
+        "baseURL": "https://example.com/v1"
+      }
+    }
+  },
+  "mcp": {
+    "search": {
+      "command": ["mcp-search"],
+      "enabled": true
+    }
+  }
+}
