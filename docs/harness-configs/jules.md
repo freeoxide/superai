@@ -53,7 +53,7 @@ Isolation for multi-instance use reduces to separate Google accounts (`jules log
 
 ## Sources
 
-- [1] https://jules.google/docs/cli/reference — commands, flags, OAuth flow
-- [2] `@google/jules` npm package 0.1.42 (https://registry.npmjs.org/@google/jules) — README, help text, Go-binary launcher mappings
-- [3] Google Developers Blog, "Meet Jules Tools: A Command Line Companion" (2025-10-02) — announcement; third-party coverage of limits (therundown.ai, agentcode.ai)
-- [4] https://developers.google.com/jules/api — Jules REST API preview
+- [1] https://jules.google/docs/cli/reference: commands, flags, OAuth flow
+- [2] `@google/jules` npm package 0.1.42 (https://registry.npmjs.org/@google/jules): README, help text, Go-binary launcher mappings
+- [3] Google Developers Blog, "Meet Jules Tools: A Command Line Companion" (2025-10-02): announcement; third-party coverage of limits (therundown.ai, agentcode.ai)
+- [4] https://developers.google.com/jules/api: Jules REST API preview

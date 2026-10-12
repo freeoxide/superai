@@ -73,6 +73,6 @@ The README states Zulu runs in "Turbo" mode with an empty blacklist: it executes
 
 ## Sources
 
-- [1] `README.md` inside `@comate/zulu` 1.7.21 tarball (https://registry.npmjs.org/@comate/zulu/-/zulu-1.7.21.tgz) — install, run flags, display modes, env vars, state paths, Turbo-mode warning
-- [2] Dist bundle inspection of the same tarball — `.comate`/`.comate-engine` path constants, mcp.json/mcp.local.json, agents/rules/commands/hooks dirs, skills discovery list
-- [3] https://comate.baidu.com/ — product site (JS app, no readable CLI docs; empty fetch 2026-10-12)
+- [1] `README.md` inside `@comate/zulu` 1.7.21 tarball (https://registry.npmjs.org/@comate/zulu/-/zulu-1.7.21.tgz): install, run flags, display modes, env vars, state paths, Turbo-mode warning
+- [2] Dist bundle inspection of the same tarball: `.comate`/`.comate-engine` path constants, mcp.json/mcp.local.json, agents/rules/commands/hooks dirs, skills discovery list
+- [3] https://comate.baidu.com/: product site (JS app, no readable CLI docs; empty fetch 2026-10-12)

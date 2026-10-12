@@ -60,6 +60,6 @@ Documented primitives: `KILO_CONFIG_CONTENT` inline config per process (trusted 
 
 ## Sources
 
-- [1] https://kilo.ai/docs/code-with-ai/platforms/cli — commands, flags, env vars, config files, exit codes, resume interop
-- [2] https://kilo.ai/cli/opencode — install tabs, platform surfaces, Kilo Pass pricing, OpenCode relationship
-- [3] https://kilo.ai/docs/getting-started/settings and https://kilo.ai/docs/contributing/architecture/config-schema — config files, schema, mcp key shape (as cited in kilo-code.md, re-checked 2026-10-12)
+- [1] https://kilo.ai/docs/code-with-ai/platforms/cli: commands, flags, env vars, config files, exit codes, resume interop
+- [2] https://kilo.ai/cli/opencode: install tabs, platform surfaces, Kilo Pass pricing, OpenCode relationship
+- [3] https://kilo.ai/docs/getting-started/settings and https://kilo.ai/docs/contributing/architecture/config-schema: config files, schema, mcp key shape (as cited in kilo-code.md, re-checked 2026-10-12)

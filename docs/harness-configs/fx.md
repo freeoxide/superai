@@ -69,7 +69,7 @@ fx acp          # ACP server over stdio
 
 ## Sources
 
-- [1] https://raw.githubusercontent.com/vercel-labs/fx/main/README.md — product, install, login, skills/MCP/subagents, sessions, fx ask, libfx
-- [2] https://fx.sh/docs/configure-fx/configuration.md — settings files, precedence, key list, env table
-- [3] https://fx.sh/docs/capabilities/mcp.md — mcp.json paths, JSON shapes, trust, commands
-- [4] https://fx.sh/docs/using-fx/cli.md — CLI reference, --json commands, version flag
+- [1] https://raw.githubusercontent.com/vercel-labs/fx/main/README.md: product, install, login, skills/MCP/subagents, sessions, fx ask, libfx
+- [2] https://fx.sh/docs/configure-fx/configuration.md: settings files, precedence, key list, env table
+- [3] https://fx.sh/docs/capabilities/mcp.md: mcp.json paths, JSON shapes, trust, commands
+- [4] https://fx.sh/docs/using-fx/cli.md: CLI reference, --json commands, version flag

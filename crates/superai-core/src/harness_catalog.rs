@@ -1137,11 +1137,30 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
+    /// Ledger tripwire: a row added or dropped without touching the ledger
+    /// constants fails the build (compare against the derived values below).
+    const LEDGER_ENTRY_COUNT: usize = 60;
+    const LEDGER_SUPPORT_COUNTS: &[(AdapterSupport, usize)] = &[
+        (AdapterSupport::Full, 24),
+        (AdapterSupport::Constrained, 22),
+        (AdapterSupport::SingleInstance, 1),
+        (AdapterSupport::MigrationOnly, 6),
+        (AdapterSupport::ResearchBlocked, 4),
+        (AdapterSupport::Unsupported, 1),
+        (AdapterSupport::ReadOnly, 2),
+    ];
+
+    fn count_support(want: AdapterSupport) -> usize {
+        ENTRIES.iter().filter(|entry| entry.support == want).count()
+    }
+
     #[test]
-    fn catalog_has_60_entries() {
-        // 51 plan rows plus the 9 research-verified additions; this pin fails
-        // loudly if a row is added or dropped without a ledger change.
-        assert_eq!(all_entries().len(), 60);
+    fn catalog_size_matches_ledger() {
+        assert_eq!(
+            all_entries().len(),
+            LEDGER_ENTRY_COUNT,
+            "catalog drifted from the ledger; add the row's doc, entry, and bump the ledger constants"
+        );
     }
 
     #[test]
@@ -1170,7 +1189,20 @@ mod tests {
                 entry.id
             );
         }
-        assert_eq!(seen.len(), 60);
+    }
+
+    #[test]
+    fn every_source_doc_exists() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for entry in ENTRIES {
+            let doc = repo_root.join(entry.source);
+            assert!(
+                doc.is_file(),
+                "entry `{}` sources `{}` but that doc is missing",
+                entry.id,
+                doc.display()
+            );
+        }
     }
 
     #[test]
@@ -1267,11 +1299,6 @@ mod tests {
     #[test]
     fn all_adapters_span_catalog() {
         let adapters = all_adapters();
-        assert_eq!(
-            adapters.len(),
-            60,
-            "all_adapters must return an adapter for each catalog row"
-        );
         let mut ids: Vec<String> = adapters
             .iter()
             .map(|adapter| adapter.id().to_string())
@@ -1279,6 +1306,11 @@ mod tests {
         ids.sort();
         let mut expected: Vec<String> = ENTRIES.iter().map(|entry| entry.id.to_owned()).collect();
         expected.sort();
+        assert_eq!(
+            ids.len(),
+            expected.len(),
+            "all_adapters must return an adapter for each catalog row"
+        );
         assert_eq!(ids, expected, "adapter ids must match catalog ids");
 
         // Check that each adapter's research link matches catalog source.
@@ -1304,41 +1336,28 @@ mod tests {
     }
 
     #[test]
-    fn catalog_support_counts_match_ledger() {
-        // Counts derived from the provisional ledger table.
-        let mut full = 0;
-        let mut constrained = 0;
-        let mut single = 0;
-        let mut migration_only = 0;
-        let mut research_blocked = 0;
-        let mut unsupported = 0;
-        let mut read_only = 0;
-        for entry in ENTRIES {
-            match entry.support {
-                AdapterSupport::Full => full += 1,
-                AdapterSupport::Constrained => constrained += 1,
-                AdapterSupport::SingleInstance => single += 1,
-                AdapterSupport::MigrationOnly => migration_only += 1,
-                AdapterSupport::ResearchBlocked => research_blocked += 1,
-                AdapterSupport::Unsupported => unsupported += 1,
-                AdapterSupport::ReadOnly => read_only += 1,
-            }
-        }
-        assert_eq!(full, 24, "expected 24 Full per ledger");
-        assert_eq!(constrained, 22, "expected 22 Constrained per ledger");
-        assert_eq!(single, 1, "expected 1 SingleInstance per ledger");
-        assert_eq!(migration_only, 6, "expected 6 MigrationOnly per ledger");
-        assert_eq!(research_blocked, 4, "expected 4 ResearchBlocked per ledger");
-        assert_eq!(unsupported, 1, "expected 1 Unsupported per ledger");
-        assert_eq!(read_only, 2, "expected 2 ReadOnly per ledger");
+    fn support_partition_covers_every_entry_and_matches_ledger() {
+        let derived_total: usize = LEDGER_SUPPORT_COUNTS
+            .iter()
+            .map(|(variant, _)| count_support(*variant))
+            .sum();
         assert_eq!(
-            full + constrained
-                + single
-                + migration_only
-                + research_blocked
-                + unsupported
-                + read_only,
-            60
+            derived_total,
+            ENTRIES.len(),
+            "the support ledger table must partition every entry; a support \
+             variant missing from the table leaves rows uncounted"
+        );
+        for (variant, expected) in LEDGER_SUPPORT_COUNTS {
+            assert_eq!(
+                count_support(*variant),
+                *expected,
+                "ledger support count drifted for {variant}"
+            );
+        }
+        let ledger_total: usize = LEDGER_SUPPORT_COUNTS.iter().map(|(_, n)| n).sum();
+        assert_eq!(
+            ledger_total, LEDGER_ENTRY_COUNT,
+            "the support ledger must sum to the catalog ledger total"
         );
     }
 

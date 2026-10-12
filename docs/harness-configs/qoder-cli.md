@@ -66,10 +66,10 @@ Managed by `qoder mcp add <name> [--scope user|local|project] [--transport stdio
 
 ## Sources
 
-- [1] https://docs.qoder.com/cli/quick-start — quick start, sign-in flow, slash commands, footer entity
-- [2] https://docs.qoder.com/cli/installation — platforms, install scripts, QODER_CONFIG_DIR, uninstall
-- [3] https://help.aliyun.com/ — Quick Start for Qoder CLI CN (Alibaba Cloud docs)
-- [4] https://docs.qoder.com/cli/settings-reference — settings files, key groups, env var table
-- [5] https://docs.qoder.com/cli/mcp-servers — MCP scopes, storage paths, transports, CLI commands, permissions example
-- [6] https://docs.qoder.com/cli/cli-reference — full flag list, subcommands
-- [7] https://docs.qoder.com/cli/plugins — plugin layout, ~/.qoder/skills, ~/.qoder/commands, marketplace
+- [1] https://docs.qoder.com/cli/quick-start: quick start, sign-in flow, slash commands, footer entity
+- [2] https://docs.qoder.com/cli/installation: platforms, install scripts, QODER_CONFIG_DIR, uninstall
+- [3] https://help.aliyun.com/: Quick Start for Qoder CLI CN (Alibaba Cloud docs)
+- [4] https://docs.qoder.com/cli/settings-reference: settings files, key groups, env var table
+- [5] https://docs.qoder.com/cli/mcp-servers: MCP scopes, storage paths, transports, CLI commands, permissions example
+- [6] https://docs.qoder.com/cli/cli-reference: full flag list, subcommands
+- [7] https://docs.qoder.com/cli/plugins: plugin layout, ~/.qoder/skills, ~/.qoder/commands, marketplace

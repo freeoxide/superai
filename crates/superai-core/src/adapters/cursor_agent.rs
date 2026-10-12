@@ -76,56 +76,42 @@ impl CursorAgentAdapter {
         Ok(Self { id })
     }
 
-    fn default_config_dir() -> Option<PathBuf> {
-        if let Ok(dir) = std::env::var(CONFIG_ENV_VAR)
-            && !dir.trim().is_empty()
-        {
-            return Some(PathBuf::from(dir));
-        }
-        let home = super::home_dir()?;
-        Some(home.join(".cursor"))
+    fn config_evidence_paths(
+        config_env: Option<&str>,
+        home: Option<&Path>,
+    ) -> (Option<PathBuf>, Option<PathBuf>) {
+        let overridden = config_env.is_some_and(|dir| !dir.trim().is_empty());
+        let cli_config = if overridden {
+            config_env.map(|dir| Path::new(dir).join("cli-config.json"))
+        } else {
+            home.map(|h| h.join(".cursor").join("cli-config.json"))
+        };
+        // mcp.json ignores CURSOR_CONFIG_DIR (live-probed; CONSTRAINED_NOTE).
+        let mcp = home.map(|h| h.join(".cursor").join("mcp.json"));
+        (cli_config, mcp)
     }
 
-    fn cli_config_for_dir(dir: &Path) -> PathBuf {
-        dir.join("cli-config.json")
-    }
-
-    #[expect(
-        clippy::excessive_nesting,
-        reason = "detection branches are explicit for evidence"
-    )]
     #[expect(clippy::unused_self, reason = "uses adapter constants via Self")]
     fn collect_config_evidence(&self, evidence: &mut Vec<String>) {
         evidence.push(format!("constrained: {CONSTRAINED_NOTE}"));
-        match Self::default_config_dir() {
-            Some(dir) => {
-                let cfg = Self::cli_config_for_dir(&dir);
-                if cfg.exists() {
-                    evidence.push(format!("cli-config.json found at {}", cfg.display()));
-                    match std::fs::read_to_string(&cfg) {
-                        Ok(text) if text.contains("version") => {
-                            evidence.push("cli-config.json carries version".to_owned());
-                        }
-                        Ok(_) => {}
-                        Err(err) => {
-                            evidence.push(format!("config unreadable at {}: {err}", cfg.display()));
-                        }
-                    }
-                } else {
-                    evidence.push(format!("cli-config.json missing at {}", cfg.display()));
-                }
-                let mcp = dir.join("mcp.json");
-                if mcp.exists() {
-                    evidence.push(format!("mcp.json found at {}", mcp.display()));
-                }
-            }
+        let config_env = std::env::var(CONFIG_ENV_VAR).ok();
+        let home = super::home_dir();
+        let (cli_config, mcp) = Self::config_evidence_paths(config_env.as_deref(), home.as_deref());
+        match cli_config {
+            Some(cfg) => Self::push_cli_config_evidence(&cfg, evidence),
             None => {
-                evidence.push("could not resolve default config dir (no HOME)".to_owned());
+                evidence.push("could not resolve cli-config.json path (no HOME)".to_owned());
             }
         }
-        if let Ok(dir) = std::env::var(CONFIG_ENV_VAR)
-            && !dir.trim().is_empty()
+        if let Some(path) = mcp
+            && path.exists()
         {
+            evidence.push(format!(
+                "mcp.json found at fixed {} (override ignored)",
+                path.display()
+            ));
+        }
+        if let Some(dir) = config_env.filter(|dir| !dir.trim().is_empty()) {
             evidence.push(format!(
                 "{CONFIG_ENV_VAR} set to {dir} (moves cli-config.json only)"
             ));
@@ -135,6 +121,23 @@ impl CursorAgentAdapter {
         }
         if Path::new(".cursor/cli.json").exists() {
             evidence.push("project .cursor/cli.json present in cwd".to_owned());
+        }
+    }
+
+    fn push_cli_config_evidence(cfg: &Path, evidence: &mut Vec<String>) {
+        if !cfg.exists() {
+            evidence.push(format!("cli-config.json missing at {}", cfg.display()));
+            return;
+        }
+        evidence.push(format!("cli-config.json found at {}", cfg.display()));
+        match std::fs::read_to_string(cfg) {
+            Ok(text) if text.contains("version") => {
+                evidence.push("cli-config.json carries version".to_owned());
+            }
+            Ok(_) => {}
+            Err(err) => {
+                evidence.push(format!("config unreadable at {}: {err}", cfg.display()));
+            }
         }
     }
 }
@@ -404,7 +407,7 @@ impl Adapter for CursorAgentAdapter {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use super::{
         API_KEY_ENV_VAR, CONFIG_ENV_VAR, CursorAgentAdapter, HARNESS_ID_STR, OWNED_SELECTORS,
@@ -481,6 +484,55 @@ mod tests {
                 assert!(!result.evidence.is_empty());
             }
         }
+    }
+
+    #[test]
+    fn evidence_probe_moves_cli_config_but_not_mcp_json() {
+        let (cli, mcp) = CursorAgentAdapter::config_evidence_paths(
+            Some("/tmp/cursor-override"),
+            Some(Path::new("/home/tester")),
+        );
+        assert_eq!(
+            cli,
+            Some(PathBuf::from("/tmp/cursor-override/cli-config.json"))
+        );
+        assert_eq!(
+            mcp,
+            Some(PathBuf::from("/home/tester/.cursor/mcp.json")),
+            "mcp.json must stay on the fixed $HOME root, never the override dir"
+        );
+    }
+
+    #[test]
+    fn evidence_probe_without_override_uses_home_for_both() {
+        let (cli, mcp) =
+            CursorAgentAdapter::config_evidence_paths(None, Some(Path::new("/home/tester")));
+        assert_eq!(
+            cli,
+            Some(PathBuf::from("/home/tester/.cursor/cli-config.json"))
+        );
+        assert_eq!(mcp, Some(PathBuf::from("/home/tester/.cursor/mcp.json")));
+    }
+
+    #[test]
+    fn evidence_probe_blank_override_falls_back_to_home() {
+        let (cli, _) =
+            CursorAgentAdapter::config_evidence_paths(Some("  "), Some(Path::new("/home/tester")));
+        assert_eq!(
+            cli,
+            Some(PathBuf::from("/home/tester/.cursor/cli-config.json"))
+        );
+    }
+
+    #[test]
+    fn evidence_probe_without_home_has_no_mcp_target() {
+        let (cli, mcp) =
+            CursorAgentAdapter::config_evidence_paths(Some("/tmp/cursor-override"), None);
+        assert_eq!(
+            cli,
+            Some(PathBuf::from("/tmp/cursor-override/cli-config.json"))
+        );
+        assert_eq!(mcp, None);
     }
 
     #[test]

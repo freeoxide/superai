@@ -73,10 +73,10 @@ Disabled-server state persists in `mcp-disabled.json`; OAuth tokens live under k
 
 ## Sources
 
-- [1] https://github.com/Snowflake-Labs/coco-skills — "Cortex Code ('CoCo') — Snowflake's CLI for building with AI"
-- [2] https://docs.snowflake.com/en/user-guide/cortex-code/cortex-code-cli — install, platforms, prerequisites, first-run wizard
-- [3] https://docs.snowflake.com/en/user-guide/cortex-code/settings — file map, precedence, settings/permissions keys, env vars
-- [4] https://docs.snowflake.com/en/user-guide/cortex-code/cortex-code-mcp — mcp.json schema, cortex mcp commands, keychain, precedence
-- [5] https://docs.snowflake.com/en/user-guide/cortex-code/cli-reference — flags, exec, exit codes, connections.toml, update
-- [6] https://docs.snowflake.com/en/user-guide/cortex-code/bundled-skills — bundled skills
-- [7] https://docs.snowflake.com/en/user-guide/cortex-code/extensibility — skills/subagents/hooks locations and formats
+- [1] https://github.com/Snowflake-Labs/coco-skills: "Cortex Code ('CoCo') — Snowflake's CLI for building with AI"
+- [2] https://docs.snowflake.com/en/user-guide/cortex-code/cortex-code-cli: install, platforms, prerequisites, first-run wizard
+- [3] https://docs.snowflake.com/en/user-guide/cortex-code/settings: file map, precedence, settings/permissions keys, env vars
+- [4] https://docs.snowflake.com/en/user-guide/cortex-code/cortex-code-mcp: mcp.json schema, cortex mcp commands, keychain, precedence
+- [5] https://docs.snowflake.com/en/user-guide/cortex-code/cli-reference: flags, exec, exit codes, connections.toml, update
+- [6] https://docs.snowflake.com/en/user-guide/cortex-code/bundled-skills: bundled skills
+- [7] https://docs.snowflake.com/en/user-guide/cortex-code/extensibility: skills/subagents/hooks locations and formats

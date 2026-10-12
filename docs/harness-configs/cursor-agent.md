@@ -75,12 +75,12 @@ Per-profile isolation: distinct `CURSOR_CONFIG_DIR` per instance plus its own `C
 
 ## Sources
 
-- [1] https://cursor.com/docs/cli/overview — install commands, platforms, modes, cloud handoff
-- [2] https://cursor.com/docs/cli/headless — print mode, output formats, stream-json events
-- [3] https://cursor.com/docs/cli/reference/authentication — login/logout, NO_OPEN_BROWSER, CURSOR_API_KEY, dashboard keys
-- [4] https://cursor.com/docs/cli/reference/authentication — API-key env/flag forms
-- [5] https://cursor.com/docs/cli/reference/configuration — cli-config.json paths/schema, CURSOR_CONFIG_DIR, XDG, proxy vars, permission syntax
-- [6] https://cursor.com/docs/context/mcp — mcp.json paths, transports, OAuth callbacks, agent mcp commands
-- [7] https://cursor.com/docs/context/rules — rules files, AGENTS.md, CLAUDE.md read by CLI
-- [8] https://cursor.com/docs/cli/reference/parameters — full flag list, worker flags
-- [9] https://cursor.com/docs/cli/headless — event field details, exit handling examples
+- [1] https://cursor.com/docs/cli/overview: install commands, platforms, modes, cloud handoff
+- [2] https://cursor.com/docs/cli/headless: print mode, output formats, stream-json events
+- [3] https://cursor.com/docs/cli/reference/authentication: login/logout, NO_OPEN_BROWSER, CURSOR_API_KEY, dashboard keys
+- [4] https://cursor.com/docs/cli/reference/authentication: API-key env/flag forms
+- [5] https://cursor.com/docs/cli/reference/configuration: cli-config.json paths/schema, CURSOR_CONFIG_DIR, XDG, proxy vars, permission syntax
+- [6] https://cursor.com/docs/context/mcp: mcp.json paths, transports, OAuth callbacks, agent mcp commands
+- [7] https://cursor.com/docs/context/rules: rules files, AGENTS.md, CLAUDE.md read by CLI
+- [8] https://cursor.com/docs/cli/reference/parameters: full flag list, worker flags
+- [9] https://cursor.com/docs/cli/headless: event field details, exit handling examples

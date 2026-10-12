@@ -82,8 +82,8 @@ Project scope only: `.mcp.json` at the workspace root of the launch directory, s
 
 ## Sources
 
-- [1] https://raw.githubusercontent.com/MiniMax-AI/minimax-code/main/README.md — install, login regions, BYOK, modes, uninstall, env vars
-- [2] https://raw.githubusercontent.com/MiniMax-AI/minimax-code/main/docs/examples.md — `.mcp.json` walkthrough, plugin commands
-- [3] https://raw.githubusercontent.com/MiniMax-AI/minimax-code/main/docs/installation.md — data dirs, MINIMAX_DATA_DIR/MAVIS_DATA_DIR, GitHub archives, source builds
-- [4] https://raw.githubusercontent.com/MiniMax-AI/minimax-code/main/docs/tui-capabilities.md — skills dirs, plugins, MCP/permissions coverage
-- [5] https://agent.minimax.io/docs/cli/quick-start — official quick start (linked from README; content lives in repo docs)
+- [1] https://raw.githubusercontent.com/MiniMax-AI/minimax-code/main/README.md: install, login regions, BYOK, modes, uninstall, env vars
+- [2] https://raw.githubusercontent.com/MiniMax-AI/minimax-code/main/docs/examples.md: `.mcp.json` walkthrough, plugin commands
+- [3] https://raw.githubusercontent.com/MiniMax-AI/minimax-code/main/docs/installation.md: data dirs, MINIMAX_DATA_DIR/MAVIS_DATA_DIR, GitHub archives, source builds
+- [4] https://raw.githubusercontent.com/MiniMax-AI/minimax-code/main/docs/tui-capabilities.md: skills dirs, plugins, MCP/permissions coverage
+- [5] https://agent.minimax.io/docs/cli/quick-start: official quick start (linked from README; content lives in repo docs)

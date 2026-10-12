@@ -69,10 +69,10 @@ Load sources[6]: built-in; user (`$XDG_CONFIG_HOME/muse/skills`, `~/.agents/skil
 
 ## Sources
 
-- [1] https://dev.meta.ai/docs/muse-code — Muse Code overview (platforms, install, auth, subcommands, SDK)
-- [2] https://dev.meta.ai/docs/overview/ — Meta Model API overview (base URL, Muse Spark models)
-- [3] https://www.cdomagazine.tech/ — Meta launches Muse Code beta (2026-08-10 coverage)
-- [4] https://www.infoworld.com/ — Meta launches Muse Code for complex software work (2026-08-06)
-- [5] https://dev.meta.ai/docs/muse-code/configuration — settings.json, AGENTS.md lookup, flags, memory
-- [6] https://dev.meta.ai/docs/muse-code/extending — MCP block, skills, hooks, subagents, muse exec
-- [7] https://dev.meta.ai/docs/muse-code/auth — META_API_KEY, credential priority, billing
+- [1] https://dev.meta.ai/docs/muse-code: Muse Code overview (platforms, install, auth, subcommands, SDK)
+- [2] https://dev.meta.ai/docs/overview/: Meta Model API overview (base URL, Muse Spark models)
+- [3] https://www.cdomagazine.tech/: Meta launches Muse Code beta (2026-08-10 coverage)
+- [4] https://www.infoworld.com/: Meta launches Muse Code for complex software work (2026-08-06)
+- [5] https://dev.meta.ai/docs/muse-code/configuration: settings.json, AGENTS.md lookup, flags, memory
+- [6] https://dev.meta.ai/docs/muse-code/extending: MCP block, skills, hooks, subagents, muse exec
+- [7] https://dev.meta.ai/docs/muse-code/auth: META_API_KEY, credential priority, billing
