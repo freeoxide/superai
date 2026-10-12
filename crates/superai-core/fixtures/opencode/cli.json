@@ -1,0 +1,7 @@
+{
+  "_provenance": "source=docs/harness-configs/opencode.md last_verified=2026-10-12 sanitized v2-line terminal settings",
+  "$schema": "https://opencode.ai/v2/cli.json",
+  "theme": { "name": "catppuccin", "mode": "dark" },
+  "scroll": { "speed": 2 },
+  "tabs": { "mode": "auto", "scope": "global" }
+}

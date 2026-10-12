@@ -1,0 +1,47 @@
+{
+  "_provenance": "source=docs/harness-configs/opencode.md last_verified=2026-10-12 sanitized fake sk-fake- v2-line keys",
+  "$schema": "https://opencode.ai/config.json",
+  "model": "anthropic/claude-sonnet-4-5",
+  "default_agent": "build",
+  "update": "notify",
+  "snapshots": true,
+  "share": "manual",
+  "permissions": [
+    { "action": "bash", "resource": "git status*", "effect": "allow" },
+    { "action": "bash", "resource": "rm -rf *", "effect": "deny" }
+  ],
+  "mcp": {
+    "timeout": { "startup": 20000 },
+    "servers": {
+      "local-server": {
+        "type": "local",
+        "command": ["npx", "-y", "@modelcontextprotocol/server-everything"],
+        "environment": { "MY_ENV_VAR": "{env:MY_ENV_VAR}" },
+        "disabled": false
+      },
+      "remote-server": {
+        "type": "remote",
+        "url": "https://mcp.example.com/mcp",
+        "disabled": true
+      }
+    }
+  },
+  "providers": {
+    "anthropic": {
+      "package": "@opencode/ai/providers/anthropic",
+      "settings": { "baseURL": "https://api.anthropic.com/v1" },
+      "env": ["ANTHROPIC_API_KEY"]
+    }
+  },
+  "agents": {
+    "code-reviewer": {
+      "description": "Reviews code for best practices",
+      "mode": "subagent",
+      "model": "anthropic/claude-sonnet-4-5"
+    }
+  },
+  "commands": {
+    "test": { "template": "run the test suite", "agent": "build" }
+  },
+  "plugins": ["opencode-helicone-session"]
+}
