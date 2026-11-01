@@ -7,8 +7,8 @@ use std::path::PathBuf;
 
 use crate::adapter::{
     ADAPTER_REVISION, Adapter, ConfigScope, ConfigSurface, DetectionResult, DocumentKind,
-    PathResolver, Platform, ProductStatus, RestartBehavior, SurfaceOwnership, VersionResolution,
-    WrapperPlan,
+    PathResolver, Platform, ProductStatus, RestartBehavior, SurfaceOwnership, UsageReaderKind,
+    UsageSurface, VersionResolution, WrapperPlan,
 };
 use crate::error::CoreError;
 use crate::ids::HarnessId;
@@ -256,6 +256,38 @@ impl Adapter for OmpAdapter {
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some(
             "extensions load from trusted paths (--trusted-extension allowlist) but no install destination or manifest format is documented (omp.md sections 4, 6)",
+        )
+    }
+    fn usage_surface(&self) -> Option<UsageSurface> {
+        Some(
+            UsageSurface::new(UsageReaderKind::TranscriptJsonl, None)
+                .with_artifact(
+                    "agent-sessions",
+                    PathResolver::fallback_only(
+                        "~/.omp/agent/sessions (PI_CONFIG_DIR relocates ~/.omp)",
+                    ),
+                )
+                .with_artifact(
+                    "xdg-sessions",
+                    PathResolver::new(
+                        Some("$XDG_DATA_HOME/omp/sessions"),
+                        Some("$XDG_DATA_HOME/omp/sessions"),
+                        None,
+                        "$XDG_DATA_HOME/omp/sessions (default ~/.local/share/omp/sessions)",
+                    ),
+                )
+                .with_artifact(
+                    "profile-sessions",
+                    PathResolver::fallback_only(
+                        "~/.omp/profiles/<profile>/{sessions,agent/sessions} (OMP_PROFILE-selected)",
+                    ),
+                )
+                .with_artifact(
+                    "xdg-profile-sessions",
+                    PathResolver::fallback_only(
+                        "$XDG_DATA_HOME/omp/profiles/<profile>/{sessions,agent/sessions}",
+                    ),
+                ),
         )
     }
 }

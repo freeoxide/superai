@@ -8,7 +8,7 @@ use superai_config::document::ValueType;
 use crate::adapter::{
     ADAPTER_REVISION, Adapter, ConfigScope, ConfigSurface, DetectionResult, DocumentKind,
     PathResolver, Platform, ProductStatus, RestartBehavior, RootShape, SurfaceOwnership,
-    SurfaceSchema, VersionResolution, WrapperPlan,
+    SurfaceSchema, UsageReaderKind, UsageSurface, VersionResolution, WrapperPlan,
 };
 use crate::error::CoreError;
 use crate::ids::HarnessId;
@@ -469,6 +469,47 @@ impl Adapter for ClaudeCodeAdapter {
             None,
             RestartBehavior::Reload,
         ))
+    }
+    fn usage_surface(&self) -> Option<UsageSurface> {
+        Some(
+            UsageSurface::new(UsageReaderKind::TranscriptJsonl, Some("anthropic"))
+                .with_artifact(
+                    "transcripts",
+                    PathResolver::new(
+                        Some("$CLAUDE_CONFIG_DIR/projects"),
+                        Some("$CLAUDE_CONFIG_DIR/projects"),
+                        Some("%CLAUDE_CONFIG_DIR%\\projects"),
+                        "~/.claude/projects",
+                    ),
+                )
+                .with_artifact(
+                    "transcripts-no-env",
+                    PathResolver::fallback_only("~/.config/claude/projects (no CLAUDE_CONFIG_DIR)"),
+                )
+                .with_artifact(
+                    "transcripts-swap-legacy",
+                    PathResolver::new(
+                        Some("~/.claude-swap-backup/sessions/<slot>/projects"),
+                        Some("~/.claude-swap-backup/sessions/<slot>/projects"),
+                        None,
+                        "~/.claude-swap-backup/sessions/<slot>/projects (cswap slots, any config dir)",
+                    ),
+                )
+                .with_artifact(
+                    "transcripts-swap-xdg",
+                    PathResolver::new(
+                        Some("$XDG_DATA_HOME/claude-swap/sessions/<slot>/projects"),
+                        None,
+                        None,
+                        "~/.local/share/claude-swap/sessions/<slot>/projects (Linux cswap slots, any config dir)",
+                    ),
+                )
+                .with_not_modeled_root(
+                    "~/Library/Application Support/Claude/{local-agent-mode-sessions,\
+                     claude-code-sessions} desktop locator (joins only while CLAUDE_CONFIG_DIR\
+                     is unset or empty): BFS depth<=4 to .claude/projects",
+                ),
+        )
     }
 }
 
@@ -1144,5 +1185,21 @@ mod tests {
         if res.detected_version.as_deref() == parsed.as_deref() {
             assert!(res.compatible);
         }
+    }
+
+    #[test]
+    fn usage_surface_keeps_desktop_locator_recorded_as_not_modeled() {
+        let surface = adapter()
+            .usage_surface()
+            .expect("claude-code declares a usage surface");
+        assert!(
+            surface.not_modeled_roots.iter().any(|note| {
+                note.contains("local-agent-mode-sessions")
+                    && note.contains("claude-code-sessions")
+                    && note.contains(".claude/projects")
+            }),
+            "the desktop locator roots must stay recorded, got {:?}",
+            surface.not_modeled_roots
+        );
     }
 }

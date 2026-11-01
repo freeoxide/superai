@@ -425,6 +425,93 @@ impl ConfigSurface {
     }
 }
 
+/// Reader family that consumes a harness's local usage artifacts (USG-01).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageReaderKind {
+    /// Newline-delimited JSON session, rollout, or transcript files.
+    TranscriptJsonl,
+    /// Single JSON signals document per session directory (grok's
+    /// `signals.json`); never traversed as JSONL.
+    SessionSignalsJson,
+    /// `SQLite` database whose history tables carry token/cost rows.
+    HistorySqlite,
+    /// `SQLite` key-value cache holding a harness-written usage document.
+    PlanCacheSqlite,
+}
+
+impl fmt::Display for UsageReaderKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            Self::TranscriptJsonl => "transcript_jsonl",
+            Self::SessionSignalsJson => "session_signals_json",
+            Self::HistorySqlite => "history_sqlite",
+            Self::PlanCacheSqlite => "plan_cache_sqlite",
+        };
+        f.write_str(s)
+    }
+}
+
+/// One local usage artifact location (USG-01). Foreign-owned, read-only
+/// telemetry: no backup, no mutation, no ownership fields apply.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageArtifact {
+    /// Stable identifier, e.g. `transcripts` or `plan-cache`.
+    pub id: String,
+    /// How to locate the artifact on each OS; hint strings may carry glob
+    /// or `<name>` shape markers the way config resolvers do.
+    pub path_resolver: PathResolver,
+}
+
+/// Declared local usage telemetry for a harness (USG-01): artifact locators,
+/// the reader kind, and the provider account the artifacts belong to. Never
+/// a [`ConfigSurface`]: usage artifacts are read-only and never backed up.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageSurface {
+    /// Local artifact locators, added by [`UsageSurface::with_artifact`].
+    pub artifacts: Vec<UsageArtifact>,
+    /// How the artifacts are read.
+    pub reader: UsageReaderKind,
+    /// Provider account the telemetry belongs to; `None` for local-only
+    /// telemetry that any provider account may have produced.
+    pub provider_account: Option<String>,
+    /// Root families the harness or a companion app writes that superai's
+    /// reader deliberately does not scan: locator notes, so a known root
+    /// stays declared instead of silently dropped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_modeled_roots: Vec<String>,
+}
+
+impl UsageSurface {
+    /// Create a surface for `reader` and an account label that is a name,
+    /// never a secret (`None` for local-only telemetry).
+    pub fn new(reader: UsageReaderKind, provider_account: Option<&str>) -> Self {
+        Self {
+            artifacts: Vec::new(),
+            reader,
+            provider_account: provider_account.map(ToOwned::to_owned),
+            not_modeled_roots: Vec::new(),
+        }
+    }
+
+    /// Add an artifact locator.
+    #[must_use]
+    pub fn with_artifact(mut self, id: &str, path_resolver: PathResolver) -> Self {
+        self.artifacts.push(UsageArtifact {
+            id: id.to_owned(),
+            path_resolver,
+        });
+        self
+    }
+
+    /// Record a root the reader knowingly leaves unscanned.
+    #[must_use]
+    pub fn with_not_modeled_root(mut self, note: &str) -> Self {
+        self.not_modeled_roots.push(note.to_owned());
+        self
+    }
+}
+
 /// Required shape of a surface's document root (HAD-03): the distinct
 /// variants keep the declaration vocabulary honest per format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1366,6 +1453,17 @@ pub trait Adapter: Send + Sync + fmt::Debug {
     fn skill_config_decl(&self) -> Option<SkillConfigDecl> {
         None
     }
+
+    /// Declared local usage telemetry (USG-01); `None` means not yet modeled.
+    fn usage_surface(&self) -> Option<UsageSurface> {
+        None
+    }
+
+    /// Explicit usage-artifact absence (USG-01): `Some(reason)` is a verified
+    /// "no readable usage artifact" and beats [`Adapter::usage_surface`].
+    fn usage_absence_reason(&self) -> Option<&'static str> {
+        None
+    }
 }
 
 /// Generic adapter constructed from catalog ledger data: the runtime shape
@@ -2050,6 +2148,49 @@ mod tests {
         assert_eq!(back, decl);
         assert_eq!(decl.shape.to_string(), "identity list (by name)");
         assert_eq!(super::McpDestShape::NameMap.to_string(), "name map");
+    }
+
+    #[test]
+    fn usage_surface_keeps_artifacts_in_declaration_order() {
+        let surface =
+            super::UsageSurface::new(super::UsageReaderKind::TranscriptJsonl, Some("anthropic"))
+                .with_artifact(
+                    "transcripts",
+                    PathResolver::fallback_only("~/.claude/projects"),
+                )
+                .with_artifact(
+                    "history",
+                    PathResolver::fallback_only("~/.claude/history.jsonl"),
+                );
+        let ids: Vec<&str> = surface.artifacts.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, vec!["transcripts", "history"]);
+        assert_eq!(surface.provider_account.as_deref(), Some("anthropic"));
+        let local_only = super::UsageSurface::new(super::UsageReaderKind::HistorySqlite, None);
+        assert!(local_only.provider_account.is_none());
+        assert!(local_only.artifacts.is_empty());
+    }
+
+    #[test]
+    fn usage_surface_round_trips_through_json() {
+        let surface =
+            super::UsageSurface::new(super::UsageReaderKind::PlanCacheSqlite, Some("windsurf"))
+                .with_artifact(
+                    "plan-cache",
+                    PathResolver::fallback_only("~/Library/state.vscdb"),
+                )
+                .with_not_modeled_root("~/.cache/windsurf (rotates too fast to scan)");
+        let json = serde_json::to_string(&surface).unwrap();
+        let back: super::UsageSurface = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, surface);
+        assert_eq!(
+            surface.not_modeled_roots,
+            vec!["~/.cache/windsurf (rotates too fast to scan)".to_owned()]
+        );
+        assert_eq!(surface.reader.to_string(), "plan_cache_sqlite");
+        // Legacy declarations without the field still deserialize.
+        let legacy = r#"{"artifacts":[],"reader":"history_sqlite","provider_account":null}"#;
+        let old: super::UsageSurface = serde_json::from_str(legacy).unwrap();
+        assert!(old.not_modeled_roots.is_empty());
     }
 
     #[test]

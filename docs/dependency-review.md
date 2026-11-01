@@ -27,6 +27,7 @@ Tooling that enforces this at CI time (see `.github/workflows/ci.yml`):
 
 | Dependency | Version | Role | Owner / maintenance | build.rs | Notes |
 |---|---|---|---|---|---|
+| memchr | 2.x (2.8.3 in the lock) | SIMD byte scans for the JSONC comment and trailing-comma strip (jsonc.rs:7) | BurntSushi (Andrew Gallant) and bluss, crates.io `memchr`; 2.8.1/2.8.2/2.8.3 released 2026-05-27/06-12/07-08 | no (`build = false` in the published manifest) | pure Rust, SIMD via core arch, no C; MIT OR Unlicense, the MIT arm satisfies the deny.toml allowlist |
 | serde | 1.x (derive) | value model for every codec | dtolnay, crates.io `serde`, one of the most-maintained Rust crates | YES (feature probing only, no external code) | derive macro only; no I/O |
 | serde_json | 1.x (preserve_order) | StrictJson codec, catalog/registry serialization | dtolnay/serde-rs, crates.io `serde_json` | YES (limbs detection) | `preserve_order` keeps unmodelled-key order stable (goal: round-trip) |
 | toml_edit | 0.23 | TOML codec with decor preservation | toml-rs org, crates.io `toml_edit` | no | the only crate that can edit TOML without reformatting — the reason it exists in-tree |
@@ -49,14 +50,16 @@ plus:
 | toride-apps | 0.1 (default-features off) | backend execution for npm, cargo, pipx, uv, Homebrew installs (toride_bridge.rs) | crates.io `toride-apps` (freeoxide, first-party: same owner as this repo) | no | sync twins only; no tokio feature; argv pinned by toride's own tests; bridge forces this repo's process posture on every spec |
 | toride-runner | 0.1 | runner seam the bridge implements to enforce env/PATH/cap/timeout policy | crates.io `toride-runner` (freeoxide, first-party) | no | default features; no tokio-runner/stream |
 | toride-registry | 0.1 (default-features off) | source model behind toride-apps planning | crates.io `toride-registry` (freeoxide, first-party) | no | no http feature; no network at runtime |
+| toride-proxy | 0.1 (default-features off, MIT) | nginx TLS site render and cert-expiry parsing for `superai vps` (VPS-02/03) | crates.io `toride-proxy` (freeoxide, first-party; 0.1.0 published 2026-10-08, verified 2026-10-13) | no | render/spec/certs_parse surfaces used at vps/render.rs:5-6 and vps/status.rs:5; pure rendering and parsing, no networking in this crate |
+| toride-wireguard | 0.1 (default-features off, MIT) | wireguard interface conf render for the deploy tunnel leg (VPS-02) | crates.io `toride-wireguard` (freeoxide, first-party; 0.1.0 published 2026-10-08, verified 2026-10-13) | no | render/spec surfaces used at vps/render.rs:7-8; previews redact credentials in the same module |
 
 Transitive participants that warrant standing attention (from `Cargo.lock`,
-168 packages total):
+206 packages total):
 
 | Package | Via | Attention |
 |---|---|---|
 | ring | ureq→rustls | **ships build.rs and compiles C code**; pinned by rustls; audited by the rustls project; acceptable because the TLS surface is confined to template fetch |
-| zeroize | ring/rustls | no build script; memory zeroing |
+| zeroize | ring/rustls; toride-wireguard | no build script; memory zeroing |
 | libyaml-rs | yaml-serde | pure-Rust safe-libyaml port; no unsafe exposed to this workspace (`unsafe_code = "forbid"` holds in our crates) |
 | async-trait | toride-apps | compile-time desugaring only; no runtime, no executor; the sync twins are the only path this repo calls |
 | option-ext (MPL-2.0) | toride-apps→dirs→dirs-sys | license added to deny.toml allowlist in dba6694; OSI-approved weak copyleft, used as a library |
@@ -64,19 +67,57 @@ Transitive participants that warrant standing attention (from `Cargo.lock`,
 | tracing / tracing-core / tracing-attributes | toride-runner | log framework compiled in; no subscriber installed here, so nothing is emitted |
 | which | toride-runner | binary discovery for runner defaults; the bridge supplies explicit argv, so this path is not exercised |
 | camino / serde_yaml / unsafe-libyaml | toride-registry | camino is a UTF-8 path wrapper; serde_yaml is upstream-archived, enters only through first-party toride-registry with no network feature, candidate to drop in a toride-side cleanup |
+| libsqlite3-sys | rusqlite (superai-usage) | ships build.rs and compiles the bundled SQLite C amalgamation; pinned by rusqlite's `bundled` feature, workspace-level decision recorded in the superai-usage section below |
+| foldhash (Zlib) | rusqlite→sqlite-wasm-rs→rsqlite-vfs→hashbrown, and hashlink→hashbrown | license added to deny.toml allowlist 2026-10-13; OSI-approved permissive (orlp, crates.io `foldhash`, 0.2.0, active), same rationale as option-ext/MPL-2.0 |
+| toride-diagnostic-types / toride-fs / similar | toride-proxy, toride-wireguard | pure-Rust support crates (diagnostic types, fs scaffolding, diff rendering); no build scripts, no networking |
+| base64 (second 0.22 line) | toride-wireguard | version duplicate alongside the graph's other base64; `bans.multiple-versions` is warn-only in deny.toml, tracked here so the duplicate stays deliberate |
 
-## superai-cli (L3 — the one binary)
+## superai-usage (L3 — usage truth)
+
+serde and thiserror as in superai-config (workspace-inherited, reviewed
+above), plus:
+
+| Dependency | Version | Role | Owner / maintenance | build.rs | Notes |
+|---|---|---|---|---|---|
+| superai-core | path (workspace) | L2 layer; `ProviderId` keys the usage registry | in-tree | no | sits between core and cli; consumes ids and adapter declarations, adds no interface types |
+| serde_json | 1.x (preserve_order, raw_value; workspace) | parse harness usage artifacts (USG-03 readers, cost tables) | dtolnay/serde-rs; 1.0.151 in the lock, active | YES (limbs detection) | raw_value used by cost.rs's models.dev table parsing (cost.rs:14); same codec discipline as superai-config |
+| jiff | 0.2.x (serde; workspace) | window resets, cost periods, DST-correct day bucketing (USG-04/05) | BurntSushi; 0.2.38 in the lock, active | no | typed timestamps, zone-aware month-to-date; used by cost.rs and both readers |
+| rusqlite | 0.40.x (bundled; workspace) | opencode v2 history reader (USG-03) | rusqlite org (gwenn); 0.40.2 in the lock, active | YES (libsqlite3-sys, see participants table) | decision: `features = ["bundled"]` pinned at the workspace root (Cargo.toml), so the reader needs no system libsqlite3 and behaves identically on every machine; the trade is the C-amalgamation participant above; foreign dbs open with SQLITE_OPEN_READ_ONLY only (reader/opencode.rs) |
+| ureq | 3.x (rustls, gzip; default-features off) | llmproxy ledger client and poller transport (USG-08/09) | crates.io `ureq` (algesten); 3.4.0 in the lock, active | no | timeout-capped agents (llmproxy.rs:602, poller.rs:447) with transport errors mapped to typed failures (poller.rs:415); the models.dev pricing fetch rides core's shared client instead (fetch_models_dev_bytes, cost.rs:1029) |
+
+## superai-cli (L4 — the one binary)
 
 | Dependency | Version | Role | Notes |
 |---|---|---|---|
-| superai-core | path (workspace) | L2 layer | the only upward dependency in the workspace; no interface types exist below this crate |
+| superai-core | path (workspace) | L2 layer | an upward dependency, as superai-usage also has; no interface types exist below this crate |
+| superai-usage | path (../superai-usage) | L3 layer: usage readers, cost engine, llmproxy client and poller behind `superai usage` and `superai vps` | landed 4058227; the interface crate may depend on every layer below it |
+| serde | 1.x (derive; workspace) | typed structs for `--json` reports (vps.rs:10) | reviewed under superai-config; no new lockfile participant |
+| serde_json | 1.x (workspace) | `--json` rendering via `to_string_pretty` (vps.rs:751) | reviewed under superai-config and superai-usage; 1.0.151 in the lock |
+| thiserror | 2.x (workspace) | `CliError` taxonomy (main.rs:14) | reviewed under superai-config; 2.0.20 in the lock |
+| jiff | 0.2.x (workspace) | window and period timestamps for `superai usage` (usage.rs:9) | reviewed under superai-usage; 0.2.38 in the lock |
+
+Dev-only: rusqlite (workspace) lets tests/usage_cli.rs build the opencode
+history-db fixture (tests/usage_cli.rs:16); tests/vps_cli.rs acks it for
+`unused_crate_dependencies`. Not in the shipped binary graph.
 
 ## Dev/tooling dependencies (not in the shipped graph)
 
 | Tool | How it enters | Review |
 |---|---|---|
+| criterion | [dev-dependencies] of superai-config (hot_lanes benches) and superai-core (drift/render/mcp lanes) | bench-only, workspace-pinned, never in the shipped graph |
 | cargo-mutants 27.1.0 | `cargo install cargo-mutants --locked`, CI `mutation-testing` job | installed from crates.io with `--locked`; scope pinned by `.cargo/mutants.toml` |
 | cargo-hack / cargo-shear / cargo-deny | CI supply-chain job, `--locked` installs | same discipline; deny.toml policy in-repo |
 
 Review date: 2026-09-01 (area 8, QAL-12); re-reviewed 2026-10-11 for the
-toride participants added by PR #8. Re-verify on every lockfile diff.
+toride participants added by PR #8; re-reviewed 2026-10-12 for the
+superai-usage crate scaffold (USG-02, one path dependency, no new external
+lockfile participants; the package count rose by the crate itself);
+re-reviewed 2026-10-13 for the USG-03 reader dependencies (serde_json with
+raw_value, jiff with serde, rusqlite 0.40 bundled) at the 193-package lock;
+re-reviewed 2026-10-13 again for the VPS deploy dependencies (toride-proxy
+and toride-wireguard, 0.1, first-party) and superai-usage's landed ureq, at
+the 206-package lock; re-reviewed 2026-10-23 after a drift check caught two
+omissions, superai-config's memchr (landed d5e7044, 2026-10-02) and
+superai-cli's usage-subcommand dependencies (landed 4058227, 2026-10-13);
+rows added, the lockfile still at 206 packages with no new participants.
+Re-verify on every lockfile diff.

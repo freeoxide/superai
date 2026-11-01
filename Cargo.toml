@@ -1,6 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["crates/superai-config", "crates/superai-core", "crates/superai-cli"]
+members = [
+    "crates/superai-config",
+    "crates/superai-core",
+    "crates/superai-usage",
+    "crates/superai-cli",
+]
 
 [workspace.package]
 edition = "2024"
@@ -16,11 +21,13 @@ repository = "https://github.com/freeoxide/superai"
 superai-config = { path = "crates/superai-config" }
 superai-core = { path = "crates/superai-core" }
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["preserve_order"] }
+serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
 toml_edit = "0.23"
 thiserror = "2"
 yaml-serde = { package = "yaml_serde", version = "0.10" }
 criterion = "0.8"
+jiff = { version = "0.2", features = ["serde"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

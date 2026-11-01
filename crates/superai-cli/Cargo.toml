@@ -9,7 +9,7 @@ keywords.workspace = true
 categories.workspace = true
 publish = false
 repository.workspace = true
-description = "Layer 3: interface. CLI placeholder until GPUI."
+description = "Layer 4: interface. CLI placeholder until GPUI."
 
 [[bin]]
 name = "superai"
@@ -17,6 +17,14 @@ path = "src/main.rs"
 
 [dependencies]
 superai-core = { workspace = true }
+superai-usage = { path = "../superai-usage" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+jiff = { workspace = true }
+
+[dev-dependencies]
+rusqlite = { workspace = true }
 
 [lints]
 workspace = true

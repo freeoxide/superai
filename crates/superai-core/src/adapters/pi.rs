@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 
 use crate::adapter::{
     ADAPTER_REVISION, Adapter, ConfigScope, ConfigSurface, DetectionResult, DocumentKind,
-    PathResolver, Platform, ProductStatus, RestartBehavior, SurfaceOwnership, VersionResolution,
-    WrapperPlan,
+    PathResolver, Platform, ProductStatus, RestartBehavior, SurfaceOwnership, UsageReaderKind,
+    UsageSurface, VersionResolution, WrapperPlan,
 };
 use crate::error::CoreError;
 use crate::ids::HarnessId;
@@ -451,6 +451,47 @@ impl Adapter for PiAdapter {
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some(
             "extensions are TypeScript modules loaded via -e/--extension flags/npm/git; no file-staged plugin mechanism (pi.md)",
+        )
+    }
+    fn usage_surface(&self) -> Option<UsageSurface> {
+        Some(
+            UsageSurface::new(UsageReaderKind::TranscriptJsonl, None)
+                .with_artifact(
+                    "sessions",
+                    PathResolver::new(
+                        Some("$PI_CODING_AGENT_DIR/sessions"),
+                        Some("$PI_CODING_AGENT_DIR/sessions"),
+                        Some("%PI_CODING_AGENT_DIR%\\sessions"),
+                        "~/.pi/agent/sessions (PI_CODING_AGENT_SESSION_DIR overrides)",
+                    ),
+                )
+                .with_artifact(
+                    "omp-agent-sessions",
+                    PathResolver::fallback_only(
+                        "~/.omp/agent/sessions (PI_CONFIG_DIR relocates ~/.omp)",
+                    ),
+                )
+                .with_artifact(
+                    "omp-xdg-sessions",
+                    PathResolver::new(
+                        Some("$XDG_DATA_HOME/omp/sessions"),
+                        Some("$XDG_DATA_HOME/omp/sessions"),
+                        None,
+                        "$XDG_DATA_HOME/omp/sessions (default ~/.local/share/omp/sessions)",
+                    ),
+                )
+                .with_artifact(
+                    "omp-profile-sessions",
+                    PathResolver::fallback_only(
+                        "~/.omp/profiles/<profile>/{sessions,agent/sessions} (OMP_PROFILE-selected)",
+                    ),
+                )
+                .with_artifact(
+                    "omp-xdg-profile-sessions",
+                    PathResolver::fallback_only(
+                        "$XDG_DATA_HOME/omp/profiles/<profile>/{sessions,agent/sessions}",
+                    ),
+                ),
         )
     }
 }
